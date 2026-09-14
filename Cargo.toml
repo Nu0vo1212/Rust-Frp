@@ -1,0 +1,71 @@
+[workspace]
+resolver = "2"
+members = ["common", "server", "client"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["rustunnel contributors"]
+
+[workspace.dependencies]
+# 内部 crate
+rustunnel-common = { path = "common", version = "0.1.0" }
+
+# 外部依赖（统一在此处锁定版本，保证各 crate 一致）
+# frp v2 控制通道加密，对应官方 go 实现的 HKDF-SHA256 + AES-256-GCM
+aes-gcm = "0.10"
+base64 = "0.22"
+hkdf = "0.12"
+md-5 = "0.10"
+rand = "0.8"
+sha2 = "0.10"
+
+# 传输层增强：yamux 多路复用（frp transport.tcpMux）+ TLS（frp transport.tls）
+yamux = "0.13"
+# 注：0.23.44 起 dangerous API（跳过证书校验）不再需要 feature gate。
+# frp 客户端默认 InsecureSkipVerify=true，所以这里必须能用到它。
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+] }
+rcgen = { version = "0.13", default-features = false, features = [
+    "ring",
+    "pem",
+] }
+
+anyhow = "1.0"
+bytes = "1"
+clap = { version = "4.5", features = ["derive"] }
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+# 只启用实际用到的特性（相比 "full" 显著减小体积与编译时间）：
+# macros(select!/main) rt-multi-thread net io-util(copy_bidirectional) time signal(Ctrl+C)
+tokio = { version = "1", default-features = false, features = [
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "time",
+    "signal",
+] }
+# compat：yamux 用 futures 的 IO trait，需要它来和 tokio 的流互相转换
+tokio-util = { version = "0.7", features = ["codec", "io", "compat"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
+
+# release 优化：体积优先（opt-level="s"）+ 全量 LTO，降低二进制体积与常驻内存
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

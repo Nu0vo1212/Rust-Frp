@@ -1,0 +1,21 @@
+[package]
+name = "rustunnel-server"
+description = "rustunnel 服务端：控制连接 + 工作连接，TCP 端口转发"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rustunnel-server"
+path = "src/main.rs"
+
+[dependencies]
+rustunnel-common = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }

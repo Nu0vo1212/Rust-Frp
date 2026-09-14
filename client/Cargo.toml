@@ -1,0 +1,21 @@
+[package]
+name = "rustunnel-client"
+description = "rustunnel 客户端：注册代理、按需建立工作连接"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rustunnel-client"
+path = "src/main.rs"
+
+[dependencies]
+rustunnel-common = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }

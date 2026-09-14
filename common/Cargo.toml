@@ -1,0 +1,32 @@
+[package]
+name = "rustunnel-common"
+description = "rustunnel 公共库：协议、配置、错误、工具与传输层抽象"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+yamux = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rcgen = { workspace = true }
+
+aes-gcm = { workspace = true }
+base64 = { workspace = true }
+hkdf = { workspace = true }
+md-5 = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+
+anyhow = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

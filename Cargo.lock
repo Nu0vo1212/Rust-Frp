@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "rustunnel-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -851,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "rustunnel-common"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -878,9 +878,10 @@ dependencies = [
 
 [[package]]
 name = "rustunnel-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "futures",
  "rustunnel-common",

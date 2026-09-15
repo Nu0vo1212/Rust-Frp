@@ -1,7 +1,14 @@
 //! `rustunnel-server`：frp v2 兼容的服务端（等价于原版 frps）。
 //!
 //! 与原版一致，控制连接与工作连接复用**同一个端口**，靠首帧消息类型区分：
-//! `Login` 走控制连接流程，`NewWorkConn` 走工作连接流程。
+//! `Login` 走控制连接流程，`NewWorkConn` 走工作连接流程，
+//! `NewVisitorConn` 走 visitor 接入流程（stcp / xtcp）。
+//!
+//! 已实现的代理类型：`tcp` / `udp` / `http` / `https` / `stcp` / `xtcp`。
+
+mod udp_proxy;
+mod vhost;
+mod visitor;
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -17,13 +24,24 @@ use rustunnel_common::{
     frp::{
         self,
         conn::{self, FrpConn, ServerAccept},
-        msg::{FrpMessage, Login, NewProxyResp, NewWorkConn, Pong, StartWorkConn},
+        msg::{
+            FrpMessage, Login, NatHoleResp, NewProxyResp, NewVisitorConn, NewVisitorConnResp,
+            NewWorkConn, Pong, StartWorkConn,
+        },
         stream::{BoxStream, PrefixedStream},
     },
     util,
 };
-use tokio::{net::TcpListener, net::TcpStream, sync::mpsc, task::AbortHandle};
+use tokio::{
+    net::TcpListener,
+    net::TcpStream,
+    sync::{mpsc, Notify},
+    task::AbortHandle,
+};
 use tracing::{debug, error, info, warn};
+
+use visitor::{VisitorEntry, VisitorTable};
+use vhost::{VhostRoute, VhostTable};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -72,10 +90,14 @@ struct WorkItem {
 }
 
 /// 一个已经连进来、等待工作连接的用户连接。
+///
+/// `stream` 可能是：
+/// * 公网端口上进来的 TCP（tcp / udp / http / https 走这条）；
+/// * visitor 连接（stcp / xtcp）：握手完成后它本身就是裸字节通道。
 struct PendingUser {
     proxy: String,
     remote_port: u16,
-    stream: TcpStream,
+    stream: BoxStream,
     peer: SocketAddr,
     at: Instant,
 }
@@ -115,10 +137,17 @@ impl PoolState {
 struct ClientState {
     run_id: String,
     client_id: String,
+    /// 客户端在 Login 里声明的用户名，用于 stcp/xtcp 的 `allow_users` 白名单匹配。
+    user: String,
     /// 代理监听器用它通知控制连接"需要一条工作连接"。
     req_tx: mpsc::UnboundedSender<()>,
     pool: Mutex<PoolState>,
     listeners: Mutex<HashMap<String, AbortHandle>>,
+    /// 本次会话协商出的 UDP 报文编码（true = 二进制），工作连接要跟着用。
+    udp_binary: bool,
+    /// 有新工作连接入池 / 代理被停止时唤醒等待者（UDP 与 HTTP 都要主动取工作连接）。
+    work_notify: Notify,
+    stopped: std::sync::atomic::AtomicBool,
     idle_timeout: Duration,
 }
 
@@ -126,16 +155,56 @@ impl ClientState {
     fn new(
         run_id: String,
         client_id: String,
+        user: String,
         req_tx: mpsc::UnboundedSender<()>,
         idle_timeout: Duration,
+        udp_binary: bool,
     ) -> Self {
         Self {
             run_id,
             client_id,
+            user,
             req_tx,
             pool: Mutex::new(PoolState::default()),
             listeners: Mutex::new(HashMap::new()),
+            udp_binary,
+            work_notify: Notify::new(),
+            stopped: std::sync::atomic::AtomicBool::new(false),
             idle_timeout,
+        }
+    }
+
+    fn udp_codec_is_binary(&self) -> bool {
+        self.udp_binary
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 主动取一条工作连接：池里没有就向客户端要，并等待它到来。
+    ///
+    /// UDP 代理和 HTTP 代理都不是"用户连进来才要连接"，必须自己发起。
+    async fn acquire_work_conn(self: &Arc<Self>, wait: Duration) -> Option<WorkItem> {
+        if let Some(w) = self.pool.lock().unwrap().work.pop_front() {
+            return Some(w);
+        }
+        let deadline = Instant::now() + wait;
+        loop {
+            if self.is_stopped() {
+                return None;
+            }
+            let remaining = deadline.checked_duration_since(Instant::now())?;
+            let _ = self.req_tx.send(());
+            if tokio::time::timeout(remaining, self.work_notify.notified())
+                .await
+                .is_err()
+            {
+                return None;
+            }
+            if let Some(w) = self.pool.lock().unwrap().work.pop_front() {
+                return Some(w);
+            }
         }
     }
 
@@ -152,17 +221,23 @@ impl ClientState {
         }
     }
 
-    /// 工作连接到来：有排队的用户就立即配对，否则进池备用。
+    /// 工作连接到来：有排队的用户就立即配对，否则进池备用并唤醒等待者。
     fn submit_work(&self, w: WorkItem) -> Option<Paired> {
-        let mut g = self.pool.lock().unwrap();
-        g.reap(self.idle_timeout);
-        match g.users.pop_front() {
-            Some(u) => Some((u, w)),
-            None => {
-                g.work.push_back(w);
-                None
+        let paired = {
+            let mut g = self.pool.lock().unwrap();
+            g.reap(self.idle_timeout);
+            match g.users.pop_front() {
+                Some(u) => Some((u, w)),
+                None => {
+                    g.work.push_back(w);
+                    None
+                }
             }
+        };
+        if paired.is_none() {
+            self.work_notify.notify_waiters();
         }
+        paired
     }
 
     fn add_listener(&self, name: String, handle: AbortHandle) {
@@ -170,10 +245,13 @@ impl ClientState {
     }
 
     fn stop(&self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         for (_, h) in self.listeners.lock().unwrap().drain() {
             h.abort();
         }
         self.pool.lock().unwrap().work.clear();
+        self.work_notify.notify_waiters();
     }
 }
 
@@ -183,7 +261,12 @@ impl ClientState {
 
 struct Registry {
     clients: Mutex<HashMap<String, Arc<ClientState>>>,
+    /// TCP + UDP 共用一份端口占用表，避免同一个端口号被两种协议同时申领。
     ports: Mutex<HashSet<u16>>,
+    /// HTTP / HTTPS 虚拟主机路由表（启动时若配置了 vhost 端口才挂上）。
+    vhosts: Mutex<Option<Arc<VhostTable>>>,
+    /// stcp / xtcp 的 visitor 接入表（始终可用，不需要额外端口配置）。
+    visitors: Arc<VisitorTable>,
 }
 
 impl Registry {
@@ -191,7 +274,17 @@ impl Registry {
         Self {
             clients: Mutex::new(HashMap::new()),
             ports: Mutex::new(HashSet::new()),
+            vhosts: Mutex::new(None),
+            visitors: Arc::new(VisitorTable::default()),
         }
+    }
+
+    fn attach_vhosts(&self, table: Arc<VhostTable>) {
+        *self.vhosts.lock().unwrap() = Some(table);
+    }
+
+    fn vhosts(&self) -> Option<Arc<VhostTable>> {
+        self.vhosts.lock().unwrap().clone()
     }
 
     fn insert(&self, client: Arc<ClientState>) {
@@ -206,6 +299,12 @@ impl Registry {
         let c = self.clients.lock().unwrap().remove(run_id);
         if let Some(c) = &c {
             c.stop();
+            // 客户端的 http/https 域名要一并回收，否则域名会一直被占着
+            if let Some(t) = self.vhosts() {
+                t.unregister_client(c);
+            }
+            // stcp / xtcp 的代理名同理
+            self.visitors.unregister_client(c);
         }
         c
     }
@@ -291,12 +390,31 @@ async fn main() -> Result<()> {
         .with_context(|| format!("监听 {addr} 失败（端口可能被占用）"))?;
 
     info!("rustunnel-server 已启动：frp v2 协议，监听 {addr}");
+    info!("支持的代理类型：tcp / udp / http / https / stcp / xtcp（xtcp 走中继，不实现 UDP 打洞）");
     info!("token = {}（{}）",
         if cfg.token.is_empty() { "<空>" } else { "已设置" },
         if cfg.token.is_empty() { "不安全" } else { "已启用" }
     );
 
     let registry = Arc::new(Registry::new());
+
+    // HTTP / HTTPS 虚拟主机端口（可选）
+    if cfg.vhost_http_port.is_some() || cfg.vhost_https_port.is_some() {
+        let table = Arc::new(VhostTable::default());
+        registry.attach_vhosts(table.clone());
+        for (port, is_https) in [
+            (cfg.vhost_http_port, false),
+            (cfg.vhost_https_port, true),
+        ] {
+            let Some(vport) = port else { continue };
+            let addr = util::resolve_addr(&format!("{}:{}", cfg.bind_addr, vport))
+                .await
+                .with_context(|| format!("解析 vhost 地址 {}:{} 失败", cfg.bind_addr, vport))?;
+            let listener = vhost::bind(addr).await?;
+            tokio::spawn(vhost::run_http(listener, table.clone(), vport, is_https));
+        }
+    }
+
     let shutdown = util::shutdown_signal();
     tokio::pin!(shutdown);
 
@@ -395,10 +513,13 @@ async fn handle_frp_stream(
 ) -> Result<()> {
     let run_id = util::new_run_id();
     match conn::server_handshake(stream, &cfg.token, &run_id).await {
-        Ok(ServerAccept::Control { conn, login }) => {
-            handle_control(conn, login, run_id, cfg, registry).await
-        }
+        Ok(ServerAccept::Control {
+            conn,
+            login,
+            udp_binary,
+        }) => handle_control(conn, login, run_id, udp_binary, cfg, registry).await,
         Ok(ServerAccept::Work { conn, msg }) => handle_work(conn, msg, registry).await,
+        Ok(ServerAccept::Visitor { conn, msg }) => handle_visitor(conn, msg, registry).await,
         Err(e) => {
             debug!("握手失败：{e:#}");
             Err(e)
@@ -414,6 +535,7 @@ async fn handle_control(
     mut conn: FrpConn,
     login: Login,
     run_id: String,
+    udp_binary: bool,
     cfg: Arc<ServerConfig>,
     registry: Arc<Registry>,
 ) -> Result<()> {
@@ -429,8 +551,10 @@ async fn handle_control(
     let client = Arc::new(ClientState::new(
         run_id.clone(),
         client_id.clone(),
+        login.user.clone(),
         req_tx,
         idle_timeout,
+        udp_binary,
     ));
     registry.insert(client.clone());
     let _guard = ClientGuard {
@@ -451,11 +575,11 @@ async fn handle_control(
                         let name = m.proxy_name.clone();
                         let port = m.remote_port;
                         let resp = match register_proxy(&cfg, &registry, &client, &m).await {
-                            Ok(()) => {
-                                info!(proxy = %name, port, "代理注册成功");
+                            Ok(remote_addr) => {
+                                info!(proxy = %name, port, remote = %remote_addr, "代理注册成功");
                                 NewProxyResp {
                                     proxy_name: name.clone(),
-                                    remote_addr: format!("{}:{}", cfg.bind_addr, port),
+                                    remote_addr,
                                     ..Default::default()
                                 }
                             }
@@ -471,7 +595,27 @@ async fn handle_control(
                     }
                     FrpMessage::CloseProxy(m) => {
                         info!(proxy = %m.proxy_name, "客户端关闭代理");
+                        registry.visitors.remove(&m.proxy_name);
                         client.stop_proxy(&m.proxy_name);
+                    }
+                    // xtcp 真·P2P 需要 UDP 打洞（QUIC/KCP + NAT 类型探测），rustunnel 未实现。
+                    // 这里明确回一条错误，让官方 frpc 的 xtcp visitor 立刻失败并走它自己的
+                    // fallbackTo 逻辑，而不是一直挂在那里等超时。
+                    FrpMessage::NatHoleVisitor(m) => {
+                        debug!(proxy = %m.proxy_name, tx = %m.transaction_id, "收到 NatHoleVisitor，回错误");
+                        conn.send_msg(&FrpMessage::NatHoleResp(NatHoleResp {
+                            transaction_id: m.transaction_id,
+                            error: "nat hole is not supported by rustunnel-server (use stcp instead)"
+                                .to_string(),
+                            ..Default::default()
+                        }))
+                        .await?;
+                    }
+                    FrpMessage::NatHoleClient(m) => {
+                        debug!(proxy = %m.proxy_name, "收到 NatHoleClient，rustunnel 不支持打洞，忽略");
+                    }
+                    FrpMessage::NatHoleReport(m) => {
+                        debug!(sid = %m.sid, success = m.success, "收到 NatHoleReport，忽略");
                     }
                     other => {
                         debug!("忽略消息：{}", other.name());
@@ -493,18 +637,70 @@ async fn handle_control(
     Ok(())
 }
 
-/// 绑定 remote_port 并启动该代理的 accept 循环。
+/// 按代理类型注册：tcp / udp 绑端口，http / https 注册虚拟主机域名。
+///
+/// 返回给客户端的 `remote_addr` 文案（frp 用它展示"暴露在哪"）。
 async fn register_proxy(
     cfg: &Arc<ServerConfig>,
     registry: &Arc<Registry>,
     client: &Arc<ClientState>,
     m: &rustunnel_common::frp::msg::NewProxy,
-) -> Result<()> {
+) -> Result<String> {
     if m.proxy_name.is_empty() {
         anyhow::bail!("代理名为空");
     }
-    if m.proxy_type != "tcp" {
-        anyhow::bail!("暂不支持的代理类型：{}（MVP 仅支持 tcp）", m.proxy_type);
+    match m.proxy_type.as_str() {
+        "tcp" => register_tcp(cfg, registry, client, m).await,
+        "udp" => register_udp(cfg, registry, client, m).await,
+        "http" => register_vhost(cfg, registry, client, m, false).await,
+        "https" => register_vhost(cfg, registry, client, m, true).await,
+        "stcp" => register_visitor_proxy(registry, client, m, "stcp").await,
+        "xtcp" => register_visitor_proxy(registry, client, m, "xtcp").await,
+        other => anyhow::bail!(
+            "暂不支持的代理类型：{other}（支持 tcp / udp / http / https / stcp / xtcp）"
+        ),
+    }
+}
+
+/// stcp / xtcp：**不需要公网端口**，只在 visitor 表里登记一条记录。
+///
+/// 之后 visitor 主动连进来时才会校验密钥并配对工作连接。
+///
+/// 说明：rustunnel 目前**不实现 xtcp 的 UDP 打洞**（真 P2P 需要 QUIC/KCP +
+/// NAT 类型探测），`xtcp` 走与 `stcp` 完全相同的中继路径。
+async fn register_visitor_proxy(
+    registry: &Arc<Registry>,
+    client: &Arc<ClientState>,
+    m: &rustunnel_common::frp::msg::NewProxy,
+    kind: &str,
+) -> Result<String> {
+    if m.sk.is_empty() {
+        anyhow::bail!("{kind} 代理必须配置 secret_key（frpc 里叫 secretKey）");
+    }
+    registry
+        .visitors
+        .register(VisitorEntry {
+            proxy_name: m.proxy_name.clone(),
+            secret_key: m.sk.clone(),
+            allow_users: m.allow_users.clone(),
+            provider_user: client.user.clone(),
+            client: client.clone(),
+            proxy_type: kind.to_string(),
+        })
+        .map_err(|e| anyhow!(e))?;
+    // 与官方 frps 一致：visitor 类代理没有公网地址，remote_addr 留空
+    Ok(String::new())
+}
+
+/// TCP：绑定公网端口，用户连进来时向客户端要工作连接配对。
+async fn register_tcp(
+    cfg: &Arc<ServerConfig>,
+    registry: &Arc<Registry>,
+    client: &Arc<ClientState>,
+    m: &rustunnel_common::frp::msg::NewProxy,
+) -> Result<String> {
+    if m.remote_port == 0 {
+        anyhow::bail!("tcp 代理必须指定 remote_port");
     }
     if !registry.reserve_port(m.remote_port) {
         anyhow::bail!("端口 {} 已被占用", m.remote_port);
@@ -528,7 +724,105 @@ async fn register_proxy(
         proxy_accept_loop(listener, proxy_name, remote_port, client2).await;
     });
     client.add_listener(m.proxy_name.clone(), handle.abort_handle());
-    Ok(())
+    Ok(format!("{}:{}", cfg.bind_addr, m.remote_port))
+}
+
+/// UDP：绑定 UDP 端口 + 维持一条专用工作连接。
+async fn register_udp(
+    cfg: &Arc<ServerConfig>,
+    registry: &Arc<Registry>,
+    client: &Arc<ClientState>,
+    m: &rustunnel_common::frp::msg::NewProxy,
+) -> Result<String> {
+    if m.remote_port == 0 {
+        anyhow::bail!("udp 代理必须指定 remote_port");
+    }
+    if !registry.reserve_port(m.remote_port) {
+        anyhow::bail!("端口 {} 已被占用", m.remote_port);
+    }
+    let udp = match udp_proxy::bind_udp(&cfg.bind_addr, m.remote_port).await {
+        Ok(u) => u,
+        Err(e) => {
+            registry.release_port(m.remote_port);
+            return Err(e);
+        }
+    };
+    let handle = udp_proxy::spawn(Arc::new(udp), m.proxy_name.clone(), client.clone());
+    client.add_listener(m.proxy_name.clone(), handle.abort_handle());
+    Ok(format!("{}:{}/udp", cfg.bind_addr, m.remote_port))
+}
+
+/// HTTP / HTTPS：把域名注册进虚拟主机路由表（不需要额外端口）。
+async fn register_vhost(
+    cfg: &Arc<ServerConfig>,
+    registry: &Arc<Registry>,
+    client: &Arc<ClientState>,
+    m: &rustunnel_common::frp::msg::NewProxy,
+    is_https: bool,
+) -> Result<String> {
+    let kind = if is_https { "https" } else { "http" };
+    let vhost_port = if is_https {
+        cfg.vhost_https_port
+    } else {
+        cfg.vhost_http_port
+    };
+    let Some(vhost_port) = vhost_port else {
+        anyhow::bail!(
+            "服务端未配置 vhost_{}_port，无法注册 {kind} 代理",
+            if is_https { "https" } else { "http" }
+        );
+    };
+    let table = registry
+        .vhosts()
+        .ok_or_else(|| anyhow!("虚拟主机路由表未初始化"))?;
+
+    let mut domains: Vec<String> = m
+        .custom_domains
+        .iter()
+        .map(|d| d.trim().to_ascii_lowercase())
+        .filter(|d| !d.is_empty())
+        .collect();
+    if !m.subdomain.is_empty() {
+        if cfg.subdomain_host.is_empty() {
+            anyhow::bail!("客户端用了 subdomain，但服务端未配置 subdomain_host");
+        }
+        domains.push(format!(
+            "{}.{}",
+            m.subdomain.trim().to_ascii_lowercase(),
+            cfg.subdomain_host.trim().to_ascii_lowercase()
+        ));
+    }
+    if domains.is_empty() {
+        anyhow::bail!("{kind} 代理必须配置 custom_domains 或 subdomain");
+    }
+
+    let mut locations: Vec<String> = if m.locations.is_empty() {
+        vec!["/".to_string()]
+    } else {
+        m.locations.clone()
+    };
+    // 长前缀优先匹配（frp 的路由优先级规则）
+    locations.sort_by_key(|a| std::cmp::Reverse(a.len()));
+    for domain in &domains {
+        table.register(Arc::new(VhostRoute {
+            proxy_name: m.proxy_name.clone(),
+            client: client.clone(),
+            domain: domain.clone(),
+            locations: locations.clone(),
+            http_user: m.http_user.clone(),
+            http_pwd: m.http_pwd.clone(),
+            route_by_http_user: m.route_by_http_user.clone(),
+            rewrite_host: m.host_header_rewrite.clone(),
+            req_headers: m.headers.clone(),
+            resp_headers: m.response_headers.clone(),
+            is_https,
+        }))?;
+    }
+    Ok(domains
+        .iter()
+        .map(|d| format!("{d}:{vhost_port}"))
+        .collect::<Vec<_>>()
+        .join(","))
 }
 
 impl ClientState {
@@ -553,7 +847,7 @@ async fn proxy_accept_loop(
                 let user = PendingUser {
                     proxy: proxy_name.clone(),
                     remote_port,
-                    stream,
+                    stream: Box::pin(stream),
                     peer,
                     at: Instant::now(),
                 };
@@ -577,10 +871,12 @@ async fn proxy_accept_loop(
 // 工作连接
 // ---------------------------------------------------------------------------
 
-async fn handle_work(conn: FrpConn, msg: NewWorkConn, registry: Arc<Registry>) -> Result<()> {
+async fn handle_work(mut conn: FrpConn, msg: NewWorkConn, registry: Arc<Registry>) -> Result<()> {
     let client = registry
         .get(&msg.run_id)
         .ok_or_else(|| anyhow!("找不到 run_id={} 对应的客户端", msg.run_id))?;
+    // 工作连接继承控制连接协商出的 UDP 报文编码
+    conn.set_udp_codec(client.udp_codec_is_binary());
     let work = WorkItem {
         conn,
         at: Instant::now(),
@@ -592,6 +888,113 @@ async fn handle_work(conn: FrpConn, msg: NewWorkConn, registry: Arc<Registry>) -
         }
         None => debug!(client = %client.client_id, "工作连接进入空闲池"),
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// visitor 连接（stcp / xtcp 的接入方）
+// ---------------------------------------------------------------------------
+
+/// 处理一条 visitor 连接：校验 -> 回 Resp -> 与 provider 的工作连接配对。
+///
+/// 配对成功后这条 visitor 连接就变成"用户连接"，转发逻辑与 tcp 完全一样。
+async fn handle_visitor(
+    mut conn: FrpConn,
+    msg: NewVisitorConn,
+    registry: Arc<Registry>,
+) -> Result<()> {
+    let proxy_name = msg.proxy_name.clone();
+
+    /// 回一条错误响应并结束（官方 frpc 会把 error 原样打到日志上）。
+    async fn reject(conn: &mut FrpConn, proxy_name: &str, err: String) -> Result<()> {
+        let _ = conn
+            .send_msg(&FrpMessage::NewVisitorConnResp(NewVisitorConnResp {
+                proxy_name: proxy_name.to_string(),
+                error: err.clone(),
+            }))
+            .await;
+        // 必须优雅关闭：直接 drop 会变成 RST，对端读不到 error，只会看到 connection reset
+        let _ = conn.shutdown().await;
+        anyhow::bail!("visitor 接入被拒绝：{err}");
+    }
+
+    // 1) run_id 必须能对上一条已登录的控制会话（对应 frps 的 admitVisitorByRunID）
+    if !msg.run_id.is_empty() && registry.get(&msg.run_id).is_none() {
+        return reject(
+            &mut conn,
+            &proxy_name,
+            format!("no client control found for run id [{}]", msg.run_id),
+        )
+        .await;
+    }
+
+    // 2) 代理必须已注册
+    let Some(entry) = registry.visitors.get(&proxy_name) else {
+        return reject(
+            &mut conn,
+            &proxy_name,
+            format!("custom listener for [{proxy_name}] doesn't exist"),
+        )
+        .await;
+    };
+
+    // 3) 密钥签名校验：hex(md5(secret_key + timestamp))
+    if !entry.check_sign(&msg.sign_key, msg.timestamp) {
+        warn!(proxy = %proxy_name, "visitor 密钥校验失败");
+        return reject(
+            &mut conn,
+            &proxy_name,
+            format!("visitor connection of [{proxy_name}] auth failed"),
+        )
+        .await;
+    }
+
+    // 4) 访客用户白名单
+    //
+    // 与官方 frps 一致：比对的**不是** visitor 的 name，而是发起这条 visitor 连接的那个
+    // frpc 在 Login 里声明的顶层 `user`（对应 frpc.toml 的 `user = "alice"`）。
+    let visitor_user = registry
+        .get(&msg.run_id)
+        .map(|c| c.user.clone())
+        .unwrap_or_default();
+    if !entry.check_user(&visitor_user) {
+        warn!(proxy = %proxy_name, user = %visitor_user, "visitor 用户不在 allow_users 白名单内");
+        return reject(
+            &mut conn,
+            &proxy_name,
+            format!("visitor connection of [{proxy_name}] user [{visitor_user}] not allowed"),
+        )
+        .await;
+    }
+
+    // 5) 先回成功（官方 frps 也是先 PutConn 再回 ok，之后才去池里取工作连接）
+    conn.send_msg(&FrpMessage::NewVisitorConnResp(NewVisitorConnResp {
+        proxy_name: proxy_name.clone(),
+        error: String::new(),
+    }))
+    .await
+    .context("发送 NewVisitorConnResp 失败")?;
+
+    // 6) 向 provider 要一条工作连接并配对
+    let Some(work) = entry
+        .client
+        .acquire_work_conn(Duration::from_secs(10))
+        .await
+    else {
+        anyhow::bail!("provider [{proxy_name}] 没有可用的工作连接，visitor 连接关闭");
+    };
+
+    let (stream, leftover) = conn.into_stream();
+    let user = PendingUser {
+        proxy: proxy_name.clone(),
+        // visitor 没有公网端口概念
+        remote_port: 0,
+        stream: Box::pin(PrefixedStream::new(leftover, stream)),
+        peer: SocketAddr::from(([0, 0, 0, 0], 0)),
+        at: Instant::now(),
+    };
+    info!(proxy = %proxy_name, kind = %entry.proxy_type, "visitor 接入成功，开始中继");
+    spawn_bridge(user, work);
     Ok(())
 }
 
@@ -608,7 +1011,7 @@ async fn bridge(user: PendingUser, work: WorkItem) -> Result<()> {
     let PendingUser {
         proxy,
         remote_port,
-        stream: mut user,
+        stream: mut user_stream,
         peer,
         ..
     } = user;
@@ -629,10 +1032,10 @@ async fn bridge(user: PendingUser, work: WorkItem) -> Result<()> {
     let (mut work_stream, leftover) = work_conn.into_stream();
     if !leftover.is_empty() {
         use tokio::io::AsyncWriteExt;
-        user.write_all(&leftover).await?;
+        user_stream.write_all(&leftover).await?;
     }
 
-    match tokio::io::copy_bidirectional(&mut user, &mut work_stream).await {
+    match util::relay_between(&mut user_stream, &mut work_stream).await {
         Ok((up, down)) => debug!(proxy = %proxy, "转发结束：上行 {up}B / 下行 {down}B"),
         Err(e) => debug!(proxy = %proxy, "转发中断：{e}"),
     }

@@ -108,6 +108,21 @@ pub struct ServerConfig {
     #[serde(default)]
     pub tls_force: bool,
 
+    /// HTTP 代理的虚拟主机端口（对应 frp `vhostHTTPPort`）。
+    /// 留空表示不启用 http 类型代理。
+    #[serde(default)]
+    pub vhost_http_port: Option<u16>,
+
+    /// HTTPS 代理的虚拟主机端口（对应 frp `vhostHTTPSPort`）。
+    /// 服务端按 TLS ClientHello 里的 SNI 路由，证书由内网服务自己提供（纯透传）。
+    #[serde(default)]
+    pub vhost_https_port: Option<u16>,
+
+    /// 泛域名后缀（对应 frp `subdomainHost`），形如 `example.com`。
+    /// 配置后客户端可用 `subdomain = "abc"` 注册 `abc.example.com`。
+    #[serde(default)]
+    pub subdomain_host: String,
+
     /// 日志级别，形如 `info` / `debug` / `rustunnel_server=debug`。
     #[serde(default = "default_log_level")]
     pub log_level: String,
@@ -133,6 +148,9 @@ impl Default for ServerConfig {
             protocol: Protocol::default(),
             tcp_mux: true,
             tls_force: false,
+            vhost_http_port: None,
+            vhost_https_port: None,
+            subdomain_host: String::new(),
             log_level: default_log_level(),
         }
     }
@@ -173,14 +191,100 @@ impl ServerConfig {
 // ---------------------------------------------------------------------------
 
 /// 单个代理的配置。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProxyConfig {
     /// 代理名，全局唯一（服务端用它匹配工作连接）。
     pub name: String,
+    /// 代理类型：`tcp`（默认）/ `udp` / `http` / `https`。
+    #[serde(rename = "type", default = "default_proxy_type")]
+    pub proxy_type: String,
     /// 内网服务地址，形如 `127.0.0.1:22`。
     pub local_addr: String,
-    /// 希望服务端开放的公网端口。
+    /// 希望服务端开放的公网端口（tcp / udp 必填）。
+    #[serde(default)]
     pub remote_port: u16,
+
+    // ---- http / https 专用 ----
+    /// 自定义域名（http / https 必填其一，或配合 `subdomain`）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub custom_domains: Vec<String>,
+    /// 泛域名子域前缀，配合服务端 `subdomain_host`。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub subdomain: String,
+    /// 路由前缀列表（留空等价于 `/`）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locations: Vec<String>,
+    /// HTTP Basic Auth 用户名 / 密码。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub http_user: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub http_pwd: String,
+    /// 转发到内网服务时重写 Host 头。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub host_header_rewrite: String,
+
+    // ---- stcp / xtcp 专用 ----
+    /// 共享密钥（frpc 里叫 `secretKey`）。provider 与 visitor 必须一致。
+    #[serde(default, alias = "secretKey", skip_serializing_if = "String::is_empty")]
+    pub secret_key: String,
+    /// 允许接入的访客用户列表（对应 frpc 的 `allowUsers`）。
+    ///
+    /// 与官方 frp 一致：比对的是**访问方 frpc 的顶层 `user`**（`client.user`），
+    /// 不是 `[[visitors]]` 的 `name`。留空 = 允许所有访客。
+    #[serde(default, alias = "allowUsers", skip_serializing_if = "Vec::is_empty")]
+    pub allow_users: Vec<String>,
+}
+
+/// 一个 visitor（访客）的配置，对应 frpc 的 `[[visitors]]` 段。
+///
+/// visitor 是 stcp / xtcp 的**接入方**：它在本地监听一个端口，
+/// 把连上来的流量通过服务端送到远端的 provider，最后到达 provider 的内网服务。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisitorConfig {
+    /// visitor 自己的名字（仅本地使用，可与 provider 的代理名不同）。
+    ///
+    /// 注意：provider 的 `allow_users` 比对的是本客户端顶层的 `user`，**不是**这个名字。
+    pub name: String,
+    /// 类型：`stcp` 或 `xtcp`。
+    #[serde(rename = "type", default = "default_visitor_type")]
+    pub visitor_type: String,
+    /// 目标 provider 注册的代理名（frpc 里叫 `serverName`）。
+    #[serde(default, alias = "serverName")]
+    pub server_name: String,
+    /// 目标 provider 所属客户端的 user（frpc 里叫 `serverUser`）。
+    ///
+    /// 留空则用**本客户端**的顶层 `user`。目标名会按官方规则拼成
+    /// `"{server_user|本客户端 user}.{server_name}"`。
+    #[serde(default, alias = "serverUser")]
+    pub server_user: String,
+    /// 共享密钥，必须与 provider 的 `secret_key` 相同。
+    #[serde(default, alias = "secretKey")]
+    pub secret_key: String,
+    /// 本地监听地址。
+    #[serde(default = "default_bind_addr")]
+    pub bind_addr: String,
+    /// 本地监听端口。为 0 时不监听（仅用于给别的 visitor 做 fallback 目标）。
+    #[serde(default, alias = "bindPort")]
+    pub bind_port: u16,
+}
+
+impl Default for VisitorConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            visitor_type: default_visitor_type(),
+            server_name: String::new(),
+            server_user: String::new(),
+            secret_key: String::new(),
+            bind_addr: default_bind_addr(),
+            bind_port: 0,
+        }
+    }
+}
+
+/// visitor 类型默认 stcp。
+fn default_visitor_type() -> String {
+    "stcp".to_string()
 }
 
 /// 客户端配置，对应 `client.toml`。
@@ -204,6 +308,13 @@ pub struct ClientConfig {
     /// 客户端标识，用于服务端日志与多客户端区分。
     #[serde(default = "default_client_id")]
     pub client_id: String,
+
+    /// 客户端用户名，对应 frp 顶层的 `user`。
+    ///
+    /// 官方 frp 用它做 stcp / xtcp 的 `allow_users` 白名单匹配
+    /// （服务端比对的是 `Login.User`，不是 visitor 的 `name`）。
+    #[serde(default)]
+    pub user: String,
 
     /// 心跳间隔（秒）。
     #[serde(default = "default_heartbeat_interval")]
@@ -254,6 +365,10 @@ pub struct ClientConfig {
     /// 需要暴露的代理列表。
     #[serde(default)]
     pub proxies: Vec<ProxyConfig>,
+
+    /// 需要接入的访客列表（stcp / xtcp）。
+    #[serde(default)]
+    pub visitors: Vec<VisitorConfig>,
 }
 
 impl Default for ClientConfig {
@@ -264,6 +379,7 @@ impl Default for ClientConfig {
             server_work_port: None,
             token: String::new(),
             client_id: default_client_id(),
+            user: String::new(),
             heartbeat_interval: default_heartbeat_interval(),
             heartbeat_timeout: default_heartbeat_timeout(),
             reconnect_interval: default_reconnect_interval(),
@@ -275,6 +391,7 @@ impl Default for ClientConfig {
             tls_custom_first_byte: true,
             log_level: default_log_level(),
             proxies: Vec::new(),
+            visitors: Vec::new(),
         }
     }
 }
@@ -298,8 +415,10 @@ impl ClientConfig {
             token: "your_secret_token".into(),
             proxies: vec![ProxyConfig {
                 name: "ssh".into(),
+                proxy_type: "tcp".into(),
                 local_addr: "127.0.0.1:22".into(),
                 remote_port: 6000,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -342,6 +461,11 @@ fn default_reconnect_interval() -> u64 {
 fn default_log_level() -> String {
     DEFAULT_LOG_LEVEL.to_string()
 }
+/// 代理类型默认 tcp。
+fn default_proxy_type() -> String {
+    "tcp".to_string()
+}
+
 /// frp 客户端默认预建 1 条工作连接（与官方 frpc 默认一致）。
 fn default_pool_count() -> i32 {
     1

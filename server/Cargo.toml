@@ -11,6 +11,7 @@ name = "rustunnel-server"
 path = "src/main.rs"
 
 [dependencies]
+base64.workspace = true
 rustunnel-common = { workspace = true }
 
 anyhow = { workspace = true }

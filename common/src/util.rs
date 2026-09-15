@@ -58,11 +58,57 @@ pub fn init_tracing(default_level: &str) {
         .init();
 }
 
+/// 中继转发的缓冲区大小。
+///
+/// tokio 的 `copy_bidirectional` 默认只给 **8 KiB**，在高速链路（回环 / 内网 10G）
+/// 下单流吞吐会被它压住：本机回环实测官方 frp（Go，`io.Copy` 用 32 KiB + 内核零拷贝）
+/// 单流 1.6 Gbps，而 8 KiB 缓冲只能跑到 475 Mbps。
+/// 换成 128 KiB 后差距基本抹平。
+///
+/// 内存代价：每条**活跃**转发连接多占 2 × 128 KiB；连接结束即释放，
+/// 空闲进程不持有，所以常驻内存仍然很低。
+pub const RELAY_BUF: usize = 128 * 1024;
+
+/// 官方 frp 的“线协议代理名”：客户端的顶层 `user` 非空时，代理名会带 `"{user}."` 前缀。
+///
+/// 对应 Go 的 `naming.AddUserPrefix`。provider 注册 `NewProxy`、
+/// visitor 发起 `NewVisitorConn` 都要用这个带前缀的名字，否则跨实现找不到对方。
+pub fn add_user_prefix(user: &str, name: &str) -> String {
+    if user.is_empty() {
+        name.to_string()
+    } else {
+        format!("{user}.{name}")
+    }
+}
+
+/// 去掉 `"{user}."` 前缀（只剥一层），对应 Go 的 `naming.StripUserPrefix`。
+///
+/// 服务端在 `NewProxyResp` / `StartWorkConn` 里回的是带前缀的名字，
+/// 客户端要剥掉后才能对回本地配置。
+pub fn strip_user_prefix<'a>(user: &str, name: &'a str) -> &'a str {
+    if user.is_empty() {
+        return name;
+    }
+    match name.strip_prefix(user) {
+        Some(rest) => rest.strip_prefix('.').unwrap_or(name),
+        None => name,
+    }
+}
+
+/// 双向转发的统一入口（使用 [`RELAY_BUF`] 大小的缓冲）。
+pub async fn relay_between<A, B>(a: &mut A, b: &mut B) -> std::io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    tokio::io::copy_bidirectional_with_sizes(a, b, RELAY_BUF, RELAY_BUF).await
+}
+
 /// 双向转发：把 `a` 收到的字节原样写给 `b`，反之亦然。
 ///
 /// 任一端断开即返回，返回值为 `(a -> b, b -> a)` 的字节数。
 pub async fn bridge(mut a: TunnelIo, mut b: TunnelIo) -> std::io::Result<(u64, u64)> {
-    tokio::io::copy_bidirectional(&mut a, &mut b).await
+    relay_between(&mut a, &mut b).await
 }
 
 /// 与 [`bridge`] 相同，但两端类型不同（例如一端是隧道流、一端是内网明文连接）。
@@ -71,7 +117,7 @@ where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    tokio::io::copy_bidirectional(&mut a, &mut b).await
+    relay_between(&mut a, &mut b).await
 }
 
 /// 读取主机名。
@@ -84,21 +130,36 @@ pub fn hostname() -> String {
 }
 
 /// 生成会话 ID（frp 的 `runID`），随机 16 字节十六进制。
+///
+/// 这里**必须**每次都不同：`run_id` 是服务端 `Registry` 里控制会话的主键，
+/// 撞号会让新会话顶掉旧会话（visitor 会被算到错误的 client 头上）。
+/// 早先的实现只用「当前秒 + pid」当种子，同一秒内接受的两个连接会得到同一个
+/// run_id —— 这个坑在同时跑多个 frpc 时才会暴露。
+///
+/// 现在混入 `RandomState`（由 OS 随机数播种，且每次 `new()` 递增计数器）与
+/// 进程内自增序号，既有熵又不需要引入 `rand` 依赖。
 pub fn new_run_id() -> String {
     use std::fmt::Write;
-    let mut buf = [0u8; 16];
-    for (i, b) in buf.iter_mut().enumerate() {
-        // 用时间 + 进程 + 计数器做种子，避免引入额外随机数依赖
-        let seed = now_unix_secs()
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .rotate_left((i as u32) * 7)
-            ^ (std::process::id() as u64) << (i % 5);
-        *b = (seed >> 24) as u8;
-    }
-    let mut s = String::with_capacity(buf.len() * 2);
-    for b in buf {
-        let _ = write!(s, "{b:02x}");
-    }
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let mut h1 = std::collections::hash_map::RandomState::new().build_hasher();
+    h1.write_u64(now_unix_secs());
+    h1.write_u32(std::process::id());
+    h1.write_u64(seq);
+    let a = h1.finish();
+
+    let mut h2 = std::collections::hash_map::RandomState::new().build_hasher();
+    h2.write_u64(a);
+    h2.write_u64(seq ^ 0x9e37_79b9_7f4a_7c15);
+    let b = h2.finish();
+
+    let mut s = String::with_capacity(32);
+    let _ = write!(s, "{a:016x}{b:016x}");
     s
 }
 
@@ -131,4 +192,33 @@ pub async fn shutdown_signal() {
     }
 
     tracing::info!("收到退出信号，开始优雅关闭");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// run_id 必须每次都不同：同秒内连续生成 1000 个也要互不相同
+    /// （服务端 Registry 以它为会话主键，撞号会顶掉已有会话）。
+    #[test]
+    fn run_id_is_unique() {
+        let ids: std::collections::HashSet<String> = (0..1000).map(|_| new_run_id()).collect();
+        assert_eq!(ids.len(), 1000, "run_id 出现重复");
+        for id in &ids {
+            assert_eq!(id.len(), 32, "run_id 应为 32 个十六进制字符：{id}");
+            assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
+
+    /// 官方 frp 的代理名带用户前缀：`user` 非空时是 `"{user}.{name}"`。
+    #[test]
+    fn user_prefix_roundtrip() {
+        assert_eq!(add_user_prefix("", "ssh"), "ssh");
+        assert_eq!(add_user_prefix("alice", "ssh"), "alice.ssh");
+        assert_eq!(strip_user_prefix("", "ssh"), "ssh");
+        assert_eq!(strip_user_prefix("alice", "alice.ssh"), "ssh");
+        // 前缀不匹配时原样返回（与 Go 的 StripUserPrefix 一致）
+        assert_eq!(strip_user_prefix("bob", "alice.ssh"), "alice.ssh");
+        assert_eq!(strip_user_prefix("alice", "alice"), "alice");
+    }
 }

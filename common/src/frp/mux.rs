@@ -18,9 +18,13 @@ use super::stream::BoxStream;
 type OpenReq = oneshot::Sender<std::result::Result<yamux::Stream, yamux::ConnectionError>>;
 
 fn mux_config() -> Config {
-    // frp 侧把 MaxStreamWindowSize 调到 6MB；rust-yamux 会按带宽时延自动调窗，
-    // 这里只需保证并发流数量够用（默认 512）。
-    Config::default()
+    // 默认 `split_send_size` 只有 16 KiB：单流打满时每 16 KiB 就要走一遍
+    // "分配缓冲 + 加锁 + 写 frame 头 + 唤醒驱动任务"的流程，
+    // 本机回环实测单流只有 ~530 Mbps（官方 frp 用 Go yamux 能到 ~2 Gbps）。
+    // 提高到 128 KiB 后单流吞吐明显改善；多流场景本来就够快。
+    let mut cfg = Config::default();
+    cfg.set_split_send_size(128 * 1024);
+    cfg
 }
 
 /// 服务端：接收对端打开的 yamux stream。
@@ -120,24 +124,22 @@ where
                 std::task::Poll::Pending => {}
             }
 
-            // 2) 处理开流请求
-            loop {
-                if pending.is_none() {
-                    match req_rx.poll_recv(cx) {
-                        std::task::Poll::Ready(Some(tx)) => pending = Some(tx),
-                        std::task::Poll::Ready(None) => return std::task::Poll::Ready(Ev::Closed),
-                        std::task::Poll::Pending => return std::task::Poll::Pending,
-                    }
+            // 2) 处理开流请求（每条分支都会返回，所以不需要循环）
+            if pending.is_none() {
+                match req_rx.poll_recv(cx) {
+                    std::task::Poll::Ready(Some(tx)) => pending = Some(tx),
+                    std::task::Poll::Ready(None) => return std::task::Poll::Ready(Ev::Closed),
+                    std::task::Poll::Pending => return std::task::Poll::Pending,
                 }
-                let Some(tx) = pending.take() else {
-                    return std::task::Poll::Pending;
-                };
-                match conn.poll_new_outbound(cx) {
-                    std::task::Poll::Ready(r) => return std::task::Poll::Ready(Ev::Outbound(tx, r)),
-                    std::task::Poll::Pending => {
-                        pending = Some(tx);
-                        return std::task::Poll::Pending;
-                    }
+            }
+            let Some(tx) = pending.take() else {
+                return std::task::Poll::Pending;
+            };
+            match conn.poll_new_outbound(cx) {
+                std::task::Poll::Ready(r) => std::task::Poll::Ready(Ev::Outbound(tx, r)),
+                std::task::Poll::Pending => {
+                    pending = Some(tx);
+                    std::task::Poll::Pending
                 }
             }
         })

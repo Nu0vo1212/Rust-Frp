@@ -8,7 +8,7 @@ use crate::util::now_unix_secs;
 
 use super::crypto::{derive_control_keys, transcript_hash, AeadReader, AeadWriter};
 use super::msg;
-use super::msg::{FrpMessage, Login, LoginResp, NewWorkConn, StartWorkConn};
+use super::msg::{FrpMessage, Login, LoginResp, NewVisitorConn, NewWorkConn, StartWorkConn};
 use super::wire::{
     self, ClientHello, ServerHello, FRAME_CLIENT_HELLO, FRAME_MESSAGE, FRAME_SERVER_HELLO, MAGIC_V2,
 };
@@ -27,6 +27,8 @@ pub struct FrpConn {
     plain: Vec<u8>,
     writer: Option<AeadWriter>,
     reader: Option<AeadReader>,
+    /// UDP 报文用二进制编码（v2 握手协商结果），默认 JSON。
+    udp_binary: bool,
 }
 
 impl FrpConn {
@@ -37,7 +39,17 @@ impl FrpConn {
             plain: Vec::new(),
             writer: None,
             reader: None,
+            udp_binary: false,
         }
+    }
+
+    /// 设置 UDP 报文编码（由握手协商结果决定）。
+    pub fn set_udp_codec(&mut self, binary: bool) {
+        self.udp_binary = binary;
+    }
+
+    pub fn udp_codec_is_binary(&self) -> bool {
+        self.udp_binary
     }
 
 
@@ -100,9 +112,33 @@ impl FrpConn {
     }
 
     /// 发送一条消息。
+    ///
+    /// UDP 报文（`UdpPacket`）在协商为 binary codec 时会改用二进制编码，
+    /// 与官方 frp 的 `V2BinaryUDPPacketReadWriter` 保持一致。
     pub async fn send_msg(&mut self, m: &FrpMessage) -> Result<()> {
+        if self.udp_binary {
+            if let FrpMessage::UdpPacket(pkt) = m {
+                let body = msg::encode_udp_binary(pkt)?;
+                let mut payload = Vec::with_capacity(2 + body.len());
+                payload.extend_from_slice(&msg::TYPE_UDP_PACKET_BINARY.to_be_bytes());
+                payload.extend_from_slice(&body);
+                return self.write_frame(FRAME_MESSAGE, &payload).await;
+            }
+        }
         let payload = m.encode()?;
         self.write_frame(FRAME_MESSAGE, &payload).await
+    }
+
+    /// 优雅关闭：先 flush，再对底层流 shutdown。
+    ///
+    /// 用于「回一条错误响应就断开」的场景（如 visitor 被拒）：
+    /// 直接 drop 会让 yamux 流以 RST 收场，对端只能看到 `connection reset`，
+    /// 读不到我们刚写进去的 error 文本。
+    pub async fn shutdown(&mut self) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        self.stream.flush().await.ok();
+        self.stream.shutdown().await.ok();
+        Ok(())
     }
 
     /// 接收一条消息。
@@ -116,6 +152,10 @@ impl FrpConn {
                     bail!("消息帧负载过短");
                 }
                 let type_id = u16::from_be_bytes([payload[0], payload[1]]);
+                if type_id == msg::TYPE_UDP_PACKET_BINARY {
+                    let pkt = msg::decode_udp_binary(&payload[2..])?;
+                    return Ok(Some(FrpMessage::UdpPacket(pkt)));
+                }
                 Ok(Some(FrpMessage::decode(type_id, &payload[2..])?))
             }
             None => Ok(None),
@@ -186,8 +226,9 @@ pub async fn client_handshake(
     stream: BoxStream,
     token: &str,
     client_id: &str,
+    user: &str,
     pool_count: i32,
-) -> Result<(FrpConn, String)> {
+) -> Result<(FrpConn, String, bool)> {
     let mut conn = FrpConn::new(stream);
     conn.write_magic().await?;
 
@@ -201,6 +242,8 @@ pub async fn client_handshake(
         hostname: crate::util::hostname(),
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
+        // 官方 frps 用 Login.User 匹配 stcp/xtcp 的 allow_users 白名单
+        user: user.to_string(),
         privilege_key: msg::auth_key(token, ts),
         timestamp: ts,
         client_id: client_id.to_string(),
@@ -237,12 +280,16 @@ pub async fn client_handshake(
         bail!("服务端未下发 run_id");
     }
 
-    // 3) 切换到加密帧流
+    // 3) 协商出的 UDP 报文编码：官方 frps 默认选二进制
+    let udp_binary = server_hello.selected.message.udp_packet_codec == wire::UDP_PACKET_CODEC_BINARY;
+    conn.set_udp_codec(udp_binary);
+
+    // 4) 切换到加密帧流
     let transcript = transcript_hash(&hello_payload, &sh_payload);
     let (c2s, s2c) = derive_control_keys(token.as_bytes(), &algorithm, &transcript)?;
     conn.upgrade(s2c, c2s)?; // 客户端用 s2c 读、c2s 写
 
-    Ok((conn, login_resp.run_id))
+    Ok((conn, login_resp.run_id, udp_binary))
 }
 
 // ---------------------------------------------------------------------------
@@ -252,9 +299,16 @@ pub async fn client_handshake(
 /// 服务端接受一条连接后的分类。
 pub enum ServerAccept {
     /// 控制连接（已通过 token 校验并升级加密）
-    Control { conn: FrpConn, login: Login },
+    Control {
+        conn: FrpConn,
+        login: Login,
+        /// 本次会话协商出的 UDP 报文编码（true = 二进制）
+        udp_binary: bool,
+    },
     /// 工作连接（明文，等待分配代理后回 StartWorkConn）
     Work { conn: FrpConn, msg: NewWorkConn },
+    /// visitor 连接（stcp / xtcp 的接入方，明文，等待校验后回 NewVisitorConnResp）
+    Visitor { conn: FrpConn, msg: NewVisitorConn },
 }
 
 /// 服务端握手。
@@ -294,11 +348,15 @@ pub async fn server_handshake(
             bail!("ServerHello 协商失败: {}", server_hello.error);
         }
         let algorithm = server_hello.selected.crypto.algorithm.clone();
+        // 与 frp 一致：客户端宣告支持 binary 就选 binary
+        let udp_binary =
+            server_hello.selected.message.udp_packet_codec == wire::UDP_PACKET_CODEC_BINARY;
+        conn.set_udp_codec(udp_binary);
         let next = conn
             .read_frame()
             .await?
             .ok_or_else(|| anyhow!("客户端在发送 Login 前断开"))?;
-        (next, Some((payload, sh_payload, algorithm)))
+        (next, Some((payload, sh_payload, algorithm, udp_binary)))
     } else {
         ((ft, payload), None)
     };
@@ -320,6 +378,20 @@ pub async fn server_handshake(
         let m = FrpMessage::decode(type_id, &body[2..])?;
         match m {
             FrpMessage::NewWorkConn(nwc) => return Ok(ServerAccept::Work { conn, msg: nwc }),
+            _ => unreachable!(),
+        }
+    }
+
+    // visitor 连接：同样不允许携带 ClientHello
+    if type_id == msg::TYPE_NEW_VISITOR_CONN {
+        if crypto_state.is_some() {
+            bail!("visitor 连接不允许携带 ClientHello");
+        }
+        let m = FrpMessage::decode(type_id, &body[2..])?;
+        match m {
+            FrpMessage::NewVisitorConn(nvc) => {
+                return Ok(ServerAccept::Visitor { conn, msg: nvc })
+            }
             _ => unreachable!(),
         }
     }
@@ -352,13 +424,21 @@ pub async fn server_handshake(
     }))
     .await?;
 
-    if let Some((ch_payload, sh_payload, algorithm)) = crypto_state {
+    let udp_binary = crypto_state
+        .as_ref()
+        .map(|(_, _, _, udp_binary)| *udp_binary)
+        .unwrap_or(false);
+    if let Some((ch_payload, sh_payload, algorithm, _)) = crypto_state {
         let transcript = transcript_hash(&ch_payload, &sh_payload);
         let (c2s, s2c) = derive_control_keys(token.as_bytes(), &algorithm, &transcript)?;
         conn.upgrade(c2s, s2c)?; // 服务端用 c2s 读、s2c 写
     }
 
-    Ok(ServerAccept::Control { conn, login })
+    Ok(ServerAccept::Control {
+        conn,
+        login,
+        udp_binary,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -393,5 +473,45 @@ pub async fn client_work_conn(
         }
         Some(other) => bail!("期望 StartWorkConn，收到 {}", other.name()),
         None => bail!("服务端在工作连接握手完成前断开"),
+    }
+}
+
+/// 客户端建立一条 **visitor 连接**（stcp / xtcp 的接入通道）。
+///
+/// 时序与工作连接类似，但首帧是 `NewVisitorConn`，服务端回 `NewVisitorConnResp`。
+/// 校验通过后这条连接直接变成裸字节通道（服务端会把它与 provider 的工作连接对接）。
+///
+/// 返回 `(stream, leftover)`：leftover 是已经读进来但还没消费的字节
+/// （visitor 收到 Resp 后可能立刻开始发数据，必须原样交给转发方）。
+pub async fn client_visitor_conn(
+    stream: BoxStream,
+    run_id: &str,
+    proxy_name: &str,
+    secret_key: &str,
+) -> Result<(BoxStream, Vec<u8>)> {
+    let mut conn = FrpConn::new(stream);
+    conn.write_magic().await?;
+
+    let ts = now_unix_secs() as i64;
+    conn.send_msg(&FrpMessage::NewVisitorConn(NewVisitorConn {
+        run_id: run_id.to_string(),
+        proxy_name: proxy_name.to_string(),
+        // 与官方 frpc 一致：hex(md5(secret_key + timestamp))
+        sign_key: msg::auth_key(secret_key, ts),
+        timestamp: ts,
+        ..Default::default()
+    }))
+    .await?;
+
+    match conn.recv_msg().await? {
+        Some(FrpMessage::NewVisitorConnResp(r)) => {
+            if !r.error.is_empty() {
+                bail!("NewVisitorConnResp 返回错误: {}", r.error);
+            }
+            let (stream, leftover) = conn.into_stream();
+            Ok((stream, leftover))
+        }
+        Some(other) => bail!("期望 NewVisitorConnResp，收到 {}", other.name()),
+        None => bail!("服务端在 visitor 连接握手完成前断开"),
     }
 }

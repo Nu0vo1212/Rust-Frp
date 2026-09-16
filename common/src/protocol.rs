@@ -36,10 +36,7 @@ pub const MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlMessage {
     /// 客户端 -> 服务端：控制连接建立后的第一条消息。
-    Login {
-        token: String,
-        client_id: String,
-    },
+    Login { token: String, client_id: String },
     /// 服务端 -> 客户端：登录结果。
     LoginResp {
         success: bool,
@@ -110,7 +107,9 @@ pub struct ControlCodec {
 impl ControlCodec {
     /// 使用默认上限（8 MiB）创建编解码器。
     pub fn new() -> Self {
-        Self { max_frame_len: None }
+        Self {
+            max_frame_len: None,
+        }
     }
 
     /// 自定义单帧上限。

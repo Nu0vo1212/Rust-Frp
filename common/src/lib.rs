@@ -14,7 +14,9 @@ pub mod compat;
 pub mod config;
 pub mod error;
 pub mod frp;
+pub mod p2p;
 pub mod protocol;
+pub mod throttle;
 pub mod transport;
 pub mod util;
 

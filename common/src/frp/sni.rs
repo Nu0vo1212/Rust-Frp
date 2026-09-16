@@ -15,7 +15,9 @@ const MAX_BYTES: usize = 32 * 1024;
 /// 读出一个 ClientHello，返回 `(SNI, 原始字节)`。
 ///
 /// 原始字节必须原样转发给上游，否则 TLS 握手会失败。
-pub async fn sniff_client_hello<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(Option<String>, Vec<u8>)> {
+pub async fn sniff_client_hello<S: AsyncRead + Unpin>(
+    stream: &mut S,
+) -> Result<(Option<String>, Vec<u8>)> {
     let mut raw: Vec<u8> = Vec::new();
     let mut payload: Vec<u8> = Vec::new();
     let mut need: Option<usize> = None; // 握手体总长度（4 + body_len）
@@ -48,7 +50,8 @@ pub async fn sniff_client_hello<S: AsyncRead + Unpin>(stream: &mut S) -> Result<
             if payload[0] != 0x01 {
                 bail!("不是 ClientHello（handshake type = 0x{:02x}）", payload[0]);
             }
-            let body_len = ((payload[1] as usize) << 16) | ((payload[2] as usize) << 8) | payload[3] as usize;
+            let body_len =
+                ((payload[1] as usize) << 16) | ((payload[2] as usize) << 8) | payload[3] as usize;
             need = Some(4 + body_len);
         }
         if let Some(need) = need {
@@ -178,7 +181,10 @@ mod tests {
     fn parses_sni() {
         let raw = build_hello("test.example.com");
         let payload = raw[5..].to_vec();
-        assert_eq!(parse_sni(&payload).unwrap().as_deref(), Some("test.example.com"));
+        assert_eq!(
+            parse_sni(&payload).unwrap().as_deref(),
+            Some("test.example.com")
+        );
     }
 
     #[test]

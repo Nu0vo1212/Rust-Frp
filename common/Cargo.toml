@@ -5,8 +5,15 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords = ["frp", "proxy", "tunnel", "protocol", "nat"]
+categories = ["network-programming"]
 
 [dependencies]
+quinn = { workspace = true }
 yamux = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }

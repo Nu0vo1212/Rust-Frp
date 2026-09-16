@@ -53,6 +53,16 @@ impl VisitorEntry {
     }
 }
 
+/// 一条 stcp / xtcp 代理的只读快照（给面板 / API 用）。
+#[derive(Debug, Clone)]
+pub struct VisitorInfo {
+    pub proxy_name: String,
+    pub proxy_type: String,
+    pub provider_user: String,
+    pub allow_users: Vec<String>,
+    pub client_id: String,
+}
+
 /// 全局的 visitor 表（按代理名索引）。
 #[derive(Default)]
 pub struct VisitorTable {
@@ -79,6 +89,22 @@ impl VisitorTable {
     /// 客户端主动 `CloseProxy` 时摘掉一条记录，之后同名代理可以重新注册。
     pub fn remove(&self, name: &str) -> Option<Arc<VisitorEntry>> {
         self.inner.lock().unwrap().remove(name)
+    }
+
+    /// 全部 stcp / xtcp 代理的快照（面板展示用）。
+    pub fn list(&self) -> Vec<VisitorInfo> {
+        self.inner
+            .lock()
+            .unwrap()
+            .values()
+            .map(|e| VisitorInfo {
+                proxy_name: e.proxy_name.clone(),
+                proxy_type: e.proxy_type.clone(),
+                provider_user: e.provider_user.clone(),
+                allow_users: e.allow_users.clone(),
+                client_id: e.client.client_id().to_string(),
+            })
+            .collect()
     }
 
     /// 客户端断开时回收它的全部 stcp / xtcp 代理。

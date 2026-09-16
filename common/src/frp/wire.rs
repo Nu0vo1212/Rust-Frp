@@ -61,7 +61,11 @@ pub struct BootstrapInfo {
 pub struct MessageCapabilities {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub codecs: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "udpPacketCodecs")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "udpPacketCodecs"
+    )]
     pub udp_packet_codecs: Vec<String>,
 }
 
@@ -70,7 +74,11 @@ pub struct CryptoCapabilities {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub algorithms: Vec<String>,
     /// Go 侧是 `[]byte`，JSON 里是 base64 字符串。
-    #[serde(default, skip_serializing_if = "String::is_empty", rename = "clientRandom")]
+    #[serde(
+        default,
+        skip_serializing_if = "String::is_empty",
+        rename = "clientRandom"
+    )]
     pub client_random: String,
 }
 
@@ -94,7 +102,11 @@ pub struct ClientHello {
 pub struct MessageSelection {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub codec: String,
-    #[serde(default, skip_serializing_if = "String::is_empty", rename = "udpPacketCodec")]
+    #[serde(
+        default,
+        skip_serializing_if = "String::is_empty",
+        rename = "udpPacketCodec"
+    )]
     pub udp_packet_codec: String,
 }
 
@@ -102,7 +114,11 @@ pub struct MessageSelection {
 pub struct CryptoSelection {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub algorithm: String,
-    #[serde(default, skip_serializing_if = "String::is_empty", rename = "serverRandom")]
+    #[serde(
+        default,
+        skip_serializing_if = "String::is_empty",
+        rename = "serverRandom"
+    )]
     pub server_random: String,
 }
 
@@ -218,7 +234,10 @@ pub fn new_server_hello(hello: &ClientHello) -> Result<ServerHello> {
 /// 客户端校验 ServerHello（对应 `ValidateServerHelloForClient`）。
 pub fn validate_server_hello(client_hello: &ClientHello, server_hello: &ServerHello) -> Result<()> {
     if server_hello.selected.message.codec != MESSAGE_CODEC_JSON {
-        bail!("unsupported selected message codec: {}", server_hello.selected.message.codec);
+        bail!(
+            "unsupported selected message codec: {}",
+            server_hello.selected.message.codec
+        );
     }
     let algo = &server_hello.selected.crypto.algorithm;
     if algo != AEAD_AES_256_GCM && algo != AEAD_XCHACHA20_POLY1305 {

@@ -108,7 +108,10 @@ where
         /// 收到入站 stream。frp 服务端不会主动向客户端开流，直接丢弃即可。
         Inbound,
         InboundErr(String),
-        Outbound(OpenReq, std::result::Result<yamux::Stream, yamux::ConnectionError>),
+        Outbound(
+            OpenReq,
+            std::result::Result<yamux::Stream, yamux::ConnectionError>,
+        ),
         Closed,
     }
 

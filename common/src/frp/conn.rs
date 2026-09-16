@@ -1,8 +1,8 @@
 //! frp v2 连接：帧读写、明文/加密阶段切换、握手流程。
 
+use super::stream::BoxStream;
 use anyhow::{anyhow, bail, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use super::stream::BoxStream;
 
 use crate::util::now_unix_secs;
 
@@ -51,7 +51,6 @@ impl FrpConn {
     pub fn udp_codec_is_binary(&self) -> bool {
         self.udp_binary
     }
-
 
     /// 写入 v2 魔术字（客户端必须先发）。
     pub async fn write_magic(&mut self) -> Result<()> {
@@ -281,7 +280,8 @@ pub async fn client_handshake(
     }
 
     // 3) 协商出的 UDP 报文编码：官方 frps 默认选二进制
-    let udp_binary = server_hello.selected.message.udp_packet_codec == wire::UDP_PACKET_CODEC_BINARY;
+    let udp_binary =
+        server_hello.selected.message.udp_packet_codec == wire::UDP_PACKET_CODEC_BINARY;
     conn.set_udp_codec(udp_binary);
 
     // 4) 切换到加密帧流
@@ -389,9 +389,7 @@ pub async fn server_handshake(
         }
         let m = FrpMessage::decode(type_id, &body[2..])?;
         match m {
-            FrpMessage::NewVisitorConn(nvc) => {
-                return Ok(ServerAccept::Visitor { conn, msg: nvc })
-            }
+            FrpMessage::NewVisitorConn(nvc) => return Ok(ServerAccept::Visitor { conn, msg: nvc }),
             _ => unreachable!(),
         }
     }

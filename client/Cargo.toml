@@ -5,6 +5,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords = ["frp", "proxy", "tunnel", "client", "nat"]
+categories = ["network-programming"]
 
 [[bin]]
 name = "rustunnel-client"
@@ -13,7 +19,13 @@ path = "src/main.rs"
 [dependencies]
 rustunnel-common = { workspace = true }
 
+# xtcp 真 P2P 用 QUIC 承载直连流量（打洞成功后不再经过服务端）
+quinn = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+
 anyhow = { workspace = true }
+base64 = { workspace = true }
 clap = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }

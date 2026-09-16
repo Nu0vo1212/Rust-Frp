@@ -494,7 +494,9 @@ pub fn decode_udp_binary(body: &[u8]) -> Result<UdpPacket, crate::error::Error> 
     }
     let flags = body[0];
     if flags & !(UDP_BINARY_FLAG_LOCAL | UDP_BINARY_FLAG_REMOTE) != 0 {
-        return Err(Error::Protocol(format!("UDP 保留标志位被置位：0x{flags:02x}")));
+        return Err(Error::Protocol(format!(
+            "UDP 保留标志位被置位：0x{flags:02x}"
+        )));
     }
     if flags & UDP_BINARY_FLAG_REMOTE == 0 {
         return Err(Error::Protocol("UDP 报文缺少远端地址".into()));
@@ -580,7 +582,10 @@ fn take_udp_addr(body: &[u8], i: &mut usize) -> Result<UdpAddr, crate::error::Er
     *i += zone_len;
     let ip = if family == 4 {
         std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-            ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3],
+            ip_bytes[0],
+            ip_bytes[1],
+            ip_bytes[2],
+            ip_bytes[3],
         ))
     } else {
         let mut octets = [0u8; 16];
@@ -850,7 +855,10 @@ mod tests {
             }),
         };
         let json = serde_json::to_string(&pkt).unwrap();
-        assert!(json.contains("\"c\":\"aGk=\""), "content 应是 base64：{json}");
+        assert!(
+            json.contains("\"c\":\"aGk=\""),
+            "content 应是 base64：{json}"
+        );
         assert!(json.contains("\"IP\":\"1.2.3.4\""), "地址字段名：{json}");
         assert!(json.contains("\"Port\":53"), "端口字段名：{json}");
         let back: UdpPacket = serde_json::from_str(&json).unwrap();
@@ -913,11 +921,23 @@ mod tests {
     /// nat hole 消息的编号：官方 v2 里是 14~18，UDP 二进制是 19。
     #[test]
     fn nat_hole_type_ids_match_go() {
-        assert_eq!(FrpMessage::NatHoleVisitor(NatHoleVisitor::default()).type_id(), 14);
-        assert_eq!(FrpMessage::NatHoleClient(NatHoleClient::default()).type_id(), 15);
-        assert_eq!(FrpMessage::NatHoleResp(NatHoleResp::default()).type_id(), 16);
+        assert_eq!(
+            FrpMessage::NatHoleVisitor(NatHoleVisitor::default()).type_id(),
+            14
+        );
+        assert_eq!(
+            FrpMessage::NatHoleClient(NatHoleClient::default()).type_id(),
+            15
+        );
+        assert_eq!(
+            FrpMessage::NatHoleResp(NatHoleResp::default()).type_id(),
+            16
+        );
         assert_eq!(FrpMessage::NatHoleSid(NatHoleSid::default()).type_id(), 17);
-        assert_eq!(FrpMessage::NatHoleReport(NatHoleReport::default()).type_id(), 18);
+        assert_eq!(
+            FrpMessage::NatHoleReport(NatHoleReport::default()).type_id(),
+            18
+        );
         assert_eq!(TYPE_UDP_PACKET_BINARY, 19);
     }
 
@@ -954,7 +974,10 @@ mod tests {
                 ttl: 5,
                 send_delay_ms: 20,
                 read_timeout_ms: 500,
-                candidate_ports: vec![PortsRange { from: 5000, to: 5010 }],
+                candidate_ports: vec![PortsRange {
+                    from: 5000,
+                    to: 5010,
+                }],
                 send_random_ports: 0,
                 listen_random_ports: 0,
             },

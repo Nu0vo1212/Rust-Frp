@@ -1,0 +1,1168 @@
+//! 服务端网络入口：监听、分发、控制连接处理、代理注册与转发配对。
+//!
+//! 与原版 frps 一致，控制连接与工作连接**复用同一个端口**，靠首帧消息类型区分：
+//! `Login` 走控制连接流程，`NewWorkConn` 走工作连接流程，
+//! `NewVisitorConn` 走 visitor 接入流程（stcp / xtcp）。
+
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, RwLock},
+    time::{Duration, Instant},
+};
+
+use anyhow::{anyhow, Context, Result};
+use rustunnel_common::{
+    config::{is_quic, Protocol, ServerConfig},
+    frp::{
+        self,
+        conn::{self, FrpConn, ServerAccept},
+        msg::{
+            FrpMessage, Login, NewProxyResp, NewVisitorConn, NewVisitorConnResp, NewWorkConn, Pong,
+            StartWorkConn,
+        },
+        stream::{BoxStream, PrefixedStream},
+    },
+    util,
+};
+use tokio::{net::TcpListener, net::TcpStream, net::UdpSocket};
+use tracing::{debug, info, warn};
+
+use crate::{
+    dashboard,
+    limits::Permit,
+    pool::{ClientState, ConnSlot, CtrlCmd, PendingUser, Submit, WorkItem},
+    registry::{ClientGuard, PortClaim, Registry, ServerLimits},
+    udp_proxy,
+    vhost::{self, VhostRoute, VhostTable},
+    visitor,
+};
+
+use visitor::VisitorEntry;
+
+/// yamux 帧头的第一个字节是协议版本号（固定 0）。
+///
+/// frp v2 的魔术字以 `F`(0x46) 开头，两者不会混淆，服务端因此可以自动探测。
+const YAMUX_VERSION_BYTE: u8 = 0x00;
+
+/// 探测首字节的超时时间。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 由 [`ServerConfig`] 里的上限字段折算出来的结构体。
+pub fn limits_from(cfg: &ServerConfig) -> ServerLimits {
+    ServerLimits {
+        max_total_conns: cfg.max_total_conns,
+        max_clients: cfg.max_clients,
+        max_conns_per_client: cfg.max_conns_per_client,
+        max_pending_per_client: cfg.max_pending_per_client,
+        max_proxies_per_client: cfg.max_proxies_per_client,
+    }
+}
+
+/// 启动主循环时可选的附加信息（只有二进制入口会填，集成测试用默认值）。
+#[derive(Default)]
+pub struct ServeExtras {
+    /// 配置文件路径：填了才会启用热重载。
+    pub config_path: Option<PathBuf>,
+    /// 日志热重载句柄：填了才能热改 `log_level`。
+    pub log_handle: Option<rustunnel_common::util::LogFilterHandle>,
+}
+
+/// 启动服务端主循环（含 HTTP/HTTPS vhost 端口），直到收到退出信号。
+pub async fn serve(cfg: Arc<ServerConfig>, registry: Arc<Registry>) -> Result<()> {
+    serve_with(cfg, registry, ServeExtras::default()).await
+}
+
+/// [`serve`] 的完整版本：二进制入口用它把配置文件路径与日志句柄传进来。
+pub async fn serve_with(
+    cfg: Arc<ServerConfig>,
+    registry: Arc<Registry>,
+    extras: ServeExtras,
+) -> Result<()> {
+    let port = cfg.frp_bind_port();
+    let addr = util::resolve_addr(&format!("{}:{}", cfg.bind_addr, port))
+        .await
+        .with_context(|| format!("解析监听地址 {}:{} 失败", cfg.bind_addr, port))?;
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("监听 {addr} 失败（端口可能被占用）"))?;
+    serve_on_with(listener, cfg, registry, extras).await
+}
+
+/// 在一个**已经 bind 好**的监听器上跑主循环。
+///
+/// 拆出这个入口是为了集成测试：绑 `:0` 拿到内核分配的端口后，
+/// 测试才知道该往哪里连；否则 serve 内部的端口只有它自己知道。
+pub async fn serve_on(
+    listener: TcpListener,
+    cfg: Arc<ServerConfig>,
+    registry: Arc<Registry>,
+) -> Result<()> {
+    serve_on_with(listener, cfg, registry, ServeExtras::default()).await
+}
+
+/// [`serve_on`] 的完整版本：额外启动内置面板与配置热重载。
+pub async fn serve_on_with(
+    listener: TcpListener,
+    cfg: Arc<ServerConfig>,
+    registry: Arc<Registry>,
+    extras: ServeExtras,
+) -> Result<()> {
+    let addr = listener.local_addr().context("取不到监听地址")?;
+
+    info!("rustunnel-server 已启动：frp v2 协议，监听 {addr}");
+    info!("支持的代理类型：tcp / udp / http / https / stcp / xtcp");
+    info!(
+        "token = {}（{}）",
+        if cfg.token.is_empty() {
+            "<空>"
+        } else {
+            "已设置"
+        },
+        if cfg.token.is_empty() {
+            "不安全"
+        } else {
+            "已启用"
+        }
+    );
+    log_limits(&registry);
+
+    // HTTP / HTTPS 虚拟主机端口（可选）
+    if cfg.vhost_http_port.is_some() || cfg.vhost_https_port.is_some() {
+        let table = Arc::new(VhostTable::default());
+        registry.attach_vhosts(table.clone());
+        for (port, is_https) in [(cfg.vhost_http_port, false), (cfg.vhost_https_port, true)] {
+            let Some(vport) = port else { continue };
+            let addr = util::resolve_addr(&format!("{}:{}", cfg.bind_addr, vport))
+                .await
+                .with_context(|| format!("解析 vhost 地址 {}:{} 失败", cfg.bind_addr, vport))?;
+            let listener = vhost::bind(addr).await?;
+            tokio::spawn(vhost::run_http(
+                listener,
+                table.clone(),
+                vport,
+                is_https,
+                registry.clone(),
+            ));
+        }
+    }
+
+    // xtcp 真 P2P：牵线用的 UDP 端口（不配置时 xtcp 自动退化成中继）
+    if let Some(p2p_port) = cfg.p2p_port {
+        let hub = crate::p2p::P2PHub::new();
+        registry.attach_p2p(hub.clone());
+        let addr = util::resolve_addr(&format!("{}:{}", cfg.bind_addr, p2p_port))
+            .await
+            .with_context(|| format!("解析 p2p 地址 {}:{} 失败", cfg.bind_addr, p2p_port))?;
+        let sock = Arc::new(
+            UdpSocket::bind(addr)
+                .await
+                .with_context(|| format!("监听 UDP {addr} 失败"))?,
+        );
+        tokio::spawn(crate::p2p::run_rendezvous(sock, hub));
+    }
+
+    // 内置面板 + /metrics：与 frp 的 dashboard 一样是可选端口
+    let dashboard_auth: dashboard::DashboardAuth =
+        Arc::new(RwLock::new(if cfg.dashboard_user.is_empty() {
+            None
+        } else {
+            Some((cfg.dashboard_user.clone(), cfg.dashboard_pwd.clone()))
+        }));
+    if let Some(dport) = cfg.dashboard_port {
+        let addr = util::resolve_addr(&format!("{}:{}", cfg.bind_addr, dport))
+            .await
+            .with_context(|| format!("解析面板地址 {}:{} 失败", cfg.bind_addr, dport))?;
+        let listener = TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("监听 {addr} 失败（面板端口可能被占用）"))?;
+        tokio::spawn(dashboard::run(
+            listener,
+            registry.clone(),
+            dashboard_auth.clone(),
+        ));
+    }
+
+    // 配置热重载：改完日志级别/面板密码不用重启
+    if cfg.hot_reload {
+        if let Some(path) = extras.config_path.clone() {
+            tokio::spawn(crate::reload::watch(
+                path,
+                cfg.clone(),
+                extras.log_handle.clone(),
+                dashboard_auth.clone(),
+            ));
+        } else {
+            warn!("配置了 hot_reload 但没有传入配置文件路径，已跳过");
+        }
+    }
+
+    // QUIC 传输：在同一个端口号上额外监听 UDP。
+    //
+    // 保留 TCP 监听是有意的 —— 这样老客户端照旧能连，切换传输协议不会一刀切。
+    if is_quic(&cfg.transport_protocol) {
+        let qport = addr.port();
+        let qaddr = util::resolve_addr(&format!("{}:{}", cfg.bind_addr, qport))
+            .await
+            .with_context(|| format!("解析 QUIC 地址 {}:{} 失败", cfg.bind_addr, qport))?;
+        let endpoint = frp::quic::listen(&qaddr)
+            .await
+            .with_context(|| format!("监听 QUIC {qaddr} 失败"))?;
+        info!(
+            "QUIC 传输已启用，UDP {}",
+            endpoint
+                .local_addr()
+                .ok()
+                .map(|a| a.to_string())
+                .unwrap_or_default()
+        );
+        let cfg2 = cfg.clone();
+        let registry2 = registry.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                let cfg = cfg2.clone();
+                let registry = registry2.clone();
+                tokio::spawn(async move {
+                    let conn = match incoming.accept() {
+                        Ok(c) => match c.await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                debug!("QUIC 握手失败：{e}");
+                                return;
+                            }
+                        },
+                        Err(e) => {
+                            debug!("接受 QUIC 连接失败：{e}");
+                            return;
+                        }
+                    };
+                    let peer = conn.remote_address();
+                    // 每条双向流 = 一条独立的 frp 连接（控制 / 工作 / visitor 都走这里）
+                    while let Ok((send, recv)) = conn.accept_bi().await {
+                        let cfg = cfg.clone();
+                        let registry = registry.clone();
+                        tokio::spawn(async move {
+                            let stream: BoxStream =
+                                Box::pin(frp::quic::QuicStream::new(send, recv));
+                            if let Err(e) = handle_stream(stream, peer, cfg, registry, true).await {
+                                debug!(%peer, "QUIC 流结束：{e:#}");
+                            }
+                        });
+                    }
+                });
+            }
+        });
+    }
+
+    let shutdown = util::shutdown_signal();
+    tokio::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, peer) = accepted.context("accept 失败")?;
+                let cfg = cfg.clone();
+                let registry = registry.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_conn(stream, peer, cfg, registry).await {
+                        warn!(%peer, "连接结束：{e:#}");
+                    }
+                });
+            }
+            _ = &mut shutdown => {
+                info!("服务端已停止");
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn log_limits(registry: &Registry) {
+    let l = registry.limits();
+    if !l.max_total_conns.gt(&0)
+        && !l.max_clients.gt(&0)
+        && !l.max_conns_per_client.gt(&0)
+        && !l.max_proxies_per_client.gt(&0)
+    {
+        warn!("未配置任何资源上限：单个客户端即可耗尽服务端连接/代理配额");
+    } else if l.max_total_conns > 0 || l.max_conns_per_client > 0 {
+        info!(
+            "资源上限：全局连接 {} / 客户端数 {} / 单客户端连接 {} / 排队 {} / 代理数 {}（0 = 不限）",
+            l.max_total_conns,
+            l.max_clients,
+            l.max_conns_per_client,
+            l.max_pending_per_client,
+            l.max_proxies_per_client
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 连接分发
+// ---------------------------------------------------------------------------
+
+async fn handle_conn(
+    stream: TcpStream,
+    peer: SocketAddr,
+    cfg: Arc<ServerConfig>,
+    registry: Arc<Registry>,
+) -> Result<()> {
+    // 第一层：TLS。靠首字节自动识别（0x17 = frp 自定义首字节，0x16 = 标准 TLS）。
+    let stream = frp::tls::accept_server(stream, true, cfg.tls_force)
+        .await
+        .context("TLS 协商失败")?;
+    handle_stream(stream, peer, cfg, registry, false).await
+}
+
+/// 在一条已就绪的流上继续分层。
+///
+/// `secure` 表示这条流**本身已经加密且多路复用好了**（也就是 QUIC）——
+/// QUIC 的每一条双向流都是独立的 frp 连接，所以既不用再套 TLS，也不需要用
+/// yamux 去多路复用。少了这两层，QUIC 才省得下那一个 RTT。
+async fn handle_stream(
+    stream: BoxStream,
+    peer: SocketAddr,
+    cfg: Arc<ServerConfig>,
+    registry: Arc<Registry>,
+    secure: bool,
+) -> Result<()> {
+    if secure {
+        return handle_frp_stream(stream, cfg, registry).await;
+    }
+
+    // 第二层：yamux（可选）。自动探测，兼容 tcpMux=true / false 的客户端。
+    if cfg.tcp_mux {
+        let mut stream = stream;
+        let mut first = [0u8; 1];
+        let n = match tokio::time::timeout(
+            PROBE_TIMEOUT,
+            tokio::io::AsyncReadExt::read(&mut stream, &mut first),
+        )
+        .await
+        {
+            Ok(r) => r?,
+            Err(_) => {
+                debug!(%peer, "等待首字节超时，断开");
+                return Ok(());
+            }
+        };
+        if n == 0 {
+            return Ok(());
+        }
+        if first[0] == YAMUX_VERSION_BYTE {
+            // yamux 会话：每个 stream 都是一条独立的 frp 连接
+            let mut acceptor =
+                frp::mux::serve(Box::pin(PrefixedStream::new(vec![first[0]], stream)));
+            while let Some(s) = acceptor.accept().await {
+                let cfg = cfg.clone();
+                let registry = registry.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_frp_stream(s, cfg, registry).await {
+                        debug!(%peer, "yamux stream 结束：{e:#}");
+                    }
+                });
+            }
+            return Ok(());
+        }
+        let stream: BoxStream = Box::pin(PrefixedStream::new(vec![first[0]], stream));
+        return handle_frp_stream(stream, cfg, registry).await;
+    }
+
+    handle_frp_stream(stream, cfg, registry).await
+}
+
+/// 在一条流上完成 frp v2 握手并分发到控制连接 / 工作连接。
+async fn handle_frp_stream(
+    stream: BoxStream,
+    cfg: Arc<ServerConfig>,
+    registry: Arc<Registry>,
+) -> Result<()> {
+    let run_id = util::new_run_id();
+    match conn::server_handshake(stream, &cfg.token, &run_id).await {
+        Ok(ServerAccept::Control {
+            conn,
+            login,
+            udp_binary,
+        }) => handle_control(conn, login, run_id, udp_binary, cfg, registry).await,
+        Ok(ServerAccept::Work { conn, msg }) => handle_work(conn, msg, registry).await,
+        Ok(ServerAccept::Visitor { conn, msg }) => handle_visitor(conn, msg, registry).await,
+        Err(e) => {
+            debug!("握手失败：{e:#}");
+            Err(e)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 控制连接
+// ---------------------------------------------------------------------------
+
+async fn handle_control(
+    mut conn: FrpConn,
+    login: Login,
+    run_id: String,
+    udp_binary: bool,
+    cfg: Arc<ServerConfig>,
+    registry: Arc<Registry>,
+) -> Result<()> {
+    let client_id = if login.client_id.is_empty() {
+        run_id.clone()
+    } else {
+        login.client_id.clone()
+    };
+    info!(%client_id, %run_id, os = %login.os, arch = %login.arch, "客户端登录成功");
+
+    let (req_tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<CtrlCmd>();
+    let idle_timeout = Duration::from_secs(cfg.work_conn_idle_timeout.max(5));
+    let limits = registry.limits().clone();
+    let (conn_limit, backlog_limit, proxy_limit) = limits.per_client();
+    let client = Arc::new(ClientState::new(
+        run_id.clone(),
+        client_id.clone(),
+        login.user.clone(),
+        req_tx,
+        idle_timeout,
+        udp_binary,
+        conn_limit,
+        backlog_limit,
+        proxy_limit,
+    ));
+
+    // 客户端数上限：超出时明确拒绝并带上 reason，方便排查
+    let _client_slot = match registry.insert(client.clone()) {
+        Some(slot) => slot,
+        None => {
+            registry.metrics().clients_rejected.inc();
+            warn!(
+                %client_id,
+                "客户端数量已达上限 {}，拒绝本次登录", limits.max_clients
+            );
+            let _ = conn
+                .send_msg(&FrpMessage::NewProxyResp(NewProxyResp {
+                    proxy_name: String::new(),
+                    error: format!(
+                        "too many clients (limit = {}), login rejected",
+                        limits.max_clients
+                    ),
+                    ..Default::default()
+                }))
+                .await;
+            let _ = conn.shutdown().await;
+            anyhow::bail!("客户端数量达到上限 {}", limits.max_clients);
+        }
+    };
+    let _guard = ClientGuard::new(registry.clone(), run_id.clone());
+
+    let mut hb_ticker = tokio::time::interval(Duration::from_secs(5));
+    let mut last_seen = Instant::now();
+
+    loop {
+        tokio::select! {
+            msg = conn.recv_msg() => {
+                let Some(msg) = msg? else { break };
+                last_seen = Instant::now();
+                match msg {
+                    FrpMessage::NewProxy(m) => {
+                        let name = m.proxy_name.clone();
+                        let port = m.remote_port;
+                        let resp = match register_proxy(&cfg, &registry, &client, &m).await {
+                            Ok(remote_addr) => {
+                                registry.metrics().proxies_total.inc();
+                                registry.metrics().proxies_active.inc();
+                                info!(proxy = %name, port, remote = %remote_addr, "代理注册成功");
+                                NewProxyResp {
+                                    proxy_name: name.clone(),
+                                    remote_addr,
+                                    ..Default::default()
+                                }
+                            }
+                            Err(e) => {
+                                registry.metrics().proxy_failures.inc();
+                                warn!(proxy = %name, port, "代理注册失败：{e:#}");
+                                NewProxyResp { proxy_name: name, error: e.to_string(), ..Default::default() }
+                            }
+                        };
+                        conn.send_msg(&FrpMessage::NewProxyResp(resp)).await?;
+                    }
+                    FrpMessage::Ping(_) => {
+                        conn.send_msg(&FrpMessage::Pong(Pong::default())).await?;
+                    }
+                    FrpMessage::CloseProxy(m) => {
+                        info!(proxy = %m.proxy_name, "客户端关闭代理");
+                        registry.metrics().proxies_active.dec();
+                        // stcp / xtcp 的代理名
+                        registry.visitors.remove(&m.proxy_name);
+                        // 客户端主动关代理时，它占的 http/https 域名也得摘掉，
+                        // 否则域名会一直被占着、重连注册同一个域名会被判冲突
+                        if let Some(t) = registry.vhosts() {
+                            t.remove_proxy(&m.proxy_name);
+                        }
+                        // tcp / udp 的公网端口同理：客户端这边只是记账，
+                        // 端口是注册表管的，必须显式还回去
+                        if let Some(port) = client.stop_proxy(&m.proxy_name) {
+                            registry.release_port(port, &client);
+                        }
+                    }
+                    FrpMessage::NatHoleVisitor(m) => {
+                        crate::p2p::handle_nat_hole_visitor(&registry, &client, &m).await?;
+                    }
+                    FrpMessage::NatHoleClient(m) => {
+                        debug!(proxy = %m.proxy_name, "收到 NatHoleClient（客户端侧不应下发），忽略");
+                    }
+                    FrpMessage::NatHoleReport(m) => {
+                        debug!(sid = %m.sid, success = m.success, "收到 NatHoleReport");
+                    }
+                    other => {
+                        debug!("忽略消息：{}", other.name());
+                    }
+                }
+            }
+            Some(cmd) = req_rx.recv() => {
+                match cmd {
+                    // 有用户连接排队，向客户端索要一条工作连接
+                    CtrlCmd::RequestWork => conn.send_msg(&FrpMessage::ReqWorkConn).await?,
+                    // 其他路径（xtcp 打洞协调）要发给客户端的消息，原样下发
+                    CtrlCmd::Send(msg) => conn.send_msg(&msg).await?,
+                }
+            }
+            _ = hb_ticker.tick() => {
+                if last_seen.elapsed() > Duration::from_secs(cfg.heartbeat_timeout) {
+                    warn!(%client_id, "心跳超时 {}s，断开控制连接", cfg.heartbeat_timeout);
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 按代理类型注册：tcp / udp 绑端口，http / https 注册虚拟主机域名。
+///
+/// 返回给客户端的 `remote_addr` 文案（frp 用它展示"暴露在哪"）。
+async fn register_proxy(
+    cfg: &Arc<ServerConfig>,
+    registry: &Arc<Registry>,
+    client: &Arc<ClientState>,
+    m: &rustunnel_common::frp::msg::NewProxy,
+) -> Result<String> {
+    if m.proxy_name.is_empty() {
+        anyhow::bail!("代理名为空");
+    }
+    // 代理数必须在分配端口/域名之前拦住，否则失败路径还要回头回收资源。
+    // 名额由 add_proxy 接管，随代理一起存活。
+    let slot = client.reserve_proxy().ok_or_else(|| {
+        anyhow!(
+            "代理数量已达上限 {}，注册被拒绝",
+            registry.limits().max_proxies_per_client
+        )
+    })?;
+    match m.proxy_type.as_str() {
+        "tcp" => register_tcp(cfg, registry, client, m, slot).await,
+        "udp" => register_udp(cfg, registry, client, m, slot).await,
+        "http" => register_vhost(cfg, registry, client, m, false, slot).await,
+        "https" => register_vhost(cfg, registry, client, m, true, slot).await,
+        "stcp" => register_visitor_proxy(registry, client, m, "stcp", slot).await,
+        "xtcp" => register_visitor_proxy(registry, client, m, "xtcp", slot).await,
+        other => anyhow::bail!(
+            "暂不支持的代理类型：{other}（支持 tcp / udp / http / https / stcp / xtcp）"
+        ),
+    }
+}
+
+/// stcp / xtcp：**不需要公网端口**，只在 visitor 表里登记一条记录。
+///
+/// 之后 visitor 主动连进来时才会校验密钥并配对工作连接。
+///
+/// 说明：`xtcp` 在 P2P 打洞失败时会回退成本模块的中继路径（与 stcp 一致）。
+async fn register_visitor_proxy(
+    registry: &Arc<Registry>,
+    client: &Arc<ClientState>,
+    m: &rustunnel_common::frp::msg::NewProxy,
+    kind: &str,
+    slot: Permit,
+) -> Result<String> {
+    if m.sk.is_empty() {
+        anyhow::bail!("{kind} 代理必须配置 secret_key（frpc 里叫 secretKey）");
+    }
+    registry
+        .visitors
+        .register(VisitorEntry {
+            proxy_name: m.proxy_name.clone(),
+            secret_key: m.sk.clone(),
+            allow_users: m.allow_users.clone(),
+            provider_user: client.user.clone(),
+            client: client.clone(),
+            proxy_type: kind.to_string(),
+        })
+        .map_err(|e| anyhow!(e))?;
+    client.add_proxy(m.proxy_name.clone(), None, slot);
+    // 与官方 frps 一致：visitor 类代理没有公网地址，remote_addr 留空
+    Ok(String::new())
+}
+
+/// TCP：绑定公网端口，用户连进来时向客户端要工作连接配对。
+async fn register_tcp(
+    cfg: &Arc<ServerConfig>,
+    registry: &Arc<Registry>,
+    client: &Arc<ClientState>,
+    m: &rustunnel_common::frp::msg::NewProxy,
+    slot: Permit,
+) -> Result<String> {
+    if m.remote_port == 0 {
+        anyhow::bail!("tcp 代理必须指定 remote_port");
+    }
+    // group 共享端口时**只有第一个成员**能 bind，后来者直接复用已有监听器：
+    // 再 bind 一次必然是 `Address already in use`，组里就永远只剩一个后端。
+    let claim = registry
+        .reserve_port(m.remote_port, &m.group, &m.proxy_name, client.clone())
+        .map_err(|e| anyhow!("{e}"))?;
+
+    if claim == PortClaim::Fresh {
+        let addr = util::resolve_addr(&format!("{}:{}", cfg.bind_addr, m.remote_port))
+            .await
+            .with_context(|| format!("解析 {}:{} 失败", cfg.bind_addr, m.remote_port))?;
+        let listener = match TcpListener::bind(addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                registry.release_port(m.remote_port, client);
+                return Err(e).with_context(|| format!("监听 {addr} 失败"));
+            }
+        };
+
+        let remote_port = m.remote_port;
+        let registry2 = registry.clone();
+        let handle = tokio::spawn(async move {
+            proxy_accept_loop(listener, remote_port, registry2).await;
+        });
+        // 监听器交给**端口**（而不是这个客户端）托管：组里其他成员还在时，
+        // 创建者掉线不该把端口一起带走。
+        registry.attach_listener(m.remote_port, handle.abort_handle());
+    }
+
+    client.add_proxy(m.proxy_name.clone(), Some(m.remote_port), slot);
+    Ok(format!("{}:{}", cfg.bind_addr, m.remote_port))
+}
+
+/// UDP：绑定 UDP 端口 + 维持一条专用工作连接。
+async fn register_udp(
+    cfg: &Arc<ServerConfig>,
+    registry: &Arc<Registry>,
+    client: &Arc<ClientState>,
+    m: &rustunnel_common::frp::msg::NewProxy,
+    slot: Permit,
+) -> Result<String> {
+    if m.remote_port == 0 {
+        anyhow::bail!("udp 代理必须指定 remote_port");
+    }
+    // 同 tcp：只有第一个成员负责绑定，后来者复用。
+    //
+    // 但 UDP 的 group 负载均衡这里**明确不做**：UDP 是无连接的，一条工作连接
+    // 要负责一整套来源地址的报文，按连接轮询会把同一个会话的报文拆到不同后端去，
+    // 结果比不均衡还糟。与其让它"看着配了却没生效"，不如直接说清楚。
+    let claim = registry
+        .reserve_port(m.remote_port, &m.group, &m.proxy_name, client.clone())
+        .map_err(|e| anyhow!("{e}"))?;
+    if claim == PortClaim::Joined {
+        registry.release_port(m.remote_port, client);
+        anyhow::bail!(
+            "端口 {} 已被同组 [{}] 的其他代理占用；UDP 暂不支持 group 负载均衡，请改用 tcp",
+            m.remote_port,
+            m.group
+        );
+    }
+
+    let udp = match udp_proxy::bind_udp(&cfg.bind_addr, m.remote_port).await {
+        Ok(u) => u,
+        Err(e) => {
+            registry.release_port(m.remote_port, client);
+            return Err(e);
+        }
+    };
+    let handle = udp_proxy::spawn(Arc::new(udp), m.proxy_name.clone(), client.clone());
+    registry.attach_listener(m.remote_port, handle.abort_handle());
+    client.add_proxy(m.proxy_name.clone(), Some(m.remote_port), slot);
+    Ok(format!("{}:{}/udp", cfg.bind_addr, m.remote_port))
+}
+
+/// HTTP / HTTPS：把域名注册进虚拟主机路由表（不需要额外端口）。
+async fn register_vhost(
+    cfg: &Arc<ServerConfig>,
+    registry: &Arc<Registry>,
+    client: &Arc<ClientState>,
+    m: &rustunnel_common::frp::msg::NewProxy,
+    is_https: bool,
+    slot: Permit,
+) -> Result<String> {
+    let kind = if is_https { "https" } else { "http" };
+    let vhost_port = if is_https {
+        cfg.vhost_https_port
+    } else {
+        cfg.vhost_http_port
+    };
+    let Some(vhost_port) = vhost_port else {
+        anyhow::bail!(
+            "服务端未配置 vhost_{}_port，无法注册 {kind} 代理",
+            if is_https { "https" } else { "http" }
+        );
+    };
+    let table = registry
+        .vhosts()
+        .ok_or_else(|| anyhow!("虚拟主机路由表未初始化"))?;
+
+    let mut domains: Vec<String> = m
+        .custom_domains
+        .iter()
+        .map(|d| d.trim().to_ascii_lowercase())
+        .filter(|d| !d.is_empty())
+        .collect();
+    if !m.subdomain.is_empty() {
+        if cfg.subdomain_host.is_empty() {
+            anyhow::bail!("客户端用了 subdomain，但服务端未配置 subdomain_host");
+        }
+        domains.push(format!(
+            "{}.{}",
+            m.subdomain.trim().to_ascii_lowercase(),
+            cfg.subdomain_host.trim().to_ascii_lowercase()
+        ));
+    }
+    if domains.is_empty() {
+        anyhow::bail!("{kind} 代理必须配置 custom_domains 或 subdomain");
+    }
+
+    let mut locations: Vec<String> = if m.locations.is_empty() {
+        vec!["/".to_string()]
+    } else {
+        m.locations.clone()
+    };
+    // 长前缀优先匹配（frp 的路由优先级规则）
+    locations.sort_by_key(|a| std::cmp::Reverse(a.len()));
+    for domain in &domains {
+        table.register(Arc::new(VhostRoute {
+            proxy_name: m.proxy_name.clone(),
+            client: client.clone(),
+            domain: domain.clone(),
+            locations: locations.clone(),
+            http_user: m.http_user.clone(),
+            http_pwd: m.http_pwd.clone(),
+            route_by_http_user: m.route_by_http_user.clone(),
+            rewrite_host: m.host_header_rewrite.clone(),
+            req_headers: m.headers.clone(),
+            resp_headers: m.response_headers.clone(),
+            is_https,
+        }))?;
+    }
+    client.add_proxy(m.proxy_name.clone(), None, slot);
+    Ok(domains
+        .iter()
+        .map(|d| format!("{d}:{vhost_port}"))
+        .collect::<Vec<_>>()
+        .join(","))
+}
+
+async fn proxy_accept_loop(listener: TcpListener, remote_port: u16, registry: Arc<Registry>) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, peer)) => {
+                // group 负载均衡：这个端口背后可能挂着多个客户端（同组代理），
+                // 每条新连接轮询挑一个；挑不到说明后端全掉了，直接关掉。
+                let Some(backend) = registry.pick(remote_port) else {
+                    debug!(%peer, port = remote_port, "端口没有可用后端，关闭连接");
+                    continue;
+                };
+                let client = backend.client;
+                let user = PendingUser {
+                    // 必须用**被选中那个后端自己的**代理名：服务端就是靠它
+                    // 在 StartWorkConn 里告诉客户端该服务哪条代理，
+                    // 组内各成员的 name 可以完全不同（alice.web-a / bob.web-b），
+                    // 拿创建监听器那个成员的名字下发，其他成员会找不到这条代理。
+                    proxy: backend.proxy_name.clone(),
+                    remote_port,
+                    stream: Box::pin(stream),
+                    peer,
+                    at: Instant::now(),
+                    slot: ConnSlot::acquire(&registry.conn_limit, &client),
+                    queue_permit: None,
+                };
+                admit_user(user, &client, &registry);
+            }
+            Err(e) => {
+                tracing::error!(port = remote_port, "监听失败：{e}");
+                break;
+            }
+        }
+    }
+}
+
+/// 把一条用户连接交给客户端：先过配额，再排队配对。
+///
+/// 三条验收规则：
+/// 1. **没有转发配额**（命中全局或单客户端上限）——立刻关连接，不留尾巴；
+/// 2. **队列已满**——同样立刻关，别让它无限堆积；
+/// 3. 成功入队——记得向控制连接索要一条新的工作连接。
+pub fn admit_user(user: PendingUser, client: &Arc<ClientState>, registry: &Arc<Registry>) {
+    if user.slot.is_none() {
+        registry.metrics().conns_rejected.inc();
+        warn!(
+            proxy = %user.proxy,
+            "转发连接数已达上限（全局 {} / 客户端 {}），拒绝本次连接",
+            registry.limits().max_total_conns,
+            registry.limits().max_conns_per_client
+        );
+        return;
+    }
+    registry.metrics().conns_total.inc();
+    registry.metrics().conns_active.inc();
+    match client.submit_user(user) {
+        Submit::Paired(pair) => {
+            let p = *pair;
+            spawn_bridge(p.user, p.work, registry.clone())
+        }
+        Submit::Queued => client.request_work_conn(),
+        Submit::Full(_u) => {
+            registry.metrics().conns_rejected.inc();
+            warn!(proxy = %_u.proxy, "待配对队列已满，拒绝本次连接");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 工作连接
+// ---------------------------------------------------------------------------
+
+async fn handle_work(mut conn: FrpConn, msg: NewWorkConn, registry: Arc<Registry>) -> Result<()> {
+    let client = registry
+        .get(&msg.run_id)
+        .ok_or_else(|| anyhow!("找不到 run_id={} 对应的客户端", msg.run_id))?;
+    // 工作连接继承控制连接协商出的 UDP 报文编码
+    conn.set_udp_codec(client.udp_codec_is_binary());
+    let work = WorkItem {
+        conn,
+        at: Instant::now(),
+    };
+    match client.submit_work(work) {
+        Some(p) => {
+            debug!(proxy = %p.user.proxy, "工作连接与排队用户配对");
+            registry.metrics().conns_active.inc();
+            spawn_bridge(p.user, p.work, registry.clone());
+        }
+        None => debug!(client = %client.client_id, "工作连接进入空闲池"),
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// visitor 连接（stcp / xtcp 的接入方）
+// ---------------------------------------------------------------------------
+
+/// 处理一条 visitor 连接：校验 -> 回 Resp -> 与 provider 的工作连接配对。
+///
+/// 配对成功后这条 visitor 连接就变成"用户连接"，转发逻辑与 tcp 完全一样。
+async fn handle_visitor(
+    mut conn: FrpConn,
+    msg: NewVisitorConn,
+    registry: Arc<Registry>,
+) -> Result<()> {
+    let proxy_name = msg.proxy_name.clone();
+
+    /// 回一条错误响应并结束（官方 frpc 会把 error 原样打到日志上）。
+    async fn reject(
+        conn: &mut FrpConn,
+        proxy_name: &str,
+        err: String,
+        registry: &Registry,
+    ) -> Result<()> {
+        registry.metrics().visitor_rejected.inc();
+        let _ = conn
+            .send_msg(&FrpMessage::NewVisitorConnResp(NewVisitorConnResp {
+                proxy_name: proxy_name.to_string(),
+                error: err.clone(),
+            }))
+            .await;
+        // 必须优雅关闭：直接 drop 会变成 RST，对端读不到 error，只会看到 connection reset
+        let _ = conn.shutdown().await;
+        anyhow::bail!("visitor 接入被拒绝：{err}");
+    }
+
+    // 1) run_id 必须能对上一条已登录的控制会话（对应 frps 的 admitVisitorByRunID）
+    if !msg.run_id.is_empty() && registry.get(&msg.run_id).is_none() {
+        return reject(
+            &mut conn,
+            &proxy_name,
+            format!("no client control found for run id [{}]", msg.run_id),
+            &registry,
+        )
+        .await;
+    }
+
+    // 2) 代理必须已注册
+    let Some(entry) = registry.visitors.get(&proxy_name) else {
+        return reject(
+            &mut conn,
+            &proxy_name,
+            format!("custom listener for [{proxy_name}] doesn't exist"),
+            &registry,
+        )
+        .await;
+    };
+
+    // 3) 密钥签名校验：hex(md5(secret_key + timestamp))
+    if !entry.check_sign(&msg.sign_key, msg.timestamp) {
+        warn!(proxy = %proxy_name, "visitor 密钥校验失败");
+        return reject(
+            &mut conn,
+            &proxy_name,
+            format!("visitor connection of [{proxy_name}] auth failed"),
+            &registry,
+        )
+        .await;
+    }
+
+    // 4) 访客用户白名单
+    //
+    // 与官方 frps 一致：比对的**不是** visitor 的 name，而是发起这条 visitor 连接的那个
+    // frpc 在 Login 里声明的顶层 `user`（对应 frpc.toml 的 `user = "alice"`）。
+    let visitor_user = registry
+        .get(&msg.run_id)
+        .map(|c| c.user.clone())
+        .unwrap_or_default();
+    if !entry.check_user(&visitor_user) {
+        warn!(proxy = %proxy_name, user = %visitor_user, "visitor 用户不在 allow_users 白名单内");
+        return reject(
+            &mut conn,
+            &proxy_name,
+            format!("visitor connection of [{proxy_name}] user [{visitor_user}] not allowed"),
+            &registry,
+        )
+        .await;
+    }
+
+    // 5) 转发配额（stcp 走中继时同样占用一条连接）
+    let slot = ConnSlot::acquire(&registry.conn_limit, &entry.client);
+    if slot.is_none() {
+        registry.metrics().conns_rejected.inc();
+        return reject(
+            &mut conn,
+            &proxy_name,
+            "server is busy: too many active connections".to_string(),
+            &registry,
+        )
+        .await;
+    }
+
+    // 6) 先回成功（官方 frps 也是先 PutConn 再回 ok，之后才去池里取工作连接）
+    conn.send_msg(&FrpMessage::NewVisitorConnResp(NewVisitorConnResp {
+        proxy_name: proxy_name.clone(),
+        error: String::new(),
+    }))
+    .await
+    .context("发送 NewVisitorConnResp 失败")?;
+    registry.metrics().visitor_conns.inc();
+    registry.metrics().conns_total.inc();
+    registry.metrics().conns_active.inc();
+
+    // 7) 向 provider 要一条工作连接并配对
+    let Some(work) = entry
+        .client
+        .acquire_work_conn(Duration::from_secs(10))
+        .await
+    else {
+        registry.metrics().conns_active.dec();
+        anyhow::bail!("provider [{proxy_name}] 没有可用的工作连接，visitor 连接关闭");
+    };
+
+    let (stream, leftover) = conn.into_stream();
+    let user = PendingUser {
+        proxy: proxy_name.clone(),
+        // visitor 没有公网端口概念
+        remote_port: 0,
+        stream: Box::pin(PrefixedStream::new(leftover, stream)),
+        peer: SocketAddr::from(([0, 0, 0, 0], 0)),
+        at: Instant::now(),
+        slot,
+        queue_permit: None,
+    };
+    info!(proxy = %proxy_name, kind = %entry.proxy_type, "visitor 接入成功，开始中继");
+    spawn_bridge(user, work, registry.clone());
+    Ok(())
+}
+
+/// 一条转发连接结束时的收尾：归还活跃连接计数与流量统计。
+fn finish_conn(registry: &Registry, up: u64, down: u64) {
+    registry.metrics().conns_active.dec();
+    registry.metrics().bytes_up.inc_by(up);
+    registry.metrics().bytes_down.inc_by(down);
+}
+
+pub fn spawn_bridge(user: PendingUser, work: WorkItem, registry: Arc<Registry>) {
+    tokio::spawn(async move {
+        if let Err(e) = bridge(user, work, &registry).await {
+            debug!("转发结束：{e:#}");
+        }
+    });
+}
+
+/// 通知客户端这条工作连接属于哪个代理，然后开始双向转发原始字节。
+pub async fn bridge(user: PendingUser, work: WorkItem, registry: &Arc<Registry>) -> Result<()> {
+    let PendingUser {
+        proxy,
+        remote_port,
+        stream: mut user_stream,
+        peer,
+        ..
+    } = user;
+    let mut work_conn = work.conn;
+
+    work_conn
+        .send_msg(&FrpMessage::StartWorkConn(StartWorkConn {
+            proxy_name: proxy.clone(),
+            src_addr: peer.ip().to_string(),
+            dst_addr: String::new(),
+            src_port: peer.port(),
+            dst_port: remote_port,
+            ..Default::default()
+        }))
+        .await
+        .context("发送 StartWorkConn 失败")?;
+
+    let (mut work_stream, leftover) = work_conn.into_stream();
+    if !leftover.is_empty() {
+        use tokio::io::AsyncWriteExt;
+        user_stream.write_all(&leftover).await?;
+    }
+
+    match util::relay_between(&mut user_stream, &mut work_stream).await {
+        Ok((up, down)) => {
+            debug!(proxy = %proxy, "转发结束：上行 {up}B / 下行 {down}B");
+            finish_conn(registry, up, down);
+        }
+        Err(e) => {
+            debug!(proxy = %proxy, "转发中断：{e}");
+            finish_conn(registry, 0, 0);
+        }
+    }
+    Ok(())
+}
+
+/// 当前服务端支持的线协议校验（保持与原 main 的行为一致）。
+pub fn ensure_protocol(cfg: &ServerConfig) -> Result<()> {
+    if cfg.protocol != Protocol::FrpV2 {
+        anyhow::bail!("当前版本服务端仅实现 frp-v2 协议（可在配置里设置 protocol = \"frp-v2\"）");
+    }
+    Ok(())
+}
+
+/// 供单元测试构造 pending user 的辅助函数。
+#[cfg(test)]
+pub(crate) fn test_pending(proxy: &str, slot: Option<ConnSlot>) -> PendingUser {
+    PendingUser {
+        proxy: proxy.to_string(),
+        remote_port: 0,
+        stream: Box::pin(tokio::io::empty()),
+        peer: SocketAddr::from(([127, 0, 0, 1], 8080)),
+        at: Instant::now(),
+        slot,
+        queue_permit: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::limits::Limit;
+    use crate::registry::ServerLimits;
+    use tokio::sync::mpsc;
+
+    fn client_with(conn_limit: Limit, registry: &Registry) -> Arc<ClientState> {
+        let (tx, rx) = mpsc::unbounded_channel::<CtrlCmd>();
+        std::mem::forget(rx);
+        let (_, backlog, proxy) = registry.limits().per_client();
+        Arc::new(ClientState::new(
+            "run".into(),
+            "id".into(),
+            String::new(),
+            tx,
+            Duration::from_secs(60),
+            false,
+            conn_limit,
+            backlog,
+            proxy,
+        ))
+    }
+
+    #[test]
+    fn limits_from_config_defaults_to_unlimited() {
+        let cfg = ServerConfig::default();
+        let l = limits_from(&cfg);
+        assert_eq!(l.max_total_conns, 0, "默认必须保持向后兼容：不限制");
+        assert_eq!(l.max_clients, 0);
+    }
+
+    #[test]
+    fn admit_user_without_slot_is_dropped_and_counted() {
+        let registry = Arc::new(Registry::unlimited());
+        let client = client_with(Limit::new(1), &registry);
+        // 先把唯一的客户端连接配额占住
+        let held = client.try_acquire_conn().expect("占住");
+        let before = registry.metrics().conns_rejected.get();
+
+        admit_user(test_pending("ssh", None), &client, &registry);
+        assert_eq!(
+            registry.metrics().conns_rejected.get(),
+            before + 1,
+            "没有配额的连接必须被拒绝并计数"
+        );
+        assert_eq!(
+            registry.metrics().conns_total.get(),
+            0,
+            "被拒的连接不该计入"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn admit_user_over_backlog_is_dropped() {
+        let limits = ServerLimits {
+            max_pending_per_client: 1,
+            ..Default::default()
+        };
+        let registry = Arc::new(Registry::new(limits));
+        let client = client_with(Limit::unlimited(), &registry);
+
+        admit_user(
+            test_pending("a", Some(ConnSlot::default())),
+            &client,
+            &registry,
+        );
+        assert_eq!(client.backlog(), 1);
+        admit_user(
+            test_pending("b", Some(ConnSlot::default())),
+            &client,
+            &registry,
+        );
+        assert_eq!(client.backlog(), 1, "队列满了之后不能再入队");
+        assert_eq!(registry.metrics().conns_rejected.get(), 1);
+    }
+
+    #[test]
+    fn admit_user_queues_when_no_idle_work_conn() {
+        let registry = Arc::new(Registry::unlimited());
+        let client = client_with(Limit::unlimited(), &registry);
+        admit_user(
+            test_pending("ssh", Some(ConnSlot::default())),
+            &client,
+            &registry,
+        );
+        assert_eq!(client.backlog(), 1);
+        assert_eq!(registry.metrics().conns_total.get(), 1);
+        assert_eq!(registry.metrics().conns_rejected.get(), 0);
+    }
+
+    #[test]
+    fn ensure_protocol_rejects_rustunnel_wire() {
+        let mut cfg = ServerConfig::default();
+        assert!(ensure_protocol(&cfg).is_ok());
+        cfg.protocol = Protocol::Rustunnel;
+        assert!(ensure_protocol(&cfg).is_err());
+    }
+}

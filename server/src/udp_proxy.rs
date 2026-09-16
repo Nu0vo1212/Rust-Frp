@@ -85,7 +85,11 @@ async fn run_session(mut conn: FrpConn, udp: Arc<UdpSocket>, proxy_name: &str) -
             loop {
                 match udp.recv_from(&mut buf).await {
                     Ok((n, src)) => {
-                        if to_client_tx.send(UdpPacket::new(&buf[..n], &src)).await.is_err() {
+                        if to_client_tx
+                            .send(UdpPacket::new(&buf[..n], &src))
+                            .await
+                            .is_err()
+                        {
                             return;
                         }
                     }

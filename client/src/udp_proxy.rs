@@ -148,7 +148,9 @@ async fn new_session(
             loop {
                 match tokio::time::timeout(SESSION_IDLE, sock.recv(&mut buf)).await {
                     Ok(Ok(n)) => {
-                        let Some(dst) = remote2.to_socket() else { return };
+                        let Some(dst) = remote2.to_socket() else {
+                            return;
+                        };
                         if to_server
                             .send(UdpPacket::new(&buf[..n], &dst))
                             .await

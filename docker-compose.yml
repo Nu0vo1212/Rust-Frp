@@ -1,0 +1,37 @@
+# 一条命令把「服务端 + 一个演示客户端」跑起来：
+#
+#   docker compose up
+#
+# 真实使用时通常只需要 frps 那一段，把 frpc 删掉即可。
+
+services:
+  frps:
+    build: .
+    image: rustunnel:0.2.0
+    command: ["-c", "/etc/rustunnel/frps.toml"]
+    ports:
+      # 控制连接与数据端口
+      - "17000:17000"
+      # xtcp 打洞牵线（UDP，别漏了 /udp）
+      - "17002:17002/udp"
+      # 内置面板与 /metrics
+      - "17500:17500"
+    volumes:
+      - ./dist/release/assets/frps.toml:/etc/rustunnel/frps.toml:ro
+    restart: unless-stopped
+
+  # 演示：把本机 22 端口通过 frps 暴露到 6000
+  # 不需要时整段删掉
+  frpc:
+    build: .
+    image: rustunnel:0.2.0
+    entrypoint: ["/usr/local/bin/frpc"]
+    command: ["-c", "/etc/rustunnel/frpc.toml"]
+    depends_on:
+      - frps
+    volumes:
+      - ./dist/release/assets/frpc.toml:/etc/rustunnel/frpc.toml:ro
+    restart: unless-stopped
+    # 要访问宿主机上的服务时打开下面这行
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"

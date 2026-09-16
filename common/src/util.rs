@@ -58,6 +58,37 @@ pub fn init_tracing(default_level: &str) {
         .init();
 }
 
+/// 可以在运行时替换日志级别的热重载句柄。
+///
+/// 配置热重载需要在不重启进程的前提下改 `log_level`（排障时最想动的字段），
+/// 所以用 tracing-subscriber 的 reload layer 把过滤器换成可替换的。
+pub type LogFilterHandle =
+    tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>;
+
+/// 与 [`init_tracing`] 相同，但额外返回一个热重载句柄。
+pub fn init_tracing_reloadable(default_level: &str) -> Option<LogFilterHandle> {
+    let filter = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new(default_level))
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+
+    let (layer, handle) = tracing_subscriber::reload::Layer::new(filter);
+    tracing_subscriber::registry()
+        .with(layer)
+        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .init();
+    Some(handle)
+}
+
+/// 通过热重载句柄替换日志级别；返回是否成功。
+pub fn reload_log_level(handle: &LogFilterHandle, level: &str) -> bool {
+    match EnvFilter::try_new(level) {
+        Ok(f) => handle.reload(f).is_ok(),
+        Err(_) => false,
+    }
+}
+
 /// 中继转发的缓冲区大小。
 ///
 /// tokio 的 `copy_bidirectional` 默认只给 **8 KiB**，在高速链路（回环 / 内网 10G）

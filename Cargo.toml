@@ -3,14 +3,22 @@ resolver = "2"
 members = ["common", "server", "client"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["rustunnel contributors"]
+license = "Apache-2.0"
+readme = "README.md"
+# TODO(发布前)：改成你自己的仓库地址 —— crates.io 页面、文档链接都取自这里
+repository = "https://github.com/your-name/rustunnel"
+homepage = "https://github.com/your-name/rustunnel"
+
+
+
 
 [workspace.dependencies]
 # 内部 crate
-rustunnel-common = { path = "common", version = "0.2.0" }
+rustunnel-common = { path = "common", version = "0.3.0" }
 
 # 外部依赖（统一在此处锁定版本，保证各 crate 一致）
 # frp v2 控制通道加密，对应官方 go 实现的 HKDF-SHA256 + AES-256-GCM
@@ -20,6 +28,12 @@ hkdf = "0.12"
 md-5 = "0.10"
 rand = "0.8"
 sha2 = "0.10"
+
+# xtcp 真 P2P：QUIC 直连（打洞成功后用它承载业务数据）
+quinn = { version = "0.11", default-features = false, features = [
+    "runtime-tokio",
+    "rustls-ring",
+] }
 
 # 传输层增强：yamux 多路复用（frp transport.tcpMux）+ TLS（frp transport.tls）
 yamux = "0.13"
@@ -60,7 +74,7 @@ tokio = { version = "1", default-features = false, features = [
 tokio-util = { version = "0.7", features = ["codec", "io", "compat"] }
 toml = "0.8"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi", "registry", "std"] }
 
 # release 优化：体积优先（opt-level="s"）+ 全量 LTO，降低二进制体积与常驻内存
 [profile.release]

@@ -17,7 +17,7 @@ use hkdf::Hkdf;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
-use super::wire::{CRYPTO_TRANSCRIPT_LABEL, CRYPTO_RANDOM_SIZE};
+use super::wire::{CRYPTO_RANDOM_SIZE, CRYPTO_TRANSCRIPT_LABEL};
 
 /// 官方支持的算法，本实现使用 AES-256-GCM。
 pub const ALGORITHM: &str = "aes-256-gcm";
@@ -89,7 +89,8 @@ pub struct AeadWriter {
 
 impl AeadWriter {
     pub fn new(key: &[u8]) -> Result<Self> {
-        let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| anyhow!("AES-256-GCM 初始化失败: {e}"))?;
+        let cipher =
+            Aes256Gcm::new_from_slice(key).map_err(|e| anyhow!("AES-256-GCM 初始化失败: {e}"))?;
         let mut nonce = [0u8; NONCE_LEN];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
         Ok(Self {
@@ -116,7 +117,10 @@ impl AeadWriter {
                 .cipher
                 .encrypt(
                     Nonce::from_slice(&self.nonce),
-                    Payload { msg: chunk, aad: &aad },
+                    Payload {
+                        msg: chunk,
+                        aad: &aad,
+                    },
                 )
                 .map_err(|_| anyhow!("AEAD 加密失败"))?;
             out.extend_from_slice(&header);
@@ -139,7 +143,8 @@ pub struct AeadReader {
 
 impl AeadReader {
     pub fn new(key: &[u8]) -> Result<Self> {
-        let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| anyhow!("AES-256-GCM 初始化失败: {e}"))?;
+        let cipher =
+            Aes256Gcm::new_from_slice(key).map_err(|e| anyhow!("AES-256-GCM 初始化失败: {e}"))?;
         Ok(Self {
             cipher,
             stream_nonce: None,
@@ -186,7 +191,13 @@ impl AeadReader {
 
         let pt = self
             .cipher
-            .decrypt(Nonce::from_slice(&self.nonce), Payload { msg: &ct, aad: &aad })
+            .decrypt(
+                Nonce::from_slice(&self.nonce),
+                Payload {
+                    msg: &ct,
+                    aad: &aad,
+                },
+            )
             .map_err(|_| anyhow!("AEAD 解密失败：token 不一致或数据被篡改"))?;
 
         buf.drain(..4 + ct_len);

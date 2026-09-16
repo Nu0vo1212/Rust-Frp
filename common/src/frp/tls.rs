@@ -37,7 +37,8 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 每个连接都生成会明显拖慢握手。
 static SERVER_TLS_CONFIG: OnceLock<Arc<rustls::ServerConfig>> = OnceLock::new();
 
-fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+/// 进程共用的 rustls 加密后端（QUIC 直连也要用同一个 provider）。
+pub fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(ring::default_provider())
 }
 
@@ -80,8 +81,7 @@ fn to_server_name(host: &str) -> Result<ServerName<'static>> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         return Ok(ServerName::from(ip));
     }
-    ServerName::try_from(host.to_string())
-        .map_err(|e| anyhow!("无效的 SNI 名称 {host}：{e:?}"))
+    ServerName::try_from(host.to_string()).map_err(|e| anyhow!("无效的 SNI 名称 {host}：{e:?}"))
 }
 
 /// 服务端：探测首字节，按需升级到 TLS。

@@ -1,0 +1,42 @@
+rustunnel
+Copyright 2026 rustunnel contributors
+
+This product is licensed under the Apache License, Version 2.0.
+The full license text is in the LICENSE file accompanying this distribution,
+and is also available at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+-------------------------------------------------------------------------------
+Third-party components
+
+rustunnel incorporates material from the projects listed below. The original
+copyright notices and the licenses under which rustunnel received such
+material are set forth below.
+
+The project links against open-source Rust crates, predominantly under the MIT
+and/or Apache License 2.0. The authoritative, complete list with exact versions
+is in `Cargo.lock` (and the direct dependency declarations in the `Cargo.toml`
+files of the `common`, `server` and `client` crates). Notable direct
+dependencies include:
+
+  - tokio, tokio-util, futures      (MIT)
+  - quinn, quinn-proto              (MIT OR Apache-2.0)
+  - rustls, tokio-rustls, rcgen     (Apache-2.0 OR MIT / MIT)
+  - ring                            (ISC-style; see the crate's LICENSE)
+  - clap                            (MIT OR Apache-2.0)
+  - anyhow                          (MIT OR Apache-2.0)
+  - tracing, tracing-subscriber     (MIT)
+  - serde, toml, bytes, base64      (MIT OR Apache-2.0)
+  - rand, sha2, aes-gcm, hkdf, md-5 (MIT OR Apache-2.0)
+
+In addition, the frp v2 wire protocol implemented by this project is
+interoperable with fatedier/frp (Apache License 2.0). No source code from that
+project is contained in this distribution; the compatibility is achieved by
+implementing the documented protocol.

@@ -11,7 +11,8 @@
 //!         -> provider frpc -> provider 的 local_addr
 //! ```
 //!
-//! xtcp 目前走与 stcp 完全相同的中继路径（rustunnel 未实现 UDP 打洞）。
+//! xtcp 会先尝试真 P2P（见 [`crate::p2p`]）：打洞成功则数据直连，
+//! 失败自动回退到与 stcp 相同的中继路径。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,7 +22,7 @@ use rustunnel_common::{config::VisitorConfig, frp::conn, util};
 use tokio::{io::AsyncWriteExt, net::TcpListener, net::TcpStream, sync::watch};
 use tracing::{debug, info, warn};
 
-use crate::ClientSession;
+use crate::{p2p, ClientSession};
 
 /// 等控制会话就绪（客户端重连期间会短暂等待）。
 async fn wait_session(
@@ -123,6 +124,29 @@ async fn handle_user(
 
     let session = wait_session(session_rx).await?;
 
+    // xtcp 先试真 P2P：打通了数据就不经过服务端，带宽不再受它限制。
+    // 打洞失败（对称 NAT、UDP 被封等）时静默回退中继 —— xtcp 因此不会比 stcp 更差。
+    if cfg.visitor_type == "xtcp" {
+        if let Some(route) = &session.p2p {
+            debug!(visitor = %cfg.name, %peer, "xtcp 尝试 P2P 直连");
+            match p2p::try_punch_as_visitor(route, &session.run_id, &target, &cfg.secret_key).await
+            {
+                Ok(mut stream) => {
+                    match util::relay_between(&mut user, &mut stream).await {
+                        Ok((up, down)) => {
+                            debug!(visitor = %cfg.name, "P2P 转发结束：上行 {up}B / 下行 {down}B")
+                        }
+                        Err(e) => debug!(visitor = %cfg.name, "P2P 转发中断：{e}"),
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    debug!(visitor = %cfg.name, "P2P 打洞失败，回退中继：{e:#}");
+                }
+            }
+        }
+    }
+
     debug!(visitor = %cfg.name, %peer, "建立 visitor 通道 target={target}");
 
     let (mut tunnel, leftover) = conn::client_visitor_conn(
@@ -145,7 +169,9 @@ async fn handle_user(
     }
 
     match util::relay_between(&mut user, &mut tunnel).await {
-        Ok((up, down)) => debug!(visitor = %cfg.name, "visitor 转发结束：上行 {up}B / 下行 {down}B"),
+        Ok((up, down)) => {
+            debug!(visitor = %cfg.name, "visitor 转发结束：上行 {up}B / 下行 {down}B")
+        }
         Err(e) => debug!(visitor = %cfg.name, "visitor 转发中断：{e}"),
     }
     Ok(())

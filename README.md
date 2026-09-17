@@ -1,6 +1,8 @@
 # rustunnel
 
-用 Rust 实现的内网穿透工具，**完整兼容 [fatedier/frp](https://github.com/fatedier/frp) 的 wire protocol v2**，可以和官方 `frps` / `frpc`（v0.71.0 实测）直接互通。
+用 Rust 实现的内网穿透工具，**完整兼容 [fatedier/frp](https://github.com/fatedier/frp) 的 wire protocol v1 与 v2**，可以和官方 `frps` / `frpc`（v0.71.0 实测）直接互通。
+
+**默认就走 v1** —— 与官方 frp 的默认值一致，所以官方客户端 / 服务端**不需要改任何配置**就能连上；v1 覆盖官方源码里的全部算法（帧编码、AES-128-CFB 控制通道加密、yamux 复用、打洞报文），第三方 frp 平台下发的配置也能直接用。
 
 以极小的资源占用换取同等甚至更好的核心能力：服务端常驻内存约 **3.5 MB**（同负载下 Go 版 frps 为 28.8~31.8 MB），单文件部署，无任何运行时依赖。
 
@@ -8,7 +10,8 @@
 
 ### 代理与传输
 
-- ✅ **frp v2 线协议兼容** — 与官方 frp 互相连接（官方客户端需指定 `transport.wireProtocol = "v2"`）
+- ✅ **frp v1 / v2 双线协议** — **默认 v1**（与官方默认值相同），官方 frpc / frps **零配置直连**；需要时可用 `transport.wireProtocol = "v2"` 显式启用 v2
+- ✅ **原版配置直接可用** — 原版 frpc / 第三方 frp 平台下发的配置（camelCase、`[[proxies]]`、`localIP`+`localPort`、`[metadatas]`）无需改写即可运行
 - ✅ **六种代理类型** — `tcp` / `udp` / `http` / `https` / `stcp` / `xtcp`，多代理同时工作
 - ✅ **UDP 转发** — 每个 UDP 代理只占一条工作连接，靠访客地址区分会话
 - ✅ **HTTP 反向代理** — 按域名路由，支持 `locations` 前缀、Basic Auth、Host 改写、自定义请求/响应头
@@ -31,7 +34,7 @@
 
 ### 工程质量
 
-- ✅ **173 个自动化测试** — 含真实 QUIC 栈握手、口令正反用例、端到端集成测试
+- ✅ **239 个自动化测试** — 含真实 QUIC 栈握手、口令正反用例、端到端集成测试、**与官方 frpc/frps 真实抓包密文的解密回归**
 - ✅ **CI 流水线** — `fmt` / `clippy` / 测试 / 四目标构建 / 冒烟，PR 必过
 - ✅ **发布可验真** — `SHA256SUMS` + 可选 Ed25519 分离签名与本地验签脚本
 - ✅ **容器就绪** — 多阶段 `Dockerfile`（musl 静态）+ `docker-compose.yml`
@@ -44,10 +47,12 @@ rustunnel/
 ├── common/                    # 公共库（协议实现核心）
 │   └── src/
 │       ├── frp/
-│       │   ├── wire.rs        #   v2 线协议：magic 前缀、帧编解码
-│       │   ├── crypto.rs      #   控制通道加密：HKDF-SHA256 + AES-256-GCM
-│       │   ├── msg.rs         #   JSON 消息：Login/NewProxy/ReqWorkConn/NatHole*
-│       │   ├── conn.rs        #   加密连接的读写封装
+│       │   ├── v1.rs          #   v1 线协议（官方默认）：消息类型字节、帧编解码、
+│       │   │                  #     AES-128-CFB 控制通道加密（PBKDF2 salt = "frp"）
+│       │   ├── wire.rs        #   v2 线协议：magic 前缀、帧编解码、握手协商
+│       │   ├── crypto.rs      #   v2 控制通道加密：HKDF-SHA256 + AES-256-GCM
+│       │   ├── msg.rs         #   JSON 消息：Login/NewProxy/ReqWorkConn/NatHole*（v1/v2 共用）
+│       │   ├── conn.rs        #   加密连接的读写封装 + 版本自动识别（服务端）
 │       │   ├── tls.rs         #   frp 自定义 TLS（自签证书 + 0x17 首字节）
 │       │   ├── quic.rs        #   QUIC 传输（quinn），一条双向流 = 一条 frp 连接
 │       │   ├── mux.rs         #   yamux 会话封装
@@ -144,6 +149,7 @@ server_port = 7000
 token = "your_secret_token"
 tcp_mux = true
 tls_enable = false
+# protocol = "frp-v1"      # 默认就是 v1（与官方默认值一致），不用写
 
 [[proxies]]
 name = "ssh"
@@ -172,17 +178,65 @@ rustunnel 可运行在官方 frp 的任一侧：
 | 官方 frps | rustunnel frpc（stcp 提供者 / 访客，tcp_mux on/off、TLS on） | ✅ 实测通过 |
 | 官方 frps | rustunnel frpc（stcp `allow_users=["alice"]`，`user=alice` 放行） | ✅ 实测通过 |
 | rustunnel frps | rustunnel frpc（含 TLS、关 yamux 组合、stcp / xtcp、`allow_users` 空/名单/`*` 三种语义） | ✅ 实测通过 |
+| 第三方 frp 平台（LoliaFRP） | rustunnel frpc（用平台下发的**原版配置**直接启动） | ✅ 实测通过（v0.3.1） |
+| 官方 frps v0.71.0 | rustunnel frpc（**v1，零配置**） | ✅ 实测通过（v0.3.2） |
+| rustunnel frps | 官方 frpc v0.71.0（**v1，零配置**） | ✅ 实测通过（v0.3.2） |
 
-官方客户端需显式指定 v2 协议：
+### 线协议：默认 v1，和官方一致（v0.3.2 起）
+
+官方 frp 的 `transport.wireProtocol` **缺省值就是 `v1`**（见 `pkg/config/v1/client.go`），
+v2 只有显式配置才会启用。所以"兼容 frp"的实现必须以 v1 为默认 —— v0.3.2 起 rustunnel
+也照此默认，**官方 frpc / frps 不需要改任何配置**就能互通：
 
 ```toml
-# 官方 frpc 侧
+# 官方 frpc 侧 —— 什么都不用写，这就是默认值
+```
+
+想用 v2 时就显式打开（两端都要）：
+
+```toml
+# 官方 frpc 侧 / rustunnel 侧均可
 transport.wireProtocol = "v2"
 ```
+
+rustunnel 服务端**不需要预先知道对端用哪个版本**：它读满 8 字节与 v2 的魔术字逐字节比较
+（`pkg/proto/wire/wire.go` 的 `CheckMagic` 语义），相同就走 v2，不同就**把这 8 字节原样留在
+缓冲区里**按 v1 解析 —— 那 8 字节本来就是 v1 的类型字节 + 长度前缀。所以同一个端口
+同时接待 v1 与 v2 客户端。
 
 > **注意**：官方 frp 没有 QUIC 传输（只有 TCP/KCP/QUIC 三选一的 `transport.protocol`），
 > 所以 `transport_protocol = "quic"` 只在 rustunnel 两端之间可用；
 > 与官方互通时请保持 `tcp`。
+
+### 直接使用原版 frp 的配置文件（v0.3.1 起）
+
+原版 frp 的配置**不需要改写**就能直接喂给这个 `frpc` —— 第三方 frp 平台
+（LoliaFRP / OpenFrp / SakuraFrp 等）下发的就是这种格式，拷过来即可运行。
+
+解析前会过一遍 `common/src/frp_config.rs` 的兼容层，把原版字段名规范化成 rustunnel 风格：
+
+| 原版 frp 写法 | 归一化成 |
+|---|---|
+| `serverAddr` / `serverPort` | `server_addr` / `server_port` |
+| `localIP` + `localPort`（两段） | `local_addr = "ip:port"`（IPv6 自动加方括号） |
+| `auth.token` | `token` |
+| `[metadatas]` | `metas`（整表透传） |
+| `[proxies.transport] bandwidthLimit` | `bandwidth_limit` |
+| `[proxies.transport] bandwidthLimitMode` | `bandwidth_limit_mode` |
+| `[proxies.healthCheck]` 子表 | `health_check_*` 平铺 |
+| `[proxies.plugin]` 子表 | `plugin` / `plugin_local_path` / `plugin_strip_prefix` / … |
+
+原则是「只补不覆盖」：rustunnel 自己的写法同时有效，两种写法混用时**原生字段优先**。
+
+两个容易搞反的地方：
+
+- **`[metadatas]` 不参与认证**，认证用顶层 `token`。它只是"随消息带给服务端的附加信息"，
+  整表透传（登录时进 `Login.metas`，代理级的 `[proxies.metadatas]` 进 `NewProxy.metas`）。
+  平台常把隧道凭证塞在这里 —— 删了登录不上；但把它当本地认证 token 也是错的
+  （会导致服务端回 `token in login doesn't match token from configuration`）。
+- **代理名的 `{user}.` 前缀由客户端加上**（对应官方 `naming.AddUserPrefix`），
+  且服务端保持幂等。注意官方 frpc 的日志 `proxy added: [xxx]` 打的是**配置里的原始名**，
+  很容易据此以为线上也不带前缀 —— 别信日志，要抓包看 `NewProxy.proxy_name`。
 
 ## 代理类型
 
@@ -532,6 +586,8 @@ max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
 | `p2p_port` | 服务端 xtcp 牵线端口，需与服务端 `p2p_port` 一致 | 空 |
 | `p2p_enable` | 是否允许 xtcp 尝试 P2P（失败自动回退中继） | `true` |
 | `pool_count` | 预建工作连接数（0 = 按需） | `1` |
+| `login_fail_exit` | 首次登录失败就退出（对齐官方 `loginFailExit`）。成功登录过之后断线仍无限重连 | `true` |
+| `reconnect_interval` | 断线重连间隔（秒），对齐官方 `reconnectInterval` | `10` |
 | `user` | 客户端用户名（frp 顶层 `user`），stcp/xtcp 的 `allow_users` 就是比对它 | 空 |
 | `[[proxies]]` | 代理列表，字段见下 | - |
 | `[[visitors]]` | stcp / xtcp 访客列表，字段见下 | - |
@@ -640,27 +696,42 @@ max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
 4/4 通过 —— 说明 tcp / http / stcp 三条链路在真实公网环境下（含 NAT、跨运营商）都能正常工作，
 白名单拒绝不只是「连不上」，而是服务端明确鉴权后的拒绝。复现脚本：`tmp/wan_e2e.py`。
 
-> v0.3.0 的新增能力（xtcp P2P、QUIC、插件、group、健康检查、限流）由 173 个自动化测试覆盖，
+> v0.3.0 的新增能力（xtcp P2P、QUIC、插件、group、健康检查、限流）由自动化测试覆盖，
 > 其中包含**真实 QUIC 栈**的握手与数据往返、打洞口令正反用例、以及端到端集成测试；
 > 跨公网的真机复测见 v0.3.0 发布说明。
+>
+> v0.3.1 是一个**第三方平台兼容性补丁**：`frpc` 现在能直接吃下原版 frp 平台下发的配置
+> （camelCase 字段名、`[[proxies]]` 分段、`localIP` + `localPort`），并且**线协议行为与官方
+> frpc 逐字节对齐**（`proxy_name` 带 `{user}.` 前缀、`bandwidthLimitMode` 字段）。
+> 已用 LoliaFRP 真实服务端跑通端到端隧道（公网端口 → 平台 → rustunnel → 本地服务）。
+> 同版还修掉一个 xtcp 回归：provider 侧漏剥 `{user}.` 前缀，导致打洞通知被当「未知代理」
+> 忽略、P2P 静默退化成中继（本机冒烟 12/12 已覆盖"是否真走直连"）。
+>
+> v0.3.2 补上了**官方默认的 v1 线协议**：在此之前 rustunnel 只讲 v2，官方客户端必须显式
+> 写 `transport.wireProtocol = "v2"` 才能连 —— 而第三方 frp 平台一律走 v1，这正是上一版
+> 在樱花上失败的原因。现在 v1 是默认，官方 frpc / frps 零配置直连，服务端还能在同一个
+> 端口上同时接待 v1 与 v2。踩过的最大的坑写进了源码注释：**v1 控制通道的 PBKDF2 盐是
+> `"frp"` 而不是 golib master 里的 `"crypto"`**（frp 0.71.0 锁的是 golib v0.8.2）——
+> 照着 master 写会得到一个"自加密自解密全对、一接官方 frps 就连上即断"的实现。
+> 已用官方 frps / frpc v0.71.0 双向实测，并把**官方抓包的真实密文**做成回归用例锁死。
 
 ## 质量保障
 
 ```bash
 cargo fmt --all -- --check          # 格式
 cargo clippy --workspace --all-targets   # 静态检查（当前 0 告警）
-cargo test --workspace              # 173 个测试
+cargo test --workspace              # 239 个测试
 ```
 
 测试分布：
 
 | 目标 | 数量 | 覆盖重点 |
 |---|---|---|
-| `common` 单元测试 | 39 | 线协议编解码、加密、配置解析、打洞报文/口令、令牌桶、示例配置可加载 |
-| `server` 单元测试（lib） | 92 | 虚拟主机路由表与优先级、chunked 解析、Basic Auth、连接池配对与回收、端口组轮询、资源配额、指标编码、面板鉴权、热重载字段判定、打洞会话 |
+| `common` 单元测试 | 93 | **v1 线协议**（消息类型字节、帧编解码、AES-128-CFB 密钥派生与流式状态机、**官方抓包密文解密回归**）、v2 线协议编解码、加密、配置解析、**原版 frp 配置兼容层**、打洞报文/口令、令牌桶、示例配置可加载 |
+| `server` 单元测试（lib） | 94 | 虚拟主机路由表与优先级、chunked 解析、Basic Auth、连接池配对与回收、端口组轮询、资源配额、指标编码、面板鉴权、热重载字段判定、打洞会话 |
 | `server` 单元测试（bin） | 5 | 命令行与配置装载 |
-| `client` 单元测试 | 27 | QUIC 建连与口令握手、插件（http_proxy / socks5 / static_file）、健康检查状态机、打洞编排 |
-| `server` 端到端集成测试 | 9 | 真握手 + 真转发的 TCP / HTTP / stcp / QUIC 链路、group 轮询、面板鉴权边界 |
+| `client` 单元测试 | 35 | QUIC 建连与口令握手、插件（http_proxy / socks5 / static_file）、健康检查状态机、打洞编排、`NewProxy` 字段映射（含与官方 frpc 抓包逐字节对拍）、服务端下发名 → 本地代理的翻译（`resolve_uploaded_proxy`） |
+| `server` 端到端集成测试 | 12 | 真握手 + 真转发的 TCP / HTTP / stcp / QUIC 链路、**v1 与 v2 双协议握手**、group 轮询、面板鉴权边界 |
 
 CI（`.github/workflows/ci.yml`）在每次 push / PR 上跑：`fmt` → `clippy` → 测试 →
 四个目标（windows-msvc / linux-musl / linux-gnu / linux-arm64）构建 → 端到端冒烟。
@@ -732,7 +803,8 @@ cargo build --release --target aarch64-unknown-linux-gnu
   官方 frp 同样如此；`p2p_port` 需要放行 UDP，否则只能走中继；
 - **QUIC 传输仅限 rustunnel 两端之间** —— 官方 frp 的 `transport.protocol` 语义不同，互通时用 `tcp`；
 - 打洞目前只试 QUIC 一种传输，没有 KCP 备选（KCP 在弱网下的抗丢包收益尚未纳入）；
-- 未实现 frp v1 线协议（官方 v0.78 起也已移除 v1）；
+- v1 线协议已完整实现并且是**默认**（与官方一致）；官方 v2 专有的 **UDP 二进制报文编码**
+  （`V2BinaryUDPPacketReadWriter`）只在 v2 下启用，v1 的 UDP 代理走 JSON 编码 —— 功能等价，仅包体略大；
 - 面板是**只读**的：展示状态与指标，不支持在界面上增删代理或踢人；
 - `group` 使用**轮询**而非最小连接数调度，各后端负载能力不均衡时不会自动倾斜。
 
@@ -746,4 +818,4 @@ Copyright 2026 rustunnel contributors
 内网穿透是网络基础设施里被大量商用的东西，使用者需要这份明确性 ——
 MIT 对专利只字未提，企业法务通常要额外确认一轮。
 
-与官方 frp（Apache-2.0）也更省事：两边许可一致，`frp v2` 协议的互操作说明不需要再夹一层许可解释。
+与官方 frp（Apache-2.0）也更省事：两边许可一致，`frp v1 / v2` 协议的互操作说明不需要再夹一层许可解释。

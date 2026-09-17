@@ -13,7 +13,7 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use rustunnel_common::{
-    config::{is_quic, Protocol, ServerConfig},
+    config::{is_quic, ServerConfig},
     frp::{
         self,
         conn::{self, FrpConn, ServerAccept},
@@ -384,7 +384,10 @@ async fn handle_frp_stream(
             conn,
             login,
             udp_binary,
-        }) => handle_control(conn, login, run_id, udp_binary, cfg, registry).await,
+        }) => {
+            let wire_version = conn.version();
+            handle_control(conn, login, run_id, udp_binary, wire_version, cfg, registry).await
+        }
         Ok(ServerAccept::Work { conn, msg }) => handle_work(conn, msg, registry).await,
         Ok(ServerAccept::Visitor { conn, msg }) => handle_visitor(conn, msg, registry).await,
         Err(e) => {
@@ -403,6 +406,7 @@ async fn handle_control(
     login: Login,
     run_id: String,
     udp_binary: bool,
+    wire_version: rustunnel_common::frp::WireVersion,
     cfg: Arc<ServerConfig>,
     registry: Arc<Registry>,
 ) -> Result<()> {
@@ -411,7 +415,10 @@ async fn handle_control(
     } else {
         login.client_id.clone()
     };
-    info!(%client_id, %run_id, os = %login.os, arch = %login.arch, "客户端登录成功");
+    info!(
+        %client_id, %run_id, os = %login.os, arch = %login.arch,
+        wire = %wire_version, "客户端登录成功"
+    );
 
     let (req_tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<CtrlCmd>();
     let idle_timeout = Duration::from_secs(cfg.work_conn_idle_timeout.max(5));
@@ -424,6 +431,7 @@ async fn handle_control(
         req_tx,
         idle_timeout,
         udp_binary,
+        wire_version,
         conn_limit,
         backlog_limit,
         proxy_limit,
@@ -463,7 +471,27 @@ async fn handle_control(
                 let Some(msg) = msg? else { break };
                 last_seen = Instant::now();
                 match msg {
-                    FrpMessage::NewProxy(m) => {
+                    FrpMessage::NewProxy(mut m) => {
+                        // 命名空间隔离：代理对外（注册表 / 工作连接 / 访问控制）用
+                        // `{user}.{name}` 这个全名。
+                        //
+                        // ★ 官方 frpc 在**客户端**就加好了前缀再发上来
+                        //   （`client/proxy/proxy_wrapper.go` 的 `wireName` =
+                        //   `naming.AddUserPrefix(clientCfg.User, name)`），
+                        //   实测抓包：`user = '2569'` 时线上就是
+                        //   `"proxy_name":"2569.c0462d9ce7e44bce97e626c4ae880905"`。
+                        //
+                        //   这里额外做一次「先 strip 再 add」是为了**幂等**：
+                        //   收原始名（老版 rustunnel 客户端、手写报文）也会被补成
+                        //   全名，收带前缀的名字也不会叠成 `2569.2569.xxx`。
+                        //
+                        //   之所以要兜这一层：早期判断反了 —— 以为客户端该发原始名，
+                        //   结果第三方 frps（LoliaFRP）按全名查隧道，查不到就回
+                        //   「FRPC 配置文件错误,请检查后重试」。
+                        m.proxy_name = util::add_user_prefix(
+                            &client.user,
+                            util::strip_user_prefix(&client.user, &m.proxy_name),
+                        );
                         let name = m.proxy_name.clone();
                         let port = m.remote_port;
                         let resp = match register_proxy(&cfg, &registry, &client, &m).await {
@@ -834,6 +862,17 @@ async fn handle_work(mut conn: FrpConn, msg: NewWorkConn, registry: Arc<Registry
     let client = registry
         .get(&msg.run_id)
         .ok_or_else(|| anyhow!("找不到 run_id={} 对应的客户端", msg.run_id))?;
+    // 工作连接必须与控制连接用同一套线协议 —— 与官方 frps 的
+    // `work connection wire protocol mismatch` 检查对齐。
+    // 对不上的话后面收发消息会直接解析失败，报错信息离原因很远，所以先挡下来。
+    if conn.version() != client.wire_version() {
+        anyhow::bail!(
+            "run_id={} 的工作连接线协议是 {}，控制连接是 {}",
+            msg.run_id,
+            conn.version(),
+            client.wire_version()
+        );
+    }
     // 工作连接继承控制连接协商出的 UDP 报文编码
     conn.set_udp_codec(client.udp_codec_is_binary());
     let work = WorkItem {
@@ -1045,9 +1084,20 @@ pub async fn bridge(user: PendingUser, work: WorkItem, registry: &Arc<Registry>)
 }
 
 /// 当前服务端支持的线协议校验（保持与原 main 的行为一致）。
+/// 校验配置里的线协议。
+///
+/// 服务端**按魔术字自动识别**对端用的是 v1 还是 v2（与官方 frps 的
+/// `wire.CheckMagic` 一致），所以 `frp-v1` / `frp-v2` 都能用、且同一端口可以
+/// 同时服务两种客户端 —— 这一项对服务端而言只是"别配错"。官方 frps 也是这样：
+/// 它的 `transport.wireProtocol` 在接收侧实际上不参与判断。
+///
+/// 只有 `rustunnel` 自研协议还没实现，必须显式拒绝（否则用户会以为配了就生效）。
 pub fn ensure_protocol(cfg: &ServerConfig) -> Result<()> {
-    if cfg.protocol != Protocol::FrpV2 {
-        anyhow::bail!("当前版本服务端仅实现 frp-v2 协议（可在配置里设置 protocol = \"frp-v2\"）");
+    if cfg.protocol.wire_version().is_none() {
+        anyhow::bail!(
+            "当前版本服务端尚未实现 rustunnel 自研协议，\
+             请把 protocol 设为 frp-v1（默认）或 frp-v2"
+        );
     }
     Ok(())
 }
@@ -1084,6 +1134,7 @@ mod tests {
             tx,
             Duration::from_secs(60),
             false,
+            rustunnel_common::frp::WireVersion::V1,
             conn_limit,
             backlog,
             proxy,
@@ -1158,10 +1209,19 @@ mod tests {
         assert_eq!(registry.metrics().conns_rejected.get(), 0);
     }
 
+    /// 只有 `rustunnel` 自研协议会被拒；v1 / v2 都放行 ——
+    /// 服务端本来就按魔术字自动识别对端，同一端口同时服务两种客户端。
     #[test]
-    fn ensure_protocol_rejects_rustunnel_wire() {
+    fn ensure_protocol_allows_both_frp_wire_versions() {
+        use rustunnel_common::config::Protocol;
+        // 默认就是 frp-v1（跟随官方 frpc 的默认值）
         let mut cfg = ServerConfig::default();
+        assert_eq!(cfg.protocol, Protocol::FrpV1);
         assert!(ensure_protocol(&cfg).is_ok());
+
+        cfg.protocol = Protocol::FrpV2;
+        assert!(ensure_protocol(&cfg).is_ok(), "v2 也必须被接受");
+
         cfg.protocol = Protocol::Rustunnel;
         assert!(ensure_protocol(&cfg).is_err());
     }

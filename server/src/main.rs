@@ -20,6 +20,13 @@ use rustunnel_server::{limits_from, Registry};
     about = "rustunnel 服务端（兼容原版 frp）"
 )]
 struct Cli {
+    /// 打印**上游 frp 兼容版本号**（等价于原版 frps 的 `frps -v`）
+    ///
+    /// 只输出裸版本号（如 `0.71.0`），方便脚本解析。
+    /// 想看 rustunnel 自己的版本请用 `--version`。
+    #[arg(short = 'v', long = "frp-version")]
+    frp_version: bool,
+
     /// 配置文件路径（默认 ./server.toml）
     #[arg(short, long, value_name = "PATH")]
     config: Option<std::path::PathBuf>,
@@ -56,6 +63,12 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // 与原版 frps 一致：`-v` 只打印版本号就退出（脚本/面板会解析它）
+    if cli.frp_version {
+        println!("{}", rustunnel_common::frp::FRP_WIRE_VERSION);
+        return Ok(());
+    }
 
     if cli.print_example {
         println!("{}", ServerConfig::example_toml());

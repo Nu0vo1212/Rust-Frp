@@ -981,7 +981,7 @@ dependencies = [
 
 [[package]]
 name = "rustunnel-client"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -991,6 +991,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustunnel-common",
+ "serde_json",
  "tokio",
  "tokio-util",
  "tracing",
@@ -998,14 +999,16 @@ dependencies = [
 
 [[package]]
 name = "rustunnel-common"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
+ "aes",
  "aes-gcm",
  "anyhow",
  "base64",
  "bytes",
  "futures",
  "hkdf",
+ "hmac",
  "md-5",
  "quinn",
  "rand 0.8.8",
@@ -1013,6 +1016,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "thiserror",
  "tokio",
@@ -1026,7 +1030,7 @@ dependencies = [
 
 [[package]]
 name = "rustunnel-server"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -1101,6 +1105,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest",
 ]
 
 [[package]]

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["common", "server", "client"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.2"
 edition = "2021"
 rust-version = "1.75"
 authors = ["rustunnel contributors"]
@@ -18,11 +18,16 @@ homepage = "https://github.com/your-name/rustunnel"
 
 [workspace.dependencies]
 # 内部 crate
-rustunnel-common = { path = "common", version = "0.3.0" }
+rustunnel-common = { path = "common", version = "0.3.2" }
 
 # 外部依赖（统一在此处锁定版本，保证各 crate 一致）
 # frp v2 控制通道加密，对应官方 go 实现的 HKDF-SHA256 + AES-256-GCM
 aes-gcm = "0.10"
+# frp v1 控制通道加密：AES-128-CFB 流密码（golib/crypto 用的是 aes.BlockSize 密钥）
+aes = "0.8"
+# frp v1 密钥派生：PBKDF2-HMAC-SHA1(token, "crypto", 64, 16)
+hmac = "0.12"
+sha1 = "0.10"
 base64 = "0.22"
 hkdf = "0.12"
 md-5 = "0.10"

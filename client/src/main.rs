@@ -38,6 +38,17 @@ use tracing::{debug, error, info, warn};
     about = "rustunnel 客户端（兼容原版 frp）"
 )]
 struct Cli {
+    /// 打印**上游 frp 兼容版本号**（等价于原版 frpc 的 `frpc -v`）
+    ///
+    /// 只输出裸版本号（如 `0.71.0`），一个多余的字都不加 —— 因为面板和启动器
+    /// 会逐字符解析它：NetTool 里的樱花、OpenFrp 都是跑 `frpc -v` 拿到版本号后
+    /// 报给平台，平台据此决定下发 **legacy INI** 还是 **TOML** 配置。
+    /// 这一项解析不出来时对方会当我们是远古版本，于是丢来一份 INI。
+    ///
+    /// 想看 rustunnel 自己的版本请用 `--version`。
+    #[arg(short = 'v', long = "frp-version")]
+    frp_version: bool,
+
     /// 配置文件路径（默认 ./client.toml）
     #[arg(short, long, value_name = "PATH")]
     config: Option<std::path::PathBuf>,
@@ -74,6 +85,13 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // 必须**第一个**处理：原版 frpc 的 `-v` 就是"打印版本号然后退出"，
+    // 面板/启动器会在拉起隧道之前先跑它做格式协商。
+    if cli.frp_version {
+        println!("{}", rustunnel_common::frp::FRP_WIRE_VERSION);
+        return Ok(());
+    }
 
     if cli.print_example {
         println!("{}", ClientConfig::example_toml());
@@ -120,9 +138,11 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| cfg.log_level.clone());
     util::init_tracing(&level);
 
-    if cfg.protocol != Protocol::FrpV2 {
-        bail!("当前版本客户端仅实现 frp-v2 协议（可在配置里设置 protocol = \"frp-v2\"）");
-    }
+    // 线协议：默认 v1，与官方 frpc 的 `transport.wireProtocol` 默认值一致。
+    // 樱花这类第三方 frps 分支只认 v1，配成 v2 会连不上（报错通常是"连上就断"）。
+    let wire = cfg.protocol.wire_version().ok_or_else(|| {
+        anyhow!("当前版本尚未实现 rustunnel 自研协议，请把 protocol 设为 frp-v1（默认）或 frp-v2")
+    })?;
     if cfg.proxies.is_empty() && cfg.visitors.is_empty() {
         warn!("配置里既没有 [[proxies]] 也没有 [[visitors]]，客户端不会做任何转发");
     }
@@ -132,9 +152,10 @@ async fn main() -> Result<()> {
     let health = health::Monitor::start(&cfg);
 
     info!(
-        "rustunnel-client 启动：连接 {}:{}，共 {} 个代理 / {} 个访客",
+        "rustunnel-client 启动：连接 {}:{}（线协议 {}），共 {} 个代理 / {} 个访客",
         cfg.server_addr,
         cfg.server_port,
+        wire,
         cfg.proxies.len(),
         cfg.visitors.len()
     );
@@ -157,13 +178,43 @@ async fn main() -> Result<()> {
     let shutdown = util::shutdown_signal();
     tokio::pin!(shutdown);
 
+    // 进程生命周期内**是否成功登录过**。用来实现官方 frpc 的 `loginFailExit`
+    // （默认 true）：首次登录失败就退出，登录成功过之后断线则一直重连。
+    //
+    // 这一项很关键，不是可有可无的礼节：第三方启动器（NetTool 拉 LoliaFRP 就是）
+    // 判断"隧道到底起没起来"靠的是**看子进程还活着没**。老版本无脑重试，
+    // 配置/令牌错的时候进程也不退，启动器只会显示绿灯 —— 用户看到"已启动"
+    // 但实际根本连不上，还得自己去翻日志。官方 frpc 遇到这种情况会毫秒级退出，
+    // 启动器才能把错误原样弹给用户。
+    let logged_in_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     loop {
-        let fut = run_session(cfg.clone(), session_tx.clone(), health.clone());
+        let fut = run_session(
+            cfg.clone(),
+            session_tx.clone(),
+            health.clone(),
+            logged_in_once.clone(),
+        );
         tokio::select! {
             r = fut => {
                 match r {
                     Ok(()) => info!("与控制服务端的会话结束"),
-                    Err(e) => error!("会话出错：{e:#}"),
+                    Err(e) => {
+                        // 首次登录（连不上 / 认证被拒 / 握手失败）就没成功过 → 退出，
+                        // 让启动器据此报错。已经登录过则只是普通断线，继续重连。
+                        if cfg.login_fail_exit
+                            && !logged_in_once.load(std::sync::atomic::Ordering::SeqCst)
+                        {
+                            return Err(e).with_context(|| {
+                                format!(
+                                    "首次登录 {}:{} 失败；已启用 loginFailExit（默认行为），\
+                                     不再重试。想让它一直重试请在配置里写 loginFailExit = false",
+                                    cfg.server_addr, cfg.server_port
+                                )
+                            });
+                        }
+                        error!("会话出错：{e:#}");
+                    }
                 }
             }
             _ = &mut shutdown => {
@@ -200,6 +251,9 @@ pub(crate) struct ClientSession {
 /// - `tcp_mux` 打开时只在会话开始时建一条 TCP，后续所有连接都开 yamux stream。
 struct ServerLink {
     cfg: Arc<ClientConfig>,
+    /// 本次会话使用的线协议（v1 / v2）。工作连接、visitor 连接都必须跟着用，
+    /// 否则会与服务端对不上（官方 frps 会直接以 `wire protocol mismatch` 拒绝）。
+    wire: frp::WireVersion,
     mux: Option<MuxSession>,
     /// QUIC 传输：一条 QUIC 连接上的每条双向流就是一条 frp 连接。
     ///
@@ -212,6 +266,9 @@ struct ServerLink {
 
 impl ServerLink {
     async fn open(cfg: Arc<ClientConfig>) -> Result<Self> {
+        let wire = cfg.protocol.wire_version().ok_or_else(|| {
+            anyhow!("当前版本尚未实现 rustunnel 自研协议，请把 protocol 设为 frp-v1 或 frp-v2")
+        })?;
         // QUIC 自带加密与多路复用，所以 tls / tcp_mux 这两层都跳过
         let quic = if is_quic(&cfg.transport_protocol) {
             let addr = quic_server_addr(&cfg).await?;
@@ -230,6 +287,7 @@ impl ServerLink {
         };
         Ok(Self {
             cfg,
+            wire,
             mux,
             quic,
             udp_binary: std::sync::atomic::AtomicBool::new(false),
@@ -277,51 +335,130 @@ async fn raw_connect(cfg: &ClientConfig) -> Result<BoxStream> {
 }
 
 /// 建立一次完整的控制连接会话，直到连接断开或出错。
-/// 把一条客户端代理配置翻译成线协议上的 `NewProxy`。
+/// 把一条代理配置搬成线协议里的 `NewProxy` 消息。
 ///
 /// 单独抽成函数是为了**能测**：这段映射以前内联在注册流程里，
 /// 于是新增配置字段（`group` / `group_key`）时忘了搬进消息体，
 /// 服务端单测测的是注册表、客户端也没有对应用例，最后是端到端冒烟才把它翻出来。
-fn build_new_proxy(user: &str, p: &ProxyConfig) -> NewProxy {
-    let wire_name = util::add_user_prefix(user, &p.name);
+///
+/// # `proxy_name` 必须带 `{user}.` 前缀
+///
+/// 官方 frpc 上线用的名字**不是**配置里的 `name`，而是
+/// `naming.AddUserPrefix(clientCfg.User, name)` 的结果（`client/proxy/proxy_wrapper.go`
+/// 的 `wireName` 字段）。`user = '2569'` + `name = 'c046…'`，线上就是 `2569.c046…`。
+///
+/// 第三方平台（LoliaFRP 等）正是拿这个**全名**去查隧道的，发原始名过去它查不到，
+/// 只会回一句「FRPC 配置文件错误,请检查后重试,请反馈给管理员以解决这个问题」。
+///
+/// ## 这个坑已经踩过一次，别再踩
+///
+/// 官方 frpc 的日志是
+/// `[dump-run-id] proxy added: [c0462d9ce7e44bce97e626c4ae880905]` —— **不带前缀**，
+/// 很容易据此以为线上也不带，然后把这里的前缀删掉（真发生过）。
+///
+/// 其实那行日志打的是 `pm.proxies` 的 key，也就是配置里的原始 `name`
+/// （`client/proxy/proxy_manager.go`：`name := cfg.GetBaseConfig().Name`），
+/// 跟真正发出去的 `wireName` 根本不是一回事。
+///
+/// ## 怎么才不会再搞错
+///
+/// 别读日志猜，**抓包**：用 [`server/examples/dump_frpc.rs`] 当假 frps
+/// （`cargo run -p rustunnel-server --example dump_frpc -- 17777`），把官方 frpc 的
+/// `serverAddr` 指过去，它会把你收到的每个消息原样打成 JSON，`proxy_name`
+/// 带不带前缀一眼就能看清。
+///
+/// 抓之前记得在待测配置里关掉两个传输层开关，否则连魔术字都对不上：
+///
+/// ```toml
+/// [transport]
+/// tcpMux = false          # 默认 true，会把控制连接塞进 yamux
+/// wireProtocol = "v2"     # 默认 v1，发的是 `6f`（'o' = TypeLogin），没有魔术字
+///
+/// [transport.tls]
+/// enable = false          # 默认 true，首字节是 TLS ClientHello
+/// ```
+///
+/// 服务端那边保持**幂等**（收到原始名或带前缀的名字都会被补成带前缀的），
+/// 所以老客户端直接发原始名也不会坏 —— 见 `server/src/serve.rs`。
+fn build_new_proxy(p: &ProxyConfig, user: &str) -> NewProxy {
+    // 线上名字 = `{user}.{name}`，与官方 frpc 的 `wireName` 对齐
+    let proxy_name = util::add_user_prefix(user, &p.name);
+
+    // 官方 frpc 只在值**不等于默认的 `client`** 时才发 `bandwidth_limit_mode`
+    // （`MarshalToMsg` 里写着 `if c.Transport.BandwidthLimitMode != "client"`），
+    // 所以这里把 `client` 归一化成空串，报文才能和官方 frpc 逐字段一致。
+    let bandwidth_limit_mode = if p.bandwidth_limit_mode.eq_ignore_ascii_case("client") {
+        String::new()
+    } else {
+        p.bandwidth_limit_mode.clone()
+    };
+
+    let mut m = NewProxy {
+        proxy_name,
+        proxy_type: p.proxy_type.clone(),
+        // 带宽上限：官方 frpc 会原样上报，平台拿它做限流校验
+        bandwidth_limit: p.bandwidth_limit.clone(),
+        bandwidth_limit_mode,
+        // ★ 这里放的是**代理级** `[proxies.metadatas]`，不是顶层 `[metadatas]`。
+        //   官方 frpc 的 `MarshalToMsg` 写的是 `m.Metas = c.Metadatas`，
+        //   顶层那份只进登录消息（`Login.Metas`）。
+        metas: p.metas.clone(),
+        ..Default::default()
+    };
+
     match p.proxy_type.as_str() {
-        "http" | "https" => NewProxy {
-            proxy_name: wire_name,
-            proxy_type: p.proxy_type.clone(),
-            custom_domains: p.custom_domains.clone(),
-            subdomain: p.subdomain.clone(),
-            locations: p.locations.clone(),
-            http_user: p.http_user.clone(),
-            http_pwd: p.http_pwd.clone(),
-            host_header_rewrite: p.host_header_rewrite.clone(),
-            group: p.group.clone(),
-            group_key: p.group_key.clone(),
-            ..Default::default()
-        },
+        "http" | "https" => {
+            m.custom_domains = p.custom_domains.clone();
+            m.subdomain = p.subdomain.clone();
+            m.locations = p.locations.clone();
+            m.http_user = p.http_user.clone();
+            m.http_pwd = p.http_pwd.clone();
+            m.host_header_rewrite = p.host_header_rewrite.clone();
+            m.group = p.group.clone();
+            m.group_key = p.group_key.clone();
+        }
         // stcp / xtcp：不带 remote_port，靠共享密钥 + visitor 接入
-        "stcp" | "xtcp" => NewProxy {
-            proxy_name: wire_name,
-            proxy_type: p.proxy_type.clone(),
-            sk: p.secret_key.clone(),
-            allow_users: p.allow_users.clone(),
-            ..Default::default()
-        },
+        "stcp" | "xtcp" => {
+            m.sk = p.secret_key.clone();
+            m.allow_users = p.allow_users.clone();
+        }
         // tcp / udp：remote_port + 负载均衡分组
-        _ => NewProxy {
-            proxy_name: wire_name,
-            proxy_type: p.proxy_type.clone(),
-            remote_port: p.remote_port,
-            group: p.group.clone(),
-            group_key: p.group_key.clone(),
-            ..Default::default()
-        },
+        _ => {
+            m.remote_port = p.remote_port;
+            m.group = p.group.clone();
+            m.group_key = p.group_key.clone();
+        }
     }
+
+    m
+}
+
+/// 把服务端下发的**线上全名**翻译回本地配置里的原始代理名，并取出配置。
+///
+/// 命名契约（与官方 frp 一致，别改）：
+/// - 客户端 `NewProxy.proxy_name` 发的是**线上全名** `{user}.{name}`（见 [`build_new_proxy`]）；
+/// - 服务端回显（`NewProxyResp`）与主动下发（`StartWorkConn`、`NatHoleClient`）
+///   用的**也是同一个全名**；
+/// - 而本地映射表 [`run_session`] 里是按配置里的**原始 `name`** 建的。
+///
+/// 所以**凡是拿服务端下发的 `proxy_name` 查本地表的地方，都必须过这个函数**。
+/// 这个坑踩过两次：先修了 `NewProxyResp` 和 `StartWorkConn`，漏了 `NatHoleClient`
+/// —— 表现为 provider 打印「收到未知代理的打洞通知，忽略」，xtcp **静默退化成中继**：
+/// 数据还是通的，只有「有没有走 P2P 直连」这条断言会红（本机冒烟第 4 项）。
+fn resolve_uploaded_proxy<'n, 'p>(
+    user: &str,
+    wire_name: &'n str,
+    proxies: &'p HashMap<String, ProxyConfig>,
+) -> Option<(&'n str, &'p ProxyConfig)> {
+    let raw = util::strip_user_prefix(user, wire_name);
+    proxies.get(raw).map(|p| (raw, p))
 }
 
 async fn run_session(
     cfg: Arc<ClientConfig>,
     session_tx: tokio::sync::watch::Sender<Option<Arc<ClientSession>>>,
     health: Arc<health::Monitor>,
+    logged_in_once: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     let server = format!("{}:{}", cfg.server_addr, cfg.server_port);
     let link = Arc::new(ServerLink::open(cfg.clone()).await?);
@@ -330,9 +467,11 @@ async fn run_session(
     let stream = link.connect().await?;
     let (mut conn, run_id, udp_binary) = conn::client_handshake(
         stream,
+        link.wire,
         &cfg.token,
         &cfg.client_id,
         &cfg.user,
+        &cfg.metas,
         cfg.pool_count,
     )
     .await?;
@@ -341,7 +480,11 @@ async fn run_session(
     if udp_binary {
         debug!("服务端选择了二进制 UDP 报文编码");
     }
-    info!(%run_id, "登录成功（控制通道已启用 AES-256-GCM）");
+    info!(%run_id, wire = %link.wire, "登录成功（控制通道已加密）");
+
+    // 记下"这个进程登录成功过"。上面那行之前的任何失败都算**首次登录失败**，
+    // 由 main 的循环按 `loginFailExit` 决定是退出还是重试。
+    logged_in_once.store(true, std::sync::atomic::Ordering::SeqCst);
 
     let run_id = Arc::new(run_id);
 
@@ -365,37 +508,38 @@ async fn run_session(
     //
     // 注意：官方 frps 会在 NewProxyResp 之间插入 ReqWorkConn（填充工作连接池），
     // 所以不能发送一个就死等一个响应，必须边读边按代理名匹配。
-    // 官方 frp 的线协议名带顶层 `user` 前缀（`naming.AddUserPrefix`），
-    // 本地映射表与发出的 NewProxy 都用这个名字，服务端回包也是它。
+    //
+    // 本地映射表按配置里的**原始 `name`** 建。
+    //
+    // 服务端回包里的 `proxy_name` 是**线上全名** `{user}.{name}`
+    // （我们发上去的就是这个，官方 frps 会原样回显），所以先 `strip_user_prefix`
+    // 剥一层再查表；万一遇到不回显前缀的实现，strip 对不带前缀的名字也是恒等的。
     let proxies: Arc<HashMap<String, ProxyConfig>> = Arc::new(
         cfg.proxies
             .iter()
-            .map(|p| (util::add_user_prefix(&cfg.user, &p.name), p.clone()))
+            .map(|p| (p.name.clone(), p.clone()))
             .collect(),
     );
 
     for p in &cfg.proxies {
-        let msg = build_new_proxy(&cfg.user, p);
+        let msg = build_new_proxy(p, &cfg.user);
         conn.send_msg(&FrpMessage::NewProxy(msg)).await?;
     }
 
-    let mut pending: std::collections::HashSet<String> = cfg
-        .proxies
-        .iter()
-        .map(|p| util::add_user_prefix(&cfg.user, &p.name))
-        .collect();
+    let mut pending: std::collections::HashSet<String> =
+        cfg.proxies.iter().map(|p| p.name.clone()).collect();
     while !pending.is_empty() {
         let msg = tokio::time::timeout(Duration::from_secs(15), conn.recv_msg())
             .await
             .context("等待 NewProxyResp 超时")??;
         match msg {
             Some(FrpMessage::NewProxyResp(r)) => {
-                pending.remove(&r.proxy_name);
-                let raw = util::strip_user_prefix(&cfg.user, &r.proxy_name);
-                let local = proxies
-                    .get(&r.proxy_name)
-                    .map(|p| p.local_addr.clone())
-                    .unwrap_or_else(|| "?".to_string());
+                let raw = util::strip_user_prefix(&cfg.user, &r.proxy_name).to_string();
+                pending.remove(&raw);
+                let local = match resolve_uploaded_proxy(&cfg.user, &r.proxy_name, &proxies) {
+                    Some((_, p)) => p.local_addr.clone(),
+                    None => "?".to_string(),
+                };
                 if r.error.is_empty() {
                     info!(proxy = %raw, remote = %r.remote_addr, local, "代理注册成功");
                 } else {
@@ -461,8 +605,13 @@ async fn run_session(
                     // xtcp：服务端通知本端（provider）去打洞
                     FrpMessage::NatHoleClient(m) => {
                         debug!(proxy = %m.proxy_name, sid = %m.sid, "收到打洞通知");
-                        match proxies.get(&m.proxy_name) {
-                            Some(proxy) => {
+                        // 服务端下发的是**线上全名**（带 `{user}.` 前缀），
+                        // 而本地映射表按配置里的原始 `name` 建 —— 必须走
+                        // `resolve_uploaded_proxy` 剥前缀，否则这里会打印
+                        // 「收到未知代理的打洞通知，忽略」，xtcp 静默退化成中继。
+                        match resolve_uploaded_proxy(&cfg.user, &m.proxy_name, &proxies) {
+                            Some((raw, proxy)) => {
+                                debug!(proxy = %raw, "本端作为 provider 参与打洞");
                                 let cfg = cfg.clone();
                                 let proxy = proxy.clone();
                                 tokio::spawn(async move {
@@ -530,28 +679,27 @@ async fn work_conn_flow(
 
     let ts = util::now_unix_secs() as i64;
     let (mut work, leftover, start) =
-        conn::client_work_conn(stream, &run_id, &link.cfg.token, ts).await?;
+        conn::client_work_conn(stream, link.wire, &run_id, &link.cfg.token, ts).await?;
 
-    let proxy = proxies
-        .get(&start.proxy_name)
-        .ok_or_else(|| anyhow!("服务端指定了未知代理：{}", start.proxy_name))?
-        .clone();
+    // 服务端下发的名字是**线上全名**（带 `{user}.` 前缀），本地映射表按配置里的
+    // 原始 `name` 建 —— 统一走 `resolve_uploaded_proxy`。
+    let (proxy_name, proxy) =
+        resolve_uploaded_proxy(&link.cfg.user, &start.proxy_name, &proxies)
+            .ok_or_else(|| anyhow!("服务端指定了未知代理：{}", start.proxy_name))?;
+    let proxy = proxy.clone();
 
     // 健康检查不通过：直接拒掉这条工作连接，让用户去连别的后端
-    if !health.is_healthy(&start.proxy_name) {
-        anyhow::bail!(
-            "代理 [{}] 健康检查未通过，暂不提供服务",
-            util::strip_user_prefix(&link.cfg.user, &start.proxy_name)
-        );
+    if !health.is_healthy(proxy_name) {
+        anyhow::bail!("代理 [{proxy_name}] 健康检查未通过，暂不提供服务");
     }
 
     // UDP 代理：工作连接上跑的是 UdpPacket 消息，交给专门的转发器
     if proxy.proxy_type == "udp" {
         // 工作连接握手后是裸字节流，这里重新包一层帧读写器
         // （工作连接本身不加密，所以直接 new 即可）。
-        let mut udp_conn = FrpConn::new(work);
+        let mut udp_conn = FrpConn::new(work, link.wire);
         udp_conn.set_udp_codec(link.udp_binary.load(std::sync::atomic::Ordering::Relaxed));
-        return udp_proxy::run(udp_conn, proxy.local_addr.clone(), start.proxy_name.clone()).await;
+        return udp_proxy::run(udp_conn, proxy.local_addr.clone(), proxy_name.to_string()).await;
     }
 
     // 插件：工作连接直接接到插件上，不再连内网服务
@@ -602,6 +750,9 @@ mod tests {
 
     use super::*;
 
+    /// 测试里统一用的 `user`（真实场景就是 Lolia 那份配置里的 `user = '2569'`）。
+    const USER: &str = "alice";
+
     /// 一个所有字段都填满独特值的 tcp 代理配置。
     fn full_tcp_config() -> ProxyConfig {
         ProxyConfig {
@@ -616,6 +767,8 @@ mod tests {
             http_pwd: "hp".into(),
             host_header_rewrite: "backend.internal".into(),
             bandwidth_limit: "1MB".into(),
+            bandwidth_limit_mode: "server".into(),
+            metas: [("pk".to_string(), "pv".to_string())].into_iter().collect(),
             group: "web".into(),
             group_key: "gk".into(),
             health_check_type: "http".into(),
@@ -636,8 +789,12 @@ mod tests {
     #[test]
     fn tcp_carries_port_and_group() {
         let c = full_tcp_config();
-        let m = build_new_proxy("alice", &c);
-        assert_eq!(m.proxy_name, "alice.web-a", "线协议名要带 user 前缀");
+        let m = build_new_proxy(&c, USER);
+        assert_eq!(
+            m.proxy_name, "alice.web-a",
+            "线协议名必须带 `{{user}}.` 前缀 —— 官方 frpc 的 wireName 就是这么算的，\
+             少了前缀第三方平台按名字查不到隧道"
+        );
         assert_eq!(m.proxy_type, "tcp");
         assert_eq!(m.remote_port, 6100);
         assert_eq!(m.group, "web", "group 没搬过去的话负载均衡等于没配");
@@ -653,8 +810,8 @@ mod tests {
             proxy_type: "http".into(),
             ..full_tcp_config()
         };
-        let m = build_new_proxy("bob", &c);
-        assert_eq!(m.proxy_name, "bob.web-a");
+        let m = build_new_proxy(&c, USER);
+        assert_eq!(m.proxy_name, "alice.web-a");
         assert_eq!(m.custom_domains, vec!["a.example.com".to_string()]);
         assert_eq!(m.subdomain, "sub");
         assert_eq!(m.locations, vec!["/api".to_string()]);
@@ -672,7 +829,7 @@ mod tests {
             proxy_type: "stcp".into(),
             ..full_tcp_config()
         };
-        let m = build_new_proxy("alice", &c);
+        let m = build_new_proxy(&c, USER);
         assert_eq!(m.proxy_name, "alice.web-a");
         assert_eq!(m.sk, "sk");
         assert_eq!(m.allow_users, vec!["alice".to_string()]);
@@ -681,11 +838,109 @@ mod tests {
         assert!(m.group.is_empty(), "stcp 不走端口组，不该带 group");
     }
 
-    /// 没配 user 时不该凭空造出一个 `.` 前缀。
+    /// **金标准测试**：报文必须和官方 frpc v0.71.0 抓到的那一帧**逐字节一致**。
+    ///
+    /// 下面这串 JSON 是从
+    /// `cargo run -p rustunnel-server --example dump_frpc -- 17777`
+    /// 抓到的原文（Lolia 下发的那份配置，一字未改）：
+    ///
+    /// ```text
+    /// [msg_type=3 NewProxy] {"proxy_name":"2569.c0462d9ce7e44bce97e626c4ae880905",
+    ///  "proxy_type":"tcp","bandwidth_limit":"25MB","bandwidth_limit_mode":"server",
+    ///  "remote_port":38725}
+    /// ```
+    ///
+    /// 之所以按**字符串**比而不是逐字段比：`NewProxy` 的字段顺序 = serde 的
+    /// 序列化顺序 = 结构体声明顺序，所以字符串相同就意味着连字段顺序都对上了。
+    /// 谁把字段顺序挪了、漏了、多发了，这条都会红。
     #[test]
-    fn empty_user_leaves_name_untouched() {
-        let m = build_new_proxy("", &full_tcp_config());
+    fn 与官方_frpc_抓包逐字节一致() {
+        let cfg = rustunnel_common::config::parse_client_toml(LOLIA_FRPC).unwrap();
+        let m = build_new_proxy(&cfg.proxies[0], &cfg.user);
+
+        assert_eq!(
+            serde_json::to_string(&m).unwrap(),
+            concat!(
+                r#"{"proxy_name":"2569.c0462d9ce7e44bce97e626c4ae880905","#,
+                r#""proxy_type":"tcp","#,
+                r#""bandwidth_limit":"25MB","#,
+                r#""bandwidth_limit_mode":"server","#,
+                r#""remote_port":38725}"#,
+            )
+        );
+    }
+
+    /// LoliaFRP 平台真实下发的配置（`GET /user/frpc/config`，Base64 解出来的原文）。
+    const LOLIA_FRPC: &str = r#"
+serverAddr = 'cn-hz-2.qwq.fan'
+serverPort = 30000
+user = '2569'
+
+[metadatas]
+token = 'x8p5mo0u8ips3lmohc67r58mejp7uthf'
+
+[[proxies]]
+name = 'c0462d9ce7e44bce97e626c4ae880905'
+type = 'tcp'
+localIP = '127.0.0.1'
+localPort = 25565
+remotePort = 38725
+
+[proxies.transport]
+bandwidthLimit = '25MB'
+bandwidthLimitMode = 'server'
+"#;
+
+    /// 没配 `user` 时不该凭空造出一个 `.` 前缀。
+    #[test]
+    fn 空_user_不加前缀() {
+        let m = build_new_proxy(&full_tcp_config(), "");
         assert_eq!(m.proxy_name, "web-a");
+    }
+
+    /// `bandwidth_limit_mode` 默认值 `client` 要**省略**。
+    ///
+    /// 官方 frpc 的 `MarshalToMsg` 只在值不等于 `client` 时才发这个字段
+    /// （`if c.Transport.BandwidthLimitMode != "client"`），我们多发一个
+    /// `"bandwidth_limit_mode":"client"` 就和官方报文对不上了。
+    #[test]
+    fn 默认限流模式不上报() {
+        for raw in ["", "client", "CLIENT"] {
+            let c = ProxyConfig {
+                bandwidth_limit_mode: raw.into(),
+                ..full_tcp_config()
+            };
+            assert!(
+                build_new_proxy(&c, USER).bandwidth_limit_mode.is_empty(),
+                "值 {raw:?} 应当被归一化成空串（即不发送）"
+            );
+        }
+        // 非默认值要原样上报
+        let c = ProxyConfig {
+            bandwidth_limit_mode: "server".into(),
+            ..full_tcp_config()
+        };
+        assert_eq!(build_new_proxy(&c, USER).bandwidth_limit_mode, "server");
+    }
+
+    /// `NewProxy.metas` 装的是**代理级** `[proxies.metadatas]`，不是顶层 `[metadatas]`。
+    ///
+    /// 搞混的后果：报文里会多出一个官方 frpc 不会发的 `token` 字段，
+    /// 平台一旦校验就报错，而且很难看出是"多发了一个键"。
+    #[test]
+    fn 代理级_metas_才上进注册报文() {
+        let cfg = rustunnel_common::config::parse_client_toml(LOLIA_FRPC).unwrap();
+        // 登录 metas 里有 token
+        assert_eq!(
+            cfg.metas.get("token").map(String::as_str),
+            Some("x8p5mo0u8ips3lmohc67r58mejp7uthf")
+        );
+        // 但代理级没有 → 注册报文里也不该有
+        let m = build_new_proxy(&cfg.proxies[0], &cfg.user);
+        assert!(
+            m.metas.is_empty(),
+            "顶层 [metadatas] 只进登录消息，不该出现在 NewProxy 里"
+        );
     }
 
     /// 没配 group 时必须原样为空 —— 服务端把空 group 当「独占端口」，
@@ -697,7 +952,7 @@ mod tests {
             group_key: String::new(),
             ..full_tcp_config()
         };
-        let m = build_new_proxy("alice", &c);
+        let m = build_new_proxy(&c, USER);
         assert!(m.group.is_empty());
         assert!(m.group_key.is_empty());
     }
@@ -708,18 +963,21 @@ mod tests {
     fn every_shareable_field_is_carried() {
         let c = full_tcp_config();
         // 用 tcp 分支检查「端口类」字段
-        let tcp = build_new_proxy("u", &c);
+        let tcp = build_new_proxy(&c, USER);
         assert_eq!(tcp.remote_port, c.remote_port);
         assert_eq!(tcp.group, c.group);
         assert_eq!(tcp.group_key, c.group_key);
+        assert_eq!(tcp.bandwidth_limit, c.bandwidth_limit);
+        assert_eq!(tcp.bandwidth_limit_mode, c.bandwidth_limit_mode);
+        assert_eq!(tcp.metas, c.metas);
 
         // 用 http 分支检查「路由类」字段
         let http = build_new_proxy(
-            "u",
             &ProxyConfig {
                 proxy_type: "http".into(),
                 ..c.clone()
             },
+            USER,
         );
         assert_eq!(http.custom_domains, c.custom_domains);
         assert_eq!(http.subdomain, c.subdomain);
@@ -730,13 +988,76 @@ mod tests {
 
         // 用 stcp 分支检查「私密隧道类」字段
         let stcp = build_new_proxy(
-            "u",
             &ProxyConfig {
                 proxy_type: "stcp".into(),
                 ..c.clone()
             },
+            USER,
         );
         assert_eq!(stcp.sk, c.secret_key);
         assert_eq!(stcp.allow_users, c.allow_users);
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_uploaded_proxy：服务端下发名 → 本地配置
+    //
+    // xtcp 就是栽在这里的：`NatHoleClient.proxy_name` 是线上全名 `alice.p2p-echo`，
+    // 本地表键是 `p2p-echo`，漏剥前缀就被当「未知代理」忽略，
+    // P2P **静默退化成中继**（数据照样通，只有"走没走直连"这条断言会红）。
+    // -----------------------------------------------------------------------
+
+    /// 本地映射表：键是配置里的**原始** `name`（与 `run_session` 里一致）。
+    fn local_map(names: &[&str]) -> HashMap<String, ProxyConfig> {
+        names
+            .iter()
+            .map(|n| {
+                let mut cfg = full_tcp_config();
+                cfg.name = (*n).to_string();
+                ((*n).to_string(), cfg)
+            })
+            .collect()
+    }
+
+    /// 服务端下发**带前缀的线上全名**时必须能查到。
+    #[test]
+    fn 带前缀的下发名能查到本地代理() {
+        let m = local_map(&["p2p-echo"]);
+        let (raw, p) = resolve_uploaded_proxy("alice", "alice.p2p-echo", &m)
+            .expect("带 user 前缀的线上全名应当能查到");
+        assert_eq!(raw, "p2p-echo", "查到的应当是配置里的原始名");
+        assert_eq!(p.name, "p2p-echo");
+    }
+
+    /// 服务端若原样回显（不带前缀），也要能查到 —— strip 对不带前缀的名字是恒等的。
+    #[test]
+    fn 不带前缀的下发名同样能查到() {
+        let m = local_map(&["p2p-echo"]);
+        let (raw, _) = resolve_uploaded_proxy("alice", "p2p-echo", &m).expect("应当能查到");
+        assert_eq!(raw, "p2p-echo");
+    }
+
+    /// 没配 `user` 时表键就是原名。
+    #[test]
+    fn 无_user_时能查到() {
+        let m = local_map(&["web-a"]);
+        assert!(resolve_uploaded_proxy("", "web-a", &m).is_some());
+    }
+
+    /// 别人的前缀不该被剥掉：`bob` 的客户端收到 `alice.web-a` 必须查不到，
+    /// 否则它会去服务别人的代理。
+    #[test]
+    fn 别人的前缀不会被剥掉() {
+        let m = local_map(&["web-a"]);
+        assert!(
+            resolve_uploaded_proxy("bob", "alice.web-a", &m).is_none(),
+            "非本用户的代理名必须查不到"
+        );
+    }
+
+    /// 完全不认识的代理名 → `None`（调用方据此走「未知代理」分支）。
+    #[test]
+    fn 未知代理返回_none() {
+        let m = local_map(&["web-a"]);
+        assert!(resolve_uploaded_proxy("alice", "alice.nope", &m).is_none());
     }
 }

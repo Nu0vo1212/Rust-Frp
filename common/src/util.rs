@@ -48,6 +48,18 @@ pub async fn resolve_host_port(host: &str, port: u16) -> Result<SocketAddr> {
 /// 初始化 `tracing` 订阅者。
 ///
 /// 优先级：环境变量 `RUST_LOG` > 配置里的 `log_level` > `info`。
+/// 日志要不要带 ANSI 颜色转义码。
+///
+/// 只在**输出是终端**时才上色。这一点对第三方启动器很关键：NetTool 之类
+/// 是把 frpc 的 stdout/stderr **按行读进日志面板**的，如果日志里夹着
+/// `\x1b[2m` / `\x1b[32m` 这些转义码，面板上就会显示成
+/// `[2m2026-09-17T...` 这种乱码。官方 frpc 也是同样的判断
+/// （`IsTerminal`），所以行为和原版一致。
+fn ansi_enabled() -> bool {
+    use std::io::IsTerminal as _;
+    std::io::stdout().is_terminal()
+}
+
 pub fn init_tracing(default_level: &str) {
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(default_level))
@@ -55,6 +67,7 @@ pub fn init_tracing(default_level: &str) {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_ansi(ansi_enabled())
         .init();
 }
 
@@ -76,7 +89,11 @@ pub fn init_tracing_reloadable(default_level: &str) -> Option<LogFilterHandle> {
     let (layer, handle) = tracing_subscriber::reload::Layer::new(filter);
     tracing_subscriber::registry()
         .with(layer)
-        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_ansi(ansi_enabled()),
+        )
         .init();
     Some(handle)
 }

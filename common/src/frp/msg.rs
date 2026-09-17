@@ -98,6 +98,21 @@ pub struct NewProxy {
     pub use_encryption: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub use_compression: bool,
+    /// 带宽上限的字符串写法（`1MB` / `500KB` / `25MB`…）。
+    ///
+    /// 对应官方 frpc `ProxyBaseConfig.MarshalToMsg` 里的
+    /// `m.BandwidthLimit = c.Transport.BandwidthLimit.String()` —— 配了才发，
+    /// 没配就是空串（`omitempty` 直接省略）。第三方平台会照它做限流校验，
+    /// 所以本地配了 `[proxies.transport] bandwidthLimit` 就得原样带上去。
+    #[serde(default, skip_serializing_if = "is_empty_str")]
+    pub bandwidth_limit: String,
+    /// 限流在哪一端执行：`client`（默认）/ `server`。
+    ///
+    /// ★ 官方 frpc **只在值不等于默认的 `client` 时才发**
+    /// （`MarshalToMsg` 里写着 `if c.Transport.BandwidthLimitMode != "client"`）。
+    /// 所以发之前必须把 `client` 归一化成空串，否则报文和官方 frpc 不一致。
+    #[serde(default, skip_serializing_if = "is_empty_str")]
+    pub bandwidth_limit_mode: String,
     #[serde(default, skip_serializing_if = "is_empty_str")]
     pub group: String,
     #[serde(default, skip_serializing_if = "is_empty_str")]
@@ -678,9 +693,15 @@ impl FrpMessage {
         }
     }
 
-    /// 编码为消息帧负载：`2 字节 type_id + JSON`。
-    pub fn encode(&self) -> Result<Vec<u8>, crate::error::Error> {
-        let body = match self {
+    /// 编码**消息体**（纯 JSON，不含任何类型前缀）。
+    ///
+    /// v1 与 v2 的消息体是同一份 JSON，差别只在外层容器：
+    /// * v1 外层是 `[类型字节][i64 长度]`；
+    /// * v2 外层是 `[u16 类型号][JSON]` 的帧载荷。
+    ///
+    /// 所以两套协议共用这一个函数，谁也别自己拼 JSON。
+    pub fn encode_body(&self) -> Result<Vec<u8>, crate::error::Error> {
+        Ok(match self {
             Self::Login(m) => serde_json::to_vec(m)?,
             Self::LoginResp(m) => serde_json::to_vec(m)?,
             Self::NewProxy(m) => serde_json::to_vec(m)?,
@@ -701,7 +722,12 @@ impl FrpMessage {
             Self::NatHoleResp(m) => serde_json::to_vec(m)?,
             Self::NatHoleSid(m) => serde_json::to_vec(m)?,
             Self::NatHoleReport(m) => serde_json::to_vec(m)?,
-        };
+        })
+    }
+
+    /// 编码为 **v2** 的消息帧载荷：`2 字节 type_id + JSON`。
+    pub fn encode(&self) -> Result<Vec<u8>, crate::error::Error> {
+        let body = self.encode_body()?;
         let mut out = Vec::with_capacity(2 + body.len());
         out.extend_from_slice(&self.type_id().to_be_bytes());
         out.extend_from_slice(&body);

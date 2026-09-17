@@ -13,6 +13,7 @@ use rustunnel_common::{
     frp::{
         conn::{self, FrpConn},
         msg::{FrpMessage, NewProxy, NewProxyResp},
+        WireVersion,
     },
     util,
 };
@@ -23,6 +24,14 @@ use tokio::{
 };
 
 const TOKEN: &str = "e2e-token";
+
+/// 握手用的空 `metas`。
+///
+/// frp 的 `[metadatas]` 会原样进 `Login.metas`（frp 平台靠 `metas["token"]`
+/// 识别隧道）；这些用例走的是自带 token 的模式，不需要附加元数据。
+fn empty_metas() -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::new()
+}
 
 // ---------------------------------------------------------------------------
 // 测试脚手架
@@ -127,15 +136,30 @@ async fn echo_service() -> SocketAddr {
     addr
 }
 
-/// 完成一次 frp v2 登录，返回控制连接与服务端分配的 run_id。
+/// 完成一次 frp **v2** 登录（历史用例默认走 v2，保持既有覆盖率）。
 async fn login(port: u16, token: &str, user: &str) -> (FrpConn, String) {
+    login_with(port, token, user, WireVersion::V2).await
+}
+
+/// 指定线协议登录，返回控制连接与服务端分配的 run_id。
+///
+/// 两套协议的服务端入口是同一个端口 —— 服务端按魔术字自动识别
+/// （对应官方 frps 的 `wire.CheckMagic`），所以这里只是发不发魔术字的区别。
+async fn login_with(port: u16, token: &str, user: &str, wire: WireVersion) -> (FrpConn, String) {
     let stream = TcpStream::connect(("127.0.0.1", port))
         .await
         .expect("连接服务端");
-    let (conn, run_id, _udp_binary) =
-        conn::client_handshake(Box::pin(stream), token, "e2e-client", user, 0)
-            .await
-            .expect("frp 握手");
+    let (conn, run_id, _udp_binary) = conn::client_handshake(
+        Box::pin(stream),
+        wire,
+        token,
+        "e2e-client",
+        user,
+        &empty_metas(),
+        0,
+    )
+    .await
+    .expect("frp 握手");
     (conn, run_id)
 }
 
@@ -143,6 +167,14 @@ async fn login(port: u16, token: &str, user: &str) -> (FrpConn, String) {
 ///
 /// 注意：注册期间服务端**可能**先插进来 ReqWorkConn（填池子），
 /// 所以不能发完就死等 Resp，要边读边匹配，这也是真客户端的写法。
+///
+/// 命名的契约（与官方 frp 一致，别改）：
+/// - 客户端 `NewProxy.proxy_name` 发的是**线上全名** `"{user}.{name}"`
+///   （官方 frpc 的 `wireName` 就是这么算的：`naming.AddUserPrefix(user, name)`）；
+/// - 注册表里的键与 `NewProxyResp.proxy_name` 同样是这个全名；
+/// - rustunnel 服务端还额外做了层幂等（收到原始名也会补成全名），
+///   所以本文件里传原始名进来也能跑通；
+/// - 所以 visitor 的 `serverName` 必须自己拼上前缀（`serverUser` 或本机 `user`）。
 async fn register_proxy(conn: &mut FrpConn, proxy: NewProxy) -> NewProxyResp {
     conn.send_msg(&FrpMessage::NewProxy(proxy))
         .await
@@ -162,13 +194,24 @@ async fn register_proxy(conn: &mut FrpConn, proxy: NewProxy) -> NewProxyResp {
 
 /// 把控制连接交给后台任务：它只负责响应 ReqWorkConn，
 /// 收到一次就开一条工作连接去连 `local`。
-fn spawn_provider(mut conn: FrpConn, port: u16, run_id: String, local: SocketAddr) {
+fn spawn_provider(conn: FrpConn, port: u16, run_id: String, local: SocketAddr) {
+    spawn_provider_with(conn, port, run_id, local, WireVersion::V2);
+}
+
+/// 同 [`spawn_provider`]，但显式指定线协议 —— 工作连接必须与控制连接一致。
+fn spawn_provider_with(
+    mut conn: FrpConn,
+    port: u16,
+    run_id: String,
+    local: SocketAddr,
+    wire: WireVersion,
+) {
     tokio::spawn(async move {
         while let Ok(Some(msg)) = conn.recv_msg().await {
             if matches!(msg, FrpMessage::ReqWorkConn) {
                 let run = run_id.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve_work_conn(port, &run, local).await {
+                    if let Err(e) = serve_work_conn_with(port, &run, local, wire).await {
                         eprintln!("工作连接出错：{e:#}");
                     }
                 });
@@ -195,11 +238,16 @@ fn spawn_provider_quic(mut conn: FrpConn, q: quinn::Connection, run_id: String, 
 }
 
 /// 客户端侧的"工作连接"完整流程：NewWorkConn -> StartWorkConn -> 连内网 -> 双向转发。
-async fn serve_work_conn(port: u16, run_id: &str, local: SocketAddr) -> anyhow::Result<()> {
+async fn serve_work_conn_with(
+    port: u16,
+    run_id: &str,
+    local: SocketAddr,
+    wire: WireVersion,
+) -> anyhow::Result<()> {
     let stream = TcpStream::connect(("127.0.0.1", port)).await?;
     let ts = util::now_unix_secs() as i64;
     let (mut work, leftover, _start) =
-        conn::client_work_conn(Box::pin(stream), run_id, TOKEN, ts).await?;
+        conn::client_work_conn(Box::pin(stream), wire, run_id, TOKEN, ts).await?;
     let mut dst = TcpStream::connect(local).await?;
     if !leftover.is_empty() {
         dst.write_all(&leftover).await?;
@@ -265,9 +313,17 @@ async fn login_quic(
         .expect("QUIC 连接");
     let (send, recv) = conn.open_bi().await.expect("开控制流");
     let stream = Box::pin(rustunnel_common::frp::quic::QuicStream::new(send, recv));
-    let (frp, run_id, _) = conn::client_handshake(stream, token, "e2e-quic", user, 0)
-        .await
-        .expect("frp 握手（QUIC）");
+    let (frp, run_id, _) = conn::client_handshake(
+        stream,
+        WireVersion::V2,
+        token,
+        "e2e-quic",
+        user,
+        &empty_metas(),
+        0,
+    )
+    .await
+    .expect("frp 握手（QUIC）");
     (endpoint, conn, frp, run_id)
 }
 
@@ -282,6 +338,7 @@ async fn serve_work_conn_quic(
     let ts = util::now_unix_secs() as i64;
     let (mut work, leftover, _start) = conn::client_work_conn(
         Box::pin(rustunnel_common::frp::quic::QuicStream::new(send, recv)),
+        WireVersion::V2,
         run_id,
         TOKEN,
         ts,
@@ -317,7 +374,13 @@ async fn tcp_proxy_roundtrip_through_real_wire_protocol() {
     )
     .await;
     assert!(resp.error.is_empty(), "代理注册失败：{}", resp.error);
-    assert_eq!(resp.proxy_name, "ssh");
+    // 这里传的是配置里的原始名 `ssh`，服务端的幂等兜底会把它补成全名 `alice.ssh`。
+    // （真客户端会自己先发全名 —— 官方 frpc 的 `wireName` 就带前缀，别被它
+    //  `proxy added: [ssh]` 那行日志骗了，那打的是配置原始名。）
+    assert_eq!(
+        resp.proxy_name, "alice.ssh",
+        "注册表名字要带 `{{user}}.` 前缀"
+    );
 
     spawn_provider(conn, port, run_id, local);
 
@@ -334,7 +397,16 @@ async fn tcp_proxy_roundtrip_through_real_wire_protocol() {
 async fn wrong_token_is_rejected_at_handshake() {
     let port = start_server(base_cfg()).await;
     let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    let r = conn::client_handshake(Box::pin(stream), "wrong-token", "x", "", 0).await;
+    let r = conn::client_handshake(
+        Box::pin(stream),
+        WireVersion::V2,
+        "wrong-token",
+        "x",
+        "",
+        &empty_metas(),
+        0,
+    )
+    .await;
     assert!(r.is_err(), "token 不对时必须握手失败，否则等于没有鉴权");
 }
 
@@ -408,7 +480,16 @@ async fn stcp_visitor_is_paired_with_provider() {
 
     let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     let (mut tunnel, leftover) =
-        conn::client_visitor_conn(Box::pin(stream), &visitor_run, "secret", "my-secret")
+        // frp 规则：visitor 的 serverName 要拼上前缀 —— 没写 `serverUser` 时用
+        // **本客户端的 user**，这里 provider 的 user 是 "provider"。
+        // 服务端存的监听器名就是 `provider.secret`（provider 登录时加的）。
+        conn::client_visitor_conn(
+            Box::pin(stream),
+            WireVersion::V2,
+            &visitor_run,
+            "provider.secret",
+            "my-secret",
+        )
             .await
             .expect("visitor 接入");
     assert!(leftover.is_empty());
@@ -445,8 +526,16 @@ async fn stcp_visitor_with_wrong_secret_is_rejected() {
 
     let (_v, visitor_run) = login(port, TOKEN, "guest").await;
     let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    let r =
-        conn::client_visitor_conn(Box::pin(stream), &visitor_run, "secret", "wrong-secret").await;
+    // 名字按 frp 规则带上 provider 的 user 前缀，确保拒绝的原因是**密钥不对**，
+    // 而不是"这个监听器不存在"
+    let r = conn::client_visitor_conn(
+        Box::pin(stream),
+        WireVersion::V2,
+        &visitor_run,
+        "provider.secret",
+        "wrong-secret",
+    )
+    .await;
     assert!(r.is_err(), "密钥不对时必须拒绝接入，否则 stcp 形同虚设");
 }
 
@@ -697,5 +786,121 @@ async fn dashboard_healthz_is_public_but_other_paths_need_auth() {
         http_status(panel, "/api/status", Some(&wrong)).await,
         401,
         "密码不对必须拒绝"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// v1 线协议（官方默认协议）
+// ---------------------------------------------------------------------------
+//
+// 为什么必须单独测：v1 与 v2 的差别不在"功能"上，而在**每一条字节的排布**上
+// —— 有没有魔术字、长度是 8 字节 i64 还是 4 字节 u32、登录之后是 CFB 还是 AEAD。
+// 功能测试全绿也证明不了这些：只要两端用的是同一套错误实现，自环测试照样过。
+// 所以下面除了自环，还靠 `conn.rs` 里那条"盯着线上字节解密"的测试兜底。
+
+/// v1 上跑完整的 tcp 隧道：登录 -> 注册 -> 工作连接 -> 数据往返。
+#[tokio::test]
+async fn tcp_proxy_roundtrip_over_wire_v1() {
+    let port = start_server(base_cfg()).await;
+    let local = echo_service().await;
+
+    let (mut conn, run_id) = login_with(port, TOKEN, "alice", WireVersion::V1).await;
+    assert_eq!(conn.version(), WireVersion::V1);
+    assert!(conn.is_encrypted(), "v1 登录后控制通道必须已加密");
+
+    let remote_port = free_port();
+    let resp = register_proxy(
+        &mut conn,
+        NewProxy {
+            proxy_name: "ssh".into(),
+            proxy_type: "tcp".into(),
+            remote_port,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(resp.error.is_empty(), "代理注册失败：{}", resp.error);
+    assert_eq!(resp.proxy_name, "alice.ssh");
+
+    spawn_provider_with(conn, port, run_id, local, WireVersion::V1);
+
+    let echoed = roundtrip(SocketAddr::from(([127, 0, 0, 1], remote_port)), b"hello-v1").await;
+    assert_eq!(echoed, b"hello-v1", "v1 上数据必须原样往返");
+}
+
+/// 同一个端口上 v1 与 v2 客户端必须能**共存**。
+///
+/// 官方 frps 就是靠魔术字自动分流（`wire.CheckMagic`），rustunnel-server 同理。
+/// 这条测试的价值：证明"接到一个 frp 服务端上，不用问它支持哪一版"。
+#[tokio::test]
+async fn wire_v1_and_v2_coexist_on_one_port() {
+    let port = start_server(base_cfg()).await;
+    let local_v1 = tagged_echo_service("v1").await;
+    let local_v2 = tagged_echo_service("v2").await;
+
+    // 两条控制连接同时挂在一个端口上，各用一套协议
+    let (mut c1, run1) = login_with(port, TOKEN, "one", WireVersion::V1).await;
+    let (mut c2, run2) = login_with(port, TOKEN, "two", WireVersion::V2).await;
+
+    let port1 = free_port();
+    let resp1 = register_proxy(
+        &mut c1,
+        NewProxy {
+            proxy_name: "p1".into(),
+            proxy_type: "tcp".into(),
+            remote_port: port1,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(resp1.error.is_empty(), "v1 注册失败：{}", resp1.error);
+
+    let port2 = free_port();
+    let resp2 = register_proxy(
+        &mut c2,
+        NewProxy {
+            proxy_name: "p2".into(),
+            proxy_type: "tcp".into(),
+            remote_port: port2,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(resp2.error.is_empty(), "v2 注册失败：{}", resp2.error);
+
+    spawn_provider_with(c1, port, run1, local_v1, WireVersion::V1);
+    spawn_provider_with(c2, port, run2, local_v2, WireVersion::V2);
+
+    // 后端会把 tag 前缀回显出来，所以看回包就能知道**这条链路走到了哪个后端**
+    assert_eq!(
+        roundtrip(SocketAddr::from(([127, 0, 0, 1], port1)), b"ping").await,
+        b"v1:ping",
+        "v1 通道应连到 v1 后端"
+    );
+    assert_eq!(
+        roundtrip(SocketAddr::from(([127, 0, 0, 1], port2)), b"ping").await,
+        b"v2:ping",
+        "v2 通道应连到 v2 后端"
+    );
+}
+
+/// 工作连接跟控制连接**协议不一致**时必须被拒。
+///
+/// 与官方 frps 的 `work connection wire protocol mismatch` 对齐。
+/// 不挡的话，后面的 `StartWorkConn` 会用错误的容器发出去，
+/// 对端只会看到一句难懂的解析错误，回头看日志根本不知道哪里配错了。
+#[tokio::test]
+async fn work_conn_wire_protocol_mismatch_is_rejected() {
+    let port = start_server(base_cfg()).await;
+
+    // 控制连接走 v1，工作连接故意走 v2
+    let (_conn, run_id) = login_with(port, TOKEN, "alice", WireVersion::V1).await;
+
+    let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let ts = util::now_unix_secs() as i64;
+    let r = conn::client_work_conn(Box::pin(stream), WireVersion::V2, &run_id, TOKEN, ts).await;
+    assert!(
+        r.is_err(),
+        "线协议对不上的工作连接必须被拒绝，否则会带着错误的容器一路错下去"
     );
 }

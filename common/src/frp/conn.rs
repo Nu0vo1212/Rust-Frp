@@ -1,4 +1,20 @@
-//! frp v2 连接：帧读写、明文/加密阶段切换、握手流程。
+//! frp 连接：帧读写、明密文阶段切换、两套线协议（v1 / v2）的握手流程。
+//!
+//! 同一个 [`FrpConn`] 同时支持 v1 与 v2 —— 两者的差别被收敛成三件事：
+//!
+//! | | v1 | v2 |
+//! |---|---|---|
+//! | 外层容器 | `[类型字节][i64 长度][JSON]` | `[u16 类型号][JSON]` 装进帧 |
+//! | 登录前 | 什么都不发，直接发 Login | 先发魔术字 + ClientHello，收 ServerHello |
+//! | 登录后加密 | AES-128-CFB 流密码 | AES-256-GCM AEAD 帧流 |
+//!
+//! 消息体本身两套协议完全一样，由 [`super::msg::FrpMessage::encode_body`] 产出。
+//!
+//! # 服务端自动探测
+//!
+//! 与官方 frps 的 `wire.CheckMagic` 行为一致：先读 8 字节，等于 v2 魔术字就
+//! 走 v2，否则把这 8 字节**回填**当 v1 的消息前缀 —— 所以同一个端口能同时
+//! 服务两套协议的客户端，不需要任何配置。
 
 use super::stream::BoxStream;
 use anyhow::{anyhow, bail, Result};
@@ -9,41 +25,105 @@ use crate::util::now_unix_secs;
 use super::crypto::{derive_control_keys, transcript_hash, AeadReader, AeadWriter};
 use super::msg;
 use super::msg::{FrpMessage, Login, LoginResp, NewVisitorConn, NewWorkConn, StartWorkConn};
+use super::v1;
 use super::wire::{
     self, ClientHello, ServerHello, FRAME_CLIENT_HELLO, FRAME_MESSAGE, FRAME_SERVER_HELLO, MAGIC_V2,
 };
+use super::WireVersion;
 
 /// 缓冲区上限，避免对端恶意灌数据。
 const MAX_BUFFER: usize = 8 * 1024 * 1024;
 
-/// 一条 frp v2 连接。
+/// v2 的控制通道加密状态（AES-256-GCM AEAD 帧流，`golib/crypto/aead_stream.go`）。
 ///
-/// 握手阶段为明文，握手成功后调用 [`FrpConn::upgrade`] 切换为 AES-256-GCM 帧流。
+/// 单独成结构体并装箱，理由见 [`ControlCrypto`]。
+struct V2Crypto {
+    writer: AeadWriter,
+    reader: AeadReader,
+}
+
+/// 控制通道的加密状态。
+///
+/// 三条状态互斥，对应"握手明文期 / v1 登录后 / v2 登录后"。
+///
+/// 两个加密变体内的密码学状态都有一两 KB（AES 轮密钥展开 + 收发缓冲区），
+/// 而一条连接只持有一份、生命周期与连接等长，所以统一装箱：
+/// 否则 `FrpConn` 每条连接都要多背 1.6 KB 的枚举体量，
+/// **而且明文态（工作连接/visitor 连接，数量远多于控制连接）也得跟着背**。
+enum ControlCrypto {
+    /// 明文：v1 登录前的握手阶段，以及所有工作连接/visitor 连接。
+    None,
+    /// v1：AES-128-CFB 流密码（`golib/crypto`）。
+    V1(Box<v1::CryptoStream>),
+    /// v2：AES-256-GCM AEAD 帧流。
+    V2(Box<V2Crypto>),
+}
+
+/// 一条 frp 连接（v1 或 v2）。
+///
+/// 握手阶段为明文，握手成功后按协议切换加密：
+/// v1 用 [`FrpConn::enable_v1_crypto`]，v2 用 [`FrpConn::upgrade`]。
 pub struct FrpConn {
     stream: BoxStream,
+    /// 本连接使用的线协议。
+    version: WireVersion,
     /// 从套接字读到的原始字节（加密阶段为密文）。
     raw: Vec<u8>,
     /// 解密后的明文（仅加密阶段使用）。
     plain: Vec<u8>,
-    writer: Option<AeadWriter>,
-    reader: Option<AeadReader>,
-    /// UDP 报文用二进制编码（v2 握手协商结果），默认 JSON。
+    crypto: ControlCrypto,
+    /// UDP 报文用二进制编码（**v2** 握手协商结果），默认 JSON。
     udp_binary: bool,
 }
 
 impl FrpConn {
-    pub fn new(stream: BoxStream) -> Self {
+    pub fn new(stream: BoxStream, version: WireVersion) -> Self {
         Self {
             stream,
+            version,
             raw: Vec::new(),
             plain: Vec::new(),
-            writer: None,
-            reader: None,
+            crypto: ControlCrypto::None,
             udp_binary: false,
         }
     }
 
-    /// 设置 UDP 报文编码（由握手协商结果决定）。
+    /// 本连接的线协议。
+    pub fn version(&self) -> WireVersion {
+        self.version
+    }
+
+    /// 探测并锁定线协议（仅服务端用）。
+    ///
+    /// 严格对照官方 `pkg/proto/wire/wire.go` 的 `CheckMagic`：
+    /// 读满 8 字节，与 v2 魔术字逐字节比较；相同则**消费掉**这 8 字节走 v2，
+    /// 不同则**原样留在缓冲区里**走 v1（那 8 字节本来就是 v1 的
+    /// 类型字节 + 长度前缀）。
+    ///
+    /// 官方用 `libnet.NewSharedConnSize` 把已读的字节"塞回去"，这里等价地
+    /// 让字节留在 `raw` 缓冲区，后续解析照常从 `raw` 开头继续。
+    pub async fn detect_version(&mut self) -> Result<WireVersion> {
+        while self.raw.len() < MAGIC_V2.len() {
+            let need = MAGIC_V2.len() - self.raw.len();
+            let mut chunk = vec![0u8; need];
+            let n = self.stream.read(&mut chunk).await?;
+            if n == 0 {
+                bail!("对端在读满 {} 字节线协议标识前就断开了", MAGIC_V2.len());
+            }
+            self.raw.extend_from_slice(&chunk[..n]);
+        }
+
+        if self.raw[..MAGIC_V2.len()] == *MAGIC_V2 {
+            self.raw.drain(..MAGIC_V2.len());
+            self.version = WireVersion::V2;
+        } else {
+            // v1：这 8 字节属于第一条消息，留在 raw 里等 take_msg 消费
+            self.version = WireVersion::V1;
+        }
+        Ok(self.version)
+    }
+
+    /// 设置 UDP 报文编码（由 **v2** 握手协商结果决定）。
     pub fn set_udp_codec(&mut self, binary: bool) {
         self.udp_binary = binary;
     }
@@ -52,54 +132,60 @@ impl FrpConn {
         self.udp_binary
     }
 
-    /// 写入 v2 魔术字（客户端必须先发）。
+    /// 写入 v2 魔术字（客户端在 v2 下必须先发）。v1 下什么都不做。
     pub async fn write_magic(&mut self) -> Result<()> {
-        self.stream.write_all(MAGIC_V2).await?;
-        self.stream.flush().await?;
+        if self.version.is_v2() {
+            self.stream.write_all(MAGIC_V2).await?;
+            self.stream.flush().await?;
+        }
         Ok(())
     }
 
-    /// 服务端探测魔术字；不匹配则返回 false（说明不是 frp v2 客户端）。
-    pub async fn peek_magic(&mut self) -> Result<bool> {
-        let mut head = [0u8; MAGIC_V2.len()];
-        self.stream.read_exact(&mut head).await?;
-        Ok(head == MAGIC_V2)
+    /// v1：登录成功后给控制连接套上 AES-128-CFB 流密码。
+    ///
+    /// 时序必须与官方一致 —— **`Login` 与 `LoginResp` 都是明文**，
+    /// 加密从下一条消息开始（Go 的 `crypto.Writer` 是惰性的：第一次写才发 IV）。
+    pub fn enable_v1_crypto(&mut self, token: &str) -> Result<()> {
+        if self.version != WireVersion::V1 {
+            bail!("v1 控制通道加密只能用在 v1 连接上");
+        }
+        self.crypto = ControlCrypto::V1(Box::new(v1::CryptoStream::new(token)));
+        Ok(())
     }
 
-    /// 切换为加密帧流。
+    /// v2：切换为 AEAD 加密帧流。
     pub fn upgrade(&mut self, read_key: Vec<u8>, write_key: Vec<u8>) -> Result<()> {
-        self.writer = Some(AeadWriter::new(&write_key)?);
-        self.reader = Some(AeadReader::new(&read_key)?);
+        if self.version != WireVersion::V2 {
+            bail!("AEAD 升级只能用在 v2 连接上");
+        }
+        self.crypto = ControlCrypto::V2(Box::new(V2Crypto {
+            writer: AeadWriter::new(&write_key)?,
+            reader: AeadReader::new(&read_key)?,
+        }));
         Ok(())
     }
 
     pub fn is_encrypted(&self) -> bool {
-        self.writer.is_some()
+        !matches!(self.crypto, ControlCrypto::None)
     }
 
-    /// 写入一个帧。
+    /// 写一个 v2 帧。v1 没有帧概念，调用会报错 —— 走 [`FrpConn::send_msg`]。
     pub async fn write_frame(&mut self, frame_type: u16, payload: &[u8]) -> Result<()> {
-        let raw = wire::encode_frame(frame_type, payload);
-        match self.writer.as_mut() {
-            Some(w) => {
-                let enc = w.seal(&raw)?;
-                self.stream.write_all(&enc).await?;
-            }
-            None => self.stream.write_all(&raw).await?,
+        if self.version != WireVersion::V2 {
+            bail!("v1 协议没有帧结构，请用 send_msg");
         }
-        self.stream.flush().await?;
-        Ok(())
+        let raw = wire::encode_frame(frame_type, payload);
+        self.write_bytes(&raw).await
     }
 
-    /// 读取一个帧；对端干净关闭时返回 `Ok(None)`。
+    /// 读一个 v2 帧；对端干净关闭时返回 `Ok(None)`。
     pub async fn read_frame(&mut self) -> Result<Option<(u16, Vec<u8>)>> {
+        if self.version != WireVersion::V2 {
+            bail!("v1 协议没有帧结构");
+        }
         loop {
             {
-                let buf = if self.reader.is_some() {
-                    &mut self.plain
-                } else {
-                    &mut self.raw
-                };
+                let buf = self.read_buf();
                 if let Some(frame) = take_frame(buf)? {
                     return Ok(Some(frame));
                 }
@@ -110,22 +196,37 @@ impl FrpConn {
         }
     }
 
-    /// 发送一条消息。
+    /// 发送一条消息（两套协议共用入口）。
     ///
-    /// UDP 报文（`UdpPacket`）在协商为 binary codec 时会改用二进制编码，
-    /// 与官方 frp 的 `V2BinaryUDPPacketReadWriter` 保持一致。
+    /// UDP 报文（`UdpPacket`）在 **v2** 协商为 binary codec 时会改用二进制编码，
+    /// 与官方 frp 的 `V2BinaryUDPPacketReadWriter` 保持一致；v1 没有这套协商，
+    /// 永远走 JSON。
     pub async fn send_msg(&mut self, m: &FrpMessage) -> Result<()> {
-        if self.udp_binary {
-            if let FrpMessage::UdpPacket(pkt) = m {
-                let body = msg::encode_udp_binary(pkt)?;
-                let mut payload = Vec::with_capacity(2 + body.len());
-                payload.extend_from_slice(&msg::TYPE_UDP_PACKET_BINARY.to_be_bytes());
-                payload.extend_from_slice(&body);
-                return self.write_frame(FRAME_MESSAGE, &payload).await;
+        match self.version {
+            WireVersion::V2 => {
+                if self.udp_binary {
+                    if let FrpMessage::UdpPacket(pkt) = m {
+                        let body = msg::encode_udp_binary(pkt)?;
+                        let mut payload = Vec::with_capacity(2 + body.len());
+                        payload.extend_from_slice(&msg::TYPE_UDP_PACKET_BINARY.to_be_bytes());
+                        payload.extend_from_slice(&body);
+                        return self.write_frame(FRAME_MESSAGE, &payload).await;
+                    }
+                }
+                let payload = m.encode()?;
+                self.write_frame(FRAME_MESSAGE, &payload).await
+            }
+            WireVersion::V1 => {
+                let byte = v1::type_byte(m.type_id()).ok_or_else(|| {
+                    anyhow!(
+                        "消息 {} 在 frp v1 里没有对应的类型字节（它是 v2 独有的）",
+                        m.name()
+                    )
+                })?;
+                let frame = v1::encode_msg(byte, &m.encode_body()?);
+                self.write_bytes(&frame).await
             }
         }
-        let payload = m.encode()?;
-        self.write_frame(FRAME_MESSAGE, &payload).await
     }
 
     /// 优雅关闭：先 flush，再对底层流 shutdown。
@@ -134,7 +235,6 @@ impl FrpConn {
     /// 直接 drop 会让 yamux 流以 RST 收场，对端只能看到 `connection reset`，
     /// 读不到我们刚写进去的 error 文本。
     pub async fn shutdown(&mut self) -> Result<()> {
-        use tokio::io::AsyncWriteExt;
         self.stream.flush().await.ok();
         self.stream.shutdown().await.ok();
         Ok(())
@@ -142,23 +242,65 @@ impl FrpConn {
 
     /// 接收一条消息。
     pub async fn recv_msg(&mut self) -> Result<Option<FrpMessage>> {
-        match self.read_frame().await? {
-            Some((ft, payload)) => {
-                if ft != FRAME_MESSAGE {
-                    bail!("期望消息帧({FRAME_MESSAGE})，实际收到帧类型 {ft}");
+        match self.version {
+            WireVersion::V2 => match self.read_frame().await? {
+                Some((ft, payload)) => {
+                    if ft != FRAME_MESSAGE {
+                        bail!("期望消息帧({FRAME_MESSAGE})，实际收到帧类型 {ft}");
+                    }
+                    if payload.len() < 2 {
+                        bail!("消息帧负载过短");
+                    }
+                    let type_id = u16::from_be_bytes([payload[0], payload[1]]);
+                    if type_id == msg::TYPE_UDP_PACKET_BINARY {
+                        let pkt = msg::decode_udp_binary(&payload[2..])?;
+                        return Ok(Some(FrpMessage::UdpPacket(pkt)));
+                    }
+                    Ok(Some(FrpMessage::decode(type_id, &payload[2..])?))
                 }
-                if payload.len() < 2 {
-                    bail!("消息帧负载过短");
+                None => Ok(None),
+            },
+            WireVersion::V1 => loop {
+                {
+                    let buf = self.read_buf();
+                    if let Some((byte, body)) = v1::take_msg(buf)? {
+                        let type_id = v1::type_id(byte).expect("take_msg 已校验过类型字节");
+                        return Ok(Some(FrpMessage::decode(type_id, &body)?));
+                    }
                 }
-                let type_id = u16::from_be_bytes([payload[0], payload[1]]);
-                if type_id == msg::TYPE_UDP_PACKET_BINARY {
-                    let pkt = msg::decode_udp_binary(&payload[2..])?;
-                    return Ok(Some(FrpMessage::UdpPacket(pkt)));
+                if !self.fill().await? {
+                    return Ok(None);
                 }
-                Ok(Some(FrpMessage::decode(type_id, &payload[2..])?))
-            }
-            None => Ok(None),
+            },
         }
+    }
+
+    /// 当前应该从哪个缓冲区取明文帧 / 消息。
+    ///
+    /// 加密阶段读解密后的 `plain`，明文阶段直接读 `raw`。
+    fn read_buf(&mut self) -> &mut Vec<u8> {
+        if self.is_encrypted() {
+            &mut self.plain
+        } else {
+            &mut self.raw
+        }
+    }
+
+    /// 把一段**明文**写出去（内部按当前加密状态处理）。
+    async fn write_bytes(&mut self, data: &[u8]) -> Result<()> {
+        match &mut self.crypto {
+            ControlCrypto::None => self.stream.write_all(data).await?,
+            ControlCrypto::V1(c) => {
+                let enc = c.encrypt(data);
+                self.stream.write_all(&enc).await?;
+            }
+            ControlCrypto::V2(v) => {
+                let enc = v.writer.seal(data)?;
+                self.stream.write_all(&enc).await?;
+            }
+        }
+        self.stream.flush().await?;
+        Ok(())
     }
 
     /// 从套接字补数据；返回 false 表示 EOF。
@@ -172,9 +314,17 @@ impl FrpConn {
             bail!("接收缓冲区超限");
         }
         self.raw.extend_from_slice(&chunk[..n]);
-        if let Some(rd) = self.reader.as_mut() {
-            while let Some(pt) = rd.open(&mut self.raw)? {
+        match &mut self.crypto {
+            ControlCrypto::None => {}
+            ControlCrypto::V1(c) => {
+                // v1 是流密码：把缓冲区里所有能解的字节都解出来
+                let pt = c.decrypt(&mut self.raw);
                 self.plain.extend_from_slice(&pt);
+            }
+            ControlCrypto::V2(v) => {
+                while let Some(pt) = v.reader.open(&mut self.raw)? {
+                    self.plain.extend_from_slice(&pt);
+                }
             }
         }
         Ok(true)
@@ -185,7 +335,9 @@ impl FrpConn {
     /// 工作连接握手完成后要转原始字节流转发，残留字节必须交给调用方，
     /// 否则会丢掉用户已经发来的第一笔数据。
     pub fn into_stream(mut self) -> (BoxStream, Vec<u8>) {
-        let leftover = if self.reader.is_some() {
+        // 加密阶段返回解密后的明文；明文阶段默认 v2 语义（工作连接不加密，
+        // 只有 v2 控制连接会走到这里之外的分支）。
+        let leftover = if self.is_encrypted() {
             std::mem::take(&mut self.plain)
         } else {
             std::mem::take(&mut self.raw)
@@ -194,7 +346,7 @@ impl FrpConn {
     }
 }
 
-/// 从缓冲区里切出一个完整帧（`8 字节头 + payload`）。
+/// 从缓冲区里切出一个 v2 帧（`8 字节头 + payload`）。
 fn take_frame(buf: &mut Vec<u8>) -> Result<Option<(u16, Vec<u8>)>> {
     if buf.len() < 8 {
         return Ok(None);
@@ -216,28 +368,21 @@ fn take_frame(buf: &mut Vec<u8>) -> Result<Option<(u16, Vec<u8>)>> {
     Ok(Some((frame_type, payload)))
 }
 
-// ---------------------------------------------------------------------------
-// 客户端握手
-// ---------------------------------------------------------------------------
-
-/// 客户端建立控制连接，返回 `(连接, run_id)`。
-pub async fn client_handshake(
-    stream: BoxStream,
+/// 构造登录消息（两套协议共用）。
+///
+/// `version` 必须是**官方的裸版本号**（如 `0.71.0`），不能带 `rustunnel/` 之类
+/// 的前缀：第三方 frps 与面板会解析这个字段，不认识的写法可能直接被判为
+/// "不支持的客户端版本"。
+fn build_login(
     token: &str,
     client_id: &str,
     user: &str,
+    metas: &std::collections::HashMap<String, String>,
     pool_count: i32,
-) -> Result<(FrpConn, String, bool)> {
-    let mut conn = FrpConn::new(stream);
-    conn.write_magic().await?;
-
-    let hello = wire::new_client_hello("tcp", false, false);
-    let hello_payload = serde_json::to_vec(&hello)?;
-    conn.write_frame(FRAME_CLIENT_HELLO, &hello_payload).await?;
-
-    let ts = now_unix_secs() as i64;
-    conn.send_msg(&FrpMessage::Login(Login {
-        version: format!("rustunnel/{}", env!("CARGO_PKG_VERSION")),
+    ts: i64,
+) -> Login {
+    Login {
+        version: super::FRP_WIRE_VERSION.to_string(),
         hostname: crate::util::hostname(),
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
@@ -246,10 +391,60 @@ pub async fn client_handshake(
         privilege_key: msg::auth_key(token, ts),
         timestamp: ts,
         client_id: client_id.to_string(),
+        // frp 的 `[metadatas]` 原样透传：不少 frp 平台靠 `metas["token"]`
+        // 识别隧道（拿不到它只会回一句「FRPC 配置文件错误」）
+        metas: metas.clone(),
         pool_count,
         ..Default::default()
-    }))
-    .await?;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 客户端握手
+// ---------------------------------------------------------------------------
+
+/// 客户端建立控制连接，返回 `(连接, run_id, udp_binary)`。
+#[allow(clippy::too_many_arguments)]
+pub async fn client_handshake(
+    stream: BoxStream,
+    version: WireVersion,
+    token: &str,
+    client_id: &str,
+    user: &str,
+    metas: &std::collections::HashMap<String, String>,
+    pool_count: i32,
+) -> Result<(FrpConn, String, bool)> {
+    let mut conn = FrpConn::new(stream, version);
+    let ts = now_unix_secs() as i64;
+    let login = build_login(token, client_id, user, metas, pool_count, ts);
+
+    // ---------------------------------------------------------------- v1
+    if version == WireVersion::V1 {
+        conn.send_msg(&FrpMessage::Login(login)).await?;
+        let login_resp: LoginResp = match conn.recv_msg().await? {
+            Some(FrpMessage::LoginResp(r)) => r,
+            Some(other) => bail!("期望 LoginResp，收到 {}", other.name()),
+            None => bail!("服务端在 LoginResp 之前断开连接"),
+        };
+        if !login_resp.error.is_empty() {
+            bail!("登录失败: {}", login_resp.error);
+        }
+        if login_resp.run_id.is_empty() {
+            bail!("服务端未下发 run_id");
+        }
+        // 官方时序：Login / LoginResp 明文，之后的控制消息才走 CFB
+        conn.enable_v1_crypto(token)?;
+        return Ok((conn, login_resp.run_id, false));
+    }
+
+    // ---------------------------------------------------------------- v2
+    conn.write_magic().await?;
+
+    let hello = wire::new_client_hello("tcp", false, false);
+    let hello_payload = serde_json::to_vec(&hello)?;
+    conn.write_frame(FRAME_CLIENT_HELLO, &hello_payload).await?;
+
+    conn.send_msg(&FrpMessage::Login(login)).await?;
 
     // 1) ServerHello
     let (ft, sh_payload) = conn
@@ -311,7 +506,7 @@ pub enum ServerAccept {
     Visitor { conn: FrpConn, msg: NewVisitorConn },
 }
 
-/// 服务端握手。
+/// 服务端握手。**自动探测**对端是 v1 还是 v2（与官方 frps 一致）。
 ///
 /// * `run_id` —— 本次会话的标识，会写进 LoginResp 下发给客户端。
 pub async fn server_handshake(
@@ -319,75 +514,98 @@ pub async fn server_handshake(
     token: &str,
     run_id: &str,
 ) -> Result<ServerAccept> {
-    let mut conn = FrpConn::new(stream);
+    // 先用 v1 建连接对象：探测只在 raw 缓冲区上做事，跟协议无关
+    let mut conn = FrpConn::new(stream, WireVersion::V1);
+    let version = conn.detect_version().await?;
 
-    if !conn.peek_magic().await? {
-        bail!("不是 frp v2 协议（魔术字不匹配），请确认对端是 v0.70+ 的 frpc");
-    }
-
-    let (ft, payload) = conn
-        .read_frame()
-        .await?
-        .ok_or_else(|| anyhow!("客户端在发送首帧前断开"))?;
-
-    // 首帧可能是 ClientHello（控制连接），也可能直接是消息帧（工作连接）
-    let (msg_frame, crypto_state) = if ft == FRAME_CLIENT_HELLO {
-        let hello: ClientHello = serde_json::from_slice(&payload)?;
-        let server_hello = match wire::new_server_hello(&hello) {
-            Ok(h) => h,
-            Err(e) => {
-                let mut h = ServerHello::default();
-                h.selected.message.codec = wire::MESSAGE_CODEC_JSON.to_string();
-                h.error = e.to_string();
-                h
-            }
-        };
-        let sh_payload = serde_json::to_vec(&server_hello)?;
-        conn.write_frame(FRAME_SERVER_HELLO, &sh_payload).await?;
-        if !server_hello.error.is_empty() {
-            bail!("ServerHello 协商失败: {}", server_hello.error);
-        }
-        let algorithm = server_hello.selected.crypto.algorithm.clone();
-        // 与 frp 一致：客户端宣告支持 binary 就选 binary
-        let udp_binary =
-            server_hello.selected.message.udp_packet_codec == wire::UDP_PACKET_CODEC_BINARY;
-        conn.set_udp_codec(udp_binary);
-        let next = conn
+    // 首帧/首消息的解析：v2 要先处理 ClientHello，v1 直接就是消息
+    let (type_id, body, crypto_state) = if version.is_v2() {
+        let (ft, payload) = conn
             .read_frame()
             .await?
-            .ok_or_else(|| anyhow!("客户端在发送 Login 前断开"))?;
-        (next, Some((payload, sh_payload, algorithm, udp_binary)))
+            .ok_or_else(|| anyhow!("客户端在发送首帧前断开"))?;
+
+        let mut msg_payload: Option<Vec<u8>> = None;
+        let crypto_state = if ft == FRAME_CLIENT_HELLO {
+            let hello: ClientHello = serde_json::from_slice(&payload)?;
+            let server_hello = match wire::new_server_hello(&hello) {
+                Ok(h) => h,
+                Err(e) => {
+                    let mut h = ServerHello::default();
+                    h.selected.message.codec = wire::MESSAGE_CODEC_JSON.to_string();
+                    h.error = e.to_string();
+                    h
+                }
+            };
+            let sh_payload = serde_json::to_vec(&server_hello)?;
+            conn.write_frame(FRAME_SERVER_HELLO, &sh_payload).await?;
+            if !server_hello.error.is_empty() {
+                bail!("ServerHello 协商失败: {}", server_hello.error);
+            }
+            let algorithm = server_hello.selected.crypto.algorithm.clone();
+            // 与 frp 一致：客户端宣告支持 binary 就选 binary
+            let udp_binary =
+                server_hello.selected.message.udp_packet_codec == wire::UDP_PACKET_CODEC_BINARY;
+            conn.set_udp_codec(udp_binary);
+
+            let next = conn
+                .read_frame()
+                .await?
+                .ok_or_else(|| anyhow!("客户端在发送 Login 前断开"))?;
+            if next.0 != FRAME_MESSAGE {
+                bail!("期望消息帧，实际收到帧类型 {}", next.0);
+            }
+            msg_payload = Some(next.1);
+            // ClientHello 的原始字节要留着算 transcript 哈希（v2 密钥派生的输入）
+            Some((payload.clone(), sh_payload, algorithm, udp_binary))
+        } else {
+            None
+        };
+
+        let payload = msg_payload.unwrap_or(payload);
+        if payload.len() < 2 {
+            bail!("消息帧负载过短");
+        }
+        (
+            u16::from_be_bytes([payload[0], payload[1]]),
+            payload[2..].to_vec(),
+            crypto_state,
+        )
     } else {
-        ((ft, payload), None)
+        // v1：第一条就是消息本身（类型字节 + 长度 + JSON），已由探测阶段
+        // 留在缓冲区里，这里直接解析。
+        loop {
+            let taken = {
+                let buf = &mut conn.raw;
+                v1::take_msg(buf)?
+            };
+            if let Some((byte, body)) = taken {
+                break (v1::type_id(byte).expect("take_msg 已校验"), body, None);
+            }
+            if !conn.fill().await? {
+                bail!("客户端在发送第一条消息前断开");
+            }
+        }
     };
 
-    if msg_frame.0 != FRAME_MESSAGE {
-        bail!("期望消息帧，实际收到帧类型 {}", msg_frame.0);
-    }
-    let body = &msg_frame.1;
-    if body.len() < 2 {
-        bail!("消息帧负载过短");
-    }
-    let type_id = u16::from_be_bytes([body[0], body[1]]);
-
-    // 工作连接：不允许携带 ClientHello
+    // ---- 工作连接：不允许携带 ClientHello ----
     if type_id == msg::TYPE_NEW_WORK_CONN {
         if crypto_state.is_some() {
             bail!("工作连接不允许携带 ClientHello");
         }
-        let m = FrpMessage::decode(type_id, &body[2..])?;
+        let m = FrpMessage::decode(type_id, &body)?;
         match m {
             FrpMessage::NewWorkConn(nwc) => return Ok(ServerAccept::Work { conn, msg: nwc }),
             _ => unreachable!(),
         }
     }
 
-    // visitor 连接：同样不允许携带 ClientHello
+    // ---- visitor 连接：同样不允许携带 ClientHello ----
     if type_id == msg::TYPE_NEW_VISITOR_CONN {
         if crypto_state.is_some() {
             bail!("visitor 连接不允许携带 ClientHello");
         }
-        let m = FrpMessage::decode(type_id, &body[2..])?;
+        let m = FrpMessage::decode(type_id, &body)?;
         match m {
             FrpMessage::NewVisitorConn(nvc) => return Ok(ServerAccept::Visitor { conn, msg: nvc }),
             _ => unreachable!(),
@@ -397,7 +615,7 @@ pub async fn server_handshake(
     if type_id != msg::TYPE_LOGIN {
         bail!("期望 Login 或 NewWorkConn，收到 type_id {type_id}");
     }
-    let login = match FrpMessage::decode(type_id, &body[2..])? {
+    let login = match FrpMessage::decode(type_id, &body)? {
         FrpMessage::Login(l) => l,
         _ => unreachable!(),
     };
@@ -405,6 +623,7 @@ pub async fn server_handshake(
     // token 校验
     let expected = msg::auth_key(token, login.timestamp);
     if !msg::constant_time_eq(&expected, &login.privilege_key) {
+        // 官方 frps 也是明文回这条错误（此时还没建立加密）
         let _ = conn
             .send_msg(&FrpMessage::LoginResp(LoginResp {
                 error: "token in login doesn't match token from configuration".into(),
@@ -416,7 +635,7 @@ pub async fn server_handshake(
 
     // LoginResp 必须明文发送（客户端此时还没升级加密）
     conn.send_msg(&FrpMessage::LoginResp(LoginResp {
-        version: format!("rustunnel/{}", env!("CARGO_PKG_VERSION")),
+        version: super::FRP_WIRE_VERSION.to_string(),
         run_id: run_id.to_string(),
         ..Default::default()
     }))
@@ -426,10 +645,15 @@ pub async fn server_handshake(
         .as_ref()
         .map(|(_, _, _, udp_binary)| *udp_binary)
         .unwrap_or(false);
-    if let Some((ch_payload, sh_payload, algorithm, _)) = crypto_state {
-        let transcript = transcript_hash(&ch_payload, &sh_payload);
-        let (c2s, s2c) = derive_control_keys(token.as_bytes(), &algorithm, &transcript)?;
-        conn.upgrade(c2s, s2c)?; // 服务端用 c2s 读、s2c 写
+    match crypto_state {
+        // v2：用 transcript 派生 AEAD 密钥
+        Some((ch_payload, sh_payload, algorithm, _)) => {
+            let transcript = transcript_hash(&ch_payload, &sh_payload);
+            let (c2s, s2c) = derive_control_keys(token.as_bytes(), &algorithm, &transcript)?;
+            conn.upgrade(c2s, s2c)?; // 服务端用 c2s 读、s2c 写
+        }
+        // v1：套 PBKDF2 + AES-128-CFB
+        None => conn.enable_v1_crypto(token)?,
     }
 
     Ok(ServerAccept::Control {
@@ -448,11 +672,13 @@ pub async fn server_handshake(
 /// 返回 `(stream, leftover, start_msg)`：之后直接在这条流上转发原始字节。
 pub async fn client_work_conn(
     stream: BoxStream,
+    version: WireVersion,
     run_id: &str,
     token: &str,
     ts: i64,
 ) -> Result<(BoxStream, Vec<u8>, StartWorkConn)> {
-    let mut conn = FrpConn::new(stream);
+    let mut conn = FrpConn::new(stream, version);
+    // v2 要求每条连接都先发魔术字；v1 什么都不发，直接上消息
     conn.write_magic().await?;
     conn.send_msg(&FrpMessage::NewWorkConn(NewWorkConn {
         run_id: run_id.to_string(),
@@ -483,11 +709,12 @@ pub async fn client_work_conn(
 /// （visitor 收到 Resp 后可能立刻开始发数据，必须原样交给转发方）。
 pub async fn client_visitor_conn(
     stream: BoxStream,
+    version: WireVersion,
     run_id: &str,
     proxy_name: &str,
     secret_key: &str,
 ) -> Result<(BoxStream, Vec<u8>)> {
-    let mut conn = FrpConn::new(stream);
+    let mut conn = FrpConn::new(stream, version);
     conn.write_magic().await?;
 
     let ts = now_unix_secs() as i64;
@@ -511,5 +738,184 @@ pub async fn client_visitor_conn(
         }
         Some(other) => bail!("期望 NewVisitorConnResp，收到 {}", other.name()),
         None => bail!("服务端在 visitor 连接握手完成前断开"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 测试
+// ---------------------------------------------------------------------------
+//
+// 这里用 `tokio::io::duplex` 当场造一条内存流，一端跑真的客户端握手，
+// 另一端当"假 frps"**直接看线上字节**。价值在于：握手时序（哪条消息是明文、
+// 从哪一条开始加密）是纯时序契约，只有盯着字节才能验证。
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frp::msg::{FrpMessage, LoginResp, Ping};
+    use crate::frp::v1;
+    use tokio::io::AsyncReadExt;
+
+    const TOKEN: &str = "tok";
+    const RUN_ID: &str = "run-1";
+
+    fn empty_metas() -> std::collections::HashMap<String, String> {
+        Default::default()
+    }
+
+    /// 从流里读一条 v1 消息（`[类型字节][i64 长度][JSON]`）。
+    async fn read_v1_raw<S: AsyncReadExt + Unpin>(s: &mut S) -> (u8, Vec<u8>) {
+        let mut head = [0u8; 9];
+        s.read_exact(&mut head).await.unwrap();
+        let len = i64::from_be_bytes(head[1..9].try_into().unwrap()) as usize;
+        let mut body = vec![0u8; len];
+        s.read_exact(&mut body).await.unwrap();
+        (head[0], body)
+    }
+
+    /// **金标准时序测试**：v1 的 `Login` / `LoginResp` 必须是明文，
+    /// 从第三条消息起必须变成 AES-128-CFB 密文，且用官方算法能解回来。
+    ///
+    /// 这条测试盯着三件事，任何一件错了线上就是"连上就断"：
+    /// 1. 首字节就是 `'o'`（TypeLogin），**没有**任何魔术字前缀；
+    /// 2. 长度是 8 字节大端 i64，消息体是可读 JSON；
+    /// 3. 登录之后的字节不是明文，而是 `16 字节 IV + 密文`，且能被
+    ///    `PBKDF2-HMAC-SHA1(token, "frp", 64, 16)` + AES-128-CFB 解回原文。
+    #[tokio::test]
+    async fn v1_登录是明文_之后立刻走_aes_cfb() {
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+
+        let client_task = tokio::spawn(async move {
+            let (conn, run_id, udp) = client_handshake(
+                Box::pin(client),
+                WireVersion::V1,
+                TOKEN,
+                "cid",
+                "alice",
+                &empty_metas(),
+                0,
+            )
+            .await
+            .unwrap();
+            assert!(conn.is_encrypted(), "v1 登录成功后控制通道必须已加密");
+            assert_eq!(conn.version(), WireVersion::V1);
+            // 登录之后的第一条消息要自己发，这样它必然落在加密阶段
+            let mut conn = conn;
+            conn.send_msg(&FrpMessage::Ping(Ping {
+                timestamp: 42,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+            (run_id, udp)
+        });
+
+        // ---- 1) Login 必须是明文 v1 帧 ----
+        let (byte, body) = read_v1_raw(&mut server).await;
+        assert_eq!(byte, v1::TYPE_LOGIN, "首字节必须是 'o'（TypeLogin）");
+        let login: Login = serde_json::from_slice(&body).expect("登录消息必须是可读 JSON");
+        assert_eq!(
+            login.version,
+            crate::frp::FRP_WIRE_VERSION,
+            "上报的版本号必须是官方的裸版本号（第三方平台会解析它）"
+        );
+        assert_eq!(login.user, "alice");
+        assert!(login.timestamp > 0, "必须带时间戳（鉴权签名要用它）");
+        assert_eq!(
+            login.privilege_key,
+            msg::auth_key(TOKEN, login.timestamp),
+            "privilege_key 必须是 md5(token + timestamp)"
+        );
+
+        // ---- 2) LoginResp 同样是明文 ----
+        let resp = serde_json::to_vec(&LoginResp {
+            version: crate::frp::FRP_WIRE_VERSION.to_string(),
+            run_id: RUN_ID.to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        server
+            .write_all(&v1::encode_msg(v1::TYPE_LOGIN_RESP, &resp))
+            .await
+            .unwrap();
+
+        // ---- 3) 之后的字节必须是 IV + CFB 密文 ----
+        let mut iv = [0u8; v1::IV_LEN];
+        server.read_exact(&mut iv).await.expect("应收到 16 字节 IV");
+
+        let expect_plain = v1::encode_msg(
+            v1::TYPE_PING,
+            &serde_json::to_vec(&Ping {
+                timestamp: 42,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let mut ct = vec![0u8; expect_plain.len()];
+        server.read_exact(&mut ct).await.expect("应收到等长密文");
+        assert_ne!(ct, expect_plain, "登录之后的控制消息不能是明文");
+        assert!(
+            std::str::from_utf8(&ct).is_err(),
+            "密文里不该能直接读出 JSON 文本"
+        );
+
+        // 用官方算法解密：PBKDF2-HMAC-SHA1(token, "frp", 64, 16) + AES-128-CFB
+        let mut wire = iv.to_vec();
+        wire.extend_from_slice(&ct);
+        let mut dec = v1::CryptoStream::with_key(v1::derive_key(TOKEN.as_bytes()));
+        let plain = dec.decrypt(&mut wire);
+        assert_eq!(plain, expect_plain, "密文必须能用官方算法解回原来那条 Ping");
+
+        // 解出来的确实是那条 Ping，不是别的
+        let mut buf = plain;
+        let (byte, body) = v1::take_msg(&mut buf).unwrap().unwrap();
+        assert_eq!(byte, v1::TYPE_PING);
+        assert!(String::from_utf8_lossy(&body).contains("\"timestamp\":42"));
+
+        let (run_id, udp) = client_task.await.unwrap();
+        assert_eq!(run_id, RUN_ID);
+        assert!(!udp, "v1 没有 UDP 二进制编码协商，恒为 false");
+    }
+
+    /// 服务端必须按魔术字自动识别（对应官方 `wire.CheckMagic`）。
+    ///
+    /// 关键点：认不出 v2 时那 8 字节**不能丢** —— 它们就是 v1 消息的
+    /// 类型字节 + 长度前缀。官方用 `SharedConn` 把它们"塞回去"，
+    /// 这里靠让字节留在读缓冲区实现。
+    #[tokio::test]
+    async fn 服务端按魔术字自动识别_v1_与_v2() {
+        // ---- v2：首字节是魔术字 ----
+        let (mut client, server) = tokio::io::duplex(4096);
+        client.write_all(MAGIC_V2).await.unwrap();
+        let mut conn = FrpConn::new(Box::pin(server), WireVersion::V1);
+        assert_eq!(conn.detect_version().await.unwrap(), WireVersion::V2);
+
+        // ---- v1：首字节是 'o'，8 字节要原样留着当消息前缀 ----
+        let (mut client, server) = tokio::io::duplex(4096);
+        let login_bytes = v1::encode_msg(v1::TYPE_LOGIN, br#"{"timestamp":7}"#);
+        client.write_all(&login_bytes).await.unwrap();
+        let mut conn = FrpConn::new(Box::pin(server), WireVersion::V1);
+        assert_eq!(conn.detect_version().await.unwrap(), WireVersion::V1);
+        match conn.recv_msg().await.unwrap().unwrap() {
+            FrpMessage::Login(l) => assert_eq!(l.timestamp, 7, "被回填的 8 字节必须参与解析"),
+            other => panic!("应当解出 Login，实际是 {}", other.name()),
+        }
+    }
+
+    /// 默认线协议必须是 v1 —— 官方 frpc 的 `transport.wireProtocol` 默认就是它。
+    ///
+    /// 这条钉死默认值：哪天有人"顺手"把默认改成 v2，第三方面板（樱花之类）
+    /// 就会全线连不上，而报错只会是含糊的"连上就断"。
+    #[test]
+    fn 默认线协议是_v1() {
+        assert_eq!(WireVersion::default(), WireVersion::V1);
+        assert_eq!(WireVersion::V1.to_string(), "v1");
+        assert_eq!("v2".parse::<WireVersion>().unwrap(), WireVersion::V2);
+        // 官方配置里写的就是这两个值
+        assert_eq!("v1".parse::<WireVersion>().unwrap(), WireVersion::V1);
+        assert_eq!(
+            <WireVersion as std::str::FromStr>::from_str("").unwrap(),
+            WireVersion::V1,
+            "空值按官方 EmptyOr 语义落到 v1"
+        );
     }
 }

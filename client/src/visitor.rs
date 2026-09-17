@@ -151,6 +151,7 @@ async fn handle_user(
 
     let (mut tunnel, leftover) = conn::client_visitor_conn(
         session.link.connect().await?,
+        session.link.wire,
         &session.run_id,
         &target,
         &cfg.secret_key,

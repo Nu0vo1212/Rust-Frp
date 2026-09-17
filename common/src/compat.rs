@@ -24,7 +24,11 @@
 use crate::protocol::ControlMessage;
 
 /// 目标兼容的 Go frp 版本线。
-pub const FRP_COMPAT_VERSION: &str = "0.5x";
+///
+/// 早先这里是占位的 `"0.5x"` —— 那时还没有真正的 v2 wire protocol 实现。
+/// 现在线协议已经逐字节对齐到具体版本，值统一收敛到
+/// [`crate::frp::FRP_WIRE_VERSION`]，避免两处各写一份、日后悄悄漂掉。
+pub use crate::frp::FRP_WIRE_VERSION as FRP_COMPAT_VERSION;
 
 /// 把 rustunnel 消息映射到 Go frp 的 `msg` 类型名。
 pub fn frp_msg_type(msg: &ControlMessage) -> &'static str {

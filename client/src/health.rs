@@ -46,7 +46,9 @@ impl Monitor {
             if p.health_check_type.is_empty() {
                 continue;
             }
-            let wire = util::add_user_prefix(&cfg.user, &p.name);
+            // 键用**配置里的原始 `name`**（不带 `{user}.` 前缀）。
+            // 服务端回包里的名字前缀策略各实现不一致，统一在这里剥掉再查。
+            let wire = p.name.clone();
             m.states.lock().unwrap().insert(wire.clone(), State::new());
 
             let mon = m.clone();

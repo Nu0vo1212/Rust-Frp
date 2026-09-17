@@ -31,3 +31,7 @@ futures = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# 单元测试拿它把 NewProxy 序列化成 JSON，和官方 frpc 的抓包逐字节对拍
+serde_json = { workspace = true }

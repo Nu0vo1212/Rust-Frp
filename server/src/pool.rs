@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rustunnel_common::frp::{conn::FrpConn, msg::FrpMessage, stream::BoxStream};
+use rustunnel_common::frp::{conn::FrpConn, msg::FrpMessage, stream::BoxStream, WireVersion};
 use tokio::sync::mpsc;
 
 use crate::limits::{Limit, Permit};
@@ -167,7 +167,12 @@ pub struct ClientState {
     /// 同理端口也要记着，客户端主动 `CloseProxy` 时才知道该归还哪一个。
     proxies: Mutex<HashMap<String, ProxyEntry>>,
     /// 本次会话协商出的 UDP 报文编码（true = 二进制），工作连接要跟着用。
+    ///
+    /// 只有 **v2** 才有这套协商；v1 永远是 JSON。
     udp_binary: bool,
+    /// 本控制会话用的线协议。工作连接必须与之一致（与官方 frps 的
+    /// `work connection wire protocol mismatch` 检查对齐）。
+    wire_version: WireVersion,
     /// 有新工作连接入池 / 代理被停止时唤醒等待者（UDP 与 HTTP 都要主动取工作连接）。
     work_notify: tokio::sync::Notify,
     stopped: AtomicBool,
@@ -189,6 +194,7 @@ impl ClientState {
         req_tx: mpsc::UnboundedSender<CtrlCmd>,
         idle_timeout: Duration,
         udp_binary: bool,
+        wire_version: WireVersion,
         conn_limit: Limit,
         backlog_limit: Limit,
         proxy_limit: Limit,
@@ -201,6 +207,7 @@ impl ClientState {
             pool: Mutex::new(PoolState::default()),
             proxies: Mutex::new(HashMap::new()),
             udp_binary,
+            wire_version,
             work_notify: tokio::sync::Notify::new(),
             stopped: AtomicBool::new(false),
             idle_timeout,
@@ -212,6 +219,10 @@ impl ClientState {
 
     pub fn udp_codec_is_binary(&self) -> bool {
         self.udp_binary
+    }
+
+    pub fn wire_version(&self) -> WireVersion {
+        self.wire_version
     }
 
     pub fn is_stopped(&self) -> bool {
@@ -387,6 +398,7 @@ pub(crate) fn dummy_client(run_id: &str) -> Arc<ClientState> {
         tx,
         Duration::from_secs(60),
         false,
+        rustunnel_common::frp::WireVersion::V1,
         Limit::unlimited(),
         Limit::unlimited(),
         Limit::unlimited(),
@@ -399,7 +411,7 @@ mod tests {
 
     fn work(now: Instant) -> WorkItem {
         WorkItem {
-            conn: FrpConn::new(Box::pin(tokio::io::empty())),
+            conn: FrpConn::new(Box::pin(tokio::io::empty()), WireVersion::V1),
             at: now,
         }
     }
@@ -432,6 +444,7 @@ mod tests {
             tx,
             Duration::from_secs(60),
             false,
+            rustunnel_common::frp::WireVersion::V1,
             conn,
             backlog,
             proxy,
@@ -480,6 +493,7 @@ mod tests {
             tx,
             Duration::from_millis(50),
             false,
+            rustunnel_common::frp::WireVersion::V1,
             Limit::unlimited(),
             Limit::unlimited(),
             Limit::unlimited(),

@@ -143,7 +143,17 @@ impl Registry {
     pub fn remove(&self, run_id: &str) -> Option<Arc<ClientState>> {
         let c = self.clients.lock().unwrap().remove(run_id);
         if let Some(c) = &c {
+            // 这个客户端被回收时还挂着几个代理，`proxies_active` 就得减几个。
+            //
+            // 客户端**主动**关代理走的是 `CloseProxy`，那条路径自己已经减过了；
+            // 但被 kill / 断网时它根本发不出这条消息，只有这里能兜底 ——
+            // 否则面板上的"生效代理"只增不减，跑几天全是水分。
+            // 必须趁 `stop()` 清空名册**之前**取数，之后再取永远是 0。
+            let outstanding = c.proxy_names().len() as i64;
             c.stop();
+            if outstanding > 0 {
+                self.metrics().proxies_active.add(-outstanding);
+            }
             // 客户端的 http/https 域名要一并回收，否则域名会一直被占着
             if let Some(t) = self.vhosts() {
                 t.unregister_client(c);
@@ -435,6 +445,7 @@ mod tests {
             tx,
             Duration::from_secs(60),
             false,
+            rustunnel_common::frp::WireVersion::V1,
             conn,
             backlog,
             proxy,
@@ -457,6 +468,60 @@ mod tests {
         assert_eq!(r.metrics().clients_active.get(), 0);
         // 未注册的 run_id 删除应当是安全的空操作
         assert!(r.remove("nope").is_none());
+    }
+
+    /// 客户端被强杀（没机会发 `CloseProxy`）时，它挂着的代理必须由
+    /// `remove` 兜底回收，否则面板上的"生效代理"只增不减。
+    ///
+    /// 这个 bug 是在云端真机上看出来的：客户端 kill 后重连，
+    /// `proxies_active` 停在 3 不回落，而面板明细里只剩 1 个代理。
+    #[test]
+    fn remove_reclaims_proxies_active_when_client_is_killed() {
+        let r = Registry::unlimited();
+        let m = r.metrics();
+        let c = client("r1");
+        let _guard = r.insert(c.clone()).expect("不限时应能登记");
+
+        // 模拟客户端注册了两个代理（只走登记 + 指标，不真起监听）
+        for name in ["web", "ssh"] {
+            let slot = c.reserve_proxy().expect("默认不限名额");
+            c.add_proxy(name.into(), None, slot);
+            m.proxies_active.inc();
+        }
+        assert_eq!(m.proxies_active.get(), 2);
+
+        r.remove("r1");
+        assert_eq!(
+            m.proxies_active.get(),
+            0,
+            "客户端断开后 proxies_active 必须回落，否则指标只增不减"
+        );
+    }
+
+    /// 主动 `CloseProxy` 已经减过一次，`remove` 不能再减一次。
+    #[test]
+    fn remove_does_not_double_count_closed_proxies() {
+        let r = Registry::unlimited();
+        let m = r.metrics();
+        let c = client("r1");
+        let _guard = r.insert(c.clone()).expect("不限时应能登记");
+
+        // 两个代理，其中一个被客户端主动关掉（走 CloseProxy 那条路径）
+        for name in ["web", "ssh"] {
+            let slot = c.reserve_proxy().expect("默认不限名额");
+            c.add_proxy(name.into(), None, slot);
+            m.proxies_active.inc();
+        }
+        c.stop_proxy("ssh");
+        m.proxies_active.dec();
+        assert_eq!(m.proxies_active.get(), 1);
+
+        r.remove("r1");
+        assert_eq!(
+            m.proxies_active.get(),
+            0,
+            "只在册的 1 个代理该被回收，已关掉的那个不能重复扣"
+        );
     }
 
     #[test]

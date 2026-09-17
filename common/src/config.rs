@@ -14,12 +14,22 @@ pub const DEFAULT_WORK_PORT: u16 = 7001;
 
 /// 线协议选择。
 ///
-/// * `frp-v2`    —— **原版 frp（v0.70+）默认线协议**，可与官方 frpc / frps 互通；
-/// * `rustunnel` —— rustunnel 自研的简化协议（4 字节长度前缀 + JSON），仅两个 rustunnel 之间互通。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+/// 与 frp 配置里的 `transport.wireProtocol` **一一对应**，并且默认值也跟随官方：
+///
+/// * `frp-v1`    —— 官方 frpc/frps **至今为止的默认线协议**
+///   （`pkg/config/v1/client.go`：`WireProtocol = util.EmptyOr(..., "v1")`）。
+///   无魔术字，`[类型字节][i64 长度][JSON]`，登录后套 AES-128-CFB。
+///   樱花这类第三方 frps 分支基本只认它。
+/// * `frp-v2`    —— v0.70 引入的新协议，魔术字 + Hello 协商 + AEAD 帧流。
+///   需要服务端也显式启用（官方 frps 会按魔术字自动识别，rustunnel-server 同理）。
+/// * `rustunnel` —— rustunnel 自研的简化协议，尚未实现（配置成它会被直接拒绝）。
+///
+/// 想写哪种都行：`"v1"` / `"v2"` / `"frp-v1"` / `"frp-v2"` 都认，
+/// 也可以直接照抄 frp 配置里的 `[transport] wireProtocol = "v2"`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Protocol {
     #[default]
+    FrpV1,
     FrpV2,
     Rustunnel,
 }
@@ -27,8 +37,18 @@ pub enum Protocol {
 impl Protocol {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Protocol::FrpV1 => "frp-v1",
             Protocol::FrpV2 => "frp-v2",
             Protocol::Rustunnel => "rustunnel",
+        }
+    }
+
+    /// 对应的 frp 线协议版本；`rustunnel` 自研协议没有对应版本。
+    pub fn wire_version(&self) -> Option<crate::frp::WireVersion> {
+        match self {
+            Protocol::FrpV1 => Some(crate::frp::WireVersion::V1),
+            Protocol::FrpV2 => Some(crate::frp::WireVersion::V2),
+            Protocol::Rustunnel => None,
         }
     }
 }
@@ -43,10 +63,27 @@ impl std::str::FromStr for Protocol {
     type Err = String;
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "frp-v2" | "frpv2" | "frp" => Ok(Protocol::FrpV2),
+            // 照抄 frp 的 `wireProtocol = "v1"` 也认；空值按官方 EmptyOr 的语义落到 v1
+            "" | "v1" | "frp-v1" | "frpv1" | "frp" => Ok(Protocol::FrpV1),
+            "v2" | "frp-v2" | "frpv2" => Ok(Protocol::FrpV2),
             "rustunnel" | "native" => Ok(Protocol::Rustunnel),
-            other => Err(format!("未知协议 {other}，可选：frp-v2 / rustunnel")),
+            other => Err(format!(
+                "未知协议 {other}，可选：frp-v1（默认）/ frp-v2 / rustunnel"
+            )),
         }
+    }
+}
+
+impl Serialize for Protocol {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Protocol {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse::<Protocol>().map_err(serde::de::Error::custom)
     }
 }
 pub const DEFAULT_HEARTBEAT_INTERVAL: u64 = 30;
@@ -91,7 +128,9 @@ pub struct ServerConfig {
     #[serde(default)]
     pub bind_port: Option<u16>,
 
-    /// 线协议：`frp-v2`（默认，可与原版 frp 互通）或 `rustunnel`（自研简化协议）。
+    /// 线协议。服务端**按魔术字自动识别**对端走 v1 还是 v2（与官方 frps 一致），
+    /// 所以这一项只是为了"原版 frps 的配置能直接喂进来"；同一端口可以同时
+    /// 服务两种客户端。只有 `rustunnel` 自研协议尚未实现，会被直接拒绝。
     #[serde(default)]
     pub protocol: Protocol,
 
@@ -215,9 +254,11 @@ impl Default for ServerConfig {
 
 impl ServerConfig {
     /// 从 TOML 文件加载。
+    ///
+    /// 走 [`parse_server_toml`]，因此**原版 frps 的配置文件可以直接用**。
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let raw = std::fs::read_to_string(path.as_ref()).map_err(crate::error::Error::Io)?;
-        Ok(toml::from_str(&raw)?)
+        parse_server_toml(&raw)
     }
 
     /// 写入一份带注释的示例配置。
@@ -242,6 +283,13 @@ bind_addr = "0.0.0.0"
 bind_port = 7000
 token = "your_secret_token"
 log_level = "info"
+
+# ---- 线协议 ----
+# 不需要配：服务端和官方 frps 一样，靠**魔术字自动识别**对端是 v1 还是 v2
+# （读 8 字节比对，不是 v2 魔术字就回填当 v1 的消息前缀）。
+# 所以同一个端口上，官方 frpc（默认 v1）和 rustunnel（可配 v2）都能连。
+# 这一项留着只是为了"原版 frps 的配置文件能直接喂进来"。
+# protocol = "frp-v1"
 
 # ---- 虚拟主机（http / https 代理共用端口）----
 vhost_http_port = 8080
@@ -317,6 +365,25 @@ pub struct ProxyConfig {
     /// 防止某一条代理把整条上行链路吃满。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub bandwidth_limit: String,
+    /// 限流在哪一端执行：`client`（默认，等价于不写）/ `server`。
+    ///
+    /// 对应 frp 的 `transport.bandwidthLimitMode`。这个值会**原样上报给服务端**
+    /// （见 [`crate::frp::msg::NewProxy`]），让服务端按同样的口径限速；
+    /// 官方 frpc 只在值不是 `client` 时才发这个字段。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bandwidth_limit_mode: String,
+
+    // ---- 代理级元数据 ----
+    /// 随 `NewProxy` 消息带给服务端的键值对（官方 frp 的 `metadatas`）。
+    ///
+    /// ★ 和顶层 `[metadatas]` 不是一回事：
+    /// - 顶层 `[metadatas]` → `Login.metas`，登录时就发了，平台靠它认账号/隧道；
+    /// - 这里的 `[proxies.metadatas]` → `NewProxy.metas`，注册单条代理时才发。
+    ///
+    /// 官方 frpc 发的是**这一份**（`MarshalToMsg` 里的 `m.Metas = c.Metadatas`），
+    /// 所以别把登录用的 metas 塞进来 —— 那会让报文和官方 frpc 不一致。
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub metas: std::collections::HashMap<String, String>,
 
     // ---- 负载均衡分组 ----
     /// 组名：同名组的多个代理可以**共享同一个 remote_port**，
@@ -461,6 +528,20 @@ pub struct ClientConfig {
     #[serde(default)]
     pub user: String,
 
+    /// 附加元数据，原样随 `Login` 消息发给服务端（对应 frp 的 `[metadatas]`）。
+    ///
+    /// 为什么要有它：很多 frp 平台（LoliaFRP、OpenFrp 之类）不给全局 auth token，
+    /// 而是**靠 `metas["token"]` 认出这是哪条隧道**。平台下发的配置长这样：
+    ///
+    /// ```toml
+    /// [metadatas]
+    /// token = 'x8p5mo0u8ips3lmohc67r58mejp7uthf'
+    /// ```
+    ///
+    /// 少了这张表，服务端只会回一句没头没尾的「FRPC 配置文件错误」。
+    #[serde(default)]
+    pub metas: std::collections::HashMap<String, String>,
+
     /// 心跳间隔（秒）。
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval: u64,
@@ -473,7 +554,22 @@ pub struct ClientConfig {
     #[serde(default = "default_reconnect_interval")]
     pub reconnect_interval: u64,
 
-    /// 线协议：`frp-v2`（默认，可与原版 frp 互通）或 `rustunnel`。
+    /// **首次**登录失败后是否直接退出（对应 frp 的 `loginFailExit`，默认 `true`）。
+    ///
+    /// 语义与官方 frpc 对齐，不是"一失败就永远不重试"：
+    /// - 进程启动后第一次登录（连不上 / 认证被拒 / 握手失败）如果失败，
+    ///   直接以非 0 退出码结束 —— 这样外部启动器（NetTool、systemd 之流）
+    ///   能立刻知道"没起来"并把错误原样报给用户，而不是显示一个假的"已启动"；
+    /// - **一旦成功登录过**，之后断线就永远按 `reconnect_interval` 重连，不受此项影响。
+    ///
+    /// 官方 frp 里这一项默认就是 `true`（`pkg/config/v1/client.go`：
+    /// `c.LoginFailExit = util.EmptyOr(c.LoginFailExit, lo.ToPtr(true))`），
+    /// 想让客户端无脑一直重试就写 `loginFailExit = false`。
+    #[serde(default = "default_true")]
+    pub login_fail_exit: bool,
+
+    /// 线协议：默认 `frp-v1`（与原版 frp 一致，樱花这类第三方 frps 只认它），
+    /// 也可以写 `frp-v2` 或照抄原版 frp 配置里的 `transport.wireProtocol`。
     #[serde(default)]
     pub protocol: Protocol,
 
@@ -540,9 +636,11 @@ impl Default for ClientConfig {
             token: String::new(),
             client_id: default_client_id(),
             user: String::new(),
+            metas: Default::default(),
             heartbeat_interval: default_heartbeat_interval(),
             heartbeat_timeout: default_heartbeat_timeout(),
             reconnect_interval: default_reconnect_interval(),
+            login_fail_exit: true,
             protocol: Protocol::default(),
             pool_count: default_pool_count(),
             tcp_mux: true,
@@ -560,10 +658,14 @@ impl Default for ClientConfig {
 }
 
 impl ClientConfig {
-    /// 从 TOML 文件加载。
+    /// 从配置文件加载（**自动识别 TOML / 原版 frpc 的 legacy INI**）。
+    ///
+    /// 走 [`parse_client`]，因此**原版 frpc 的配置文件可以直接用** ——
+    /// 不管是新式 `frpc.toml` 还是老式 `frpc.ini`（樱花这类平台就是按
+    /// `frpc -v` 的版本协商结果决定下发哪一种）。
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let raw = std::fs::read_to_string(path.as_ref()).map_err(crate::error::Error::Io)?;
-        Ok(toml::from_str(&raw)?)
+        parse_client(&raw)
     }
 
     /// 写入一份带注释的示例配置。
@@ -585,6 +687,29 @@ token = "your_secret_token"
 user = "alice"          # stcp / xtcp 的 allow_users 比对的就是它
 log_level = "info"
 
+# ---- 线协议（对应原版 frp 的 `transport.wireProtocol`，默认就是 v1）----
+# v1：原版 frp 至今的默认协议，无魔术字、消息体是裸 JSON、登录后套 AES-128-CFB。
+#     樱花 / 各类第三方 frps 分支基本只认它 —— 这也是 rustunnel 的默认值。
+# v2：v0.70 引入的新协议，魔术字 + Hello 协商 + AES-256-GCM AEAD 帧流，
+#     需要服务端也支持（rustunnel-server 会自动识别，无需配置）。
+# 写错的表现是"连上就断"，日志里不会告诉你原因，所以拿不准就别写。
+# protocol = "frp-v1"
+# protocol = "frp-v2"
+
+# ---- 启动失败时的行为（对应原版 frp 的 loginFailExit，默认 true）----
+# true：**首次**登录失败就退出（退出码非 0）。
+#       外部启动器靠"进程退没退"判断隧道起没起来，所以默认跟随 frp 取 true；
+#       连不上时会立刻报错，而不是默默重试、让面板误显示"已启动"。
+# false：无脑一直重试。手机热点 / 隧道机房抖动等场景更耐操。
+# 注意：**成功登录过之后**，断线永远会自动重连，不受这一项影响。
+# login_fail_exit = true
+
+# ---- 附加元数据（原版 frp 叫 `[metadatas]`，会原样发给服务端）----
+# 大多数场景不需要；但 LoliaFRP / OpenFrp 这类平台靠 metas 里的 token
+# 认出隧道，从平台拿到的配置里带这一段，照抄即可。
+# [metadatas]
+# token = "平台给的隧道令牌"
+
 # ---- xtcp 真 P2P ----
 # 必须与服务端 p2p_port 一致；不填则 xtcp 只走中继。
 p2p_port = 7002
@@ -602,6 +727,17 @@ remote_port = 6000
 # type = "http"
 # local_addr = "127.0.0.1:8080"
 # custom_domains = ["home.example.com"]
+
+# ---- 带宽限流（原版 frp 叫 [proxies.transport] bandwidthLimit）----
+# 单位是字节/秒，写法 `KB`=1000、`KiB`=1024。留空或 0 表示不限。
+# bandwidth_limit = "25MB"
+# bandwidth_limit_mode = "server"   # client（默认）/ server：限流在哪一端执行
+
+# ---- 代理级元数据（原版 frp 叫 [proxies.metadatas]）----
+# 注意和顶层 [metadatas] 是两回事：顶层那份进登录消息（平台靠它认隧道），
+# 这一份随注册单条代理的 NewProxy 一起上报。大多数场景用不到。
+# [proxies.metadatas]
+# role = "web"
 
 # stcp：不占公网端口，靠密钥接入
 # [[proxies]]
@@ -706,6 +842,94 @@ pub fn default_config_path(file_name: impl AsRef<Path>) -> PathBuf {
     std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(file_name)
+}
+
+// ---------------------------------------------------------------------------
+// 带原版 frp 兼容的解析入口
+// ---------------------------------------------------------------------------
+
+/// 解析客户端配置文本，**自动识别 TOML / legacy INI**。
+///
+/// 嗅探顺序与官方 frp 一致（`pkg/config/load.go` 的 `LoadClientConfigResult`）：
+/// 先看是不是 legacy INI（能解析出 `[common]` 段），不是才按 TOML 走。
+/// 判定逻辑见 [`crate::frp_legacy::is_legacy_ini`]。
+///
+/// 之所以不能只看扩展名：各种面板 / 启动器把配置写到哪个后缀是它们自己的事
+/// （樱花就把同一份隧道同时给 `.ini` 和 `.toml` 两份），而官方 frp 也确实是
+/// 按**内容**判定的。
+pub fn parse_client(raw: &str) -> Result<ClientConfig> {
+    let cfg = if crate::frp_legacy::is_legacy_ini(raw) {
+        let value = crate::frp_legacy::legacy_client_to_value(raw)?;
+        let cfg: ClientConfig = value.try_into()?;
+        cfg
+    } else {
+        parse_client_toml(raw)?
+    };
+    reject_unimplemented_types(&cfg)?;
+    Ok(cfg)
+}
+
+/// 解析服务端配置文本，自动识别 TOML / legacy INI。规则同 [`parse_client`]。
+pub fn parse_server(raw: &str) -> Result<ServerConfig> {
+    if crate::frp_legacy::is_legacy_ini(raw) {
+        let value = crate::frp_legacy::legacy_server_to_value(raw)?;
+        return Ok(value.try_into()?);
+    }
+    parse_server_toml(raw)
+}
+
+/// rustunnel 真正实现的代理 / 访客类型。
+///
+/// 原版 frp 还认 `tcpmux` 与 `sudp`，rustunnel 没实现。**宁可在这里报错，
+/// 也不能静默当成 tcp 放过去** —— 静默降级会"看起来连上了"，实际按错的语义
+/// 转发用户流量，比启动阶段报一句清楚的话危险得多。
+///
+/// （官方 frp 对未知 `type` 同样是在解码阶段直接报错，所以这也不算额外收紧。）
+const SUPPORTED_PROXY_TYPES: &[&str] = &["tcp", "udp", "http", "https", "stcp", "xtcp"];
+const SUPPORTED_VISITOR_TYPES: &[&str] = &["stcp", "xtcp"];
+
+fn reject_unimplemented_types(cfg: &ClientConfig) -> Result<()> {
+    for p in &cfg.proxies {
+        if !SUPPORTED_PROXY_TYPES.contains(&p.proxy_type.as_str()) {
+            return Err(crate::error::Error::Protocol(format!(
+                "代理 [{}] 的类型 {:?} 不受支持（rustunnel 实现了 {}）",
+                p.name,
+                p.proxy_type,
+                SUPPORTED_PROXY_TYPES.join(" / ")
+            )));
+        }
+    }
+    for v in &cfg.visitors {
+        if !SUPPORTED_VISITOR_TYPES.contains(&v.visitor_type.as_str()) {
+            return Err(crate::error::Error::Protocol(format!(
+                "访客 [{}] 的类型 {:?} 不受支持（rustunnel 实现了 {}）",
+                v.name,
+                v.visitor_type,
+                SUPPORTED_VISITOR_TYPES.join(" / ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// 解析客户端配置文本（**仅 TOML**）。
+///
+/// 解析前先过一遍 [`crate::frp_config::normalize_client`]，所以**原版 frpc 的
+/// 配置可以直接拿来用**（`serverAddr` / `localIP` / `localPort` / `auth.token` /
+/// 顶层 `[metadatas]` ...）。rustunnel 自己的写法同时有效，两种写法混用时原生字段优先。
+///
+/// 需要"连 legacy INI 一起认"时用 [`parse_client`]（`ClientConfig::load` 走的那个）。
+pub fn parse_client_toml(raw: &str) -> Result<ClientConfig> {
+    let mut value: toml::Value = toml::from_str(raw)?;
+    crate::frp_config::normalize_client(&mut value);
+    Ok(value.try_into()?)
+}
+
+/// 解析服务端配置文本（**仅 TOML**）。同 [`parse_client_toml`]，兼容原版 `frps.toml` 的字段名。
+pub fn parse_server_toml(raw: &str) -> Result<ServerConfig> {
+    let mut value: toml::Value = toml::from_str(raw)?;
+    crate::frp_config::normalize_server(&mut value);
+    Ok(value.try_into()?)
 }
 
 #[cfg(test)]

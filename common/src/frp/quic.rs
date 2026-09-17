@@ -158,10 +158,10 @@ pub async fn connect(
     server: &SocketAddr,
     bind: Option<SocketAddr>,
 ) -> Result<(quinn::Endpoint, quinn::Connection)> {
-    connect_with_timeout(server, bind, HANDSHAKE_TIMEOUT).await
+    connect_with_retry(server, bind, HANDSHAKE_TIMEOUT, HANDSHAKE_ATTEMPTS).await
 }
 
-/// QUIC 握手超时。
+/// 单次 QUIC 握手的最长等待。
 ///
 /// 为什么必须显式设：QUIC 跑在 UDP 上，"对面根本没在听这个端口"是**静默**的 ——
 /// 数据报扔掉，没有 RST、没有 ICMP 通知应用层。服务端没配
@@ -170,9 +170,71 @@ pub async fn connect(
 ///
 /// 这是实测踩到的：Linux 冒烟里 quic 客户端启动后静坐 13 秒、零日志，
 /// 看上去像"卡死"，实际只是没人回包。所以给一个短超时 + 能直接照做的提示。
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// 4 秒是怎么定的：QUIC 的 Initial 只要一个 RTT 就能拿到回包，公网 RTT 按 200ms
+/// 算也只用掉 5% 的预算；就算首飞丢了，quinn 还会按 PTO（初始约 1s）再重传一次，
+/// 4 秒足够覆盖"首包丢 + 一次重传"。真正要防的不是"等得不够久"，
+/// 而是"等太久会让一次丢包变成几十秒不可用"——一秒钟的丢包不该陪上十秒钟的等待。
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
 
-/// 同 [`connect`]，但可指定握手超时（测试用短超时，避免真等 10 秒）。
+/// 握手失败时一共尝试几次。**每次都会换一个新的本地 UDP 端口重新来过。**
+///
+/// 为什么是"换端口重试"而不是"在同一个 socket 上多等一会儿"：
+///
+/// UDP 的首飞丢包在公网上是常态，而且**丢法往往是按流的** —— 中间设备（NAT、
+/// 防火墙、运营商的 DPI/限速设备）会先对一个新五元组做策略判定，判定窗口内这个
+/// 流的包被整批吞掉。此时同一条流上重传多少次都没用，**换一个源端口立刻就好**。
+///
+/// 这是实测踩到的：某云主机上装了第三方 DPI（nft `queue` 进 NFQUEUE，再由用户态
+/// 程序判定），它对**所有网卡、连回环 `lo` 一起**生效，并偶发地吞掉新建 UDP 流的
+/// 头几个包。当时用 strace 抓客户端系统调用，`sendto()` 全部返回 1200（成功交给
+/// 内核），而 tcpdump 在设备层一个包都抓不到 —— 包在内核 netfilter 里就没了。
+/// 表现就是冒烟里 QUIC 正向用例 1/8 ~ 1/4 概率失败。
+///
+/// 3 次 × 4 秒 + 2 次间隔 ≈ 12.5 秒封顶：比原来"单次等 10 秒"放弃得还早一点，
+/// 但成功概率高得多（3 条互相独立的流 vs 1 条）。
+const HANDSHAKE_ATTEMPTS: u32 = 3;
+
+/// 换端口重试前的间隔。
+///
+/// 给中间设备一点时间更新策略/表项，也避免三次都撞在同一个判定窗口里。
+const HANDSHAKE_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// 带重试的 `connect_with_timeout`：逐次换新的本地端口，直到成功或用完次数。
+///
+/// `bind` 为 `None` 时每次都由内核分配一个新端口，这正是能从"按流丢包"里
+/// 恢复过来的原因；显式指定了 `bind` 的调用方（测试）会复用同一个端口，
+/// 此时重试退化成了"多试几次"，仍然不会更差。
+async fn connect_with_retry(
+    server: &SocketAddr,
+    bind: Option<SocketAddr>,
+    attempt_timeout: Duration,
+    attempts: u32,
+) -> Result<(quinn::Endpoint, quinn::Connection)> {
+    let attempts = attempts.max(1);
+    let mut last: Option<anyhow::Error> = None;
+    for attempt in 1..=attempts {
+        match connect_with_timeout(server, bind, attempt_timeout).await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if attempt < attempts {
+                    tracing::warn!(
+                        "QUIC 握手第 {attempt}/{attempts} 次未成功（{e:#}），换个本地端口重试"
+                    );
+                    tokio::time::sleep(HANDSHAKE_RETRY_DELAY).await;
+                }
+                last = Some(e);
+            }
+        }
+    }
+    let e = last.expect("attempts 至少为 1，循环必然执行过");
+    Err(e.context(format!("连续 {attempts} 次 QUIC 握手都没成功")))
+}
+
+/// 同 [`connect`]，但可指定**单次**握手超时（测试用短超时，避免真等 4 秒）。
+///
+/// 注意这里没有重试：调用方要的就是"一次尝试"的语义（比如冒烟里验证配错时
+/// 要快速失败）。需要重试请用 [`connect`]。
 pub async fn connect_with_timeout(
     server: &SocketAddr,
     bind: Option<SocketAddr>,
@@ -348,6 +410,39 @@ mod tests {
             start.elapsed() < Duration::from_secs(5),
             "应在超时内返回，实际耗时 {:?}",
             start.elapsed()
+        );
+    }
+
+    /// 握手失败必须**换个本地端口重试**若干次，而不是一次就放弃。
+    ///
+    /// 回归的是云端实测：宿主上的第三方 DPI 会偶发吞掉新建 UDP 流的头几个包，
+    /// 而且吞法是**按流**的 —— 同一条流上重传多少遍都没用，换一个源端口立刻通。
+    /// 所以 `connect` 的语义是"换端口多试几次"，这里断言它真的试满了次数：
+    /// 错误里必须写明试了几次（那正是循环跑满的证据）。
+    #[tokio::test]
+    async fn connect_retries_before_giving_up() {
+        let dead = {
+            let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            s.local_addr().unwrap()
+        };
+        let start = std::time::Instant::now();
+        let err = connect_with_retry(&dead, None, Duration::from_millis(200), 3)
+            .await
+            .expect_err("没人监听时必须报错");
+        let elapsed = start.elapsed();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("连续 3 次"),
+            "错误信息应交代清楚重试了几次，实际：{msg}"
+        );
+        assert!(msg.contains("QUIC"), "错误信息应能定位到 QUIC，实际：{msg}");
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "至少要跑完一次超时才谈得上重试，实际只用了 {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "重试也必须封顶，不能无限拖，实际耗时 {elapsed:?}"
         );
     }
 }

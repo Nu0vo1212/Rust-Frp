@@ -5,6 +5,7 @@
 
 use std::{
     collections::{hash_map::Entry, HashMap},
+    sync::atomic::{AtomicUsize, Ordering},
     sync::{Arc, Mutex},
 };
 
@@ -54,6 +55,11 @@ pub struct ClientInfo {
     pub backlog: usize,
     /// 池里空闲的工作连接数。
     pub idle_work_conns: usize,
+    /// 这个客户端能不能接受面板的管理命令（增删代理）。
+    ///
+    /// 官方 frpc 不会协商这个能力，所以永远是 false —— 面板据此把按钮
+    /// 置灰并给出解释，而不是让用户点了才发现没反应。
+    pub managed: bool,
 }
 
 pub struct Registry {
@@ -137,6 +143,11 @@ impl Registry {
     }
 
     pub fn get(&self, run_id: &str) -> Option<Arc<ClientState>> {
+        self.clients.lock().unwrap().get(run_id).cloned()
+    }
+
+    /// 按 `run_id` 取一个在线客户端（面板管理操作用）。
+    pub fn client(&self, run_id: &str) -> Option<Arc<ClientState>> {
         self.clients.lock().unwrap().get(run_id).cloned()
     }
 
@@ -268,13 +279,41 @@ impl Registry {
         }
     }
 
-    /// 轮询选一个后端。
+    /// 选一个后端：**在途连接最少**的那个（group 负载均衡）。
     ///
-    /// group 只有一个成员时这就是"取它自己"，多成员时按顺序分摊，
-    /// 不挑负载最轻的 —— 轮询足够公平，而且不需要后端上报任何指标。
+    /// 只有一个成员时就是"取它自己"。多成员时挑选会向空闲的后端倾斜 ——
+    /// 各后端处理能力不一样时，纯轮询会把慢的那个压死。
+    ///
+    /// 返回的 [`Backend`] 里带着一份 [`LoadGuard`]：`pick` 的调用方必须把它
+    /// 存进 `PendingUser::load`，本次转发结束时才会自动减回去。
     pub fn pick(&self, port: u16) -> Option<Backend> {
         let g = self.ports.lock().unwrap();
         g.get(&port)?.pick()
+    }
+
+    /// 取一个后端并**立刻记一条在途连接**。
+    ///
+    /// 与 [`Registry::pick`] 的差别就是这一步记账：监听器拿到后端之后
+    /// 总归要建 PendingUser，不如在这里一次做完，免得漏。
+    pub fn pick_and_hold(&self, port: u16) -> Option<(Backend, LoadGuard)> {
+        let b = self.pick(port)?;
+        let g = b.hold();
+        Some((b, g))
+    }
+
+    /// 某个端口背后各后端的在途连接数（面板展示 + 调度自测用）。
+    pub fn backend_loads(&self, port: u16) -> Vec<(String, usize)> {
+        self.ports
+            .lock()
+            .unwrap()
+            .get(&port)
+            .map(|pg| {
+                pg.members
+                    .iter()
+                    .map(|b| (b.proxy_name.clone(), b.inflight()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// 某个端口背后有几个后端（面板展示用）。
@@ -300,8 +339,25 @@ impl Registry {
                 proxies: c.proxy_names(),
                 backlog: c.backlog(),
                 idle_work_conns: c.idle_work_conns(),
+                managed: c.caps().server_cmd,
             })
             .collect()
+    }
+
+    /// 按客户端 `run_id` 直接取出组里某个后端（**仅测试用**）。
+    ///
+    /// 生产路径永远走 [`Registry::pick`]；测试要"人为把某个后端的在途数压高"，
+    /// 而 `pick` 只会挑最闲的那个，拿不到指定的成员，只能开这个口子。
+    #[cfg(test)]
+    pub(crate) fn backend_of(&self, port: u16, run_id: &str) -> Option<Backend> {
+        self.ports
+            .lock()
+            .unwrap()
+            .get(&port)?
+            .members
+            .iter()
+            .find(|b| b.client.run_id == run_id)
+            .cloned()
     }
 
     /// 当前占用的公网端口列表（dashboard 展示用）。
@@ -321,6 +377,49 @@ impl Registry {
 pub struct Backend {
     pub client: Arc<ClientState>,
     pub proxy_name: String,
+    /// 这个后端当前扛着几条**在途**连接。
+    ///
+    /// "在途"指的是从 `pick` 选中它、到这条转发彻底结束（或被拒）为止 ——
+    /// 排队等工作连接的时间也算，因为那同样占着这个后端的能力。
+    load: Arc<Load>,
+}
+
+impl Backend {
+    /// 当前在途连接数（面板 / 测试用）。
+    pub fn inflight(&self) -> usize {
+        self.load.inflight.load(Ordering::Relaxed)
+    }
+
+    /// 拿一份计数令牌：只要它还活着，本次转发就记在这个后端头上。
+    pub fn hold(&self) -> LoadGuard {
+        self.load.inflight.fetch_add(1, Ordering::Relaxed);
+        LoadGuard(self.load.clone())
+    }
+}
+
+/// 后端的在途连接计数。组内每个成员各有一份。
+#[derive(Default)]
+struct Load {
+    inflight: AtomicUsize,
+}
+
+/// 在途计数的归还令牌。
+///
+/// 靠 `Drop` 归还而不是让调用方手动减 —— 转发路径上有好几个提前 return /
+/// 被拒 / panic 的出口，手动减迟早漏一处，一漏这个后端的计数就永久偏高，
+/// 调度器从此再也不把流量分给它。
+pub struct LoadGuard(Arc<Load>);
+
+impl Drop for LoadGuard {
+    fn drop(&mut self) {
+        // 减到 0 就停： saturating 防止异常路径上多减一次把计数打到 usize::MAX
+        self.0
+            .inflight
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            })
+            .ok();
+    }
 }
 
 /// 端口申领的结果。
@@ -359,6 +458,7 @@ impl PortGroup {
             members: vec![Backend {
                 client,
                 proxy_name: proxy_name.to_string(),
+                load: Arc::new(Load::default()),
             }],
             cursor: std::sync::atomic::AtomicUsize::new(0),
             handle: None,
@@ -371,6 +471,7 @@ impl PortGroup {
         self.members.push(Backend {
             client,
             proxy_name: proxy_name.to_string(),
+            load: Arc::new(Load::default()),
         });
     }
 
@@ -387,15 +488,41 @@ impl PortGroup {
         self.members.len()
     }
 
+    /// 挑一个后端：**在途连接最少的那个**，一样多时再轮着来。
+    ///
+    /// 纯轮询（`cursor` 取模）在各后端处理能力不一样时会把慢的那个压死：
+    /// 慢后端处理一条要 10 秒、快的只要 10 毫秒，但两者分到的请求数一样多，
+    /// 于是慢后端前面永远堆着一截队列。改成看在途数之后，
+    /// 快的那个自然会分到更多 —— 它手上的连接消得快，计数就一直低。
+    ///
+    /// ## 为什么从 cursor 开始扫
+    ///
+    /// 计数相同时必须有个稳定的打破平局的规则，否则每次都挑中同一个成员
+    /// （其余成员永远 0 流量）。从 cursor 往后扫，等价于"平局时轮询"，
+    /// 既公平又不需要额外状态。
     fn pick(&self) -> Option<Backend> {
-        if self.members.is_empty() {
+        let n = self.members.len();
+        if n == 0 {
             return None;
         }
-        let i = self
-            .cursor
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            % self.members.len();
-        self.members.get(i).cloned()
+        let mut best = 0usize;
+        let mut best_load = self.members[0].inflight();
+        // 起点每次挪一格：平局时轮流坐庄
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
+        for k in 1..n {
+            let i = (start + k) % n;
+            let l = self.members[i].inflight();
+            if l < best_load {
+                best = i;
+                best_load = l;
+            }
+        }
+        // start 那个位置也要参与比较（上面的循环从 start+1 开始扫的）
+        let start_load = self.members[start].inflight();
+        if start_load <= best_load {
+            best = start;
+        }
+        self.members.get(best).cloned()
     }
 
     /// 端口彻底空掉时收掉监听器。
@@ -444,6 +571,7 @@ mod tests {
             String::new(),
             tx,
             Duration::from_secs(60),
+            Default::default(),
             false,
             rustunnel_common::frp::WireVersion::V1,
             conn,
@@ -612,7 +740,11 @@ mod tests {
         assert!(r2.reserve_port(7000, "web", "b", client("b")).is_err());
     }
 
-    /// 轮询是负载均衡的核心：连续取 N 次必须把 N 个后端都轮到一遍。
+    /// 空闲时轮询：连续取 N 次必须把 N 个后端都轮到一遍。
+    ///
+    /// 注意这里**不能**持有 `pick` 出来的在途计数（用 `pick` 而不是
+    /// `pick_and_hold`），否则第二次取的时候三个后端计数各不相同，
+    /// 调度器会一直挑那个最闲的 —— 那是下面那条测试要验的行为。
     #[test]
     fn pick_round_robins_over_group_members() {
         let r = Registry::unlimited();
@@ -639,6 +771,72 @@ mod tests {
             "第二轮同样要覆盖全部后端：{second:?}"
         );
         assert!(r.pick(9999).is_none(), "没占过的端口不该有后端");
+    }
+
+    /// 负载不均时必须往空闲的后端倾斜 —— 这是最小连接数调度的全部意义。
+    ///
+    /// 场景：a 手上还压着 5 条没结束的转发，b 一条都没有。
+    /// 纯轮询会把第 6 条照样分给 a（各 50%），最小连接数则应当全给 b。
+    #[test]
+    fn pick_prefers_the_least_loaded_backend() {
+        let r = Registry::unlimited();
+        for n in ["a", "b"] {
+            assert!(r.reserve_port(6100, "web", n, client(n)).is_ok());
+        }
+        // 直接给 a 挂 5 条在途连接（令牌**留着**不 drop，计数才一直在）
+        let a = r.backend_of(6100, "a").expect("组里应当有 a");
+        let held: Vec<_> = (0..5).map(|_| a.hold()).collect();
+        assert_eq!(a.inflight(), 5, "a 的在途数必须是 5");
+
+        // 之后的每一次挑选都应当落在 b 上
+        for _ in 0..6 {
+            let b = r.pick(6100).expect("应有后端");
+            assert_eq!(b.client.run_id, "b", "a 压着 5 条，新流量必须全给 b");
+            drop(b.hold()); // 立刻还回去，b 的计数始终是 0
+        }
+        drop(held);
+        assert_eq!(
+            r.backend_loads(6100).iter().map(|(_, v)| *v).sum::<usize>(),
+            0,
+            "令牌全部 drop 之后计数必须归零，否则调度器会永久歧视这个后端"
+        );
+    }
+
+    /// 令牌必须**自动**归还：`pick_and_hold` 出来的计数不能泄漏。
+    ///
+    /// 这是最容易写错的地方 —— 转发路径上有好几个提前 return / 被拒的出口，
+    /// 手动减迟早漏一处。靠 Drop 归还就是为了根治这件事。
+    #[test]
+    fn load_guard_returns_the_count_on_drop() {
+        let r = Registry::unlimited();
+        assert!(r.reserve_port(6200, "web", "a", client("a")).is_ok());
+        let (b, g) = r.pick_and_hold(6200).expect("应有后端");
+        assert_eq!(b.inflight(), 1, "hold 之后立刻是 1");
+        drop(g);
+        assert_eq!(r.backend_loads(6200)[0].1, 0, "drop 之后必须归零");
+
+        // 多减一次不该把计数打到 usize::MAX（异常路径上可能发生）
+        let (b2, g2) = r.pick_and_hold(6200).expect("应有后端");
+        drop(g2);
+        drop(b2);
+        assert_eq!(r.backend_loads(6200)[0].1, 0);
+    }
+
+    /// 平局时不能永远挑同一个 —— 要给每个成员机会。
+    #[test]
+    fn ties_are_broken_round_robin() {
+        let r = Registry::unlimited();
+        for n in ["a", "b", "c"] {
+            assert!(r.reserve_port(6300, "web", n, client(n)).is_ok());
+        }
+        // 每次取完立刻还回去，三个后端的计数始终都是 0（永远平局）
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..6 {
+            let (b, g) = r.pick_and_hold(6300).expect("应有后端");
+            seen.insert(b.client.run_id.clone());
+            drop(g);
+        }
+        assert_eq!(seen.len(), 3, "一直平局时必须轮流坐庄，实际只轮到 {seen:?}");
     }
 
     /// **回归**：每个后端要带上**自己**的代理名。

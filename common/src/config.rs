@@ -618,6 +618,42 @@ pub struct ClientConfig {
     #[serde(default = "default_true")]
     pub p2p_enable: bool,
 
+    /// xtcp 直连建好之后跑哪种传输：`quic`（默认）或 `kcp`。
+    ///
+    /// KCP 的重传更激进（不等 RTO、可跳包重传），在高丢包 / 高延迟链路
+    /// （移动网络、跨国）上往往能压出更低延迟；代价是不自带加密 ——
+    /// P2P 通道本来就要过一遍应用层口令鉴权，所以这里差别不大。
+    ///
+    /// 两端不必配置一致：**visitor 的选择会通过牵线服务端同步给 provider**。
+    #[serde(default = "default_xtcp_transport")]
+    pub xtcp_transport: String,
+
+    /// 对称 NAT 下是否启用端口预测（默认开）。
+    ///
+    /// 对称 NAT 给"每换一个目的地"分配一个新公网端口，于是服务端看到的端口
+    /// 根本不是 peer 之间通信用的端口 —— 官方 frp 到这里就只能回退中继。
+    /// 现实里这一类 NAT 大多是**顺序分配**端口的，于是可以先采样几个端口、
+    /// 推出步长、预测下一个，再把候选端口全部打一遍。
+    ///
+    /// 关掉它就退回官方行为（只打牵线下发的那一个地址）。
+    #[serde(default = "default_true")]
+    pub xtcp_port_predict: bool,
+
+    /// 端口预测的候选窗口（往预测值之后推几个）。
+    #[serde(default = "default_predict_window")]
+    pub xtcp_predict_window: u16,
+
+    /// 是否在 `Login` 里声明 rustunnel 私有能力（默认开）。
+    ///
+    /// 开了之后，服务端才能在面板上增删本端的代理、以及让 v1 下的 UDP 报文
+    /// 走二进制编码。能力**必须经服务端回显**才生效，所以连官方 frps /
+    /// 第三方 frps 时对方不会回显，行为与不开完全一致。
+    ///
+    /// 唯一需要关掉它的场景：遇到一个会**严格校验** `Login` 字段的非 Go 实现
+    /// （Go 的 `encoding/json` 会忽略未知字段，绝大多数服务端都是 Go 写的）。
+    #[serde(default = "default_true")]
+    pub private_caps: bool,
+
     /// 需要暴露的代理列表。
     #[serde(default)]
     pub proxies: Vec<ProxyConfig>,
@@ -651,6 +687,10 @@ impl Default for ClientConfig {
             transport_protocol: default_transport_protocol(),
             p2p_port: None,
             p2p_enable: true,
+            xtcp_transport: default_xtcp_transport(),
+            xtcp_port_predict: true,
+            xtcp_predict_window: default_predict_window(),
+            private_caps: true,
             proxies: Vec::new(),
             visitors: Vec::new(),
         }
@@ -770,8 +810,17 @@ remote_port = 6000
 // serde 默认值
 // ---------------------------------------------------------------------------
 
-/// 传输协议默认用 TCP：它不需要额外放行 UDP，兼容性最好。
-pub fn default_transport_protocol() -> String {
+/// xtcp 默认传输：QUIC 自带加密与拥塞控制，是通用场景下的稳妥选择。
+fn default_xtcp_transport() -> String {
+    "quic".to_string()
+}
+
+/// 端口预测的默认窗口（往预测值之后推几个端口）。
+fn default_predict_window() -> u16 {
+    crate::p2p::PREDICT_WINDOW
+}
+
+fn default_transport_protocol() -> String {
     "tcp".to_string()
 }
 

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["common", "server", "client"]
 
 [workspace.package]
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 rust-version = "1.75"
 authors = ["rustunnel contributors"]
@@ -18,7 +18,7 @@ homepage = "https://github.com/your-name/rustunnel"
 
 [workspace.dependencies]
 # 内部 crate
-rustunnel-common = { path = "common", version = "0.3.2" }
+rustunnel-common = { path = "common", version = "0.3.3" }
 
 # 外部依赖（统一在此处锁定版本，保证各 crate 一致）
 # frp v2 控制通道加密，对应官方 go 实现的 HKDF-SHA256 + AES-256-GCM

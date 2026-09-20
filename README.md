@@ -17,24 +17,27 @@
 - ✅ **HTTP 反向代理** — 按域名路由，支持 `locations` 前缀、Basic Auth、Host 改写、自定义请求/响应头
 - ✅ **HTTPS SNI 透传** — 只嗅探 ClientHello 里的 SNI 做路由，不终止 TLS，证书仍由内网服务提供
 - ✅ **stcp 私密隧道** — 服务端不开放公网端口，需 `secret_key` 校验 + 提供者端 `allow_users` 白名单，与官方 frp 互通
-- ✅ **xtcp 真 P2P** — UDP 打洞 + QUIC 直连，数据不经服务端；打不通自动回退中继，不会比 stcp 更差
+- ✅ **xtcp 真 P2P** — UDP 打洞 + QUIC / KCP 直连，数据不经服务端；打不通自动回退中继，不会比 stcp 更差
+- ✅ **对称 NAT 端口预测** — 靠多次观测推端口步长，锥型之外的对称 NAT 也有机会打洞成功
+- ✅ **KCP 弱网通道** — `xtcp_transport = "kcp"`，丢包环境下靠重传换来更低延迟
 - ✅ **QUIC 传输** — `transport_protocol = "quic"`，1-RTT 握手、流级多路复用、丢包不阻塞其它流
 - ✅ **yamux 多路复用** — 对应 frp `transport.tcpMux`，控制连接与工作连接复用一条 TCP
 - ✅ **TLS 加密** — 对应 frp `transport.tls`，含 frp 自定义首字节 `0x17` 伪装，服务端自动生成自签名证书
 
 ### 运维与调度
 
-- ✅ **group 负载均衡** — 同 `group` 的多个代理共享一个 `remote_port`，服务端按轮询分摊
+- ✅ **group 负载均衡** — 同 `group` 的多个代理共享一个 `remote_port`，服务端按**最小连接数**分摊
 - ✅ **健康检查** — `tcp` / `http` 探测，连续失败自动摘除后端，恢复后自动回归
 - ✅ **客户端插件** — `http_proxy` / `socks5` / `static_file` / `unix_domain_socket`，frpc 本身即正向代理或静态站点
 - ✅ **带宽限流** — 每个代理可配 `bandwidth_limit`（如 `1MB`），令牌桶精确限速
 - ✅ **资源上限** — 客户端数 / 代理数 / 转发连接数 / 待处理队列，五个维度全部可限并计入指标
 - ✅ **可观测性** — 内置 Web 面板 + Prometheus `/metrics` + 健康检查端点，支持 Basic Auth
+- ✅ **面板可写** — 在面板上直接增删代理、踢掉客户端，无需改配置重启（`/api/proxies/add` 等）
 - ✅ **配置热重载** — 改 `log_level` / 面板密码无需重启，静态项变更会明确提示需重启
 
 ### 工程质量
 
-- ✅ **239 个自动化测试** — 含真实 QUIC 栈握手、口令正反用例、端到端集成测试、**与官方 frpc/frps 真实抓包密文的解密回归**
+- ✅ **282 个自动化测试** — 含真实 QUIC 栈握手、口令正反用例、端到端集成测试、**与官方 frpc/frps 真实抓包密文的解密回归**
 - ✅ **CI 流水线** — `fmt` / `clippy` / 测试 / 四目标构建 / 冒烟，PR 必过
 - ✅ **发布可验真** — `SHA256SUMS` + 可选 Ed25519 分离签名与本地验签脚本
 - ✅ **容器就绪** — 多阶段 `Dockerfile`（musl 静态）+ `docker-compose.yml`
@@ -179,8 +182,8 @@ rustunnel 可运行在官方 frp 的任一侧：
 | 官方 frps | rustunnel frpc（stcp `allow_users=["alice"]`，`user=alice` 放行） | ✅ 实测通过 |
 | rustunnel frps | rustunnel frpc（含 TLS、关 yamux 组合、stcp / xtcp、`allow_users` 空/名单/`*` 三种语义） | ✅ 实测通过 |
 | 第三方 frp 平台（LoliaFRP） | rustunnel frpc（用平台下发的**原版配置**直接启动） | ✅ 实测通过（v0.3.1） |
-| 官方 frps v0.71.0 | rustunnel frpc（**v1，零配置**） | ✅ 实测通过（v0.3.2） |
-| rustunnel frps | 官方 frpc v0.71.0（**v1，零配置**） | ✅ 实测通过（v0.3.2） |
+| 官方 frps v0.71.0 | rustunnel frpc（**v1，零配置**） | ✅ 实测通过（v0.3.3） |
+| rustunnel frps | 官方 frpc v0.71.0（**v1，零配置**） | ✅ 实测通过（v0.3.3） |
 
 ### 线协议：默认 v1，和官方一致（v0.3.2 起）
 
@@ -392,7 +395,7 @@ transport_protocol = "quic"
 ### group：多后端共享一个端口
 
 同名 `group` 的多个代理可以**注册同一个 `remote_port`**，服务端为这个端口维护一组后端，
-每条新连接按**轮询**选一个：
+每条新连接按**最小连接数**选一个（各后端在途连接数相等时退化为轮流）：
 
 ```toml
 # 机器 A
@@ -419,7 +422,8 @@ group = "web"
 - **没配 `group` 的代理视为独占端口**，别人不能共享它，它也不能加入别人的组；
 - 组内最后一个后端掉线时端口才真正释放；客户端断线时它占的端口会被一次性收回。
 
-选择轮询而不是"挑负载最轻的"是有意的：轮询足够公平，且不需要后端上报任何指标。
+调度按**在途连接数**（不是 CPU / 内存这类需要后端上报的指标），所以既有"慢后端自动少接活"的
+弹性，又不给客户端增加任何上报负担；空闲时它等同于轮询，行为可预期。
 
 ### 健康检查
 
@@ -497,6 +501,21 @@ dashboard_pwd = "change_me"
 | `GET /metrics` | Prometheus exposition format，可直接被 Prometheus / VictoriaMetrics 抓取 |
 | `GET /api/status` | 与面板同源的 JSON 快照 |
 | `GET /api/healthz` | 存活探针，返回 `ok`（不带鉴权，供 k8s / 负载均衡器使用） |
+| `POST /api/proxies/add` | 给指定客户端动态加一条代理（JSON：`run_id` + `proxy`），成功即端口已就绪 |
+| `POST /api/proxies/remove` | 移除客户端上的一条代理（`run_id` + `name`），端口随即收回 |
+| `POST /api/clients/kick` | 断开指定客户端（`run_id`） |
+
+写接口一律需要 Basic Auth（未鉴权返回 401），执行顺序是先问客户端、后动服务端状态：
+新增时客户端拒绝就回滚，不会留下"面板显示成功但没人干活"的端口。
+
+```bash
+curl -u admin:pwd -H 'Content-Type: application/json' \
+  -d '{"run_id":"<面板里的 run_id>","proxy":{"name":"web","type":"tcp","local_addr":"127.0.0.1:8080","remote_port":6100}}' \
+  http://127.0.0.1:7500/api/proxies/add
+```
+
+> 动态管理走 rustunnel 两端之间的私有消息，**客户端先是 rustunnel frpc 才支持**
+> （官方 frpc 连上来时面板会把它标为不可管理的，对应接口返回明确错误）。
 
 指标（前缀 `rustunnel_`）：
 
@@ -714,24 +733,32 @@ max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
 > `"frp"` 而不是 golib master 里的 `"crypto"`**（frp 0.71.0 锁的是 golib v0.8.2）——
 > 照着 master 写会得到一个"自加密自解密全对、一接官方 frps 就连上即断"的实现。
 > 已用官方 frps / frpc v0.71.0 双向实测，并把**官方抓包的真实密文**做成回归用例锁死。
+>
+> v0.3.3 把上一版列在「已知限制」里的四条短板一次性补掉：**xtcp 对称 NAT 端口预测**
+> （按观测端口的步长推候选，不再一击不中就回退中继）、**KCP 弱设备通道**
+> （`xtcp_transport = "kcp"`，自研 ikcp，30% 丢包下 20KB 仍可靠送达）、
+> **面板可写**（动态增删代理 / 踢客户端，私有消息 + 能力协商，对官方 frpc 零影响）、
+> **group 改最小连接数调度**（平局退化为轮询）。顺带修掉两个真 bug：
+> QUIC `Endpoint` 被提前 drop 导致 P2P 刚握完手就 `closed by peer: 0`、
+> 面板不读请求体导致跨 TCP 段的 POST 被截断。
 
 ## 质量保障
 
 ```bash
 cargo fmt --all -- --check          # 格式
 cargo clippy --workspace --all-targets   # 静态检查（当前 0 告警）
-cargo test --workspace              # 239 个测试
+cargo test --workspace              # 282 个测试
 ```
 
 测试分布：
 
 | 目标 | 数量 | 覆盖重点 |
 |---|---|---|
-| `common` 单元测试 | 93 | **v1 线协议**（消息类型字节、帧编解码、AES-128-CFB 密钥派生与流式状态机、**官方抓包密文解密回归**）、v2 线协议编解码、加密、配置解析、**原版 frp 配置兼容层**、打洞报文/口令、令牌桶、示例配置可加载 |
-| `server` 单元测试（lib） | 94 | 虚拟主机路由表与优先级、chunked 解析、Basic Auth、连接池配对与回收、端口组轮询、资源配额、指标编码、面板鉴权、热重载字段判定、打洞会话 |
+| `common` 单元测试 | 119 | **v1 线协议**（消息类型字节、帧编解码、AES-128-CFB 密钥派生与流式状态机、**官方抓包密文解密回归**）、v2 线协议编解码、加密、配置解析、**原版 frp 配置兼容层**、打洞报文/口令/端口预测、**KCP（含 30% 丢包下的可靠传输）**、令牌桶、示例配置可加载 |
+| `server` 单元测试（lib） | 100 | 虚拟主机路由表与优先级、chunked 解析、Basic Auth、连接池配对与回收、**端口组最小连接数调度**、资源配额、指标编码、面板鉴权与**写接口**、热重载字段判定、打洞会话 |
 | `server` 单元测试（bin） | 5 | 命令行与配置装载 |
-| `client` 单元测试 | 35 | QUIC 建连与口令握手、插件（http_proxy / socks5 / static_file）、健康检查状态机、打洞编排、`NewProxy` 字段映射（含与官方 frpc 抓包逐字节对拍）、服务端下发名 → 本地代理的翻译（`resolve_uploaded_proxy`） |
-| `server` 端到端集成测试 | 12 | 真握手 + 真转发的 TCP / HTTP / stcp / QUIC 链路、**v1 与 v2 双协议握手**、group 轮询、面板鉴权边界 |
+| `client` 单元测试 | 46 | QUIC 建连与口令握手、插件（http_proxy / socks5 / static_file）、健康检查状态机、打洞编排、`NewProxy` 字段映射（含与官方 frpc 抓包逐字节对拍）、服务端下发名 → 本地代理的翻译（`resolve_uploaded_proxy`）、**动态代理表** |
+| `server` 端到端集成测试 | 12 | 真握手 + 真转发的 TCP / HTTP / stcp / QUIC 链路、**v1 与 v2 双协议握手**、group 负载均衡、面板鉴权边界 |
 
 CI（`.github/workflows/ci.yml`）在每次 push / PR 上跑：`fmt` → `clippy` → 测试 →
 四个目标（windows-msvc / linux-musl / linux-gnu / linux-arm64）构建 → 端到端冒烟。
@@ -799,14 +826,14 @@ cargo build --release --target aarch64-unknown-linux-gnu
 
 ## 当前限制
 
-- `xtcp` 已实现 UDP 打洞 + QUIC 直连，但**对称 NAT 下仍会回退中继**（没有端口预测），
-  官方 frp 同样如此；`p2p_port` 需要放行 UDP，否则只能走中继；
+- `xtcp` 已实现 UDP 打洞 + QUIC / KCP 直连，并对**对称 NAT 做端口预测**，但仍有一类
+  严格对称 NAT（每次分配完全随机、无步长可推）打不通，此时照旧回退中继；
+  `p2p_port` 需要放行 UDP，否则只能走中继；
 - **QUIC 传输仅限 rustunnel 两端之间** —— 官方 frp 的 `transport.protocol` 语义不同，互通时用 `tcp`；
-- 打洞目前只试 QUIC 一种传输，没有 KCP 备选（KCP 在弱网下的抗丢包收益尚未纳入）；
+- 面板的动态管理（增删代理 / 踢人）需要**对端也是 rustunnel frpc**：官方 frpc 不支持这套
+  私有消息，面板会把它标为不可管理，其余功能不受影响；
 - v1 线协议已完整实现并且是**默认**（与官方一致）；官方 v2 专有的 **UDP 二进制报文编码**
-  （`V2BinaryUDPPacketReadWriter`）只在 v2 下启用，v1 的 UDP 代理走 JSON 编码 —— 功能等价，仅包体略大；
-- 面板是**只读**的：展示状态与指标，不支持在界面上增删代理或踢人；
-- `group` 使用**轮询**而非最小连接数调度，各后端负载能力不均衡时不会自动倾斜。
+  （`V2BinaryUDPPacketReadWriter`）在 rustunnel 两端之间 v1/v2 都启用，与官方互通时走 JSON —— 功能等价，仅包体略大。
 
 ## License
 

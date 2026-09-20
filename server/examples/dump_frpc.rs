@@ -50,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
                 conn,
                 login,
                 udp_binary,
+                caps: _caps,
             }) => {
                 println!("[Login] {login:?}");
                 println!("[Login] udp_binary={udp_binary}（ClientHello 协商出的报文编码）");

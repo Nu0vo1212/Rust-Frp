@@ -42,6 +42,21 @@ async fn start_server(cfg: ServerConfig) -> u16 {
     start_server_with_registry(cfg).await.0
 }
 
+/// 在**指定端口**上起服务端（QUIC 用：端口号得提前挑好，保证 UDP 也能 bind）。
+async fn start_server_on(cfg: ServerConfig, port: u16) -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .await
+        .expect("bind 指定端口");
+    let registry = Arc::new(Registry::unlimited());
+    tokio::spawn(async move {
+        if let Err(e) = serve_on(listener, Arc::new(cfg), registry).await {
+            eprintln!("服务端退出：{e:#}");
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    port
+}
+
 /// 与 [`start_server`] 相同，但把 `Registry` 也交出来。
 ///
 /// 有些行为（比如"这个端口背后挂了几个后端"）只能从注册表里读，
@@ -79,6 +94,23 @@ fn free_port() -> u16 {
         .local_addr()
         .expect("local_addr")
         .port()
+}
+
+/// 挑一个**TCP 和 UDP 都 bind 得上**的端口（QUIC 服务端用）。
+///
+/// 两个协议空间是独立的：TCP:0 拿到的端口号，UDP 未必能 bind。
+/// Windows 上尤其如此 —— Hyper-V 会预留一段 UDP 端口
+/// （`netsh interface ipv4 show excludedportrange protocol=udp` 能看到），
+/// 落在这段里的号 bind UDP 会直接 `os error 10013`。
+/// 早先这里只按 TCP 挑号，测试在本机上就随机红。
+fn free_port_both() -> u16 {
+    for _ in 0..64 {
+        let p = free_port();
+        if std::net::UdpSocket::bind(("127.0.0.1", p)).is_ok() {
+            return p;
+        }
+    }
+    panic!("试了 64 次都没拿到 TCP/UDP 都能 bind 的端口")
 }
 
 /// 带标签的回显服务：回 `{tag}:` + 收到的内容。
@@ -149,7 +181,7 @@ async fn login_with(port: u16, token: &str, user: &str, wire: WireVersion) -> (F
     let stream = TcpStream::connect(("127.0.0.1", port))
         .await
         .expect("连接服务端");
-    let (conn, run_id, _udp_binary) = conn::client_handshake(
+    let (conn, run_id, _udp_binary, _caps) = conn::client_handshake(
         Box::pin(stream),
         wire,
         token,
@@ -157,6 +189,7 @@ async fn login_with(port: u16, token: &str, user: &str, wire: WireVersion) -> (F
         user,
         &empty_metas(),
         0,
+        Default::default(),
     )
     .await
     .expect("frp 握手");
@@ -313,7 +346,7 @@ async fn login_quic(
         .expect("QUIC 连接");
     let (send, recv) = conn.open_bi().await.expect("开控制流");
     let stream = Box::pin(rustunnel_common::frp::quic::QuicStream::new(send, recv));
-    let (frp, run_id, _) = conn::client_handshake(
+    let (frp, run_id, _, _caps) = conn::client_handshake(
         stream,
         WireVersion::V2,
         token,
@@ -321,6 +354,7 @@ async fn login_quic(
         user,
         &empty_metas(),
         0,
+        Default::default(),
     )
     .await
     .expect("frp 握手（QUIC）");
@@ -405,6 +439,7 @@ async fn wrong_token_is_rejected_at_handshake() {
         "",
         &empty_metas(),
         0,
+        Default::default(),
     )
     .await;
     assert!(r.is_err(), "token 不对时必须握手失败，否则等于没有鉴权");
@@ -636,7 +671,8 @@ async fn tcp_proxy_roundtrip_over_quic_transport() {
         transport_protocol: "quic".to_string(),
         ..Default::default()
     };
-    let port = start_server(cfg).await;
+    // QUIC 是 UDP：端口号必须先确认 UDP 也能 bind（见 `free_port_both`）
+    let port = start_server_on(cfg, free_port_both()).await;
     let local = echo_service().await;
 
     let (_endpoint, qconn, mut ctrl, run_id) = login_quic(port, TOKEN, "alice").await;

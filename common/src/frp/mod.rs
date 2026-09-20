@@ -74,6 +74,7 @@
 
 pub mod conn;
 pub mod crypto;
+pub mod kcp;
 pub mod msg;
 pub mod mux;
 pub mod quic;

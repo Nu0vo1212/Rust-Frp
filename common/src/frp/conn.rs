@@ -74,6 +74,8 @@ pub struct FrpConn {
     crypto: ControlCrypto,
     /// UDP 报文用二进制编码（**v2** 握手协商结果），默认 JSON。
     udp_binary: bool,
+    /// v1 下也用二进制 UDP 编码（私有能力协商结果），默认 JSON。
+    v1_udp_binary: bool,
 }
 
 impl FrpConn {
@@ -85,6 +87,7 @@ impl FrpConn {
             plain: Vec::new(),
             crypto: ControlCrypto::None,
             udp_binary: false,
+            v1_udp_binary: false,
         }
     }
 
@@ -130,6 +133,24 @@ impl FrpConn {
 
     pub fn udp_codec_is_binary(&self) -> bool {
         self.udp_binary
+    }
+
+    /// v1 下改用二进制 UDP 报文编码。
+    ///
+    /// 只能在**双方都声明了该能力**之后调用（见 `msg::RustunnelCaps`）：
+    /// v1 没有握手协商这一步，官方 frps 只会发 JSON，
+    /// 单方面开启会让两端的编码对不上。
+    pub fn set_v1_udp_binary(&mut self, binary: bool) {
+        self.v1_udp_binary = binary;
+    }
+
+    /// 本连接上 UDP 报文是不是走二进制编码（v1 / v2 各有一个开关）。
+    pub fn udp_is_binary(&self) -> bool {
+        if self.version == WireVersion::V1 {
+            self.v1_udp_binary
+        } else {
+            self.udp_binary
+        }
     }
 
     /// 写入 v2 魔术字（客户端在 v2 下必须先发）。v1 下什么都不做。
@@ -217,6 +238,15 @@ impl FrpConn {
                 self.write_frame(FRAME_MESSAGE, &payload).await
             }
             WireVersion::V1 => {
+                if self.v1_udp_binary {
+                    if let FrpMessage::UdpPacket(pkt) = m {
+                        // 类型字节仍然是官方的 'u'，只是**消息体**换成二进制。
+                        // 两端都只在协商成功后才这么做，官方 frps 永远走下面的 JSON 分支。
+                        let body = msg::encode_udp_binary(pkt)?;
+                        let frame = v1::encode_msg(v1::TYPE_UDP_PACKET, &body);
+                        return self.write_bytes(&frame).await;
+                    }
+                }
                 let byte = v1::type_byte(m.type_id()).ok_or_else(|| {
                     anyhow!(
                         "消息 {} 在 frp v1 里没有对应的类型字节（它是 v2 独有的）",
@@ -265,6 +295,9 @@ impl FrpConn {
                     let buf = self.read_buf();
                     if let Some((byte, body)) = v1::take_msg(buf)? {
                         let type_id = v1::type_id(byte).expect("take_msg 已校验过类型字节");
+                        if self.v1_udp_binary && byte == v1::TYPE_UDP_PACKET {
+                            return Ok(Some(FrpMessage::UdpPacket(msg::decode_udp_binary(&body)?)));
+                        }
                         return Ok(Some(FrpMessage::decode(type_id, &body)?));
                     }
                 }
@@ -413,10 +446,13 @@ pub async fn client_handshake(
     user: &str,
     metas: &std::collections::HashMap<String, String>,
     pool_count: i32,
-) -> Result<(FrpConn, String, bool)> {
+    caps: msg::RustunnelCaps,
+) -> Result<(FrpConn, String, bool, msg::RustunnelCaps)> {
     let mut conn = FrpConn::new(stream, version);
     let ts = now_unix_secs() as i64;
-    let login = build_login(token, client_id, user, metas, pool_count, ts);
+    let mut login = build_login(token, client_id, user, metas, pool_count, ts);
+    // 只是"声明支持"，真正开不开由服务端在 LoginResp 里回显决定
+    login.rustunnel = if caps.any() { Some(caps) } else { None };
 
     // ---------------------------------------------------------------- v1
     if version == WireVersion::V1 {
@@ -434,7 +470,11 @@ pub async fn client_handshake(
         }
         // 官方时序：Login / LoginResp 明文，之后的控制消息才走 CFB
         conn.enable_v1_crypto(token)?;
-        return Ok((conn, login_resp.run_id, false));
+        // v1 的二进制 UDP 只有在**服务端回显**了才算数：连官方 frps 时
+        // 它不会回这个字段，于是这里拿到 default()，行为与以前完全一致。
+        let accepted = login_resp.rustunnel.clone().unwrap_or_default();
+        conn.set_v1_udp_binary(accepted.udp_binary);
+        return Ok((conn, login_resp.run_id, accepted.udp_binary, accepted));
     }
 
     // ---------------------------------------------------------------- v2
@@ -484,7 +524,9 @@ pub async fn client_handshake(
     let (c2s, s2c) = derive_control_keys(token.as_bytes(), &algorithm, &transcript)?;
     conn.upgrade(s2c, c2s)?; // 客户端用 s2c 读、c2s 写
 
-    Ok((conn, login_resp.run_id, udp_binary))
+    // 5) 私有能力：仍然只认服务端回显的那一份
+    let accepted = login_resp.rustunnel.clone().unwrap_or_default();
+    Ok((conn, login_resp.run_id, udp_binary, accepted))
 }
 
 // ---------------------------------------------------------------------------
@@ -499,6 +541,11 @@ pub enum ServerAccept {
         login: Login,
         /// 本次会话协商出的 UDP 报文编码（true = 二进制）
         udp_binary: bool,
+        /// 服务端**确认**启用的 rustunnel 私有能力。
+        ///
+        /// 官方 frpc 不会在 Login 里声明能力，所以这里永远是 `default()`
+        /// （全关）—— 于是它发这些私有消息的路径根本不会打开。
+        caps: msg::RustunnelCaps,
     },
     /// 工作连接（明文，等待分配代理后回 StartWorkConn）
     Work { conn: FrpConn, msg: NewWorkConn },
@@ -633,10 +680,26 @@ pub async fn server_handshake(
         bail!("token 校验失败");
     }
 
-    // LoginResp 必须明文发送（客户端此时还没升级加密）
+    // 能力协商：客户端声明了、且服务端也支持，才回显 —— 回显了才算生效。
+    let declared = login.rustunnel.clone().unwrap_or_default();
+    let mut caps = msg::RustunnelCaps::default();
+    if declared.server_cmd {
+        caps.server_cmd = true;
+    }
+    // v2 的二进制 UDP 是握手协商出来的，与 Login 里的声明无关；
+    // v1 没有握手协商这一步，只能靠这里。
+    if version == WireVersion::V1 && declared.udp_binary {
+        caps.udp_binary = true;
+        conn.set_v1_udp_binary(true);
+    }
+
+    // LoginResp 必须明文发送（客户端此时还没升级加密）。
+    // 多挂一个 `_rustunnel` 字段：官方 frpc 会忽略未知字段，而 rustunnel 客户端
+    // 只认**回显**过来的能力 —— 这是"连官方 frps 时行为不变"的关键。
     conn.send_msg(&FrpMessage::LoginResp(LoginResp {
         version: super::FRP_WIRE_VERSION.to_string(),
         run_id: run_id.to_string(),
+        rustunnel: if caps.any() { Some(caps.clone()) } else { None },
         ..Default::default()
     }))
     .await?;
@@ -660,6 +723,7 @@ pub async fn server_handshake(
         conn,
         login,
         udp_binary,
+        caps,
     })
 }
 
@@ -785,7 +849,7 @@ mod tests {
         let (client, mut server) = tokio::io::duplex(64 * 1024);
 
         let client_task = tokio::spawn(async move {
-            let (conn, run_id, udp) = client_handshake(
+            let (conn, run_id, udp, _caps) = client_handshake(
                 Box::pin(client),
                 WireVersion::V1,
                 TOKEN,
@@ -793,6 +857,7 @@ mod tests {
                 "alice",
                 &empty_metas(),
                 0,
+                msg::RustunnelCaps::default(),
             )
             .await
             .unwrap();
@@ -917,5 +982,165 @@ mod tests {
             WireVersion::V1,
             "空值按官方 EmptyOr 语义落到 v1"
         );
+    }
+    /// 私有能力必须**服务端回显**才算数。
+    ///
+    /// 这条测试防的是一个很隐蔽的事故：客户端单方面"声明即启用"，
+    /// 于是连官方 frps 时也按二进制去解 UDP 报文 —— 而官方 frps 发的是 JSON，
+    /// 两边直接鸡同鸭讲，且症状是"UDP 代理时通时不通"，极难定位。
+    #[tokio::test]
+    async fn v1_能力协商_服务端不回显就不启用() {
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let declared = msg::RustunnelCaps {
+            udp_binary: true,
+            server_cmd: true,
+        };
+
+        let client_task = tokio::spawn(async move {
+            client_handshake(
+                Box::pin(client),
+                WireVersion::V1,
+                TOKEN,
+                "cid",
+                "alice",
+                &empty_metas(),
+                0,
+                declared,
+            )
+            .await
+            .unwrap()
+        });
+
+        // Login 里必须带上能力声明
+        let (byte, body) = read_v1_raw(&mut server).await;
+        assert_eq!(byte, v1::TYPE_LOGIN);
+        let login: Login = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            login.rustunnel,
+            Some(msg::RustunnelCaps {
+                udp_binary: true,
+                server_cmd: true
+            }),
+            "客户端必须声明自己支持哪些能力"
+        );
+
+        // 官方 frps（以及任何不认识这个字段的服务端）回的 LoginResp 里没有它
+        let resp = serde_json::to_vec(&LoginResp {
+            version: crate::frp::FRP_WIRE_VERSION.to_string(),
+            run_id: RUN_ID.to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        server
+            .write_all(&v1::encode_msg(v1::TYPE_LOGIN_RESP, &resp))
+            .await
+            .unwrap();
+        server.flush().await.unwrap();
+
+        let (_conn, run_id, udp_binary, caps) = client_task.await.unwrap();
+        assert_eq!(run_id, RUN_ID);
+        assert!(!udp_binary, "服务端没回显，v1 下必须继续走 JSON");
+        assert!(
+            !caps.udp_binary && !caps.server_cmd,
+            "没回显的能力一律当作未启用：{caps:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn v1_能力协商_服务端回显后才启用() {
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let client_task = tokio::spawn(async move {
+            client_handshake(
+                Box::pin(client),
+                WireVersion::V1,
+                TOKEN,
+                "cid",
+                "alice",
+                &empty_metas(),
+                0,
+                msg::RustunnelCaps {
+                    udp_binary: true,
+                    server_cmd: true,
+                },
+            )
+            .await
+            .unwrap()
+        });
+
+        let (_byte, _body) = read_v1_raw(&mut server).await;
+        let resp = serde_json::to_vec(&LoginResp {
+            version: crate::frp::FRP_WIRE_VERSION.to_string(),
+            run_id: RUN_ID.to_string(),
+            rustunnel: Some(msg::RustunnelCaps {
+                udp_binary: true,
+                server_cmd: true,
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        server
+            .write_all(&v1::encode_msg(v1::TYPE_LOGIN_RESP, &resp))
+            .await
+            .unwrap();
+        server.flush().await.unwrap();
+
+        let (conn, _run_id, udp_binary, caps) = client_task.await.unwrap();
+        assert!(udp_binary, "服务端回显后 v1 必须走二进制 UDP");
+        assert!(caps.udp_binary && caps.server_cmd);
+        assert!(conn.udp_is_binary());
+    }
+
+    /// v1 协商成功之后，UDP 报文的**消息体**必须是二进制，类型字节仍是官方的 `'u'`。
+    #[tokio::test]
+    async fn v1_udp_协商后走二进制编码() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let mut sender = FrpConn::new(Box::pin(a), WireVersion::V1);
+        let mut receiver = FrpConn::new(Box::pin(b), WireVersion::V1);
+        sender.set_v1_udp_binary(true);
+        receiver.set_v1_udp_binary(true);
+
+        let pkt = msg::UdpPacket::new(b"hello-udp", &"203.0.113.9:45001".parse().unwrap());
+        sender
+            .send_msg(&FrpMessage::UdpPacket(pkt.clone()))
+            .await
+            .unwrap();
+
+        // 直接看线上字节：类型字节是 'u'，但消息体不是 JSON
+        let raw = sender_side_bytes(&pkt);
+        assert_eq!(raw[0], v1::TYPE_UDP_PACKET, "类型字节必须还是官方的 'u'");
+        assert_ne!(raw[9], b'{', "协商成功时消息体不该是 JSON");
+
+        match receiver.recv_msg().await.unwrap() {
+            Some(FrpMessage::UdpPacket(got)) => assert_eq!(got, pkt),
+            other => panic!("应当解出一个 UdpPacket，实际：{other:?}"),
+        }
+    }
+
+    /// 没协商时 v1 必须保持 JSON（这是与官方互通的底线）。
+    #[tokio::test]
+    async fn v1_udp_未协商时保持_json() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let mut sender = FrpConn::new(Box::pin(a), WireVersion::V1);
+        let mut receiver = FrpConn::new(Box::pin(b), WireVersion::V1);
+
+        let pkt = msg::UdpPacket::new(b"x", &"203.0.113.9:1".parse().unwrap());
+        let raw = v1::encode_msg(v1::TYPE_UDP_PACKET, &serde_json::to_vec(&pkt).unwrap());
+        assert_eq!(raw[9], b'{', "未协商时消息体必须是 JSON");
+        sender
+            .send_msg(&FrpMessage::UdpPacket(pkt.clone()))
+            .await
+            .unwrap();
+        match receiver.recv_msg().await.unwrap() {
+            Some(FrpMessage::UdpPacket(got)) => assert_eq!(got, pkt),
+            other => panic!("应当解出一个 UdpPacket，实际：{other:?}"),
+        }
+    }
+
+    /// 单独编码一个二进制 UDP 帧（供上面那条断言对照）。
+    fn sender_side_bytes(pkt: &msg::UdpPacket) -> Vec<u8> {
+        v1::encode_msg(
+            v1::TYPE_UDP_PACKET,
+            &msg::encode_udp_binary(pkt).expect("二进制编码"),
+        )
     }
 }

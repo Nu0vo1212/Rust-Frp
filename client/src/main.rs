@@ -8,10 +8,11 @@
 mod health;
 mod p2p;
 mod plugin;
+mod registry;
 mod udp_proxy;
 mod visitor;
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
@@ -20,7 +21,7 @@ use rustunnel_common::{
     frp::{
         self,
         conn::{self, FrpConn},
-        msg::{FrpMessage, NewProxy, Ping},
+        msg::{self, FrpMessage, NewProxy, Ping},
         mux::MuxSession,
         stream::BoxStream,
         tls,
@@ -380,63 +381,10 @@ async fn raw_connect(cfg: &ClientConfig) -> Result<BoxStream> {
 ///
 /// 服务端那边保持**幂等**（收到原始名或带前缀的名字都会被补成带前缀的），
 /// 所以老客户端直接发原始名也不会坏 —— 见 `server/src/serve.rs`。
-fn build_new_proxy(p: &ProxyConfig, user: &str) -> NewProxy {
-    // 线上名字 = `{user}.{name}`，与官方 frpc 的 `wireName` 对齐
-    let proxy_name = util::add_user_prefix(user, &p.name);
-
-    // 官方 frpc 只在值**不等于默认的 `client`** 时才发 `bandwidth_limit_mode`
-    // （`MarshalToMsg` 里写着 `if c.Transport.BandwidthLimitMode != "client"`），
-    // 所以这里把 `client` 归一化成空串，报文才能和官方 frpc 逐字段一致。
-    let bandwidth_limit_mode = if p.bandwidth_limit_mode.eq_ignore_ascii_case("client") {
-        String::new()
-    } else {
-        p.bandwidth_limit_mode.clone()
-    };
-
-    let mut m = NewProxy {
-        proxy_name,
-        proxy_type: p.proxy_type.clone(),
-        // 带宽上限：官方 frpc 会原样上报，平台拿它做限流校验
-        bandwidth_limit: p.bandwidth_limit.clone(),
-        bandwidth_limit_mode,
-        // ★ 这里放的是**代理级** `[proxies.metadatas]`，不是顶层 `[metadatas]`。
-        //   官方 frpc 的 `MarshalToMsg` 写的是 `m.Metas = c.Metadatas`，
-        //   顶层那份只进登录消息（`Login.Metas`）。
-        metas: p.metas.clone(),
-        ..Default::default()
-    };
-
-    match p.proxy_type.as_str() {
-        "http" | "https" => {
-            m.custom_domains = p.custom_domains.clone();
-            m.subdomain = p.subdomain.clone();
-            m.locations = p.locations.clone();
-            m.http_user = p.http_user.clone();
-            m.http_pwd = p.http_pwd.clone();
-            m.host_header_rewrite = p.host_header_rewrite.clone();
-            m.group = p.group.clone();
-            m.group_key = p.group_key.clone();
-        }
-        // stcp / xtcp：不带 remote_port，靠共享密钥 + visitor 接入
-        "stcp" | "xtcp" => {
-            m.sk = p.secret_key.clone();
-            m.allow_users = p.allow_users.clone();
-        }
-        // tcp / udp：remote_port + 负载均衡分组
-        _ => {
-            m.remote_port = p.remote_port;
-            m.group = p.group.clone();
-            m.group_key = p.group_key.clone();
-        }
-    }
-
-    m
-}
-
 /// 把服务端下发的**线上全名**翻译回本地配置里的原始代理名，并取出配置。
 ///
 /// 命名契约（与官方 frp 一致，别改）：
-/// - 客户端 `NewProxy.proxy_name` 发的是**线上全名** `{user}.{name}`（见 [`build_new_proxy`]）；
+/// - 客户端 `NewProxy.proxy_name` 发的是**线上全名** `{user}.{name}`（见 [`NewProxy::from_config`]）；
 /// - 服务端回显（`NewProxyResp`）与主动下发（`StartWorkConn`、`NatHoleClient`）
 ///   用的**也是同一个全名**；
 /// - 而本地映射表 [`run_session`] 里是按配置里的**原始 `name`** 建的。
@@ -445,13 +393,13 @@ fn build_new_proxy(p: &ProxyConfig, user: &str) -> NewProxy {
 /// 这个坑踩过两次：先修了 `NewProxyResp` 和 `StartWorkConn`，漏了 `NatHoleClient`
 /// —— 表现为 provider 打印「收到未知代理的打洞通知，忽略」，xtcp **静默退化成中继**：
 /// 数据还是通的，只有「有没有走 P2P 直连」这条断言会红（本机冒烟第 4 项）。
-fn resolve_uploaded_proxy<'n, 'p>(
+fn resolve_uploaded_proxy(
     user: &str,
-    wire_name: &'n str,
-    proxies: &'p HashMap<String, ProxyConfig>,
-) -> Option<(&'n str, &'p ProxyConfig)> {
-    let raw = util::strip_user_prefix(user, wire_name);
-    proxies.get(raw).map(|p| (raw, p))
+    wire_name: &str,
+    proxies: &registry::ProxyTable,
+) -> Option<(String, Arc<ProxyConfig>)> {
+    let raw = util::strip_user_prefix(user, wire_name).to_string();
+    proxies.get(&raw).map(|p| (raw, p))
 }
 
 async fn run_session(
@@ -465,7 +413,13 @@ async fn run_session(
     info!(%server, "已连接到服务端，开始握手");
 
     let stream = link.connect().await?;
-    let (mut conn, run_id, udp_binary) = conn::client_handshake(
+    // 私有能力只是**声明支持**，真正开不开看服务端回显 ——
+    // 连官方 frps / 第三方 frps 时对方不会回显，行为与不开完全一致。
+    let declared = msg::RustunnelCaps {
+        udp_binary: cfg.private_caps,
+        server_cmd: cfg.private_caps,
+    };
+    let (mut conn, run_id, udp_binary, caps) = conn::client_handshake(
         stream,
         link.wire,
         &cfg.token,
@@ -473,12 +427,16 @@ async fn run_session(
         &cfg.user,
         &cfg.metas,
         cfg.pool_count,
+        declared,
     )
     .await?;
     link.udp_binary
         .store(udp_binary, std::sync::atomic::Ordering::Relaxed);
     if udp_binary {
         debug!("服务端选择了二进制 UDP 报文编码");
+    }
+    if caps.server_cmd {
+        debug!("服务端已启用私有管理命令（面板可增删本端代理）");
     }
     info!(%run_id, wire = %link.wire, "登录成功（控制通道已加密）");
 
@@ -514,15 +472,10 @@ async fn run_session(
     // 服务端回包里的 `proxy_name` 是**线上全名** `{user}.{name}`
     // （我们发上去的就是这个，官方 frps 会原样回显），所以先 `strip_user_prefix`
     // 剥一层再查表；万一遇到不回显前缀的实现，strip 对不带前缀的名字也是恒等的。
-    let proxies: Arc<HashMap<String, ProxyConfig>> = Arc::new(
-        cfg.proxies
-            .iter()
-            .map(|p| (p.name.clone(), p.clone()))
-            .collect(),
-    );
+    let proxies = registry::ProxyTable::from_iter(cfg.proxies.iter().cloned());
 
     for p in &cfg.proxies {
-        let msg = build_new_proxy(p, &cfg.user);
+        let msg = NewProxy::from_config(p, &cfg.user);
         conn.send_msg(&FrpMessage::NewProxy(msg)).await?;
     }
 
@@ -613,14 +566,27 @@ async fn run_session(
                             Some((raw, proxy)) => {
                                 debug!(proxy = %raw, "本端作为 provider 参与打洞");
                                 let cfg = cfg.clone();
-                                let proxy = proxy.clone();
                                 tokio::spawn(async move {
+                                    let proxy = (*proxy).clone();
                                     if let Err(e) = p2p::serve_as_provider(cfg, proxy, m).await {
                                         debug!("xtcp 打洞未成功（访客会回退中继）：{e:#}");
                                     }
                                 });
                             }
                             None => warn!(proxy = %m.proxy_name, "收到未知代理的打洞通知，忽略"),
+                        }
+                    }
+                    // 面板下发的管理命令（增删代理）
+                    FrpMessage::ServerCmd(cmd) => {
+                        if !caps.server_cmd {
+                            // 服务端没回显过这个能力却发了命令：要么是 bug，
+                            // 要么是对端不规矩。忽略比照做更安全。
+                            warn!(op = %cmd.op, "收到未协商的私有管理命令，忽略");
+                            continue;
+                        }
+                        let resp = apply_server_cmd(&proxies, &cmd, &mut conn).await;
+                        if let Err(e) = &resp {
+                            warn!(op = %cmd.op, "回执发送失败：{e:#}");
                         }
                     }
                     // xtcp：服务端对 visitor 打洞请求的响应，转交给等待者
@@ -655,10 +621,80 @@ async fn run_session(
     Ok(())
 }
 
+/// 执行一条服务端下发的管理命令，并把回执发回去。
+///
+/// **无论成功失败都必须回一条** `ServerCmdResp`：面板是同步等回包的，
+/// 收不到就只能在超时后报「已下发但结果未知」，体验很差。
+async fn apply_server_cmd(
+    proxies: &registry::ProxyTable,
+    cmd: &msg::ServerCmd,
+    conn: &mut FrpConn,
+) -> Result<()> {
+    let result = match cmd.op.as_str() {
+        msg::CMD_ADD_PROXY => add_proxy_cmd(proxies, cmd),
+        msg::CMD_REMOVE_PROXY => {
+            let name = cmd.proxy_name.clone();
+            if name.is_empty() {
+                Err(anyhow!("remove_proxy 缺少 proxy_name"))
+            } else if proxies.remove(&name).is_none() {
+                // 把当前有哪些代理一并报回去 —— 面板上最常见的失败原因
+                // 就是名字打错，光说"没有"用户没法自查
+                let have = proxies.names().join(", ");
+                Err(anyhow!(
+                    "本地没有名为 [{name}] 的代理（当前有：{}）",
+                    if have.is_empty() {
+                        "无".to_string()
+                    } else {
+                        have
+                    }
+                ))
+            } else {
+                info!(proxy = %name, total = proxies.len(), reason = %cmd.reason, "按服务端命令移除代理");
+                Ok(())
+            }
+        }
+        other => Err(anyhow!("未知命令：{other}")),
+    };
+
+    let resp = msg::ServerCmdResp {
+        id: cmd.id.clone(),
+        op: cmd.op.clone(),
+        proxy_name: cmd.proxy_name.clone(),
+        error: result
+            .as_ref()
+            .map_err(|e| e.to_string())
+            .err()
+            .unwrap_or_default(),
+    };
+    // 命令本身失败了也要**先把回执发出去**，再让上层记日志
+    conn.send_msg(&FrpMessage::ServerCmdResp(resp)).await?;
+    result.map(|_| ())
+}
+
+/// 面板新增代理：把配置塞进本地表，再补发一条 `NewProxy` 让服务端开端口。
+fn add_proxy_cmd(proxies: &registry::ProxyTable, cmd: &msg::ServerCmd) -> Result<()> {
+    // 命令里带的是 `serde_json::Value` 而不是 `ProxyConfig`：
+    // 配置结构体将来改字段名时，不该让一条命令因为多/少一个键就整个解析失败。
+    let p: ProxyConfig = cmd.proxy_config().map_err(anyhow::Error::msg)?;
+    if p.name.is_empty() {
+        anyhow::bail!("代理配置缺少 name");
+    }
+    if p.proxy_type.is_empty() {
+        anyhow::bail!("代理配置缺少 type");
+    }
+    let name = p.name.clone();
+    let existed = proxies.insert(p.clone()).is_some();
+    if existed {
+        warn!(proxy = %name, "覆盖了同名的已有代理");
+    }
+    info!(proxy = %name, r#type = %p.proxy_type, total = proxies.len(), reason = %cmd.reason, "按服务端命令新增代理");
+    Ok(())
+}
+
 fn spawn_work_conn(
     link: Arc<ServerLink>,
     run_id: Arc<String>,
-    proxies: Arc<HashMap<String, ProxyConfig>>,
+    proxies: registry::ProxyTable,
     health: Arc<health::Monitor>,
 ) {
     tokio::spawn(async move {
@@ -672,7 +708,7 @@ fn spawn_work_conn(
 async fn work_conn_flow(
     link: Arc<ServerLink>,
     run_id: Arc<String>,
-    proxies: Arc<HashMap<String, ProxyConfig>>,
+    proxies: registry::ProxyTable,
     health: Arc<health::Monitor>,
 ) -> Result<()> {
     let stream = link.connect().await?;
@@ -689,7 +725,7 @@ async fn work_conn_flow(
     let proxy = proxy.clone();
 
     // 健康检查不通过：直接拒掉这条工作连接，让用户去连别的后端
-    if !health.is_healthy(proxy_name) {
+    if !health.is_healthy(&proxy_name) {
         anyhow::bail!("代理 [{proxy_name}] 健康检查未通过，暂不提供服务");
     }
 
@@ -789,7 +825,7 @@ mod tests {
     #[test]
     fn tcp_carries_port_and_group() {
         let c = full_tcp_config();
-        let m = build_new_proxy(&c, USER);
+        let m = NewProxy::from_config(&c, USER);
         assert_eq!(
             m.proxy_name, "alice.web-a",
             "线协议名必须带 `{{user}}.` 前缀 —— 官方 frpc 的 wireName 就是这么算的，\
@@ -810,7 +846,7 @@ mod tests {
             proxy_type: "http".into(),
             ..full_tcp_config()
         };
-        let m = build_new_proxy(&c, USER);
+        let m = NewProxy::from_config(&c, USER);
         assert_eq!(m.proxy_name, "alice.web-a");
         assert_eq!(m.custom_domains, vec!["a.example.com".to_string()]);
         assert_eq!(m.subdomain, "sub");
@@ -829,7 +865,7 @@ mod tests {
             proxy_type: "stcp".into(),
             ..full_tcp_config()
         };
-        let m = build_new_proxy(&c, USER);
+        let m = NewProxy::from_config(&c, USER);
         assert_eq!(m.proxy_name, "alice.web-a");
         assert_eq!(m.sk, "sk");
         assert_eq!(m.allow_users, vec!["alice".to_string()]);
@@ -856,7 +892,7 @@ mod tests {
     #[test]
     fn 与官方_frpc_抓包逐字节一致() {
         let cfg = rustunnel_common::config::parse_client_toml(LOLIA_FRPC).unwrap();
-        let m = build_new_proxy(&cfg.proxies[0], &cfg.user);
+        let m = NewProxy::from_config(&cfg.proxies[0], &cfg.user);
 
         assert_eq!(
             serde_json::to_string(&m).unwrap(),
@@ -894,7 +930,7 @@ bandwidthLimitMode = 'server'
     /// 没配 `user` 时不该凭空造出一个 `.` 前缀。
     #[test]
     fn 空_user_不加前缀() {
-        let m = build_new_proxy(&full_tcp_config(), "");
+        let m = NewProxy::from_config(&full_tcp_config(), "");
         assert_eq!(m.proxy_name, "web-a");
     }
 
@@ -911,7 +947,9 @@ bandwidthLimitMode = 'server'
                 ..full_tcp_config()
             };
             assert!(
-                build_new_proxy(&c, USER).bandwidth_limit_mode.is_empty(),
+                NewProxy::from_config(&c, USER)
+                    .bandwidth_limit_mode
+                    .is_empty(),
                 "值 {raw:?} 应当被归一化成空串（即不发送）"
             );
         }
@@ -920,7 +958,10 @@ bandwidthLimitMode = 'server'
             bandwidth_limit_mode: "server".into(),
             ..full_tcp_config()
         };
-        assert_eq!(build_new_proxy(&c, USER).bandwidth_limit_mode, "server");
+        assert_eq!(
+            NewProxy::from_config(&c, USER).bandwidth_limit_mode,
+            "server"
+        );
     }
 
     /// `NewProxy.metas` 装的是**代理级** `[proxies.metadatas]`，不是顶层 `[metadatas]`。
@@ -936,7 +977,7 @@ bandwidthLimitMode = 'server'
             Some("x8p5mo0u8ips3lmohc67r58mejp7uthf")
         );
         // 但代理级没有 → 注册报文里也不该有
-        let m = build_new_proxy(&cfg.proxies[0], &cfg.user);
+        let m = NewProxy::from_config(&cfg.proxies[0], &cfg.user);
         assert!(
             m.metas.is_empty(),
             "顶层 [metadatas] 只进登录消息，不该出现在 NewProxy 里"
@@ -952,7 +993,7 @@ bandwidthLimitMode = 'server'
             group_key: String::new(),
             ..full_tcp_config()
         };
-        let m = build_new_proxy(&c, USER);
+        let m = NewProxy::from_config(&c, USER);
         assert!(m.group.is_empty());
         assert!(m.group_key.is_empty());
     }
@@ -963,7 +1004,7 @@ bandwidthLimitMode = 'server'
     fn every_shareable_field_is_carried() {
         let c = full_tcp_config();
         // 用 tcp 分支检查「端口类」字段
-        let tcp = build_new_proxy(&c, USER);
+        let tcp = NewProxy::from_config(&c, USER);
         assert_eq!(tcp.remote_port, c.remote_port);
         assert_eq!(tcp.group, c.group);
         assert_eq!(tcp.group_key, c.group_key);
@@ -972,7 +1013,7 @@ bandwidthLimitMode = 'server'
         assert_eq!(tcp.metas, c.metas);
 
         // 用 http 分支检查「路由类」字段
-        let http = build_new_proxy(
+        let http = NewProxy::from_config(
             &ProxyConfig {
                 proxy_type: "http".into(),
                 ..c.clone()
@@ -987,7 +1028,7 @@ bandwidthLimitMode = 'server'
         assert_eq!(http.host_header_rewrite, c.host_header_rewrite);
 
         // 用 stcp 分支检查「私密隧道类」字段
-        let stcp = build_new_proxy(
+        let stcp = NewProxy::from_config(
             &ProxyConfig {
                 proxy_type: "stcp".into(),
                 ..c.clone()
@@ -1007,7 +1048,7 @@ bandwidthLimitMode = 'server'
     // -----------------------------------------------------------------------
 
     /// 本地映射表：键是配置里的**原始** `name`（与 `run_session` 里一致）。
-    fn local_map(names: &[&str]) -> HashMap<String, ProxyConfig> {
+    fn local_map(names: &[&str]) -> std::collections::HashMap<String, ProxyConfig> {
         names
             .iter()
             .map(|n| {
@@ -1021,7 +1062,7 @@ bandwidthLimitMode = 'server'
     /// 服务端下发**带前缀的线上全名**时必须能查到。
     #[test]
     fn 带前缀的下发名能查到本地代理() {
-        let m = local_map(&["p2p-echo"]);
+        let m = registry::ProxyTable::from_iter(local_map(&["p2p-echo"]).into_values());
         let (raw, p) = resolve_uploaded_proxy("alice", "alice.p2p-echo", &m)
             .expect("带 user 前缀的线上全名应当能查到");
         assert_eq!(raw, "p2p-echo", "查到的应当是配置里的原始名");
@@ -1031,7 +1072,7 @@ bandwidthLimitMode = 'server'
     /// 服务端若原样回显（不带前缀），也要能查到 —— strip 对不带前缀的名字是恒等的。
     #[test]
     fn 不带前缀的下发名同样能查到() {
-        let m = local_map(&["p2p-echo"]);
+        let m = registry::ProxyTable::from_iter(local_map(&["p2p-echo"]).into_values());
         let (raw, _) = resolve_uploaded_proxy("alice", "p2p-echo", &m).expect("应当能查到");
         assert_eq!(raw, "p2p-echo");
     }
@@ -1039,7 +1080,7 @@ bandwidthLimitMode = 'server'
     /// 没配 `user` 时表键就是原名。
     #[test]
     fn 无_user_时能查到() {
-        let m = local_map(&["web-a"]);
+        let m = registry::ProxyTable::from_iter(local_map(&["web-a"]).into_values());
         assert!(resolve_uploaded_proxy("", "web-a", &m).is_some());
     }
 
@@ -1047,7 +1088,7 @@ bandwidthLimitMode = 'server'
     /// 否则它会去服务别人的代理。
     #[test]
     fn 别人的前缀不会被剥掉() {
-        let m = local_map(&["web-a"]);
+        let m = registry::ProxyTable::from_iter(local_map(&["web-a"]).into_values());
         assert!(
             resolve_uploaded_proxy("bob", "alice.web-a", &m).is_none(),
             "非本用户的代理名必须查不到"
@@ -1057,7 +1098,144 @@ bandwidthLimitMode = 'server'
     /// 完全不认识的代理名 → `None`（调用方据此走「未知代理」分支）。
     #[test]
     fn 未知代理返回_none() {
-        let m = local_map(&["web-a"]);
+        let m = registry::ProxyTable::from_iter(local_map(&["web-a"]).into_values());
         assert!(resolve_uploaded_proxy("alice", "alice.nope", &m).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // 面板下发的管理命令（ServerCmd）
+    // -----------------------------------------------------------------------
+
+    /// 造一对连起来的 `FrpConn`：一头给被测代码，另一头用来读它发出去的回执。
+    fn cmd_pair() -> (FrpConn, FrpConn) {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        (
+            FrpConn::new(Box::pin(a), frp::WireVersion::V1),
+            FrpConn::new(Box::pin(b), frp::WireVersion::V1),
+        )
+    }
+
+    fn add_cmd(name: &str) -> msg::ServerCmd {
+        let p = ProxyConfig {
+            name: name.to_string(),
+            proxy_type: "tcp".to_string(),
+            remote_port: 7000,
+            ..Default::default()
+        };
+        msg::ServerCmd {
+            id: "cmd-1".to_string(),
+            op: msg::CMD_ADD_PROXY.to_string(),
+            proxy_name: name.to_string(),
+            proxy: Some(serde_json::to_value(&p).expect("序列化")),
+            reason: "dashboard".to_string(),
+        }
+    }
+
+    /// 新增代理：本地表里要真的多出一条，且必须回一条成功回执。
+    #[tokio::test]
+    async fn 管理命令_新增代理() {
+        let (mut me, mut peer) = cmd_pair();
+        let table = registry::ProxyTable::default();
+        apply_server_cmd(&table, &add_cmd("panel-web"), &mut me)
+            .await
+            .expect("新增应当成功");
+
+        assert_eq!(table.len(), 1, "代理要真的进到本地表里");
+        assert_eq!(table.get("panel-web").expect("能查到").remote_port, 7000);
+
+        // 回执：id 必须原样带回，error 为空
+        let resp = expect_cmd_resp(&mut peer).await;
+        assert_eq!(resp.id, "cmd-1", "id 必须原样带回");
+        assert_eq!(resp.op, msg::CMD_ADD_PROXY);
+        assert!(resp.error.is_empty(), "不该带错误：{}", resp.error);
+    }
+
+    /// **失败也必须回包**：面板是同步等回执的，不回就只能等到超时。
+    #[tokio::test]
+    async fn 管理命令_失败也要回执() {
+        let (mut me, mut peer) = cmd_pair();
+        let table = registry::ProxyTable::default();
+
+        // 移除一个不存在的代理
+        let cmd = msg::ServerCmd {
+            id: "cmd-2".to_string(),
+            op: msg::CMD_REMOVE_PROXY.to_string(),
+            proxy_name: "nope".to_string(),
+            ..Default::default()
+        };
+        apply_server_cmd(&table, &cmd, &mut me)
+            .await
+            .expect_err("移除不存在的代理应当失败");
+
+        let resp = expect_cmd_resp(&mut peer).await;
+        assert_eq!(resp.id, "cmd-2");
+        assert!(
+            resp.error.contains("nope"),
+            "错误里要带上名字方便自查：{}",
+            resp.error
+        );
+        // 顺便确认错误里会把当前有哪些代理列出来 —— 名字打错是最常见的失败原因
+        assert!(
+            resp.error.contains("无"),
+            "应当顺便列出当前代理：{}",
+            resp.error
+        );
+    }
+
+    /// 未知命令要报错，而不是被当成成功。
+    #[tokio::test]
+    async fn 管理命令_未知op被拒绝() {
+        let (mut me, mut peer) = cmd_pair();
+        let table = registry::ProxyTable::default();
+        let cmd = msg::ServerCmd {
+            id: "cmd-3".to_string(),
+            op: "format_disk".to_string(),
+            ..Default::default()
+        };
+        apply_server_cmd(&table, &cmd, &mut me)
+            .await
+            .expect_err("未知命令必须失败");
+        assert!(expect_cmd_resp(&mut peer).await.error.contains("未知命令"));
+    }
+
+    /// 先加后删：整条生命周期要闭环。
+    #[tokio::test]
+    async fn 管理命令_先加后删() {
+        let (mut me, mut peer) = cmd_pair();
+        let table = registry::ProxyTable::from_iter([ProxyConfig {
+            name: "old".into(),
+            ..Default::default()
+        }]);
+
+        apply_server_cmd(&table, &add_cmd("new"), &mut me)
+            .await
+            .expect("新增");
+        let _ = expect_cmd_resp(&mut peer).await;
+        assert_eq!(table.len(), 2);
+
+        let cmd = msg::ServerCmd {
+            id: "cmd-4".to_string(),
+            op: msg::CMD_REMOVE_PROXY.to_string(),
+            proxy_name: "old".to_string(),
+            ..Default::default()
+        };
+        apply_server_cmd(&table, &cmd, &mut me).await.expect("移除");
+        let _ = expect_cmd_resp(&mut peer).await;
+        assert_eq!(table.len(), 1, "删掉之后只剩新增的那条");
+        assert!(table.get("old").is_none());
+        assert!(table.get("new").is_some());
+    }
+
+    /// 读一条回执。**带超时** —— 没有超时的话，一旦发送侧没写出去，
+    /// 这条测试会永远挂住，把整个测试进程一起拖死（踩过一次）。
+    async fn expect_cmd_resp(conn: &mut FrpConn) -> msg::ServerCmdResp {
+        let got = tokio::time::timeout(Duration::from_secs(5), conn.recv_msg())
+            .await
+            .expect("5 秒内必须收到回执 —— 没收到说明发送侧根本没写出去")
+            .expect("读回执");
+        match got {
+            Some(FrpMessage::ServerCmdResp(r)) => r,
+            other => panic!("应当是 ServerCmdResp，实际：{other:?}"),
+        }
     }
 }

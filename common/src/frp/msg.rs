@@ -8,6 +8,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::ProxyConfig;
+
 // v2 消息 type_id（pkg/msg/wire_v2.go）
 pub const TYPE_LOGIN: u16 = 1;
 pub const TYPE_LOGIN_RESP: u16 = 2;
@@ -31,6 +33,14 @@ pub const TYPE_NAT_HOLE_REPORT: u16 = 18;
 /// UDP 报文的**二进制**编码（v2 握手协商后默认用它）：
 /// `pkg/msg/udp_binary.go` 的 `V2TypeUDPPacketBinary`。
 pub const TYPE_UDP_PACKET_BINARY: u16 = 19;
+/// rustunnel 私有的服务端管理命令（面板增删代理）。
+///
+/// 从 100 起步是故意的：官方 frp 目前只用到 19，留足空间避免将来撞号。
+/// 而且它只会出现在**双方都声明了能力**的会话里（见 [`RustunnelCaps`]），
+/// 官方 frpc 一辈子也不会收到这个 type_id。
+pub const TYPE_SERVER_CMD: u16 = 100;
+/// [`TYPE_SERVER_CMD`] 的回执。
+pub const TYPE_SERVER_CMD_RESP: u16 = 101;
 
 fn is_false(b: &bool) -> bool {
     !*b
@@ -76,6 +86,52 @@ pub struct Login {
     pub metas: HashMap<String, String>,
     #[serde(default)]
     pub pool_count: i32,
+    /// 本端**支持**的 rustunnel 私有能力（能力清单见 [`RustunnelCaps`]）。
+    ///
+    /// 注意这只是"我支持"，**不等于已启用**：必须由服务端在 `LoginResp` 里
+    /// 回显才算协商成功。理由见 [`RustunnelCaps`] 的文档。
+    #[serde(
+        rename = "_rustunnel",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub rustunnel: Option<RustunnelCaps>,
+}
+
+/// rustunnel 的**私有能力协商**。
+///
+/// # 为什么可以往官方消息里塞字段
+///
+/// 官方 frps / frpc 与市面上所有第三方 frps 都是 Go 写的，解析消息用
+/// `encoding/json` —— 它对**未知字段是直接忽略**的，不会因为多了一个键就报错。
+/// 所以往 `Login` / `LoginResp` 里挂一个额外字段是零风险的：
+///
+/// * 对方是官方 frps → 它看不见这个字段，也就**永远不会回显**能力；
+///   客户端拿不到回显就不开启，行为与今天完全一致；
+/// * 对方是 rustunnel 服务端 → 双方协商，开启增强能力。
+///
+/// 反过来说：**绝不能只看客户端自己声明了就启用**。否则连官方 frps 时
+/// 客户端会按"已协商"行事（比如发二进制 UDP），而服务端回的是 JSON，
+/// 两边直接鸡同鸭讲。所以必须由**服务端回显**才算数。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RustunnelCaps {
+    /// v1 线协议下也用二进制 UDP 报文编码。
+    ///
+    /// v2 本来就有（握手协商出来的），v1 官方只支持 JSON —— 而 JSON 版要把
+    /// 载荷做 base64，每个包多出 ~33% 的体积加几十字节字段名。UDP 代理在
+    /// v1（也就是**默认**协议）下正是最需要省这几个字节的场景。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub udp_binary: bool,
+    /// 支持服务端下发管理命令（面板上增删代理 / 踢人）。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub server_cmd: bool,
+}
+
+impl RustunnelCaps {
+    /// 有没有任何一项被打开；没有就整个字段都不往报文里写。
+    pub fn any(&self) -> bool {
+        self.udp_binary || self.server_cmd
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -86,6 +142,15 @@ pub struct LoginResp {
     pub run_id: String,
     #[serde(default, skip_serializing_if = "is_empty_str")]
     pub error: String,
+    /// 服务端**确认**启用的 rustunnel 私有能力（见 [`RustunnelCaps`]）。
+    ///
+    /// 只有这里出现了的能力才算协商成功。官方 frps 不会回这个字段。
+    #[serde(
+        rename = "_rustunnel",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub rustunnel: Option<RustunnelCaps>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -354,6 +419,139 @@ pub struct NatHoleReport {
     pub sid: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub success: bool,
+}
+
+// ---------------------------------------------------------------------------
+// rustunnel 私有的服务端管理命令（面板：增删代理 / 踢人）
+// ---------------------------------------------------------------------------
+//
+// 官方 frp 的消息类型表里没有"服务端让客户端加一条代理"这种东西 ——
+// 官方的做法要么是改配置文件后热重载，要么是 frpc 自己开一个管理 API。
+// 想让**面板**直接下发，就必须有这条消息。
+//
+// 安全边界很清楚：服务端只会在客户端于 `Login` 里声明了 `server_cmd`
+// 能力时才发它（见 [`RustunnelCaps`]），官方 frpc 永远不会收到。
+
+/// 面板下发的管理命令：新增一条代理。
+pub const CMD_ADD_PROXY: &str = "add_proxy";
+/// 面板下发的管理命令：停掉一条代理。
+pub const CMD_REMOVE_PROXY: &str = "remove_proxy";
+
+/// 服务端 → 客户端的管理命令。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServerCmd {
+    /// 命令 ID，回执里**原样带回**。
+    ///
+    /// 服务端靠它把 `ServerCmdResp` 对回自己正在等的那条命令 ——
+    /// 面板一次只发一条，但控制连接上还跑着心跳、工作连接请求，
+    /// 没有 ID 就只能"收到回执就算这条成了"，并发时必然串行出错。
+    #[serde(default, skip_serializing_if = "is_empty_str")]
+    pub id: String,
+    /// [`CMD_ADD_PROXY`] / [`CMD_REMOVE_PROXY`]。
+    #[serde(default, skip_serializing_if = "is_empty_str")]
+    pub op: String,
+    /// 目标代理名（**不带** `{user}.` 前缀，客户端自己会加）。
+    ///
+    /// `add_proxy` 时若与 `proxy.name` 不一致，以 `proxy.name` 为准。
+    #[serde(default, skip_serializing_if = "is_empty_str")]
+    pub proxy_name: String,
+    /// `add_proxy` 时携带的整条代理配置（原版 frp `[[proxies]]` 的 JSON 形态）。
+    ///
+    /// 用 `serde_json::Value` 而不是 `ProxyConfig`：这条消息要能被任何版本的
+    /// 客户端解析，配置结构体演进时不该因为一个字段改名就把整条命令打废。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<serde_json::Value>,
+    /// 给人看的理由（会进客户端日志）。
+    #[serde(default, skip_serializing_if = "is_empty_str")]
+    pub reason: String,
+}
+
+impl NewProxy {
+    pub fn from_config(p: &ProxyConfig, user: &str) -> Self {
+        // 线上名字 = `{user}.{name}`，与官方 frpc 的 `wireName` 对齐
+        let proxy_name = crate::util::add_user_prefix(user, &p.name);
+
+        // 官方 frpc 只在值**不等于默认的 `client`** 时才发 `bandwidth_limit_mode`
+        // （`MarshalToMsg` 里写着 `if c.Transport.BandwidthLimitMode != "client"`），
+        // 所以这里把 `client` 归一化成空串，报文才能和官方 frpc 逐字段一致。
+        let bandwidth_limit_mode = if p.bandwidth_limit_mode.eq_ignore_ascii_case("client") {
+            String::new()
+        } else {
+            p.bandwidth_limit_mode.clone()
+        };
+
+        let mut m = NewProxy {
+            proxy_name,
+            proxy_type: p.proxy_type.clone(),
+            // 带宽上限：官方 frpc 会原样上报，平台拿它做限流校验
+            bandwidth_limit: p.bandwidth_limit.clone(),
+            bandwidth_limit_mode,
+            // ★ 这里放的是**代理级** `[proxies.metadatas]`，不是顶层 `[metadatas]`。
+            //   官方 frpc 的 `MarshalToMsg` 写的是 `m.Metas = c.Metadatas`，
+            //   顶层那份只进登录消息（`Login.Metas`）。
+            metas: p.metas.clone(),
+            ..Default::default()
+        };
+
+        match p.proxy_type.as_str() {
+            "http" | "https" => {
+                m.custom_domains = p.custom_domains.clone();
+                m.subdomain = p.subdomain.clone();
+                m.locations = p.locations.clone();
+                m.http_user = p.http_user.clone();
+                m.http_pwd = p.http_pwd.clone();
+                m.host_header_rewrite = p.host_header_rewrite.clone();
+                m.group = p.group.clone();
+                m.group_key = p.group_key.clone();
+            }
+            // stcp / xtcp：不带 remote_port，靠共享密钥 + visitor 接入
+            "stcp" | "xtcp" => {
+                m.sk = p.secret_key.clone();
+                m.allow_users = p.allow_users.clone();
+            }
+            // tcp / udp：remote_port + 负载均衡分组
+            _ => {
+                m.remote_port = p.remote_port;
+                m.group = p.group.clone();
+                m.group_key = p.group_key.clone();
+            }
+        }
+
+        m
+    }
+}
+
+impl ServerCmd {
+    /// 把 `proxy` 字段反序列化成配置类型。
+    ///
+    /// 放在这里而不是客户端里，是为了让「命令里的 JSON → 代理配置」只有一份实现：
+    /// 配置结构体将来改字段名时不用两处改。失败只返回人话错误串 ——
+    /// 这条路径的错误是要原样显示到面板上的。
+    pub fn proxy_config<T: serde::de::DeserializeOwned>(&self) -> Result<T, String> {
+        let v = self
+            .proxy
+            .clone()
+            .ok_or_else(|| "add_proxy 缺少 proxy 配置".to_string())?;
+        serde_json::from_value(v).map_err(|e| format!("解析代理配置失败：{e}"))
+    }
+}
+
+/// 客户端 → 服务端：命令执行结果。
+///
+/// 面板是同步等这个回包的（超时就当成"已下发但结果未知"），
+/// 所以客户端**必须**对每条 `ServerCmd` 回一条，哪怕失败了。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServerCmdResp {
+    /// 对应 [`ServerCmd::id`]。
+    #[serde(default, skip_serializing_if = "is_empty_str")]
+    pub id: String,
+    #[serde(default, skip_serializing_if = "is_empty_str")]
+    pub op: String,
+    #[serde(default, skip_serializing_if = "is_empty_str")]
+    pub proxy_name: String,
+    /// 空串表示成功。
+    #[serde(default, skip_serializing_if = "is_empty_str")]
+    pub error: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -666,6 +864,8 @@ pub enum FrpMessage {
     NatHoleResp(NatHoleResp),
     NatHoleSid(NatHoleSid),
     NatHoleReport(NatHoleReport),
+    ServerCmd(ServerCmd),
+    ServerCmdResp(ServerCmdResp),
 }
 
 impl FrpMessage {
@@ -690,6 +890,8 @@ impl FrpMessage {
             Self::NatHoleResp(_) => TYPE_NAT_HOLE_RESP,
             Self::NatHoleSid(_) => TYPE_NAT_HOLE_SID,
             Self::NatHoleReport(_) => TYPE_NAT_HOLE_REPORT,
+            Self::ServerCmd(_) => TYPE_SERVER_CMD,
+            Self::ServerCmdResp(_) => TYPE_SERVER_CMD_RESP,
         }
     }
 
@@ -722,6 +924,8 @@ impl FrpMessage {
             Self::NatHoleResp(m) => serde_json::to_vec(m)?,
             Self::NatHoleSid(m) => serde_json::to_vec(m)?,
             Self::NatHoleReport(m) => serde_json::to_vec(m)?,
+            Self::ServerCmd(m) => serde_json::to_vec(m)?,
+            Self::ServerCmdResp(m) => serde_json::to_vec(m)?,
         })
     }
 
@@ -755,6 +959,8 @@ impl FrpMessage {
             TYPE_NAT_HOLE_RESP => Self::NatHoleResp(serde_json::from_slice(body)?),
             TYPE_NAT_HOLE_SID => Self::NatHoleSid(serde_json::from_slice(body)?),
             TYPE_NAT_HOLE_REPORT => Self::NatHoleReport(serde_json::from_slice(body)?),
+            TYPE_SERVER_CMD => Self::ServerCmd(serde_json::from_slice(body)?),
+            TYPE_SERVER_CMD_RESP => Self::ServerCmdResp(serde_json::from_slice(body)?),
             other => {
                 return Err(crate::error::Error::Protocol(format!(
                     "未知的 frp 消息 type_id: {other}"
@@ -785,6 +991,8 @@ impl FrpMessage {
             Self::NatHoleResp(_) => "NatHoleResp",
             Self::NatHoleSid(_) => "NatHoleSid",
             Self::NatHoleReport(_) => "NatHoleReport",
+            Self::ServerCmd(_) => "ServerCmd",
+            Self::ServerCmdResp(_) => "ServerCmdResp",
         }
     }
 }

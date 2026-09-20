@@ -180,6 +180,7 @@ pub async fn serve_on_with(
             listener,
             registry.clone(),
             dashboard_auth.clone(),
+            cfg.clone(),
         ));
     }
 
@@ -384,9 +385,20 @@ async fn handle_frp_stream(
             conn,
             login,
             udp_binary,
+            caps,
         }) => {
             let wire_version = conn.version();
-            handle_control(conn, login, run_id, udp_binary, wire_version, cfg, registry).await
+            handle_control(
+                conn,
+                login,
+                run_id,
+                udp_binary,
+                caps,
+                wire_version,
+                cfg,
+                registry,
+            )
+            .await
         }
         Ok(ServerAccept::Work { conn, msg }) => handle_work(conn, msg, registry).await,
         Ok(ServerAccept::Visitor { conn, msg }) => handle_visitor(conn, msg, registry).await,
@@ -401,11 +413,13 @@ async fn handle_frp_stream(
 // 控制连接
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_control(
     mut conn: FrpConn,
     login: Login,
     run_id: String,
     udp_binary: bool,
+    caps: rustunnel_common::frp::msg::RustunnelCaps,
     wire_version: rustunnel_common::frp::WireVersion,
     cfg: Arc<ServerConfig>,
     registry: Arc<Registry>,
@@ -430,6 +444,7 @@ async fn handle_control(
         login.user.clone(),
         req_tx,
         idle_timeout,
+        caps,
         udp_binary,
         wire_version,
         conn_limit,
@@ -464,6 +479,11 @@ async fn handle_control(
 
     let mut hb_ticker = tokio::time::interval(Duration::from_secs(5));
     let mut last_seen = Instant::now();
+    // 已下发、还在等回执的管理命令：key 是命令 id
+    let mut pending_cmds: std::collections::HashMap<
+        String,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    > = std::collections::HashMap::new();
 
     loop {
         tokio::select! {
@@ -541,6 +561,23 @@ async fn handle_control(
                     FrpMessage::NatHoleReport(m) => {
                         debug!(sid = %m.sid, success = m.success, "收到 NatHoleReport");
                     }
+                    // 面板下发的管理命令的回执：按 id 交还给等待者
+                    FrpMessage::ServerCmdResp(r) => {
+                        let outcome = if r.error.is_empty() {
+                            Ok(())
+                        } else {
+                            Err(r.error.clone())
+                        };
+                        match pending_cmds.remove(&r.id) {
+                            Some(tx) => {
+                                let _ = tx.send(outcome);
+                            }
+                            None => debug!(
+                                id = %r.id, op = %r.op,
+                                "收到没有等待者的命令回执，忽略"
+                            ),
+                        }
+                    }
                     other => {
                         debug!("忽略消息：{}", other.name());
                     }
@@ -552,9 +589,32 @@ async fn handle_control(
                     CtrlCmd::RequestWork => conn.send_msg(&FrpMessage::ReqWorkConn).await?,
                     // 其他路径（xtcp 打洞协调）要发给客户端的消息，原样下发
                     CtrlCmd::Send(msg) => conn.send_msg(&msg).await?,
+                    // 面板下发的管理命令：发出去并登记等待者
+                    CtrlCmd::ServerCmd { cmd, ack } => {
+                        if !client.caps().server_cmd {
+                            // 这个客户端没协商过这个能力（官方 frpc、或者
+                            // private_caps=false），发过去它只会忽略。
+                            // 与其让面板干等到超时，不如立刻明确报错。
+                            let _ = ack.send(Err(
+                                "该客户端未启用管理命令（官方 frpc，或 private_caps=false）"
+                                    .to_string(),
+                            ));
+                            continue;
+                        }
+                        let id = cmd.id.clone();
+                        conn.send_msg(&FrpMessage::ServerCmd((*cmd).clone())).await?;
+                        pending_cmds.insert(id, ack);
+                    }
                 }
             }
             _ = hb_ticker.tick() => {
+                // 被面板踢出：`stop()` 之后必须主动断开，
+                // 否则这条控制连接会一直活到心跳超时，
+                // 期间还能继续建立工作连接 —— "踢了但没完全踢"。
+                if client.is_stopped() {
+                    warn!(%client_id, "客户端已被面板踢出，断开控制连接");
+                    break;
+                }
                 if last_seen.elapsed() > Duration::from_secs(cfg.heartbeat_timeout) {
                     warn!(%client_id, "心跳超时 {}s，断开控制连接", cfg.heartbeat_timeout);
                     break;
@@ -568,7 +628,7 @@ async fn handle_control(
 /// 按代理类型注册：tcp / udp 绑端口，http / https 注册虚拟主机域名。
 ///
 /// 返回给客户端的 `remote_addr` 文案（frp 用它展示"暴露在哪"）。
-async fn register_proxy(
+pub(crate) async fn register_proxy(
     cfg: &Arc<ServerConfig>,
     registry: &Arc<Registry>,
     client: &Arc<ClientState>,
@@ -794,7 +854,9 @@ async fn proxy_accept_loop(listener: TcpListener, remote_port: u16, registry: Ar
             Ok((stream, peer)) => {
                 // group 负载均衡：这个端口背后可能挂着多个客户端（同组代理），
                 // 每条新连接轮询挑一个；挑不到说明后端全掉了，直接关掉。
-                let Some(backend) = registry.pick(remote_port) else {
+                // 选**在途连接最少**的后端，并立刻给它记一条 ——
+                // 计数令牌一路带进 PendingUser，转发结束（或被拒）时自动减回去。
+                let Some((backend, load)) = registry.pick_and_hold(remote_port) else {
                     debug!(%peer, port = remote_port, "端口没有可用后端，关闭连接");
                     continue;
                 };
@@ -811,6 +873,7 @@ async fn proxy_accept_loop(listener: TcpListener, remote_port: u16, registry: Ar
                     at: Instant::now(),
                     slot: ConnSlot::acquire(&registry.conn_limit, &client),
                     queue_permit: None,
+                    load: Some(load),
                 };
                 admit_user(user, &client, &registry);
             }
@@ -1020,6 +1083,7 @@ async fn handle_visitor(
         at: Instant::now(),
         slot,
         queue_permit: None,
+        load: None,
     };
     info!(proxy = %proxy_name, kind = %entry.proxy_type, "visitor 接入成功，开始中继");
     spawn_bridge(user, work, registry.clone());
@@ -1113,6 +1177,7 @@ pub(crate) fn test_pending(proxy: &str, slot: Option<ConnSlot>) -> PendingUser {
         at: Instant::now(),
         slot,
         queue_permit: None,
+        load: None,
     }
 }
 
@@ -1133,6 +1198,7 @@ mod tests {
             String::new(),
             tx,
             Duration::from_secs(60),
+            Default::default(),
             false,
             rustunnel_common::frp::WireVersion::V1,
             conn_limit,

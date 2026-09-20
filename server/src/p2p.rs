@@ -32,12 +32,30 @@ use crate::{pool::ClientState, registry::Registry};
 /// 一条会话从创建到过期的时间：足够双方完成一次 HELLO + QUIC 握手。
 const SESSION_TTL: Duration = Duration::from_secs(60);
 
+/// 单个 peer 在一次会话里留下的全部信息。
+///
+/// `addrs` 里可能有多个条目：端口预测要靠它。
+/// 对称 NAT 给"每换一个本地端口"分配一个新公网端口，所以客户端会多开几个
+/// 临时 socket 各发一份 HELLO —— 服务端于是观察到一串**端口序列**，
+/// 客户端拿它算步长、预测 peer 之间通信时会落在哪个端口上。
+#[derive(Clone)]
+struct PeerSlot {
+    addrs: Vec<SocketAddr>,
+    transport: p2p::Transport,
+    at: Instant,
+}
+
+/// 单个 peer 最多记录几个观测地址。
+///
+/// 够推出步长就够了（3 个能看出两次增量），再多只是给报文增肥。
+const MAX_SAMPLES: usize = 8;
+
 /// 一次打洞会话里两个 peer 的公网地址。
 struct Session {
     /// 会话创建时间：刚 create 出来、两端都还没到的时候全靠它保命。
     created: Instant,
-    visitor: Option<(SocketAddr, Instant)>,
-    provider: Option<(SocketAddr, Instant)>,
+    visitor: Option<PeerSlot>,
+    provider: Option<PeerSlot>,
 }
 
 impl Session {
@@ -48,20 +66,43 @@ impl Session {
             provider: None,
         }
     }
-}
 
-impl Session {
-    fn slot_mut(&mut self, role: Role) -> &mut Option<(SocketAddr, Instant)> {
+    fn slot_mut(&mut self, role: Role) -> &mut Option<PeerSlot> {
         match role {
             Role::Visitor => &mut self.visitor,
             Role::Provider => &mut self.provider,
         }
     }
 
-    fn get(&self, role: Role) -> Option<SocketAddr> {
+    fn get(&self, role: Role) -> Option<&PeerSlot> {
         match role {
-            Role::Visitor => self.visitor.as_ref().map(|(a, _)| *a),
-            Role::Provider => self.provider.as_ref().map(|(a, _)| *a),
+            Role::Visitor => self.visitor.as_ref(),
+            Role::Provider => self.provider.as_ref(),
+        }
+    }
+
+    /// 记下一个观测地址。
+    ///
+    /// 同一个 peer 会发来多份 HELLO（采样），这里做去重：
+    /// 只有**公网端口不同**的才追加 —— 否则重传的 HELLO 会把样本列表
+    /// 填成同一个值，端口预测退化成"步长 0"，等于没预测。
+    fn observe(&mut self, role: Role, addr: SocketAddr, transport: p2p::Transport) {
+        let slot = self.slot_mut(role);
+        match slot {
+            None => {
+                *slot = Some(PeerSlot {
+                    addrs: vec![addr],
+                    transport,
+                    at: Instant::now(),
+                });
+            }
+            Some(s) => {
+                s.at = Instant::now();
+                s.transport = transport;
+                if s.addrs.len() < MAX_SAMPLES && !s.addrs.contains(&addr) {
+                    s.addrs.push(addr);
+                }
+            }
         }
     }
 }
@@ -84,15 +125,30 @@ impl P2PHub {
         g.entry(sid.to_string()).or_insert_with(Session::new);
     }
 
-    /// 记下某个角色的公网地址。
+    /// 记下某个角色的一个观测地址。
     ///
-    /// 若**另一个角色也到齐了**，返回它的地址 —— 调用方要把这个地址同时发给双方。
-    pub fn register(&self, sid: &str, role: Role, addr: SocketAddr) -> Option<SocketAddr> {
+    /// 若**另一个角色也到齐了**，返回它的观测地址列表与协商出的传输 ——
+    /// 调用方要把这些同时发给双方。
+    pub fn register(
+        &self,
+        sid: &str,
+        role: Role,
+        addr: SocketAddr,
+        transport: p2p::Transport,
+    ) -> Option<(Vec<SocketAddr>, p2p::Transport)> {
         let mut g = self.sessions.lock().unwrap();
         self.reap_locked(&mut g);
         let session = g.get_mut(sid)?;
-        *session.slot_mut(role) = Some((addr, Instant::now()));
-        session.get(role.peer())
+        session.observe(role, addr, transport);
+        // 传输由 **visitor** 说了算：它是主动发起的一方，也只有它知道自己
+        // 那条链路是弱网（该走 KCP）还是普通宽带（QUIC 更省事）。
+        // provider 侧的选择在这里被覆盖 —— 双方必须跑同一种传输才能握手。
+        let chosen = session
+            .get(Role::Visitor)
+            .map(|s| s.transport)
+            .unwrap_or(transport);
+        let other = session.get(role.peer())?;
+        Some((other.addrs.clone(), chosen))
     }
 
     /// 回收超时会话，避免一个永不过期的 sid 把内存慢慢吃满。
@@ -103,15 +159,16 @@ impl P2PHub {
             if now.duration_since(s.created) >= SESSION_TTL {
                 return false;
             }
-            let fresh = |slot: &Option<(SocketAddr, Instant)>| {
-                slot.map(|(_, at)| now.duration_since(at) < SESSION_TTL)
+            let fresh = |slot: &Option<PeerSlot>| {
+                slot.as_ref()
+                    .map(|s| now.duration_since(s.at) < SESSION_TTL)
                     .unwrap_or(true)
             };
             fresh(&s.visitor) && fresh(&s.provider)
         });
     }
 
-    /// 会话被双方消费完后主动清理（省内存，也避免 sid 复用带来的串tracking）。
+    /// 会话被双方消费完后主动清理（省内存，也避免 sid 复用带来的串会话）。
     pub fn finish(&self, sid: &str) {
         self.sessions.lock().unwrap().remove(sid);
     }
@@ -140,23 +197,35 @@ pub async fn run_rendezvous(sock: Arc<UdpSocket>, hub: Arc<P2PHub>) {
                 continue;
             }
         };
-        let Some(Packet::Hello { role, sid }) = p2p::decode(&buf[..n]) else {
+        let Some(Packet::Hello {
+            role,
+            sid,
+            transport,
+        }) = p2p::decode(&buf[..n])
+        else {
             debug!(%peer, "收到非法牵线报文，丢弃");
             continue;
         };
-        debug!(%peer, ?role, %sid, "收到 HELLO");
-        let Some(peer_addr) = hub.register(&sid, role, peer) else {
+        debug!(%peer, ?role, %sid, ?transport, "收到 HELLO");
+        let Some((peer_addrs, chosen)) = hub.register(&sid, role, peer, transport) else {
             debug!(%peer, %sid, "对端还没到，先记下地址");
             continue;
         };
-        // 关键动作：把对方的地址分别发给两端，双方同时开打才能穿过 NAT
-        if let Some(pkt) = p2p::encode_peer(role.peer(), &sid, &peer_addr) {
+        // 关键动作：把对方的地址分别发给两端，双方同时开打才能穿过 NAT。
+        // 用 PEERS（多个地址）而不是 PEER：对称 NAT 下 peer 要靠这一串端口
+        // 序列去预测真正通信时会落在哪个端口上。
+        if let Some(pkt) = p2p::encode_peers(role.peer(), &sid, chosen, &peer_addrs) {
             let _ = sock.send_to(&pkt, peer).await;
+            hub.finish(&sid);
         }
-        if let Some(pkt) = p2p::encode_peer(role, &sid, &peer) {
-            let _ = sock.send_to(&pkt, peer_addr).await;
+        // 采样 socket 发来的 HELLO 只会让这一侧多一个样本，回包要打回主 socket。
+        // 这里逐个地址发一遍：主 socket 的地址排在最前（它是最先被记下的）。
+        for a in &peer_addrs {
+            if let Some(pkt) = p2p::encode_peers(role, &sid, chosen, &[peer]) {
+                let _ = sock.send_to(&pkt, a).await;
+            }
         }
-        debug!(%sid, this = %peer, other = %peer_addr, "已向双方下发对方地址");
+        debug!(%sid, this = %peer, other = ?peer_addrs, ?chosen, "已向双方下发对方地址");
     }
 }
 
@@ -276,6 +345,7 @@ mod tests {
             user.to_string(),
             tx,
             Duration::from_secs(60),
+            Default::default(),
             false,
             rustunnel_common::frp::WireVersion::V1,
             conn,
@@ -304,15 +374,26 @@ mod tests {
         let a: SocketAddr = "1.2.3.4:100".parse().unwrap();
         let b: SocketAddr = "5.6.7.8:200".parse().unwrap();
         // 只有一端到：拿不到对端地址
-        assert!(hub.register(&sid, Role::Visitor, a).is_none());
+        assert!(hub
+            .register(&sid, Role::Visitor, a, p2p::Transport::Quic)
+            .is_none());
         // 另一端到：双方互推
-        assert_eq!(hub.register(&sid, Role::Provider, b), Some(a));
+        let (addrs, chosen) = hub
+            .register(&sid, Role::Provider, b, p2p::Transport::Quic)
+            .expect("两端到齐");
+        assert_eq!(addrs, vec![a]);
+        assert_eq!(chosen, p2p::Transport::Quic);
         hub.finish(&sid);
         assert_eq!(hub.len(), 0, "会话结束必须清理，避免 sid 复用串会话");
 
         // 未 create 过的 sid 直接 register 应当安全返回 None
         assert!(hub
-            .register(&format!("{:032x}", 9u64), Role::Visitor, a)
+            .register(
+                &format!("{:032x}", 9u64),
+                Role::Visitor,
+                a,
+                p2p::Transport::Quic
+            )
             .is_none());
     }
 
@@ -372,6 +453,7 @@ mod tests {
             "bob".into(),
             ptx,
             Duration::from_secs(60),
+            Default::default(),
             false,
             rustunnel_common::frp::WireVersion::V1,
             conn,
@@ -401,6 +483,7 @@ mod tests {
             "bob".into(),
             vtx,
             Duration::from_secs(60),
+            Default::default(),
             false,
             rustunnel_common::frp::WireVersion::V1,
             vconn,
@@ -487,6 +570,7 @@ mod tests {
             "bob".into(),
             vtx,
             Duration::from_secs(60),
+            Default::default(),
             false,
             rustunnel_common::frp::WireVersion::V1,
             vconn,

@@ -10,6 +10,7 @@
 //! 因此所有核心状态机——连接池、路由表、visitor 准入、资源上限、指标——
 //! 都有对应的单元测试，集成测试也能直接驱动它们。
 
+pub mod admin;
 pub mod dashboard;
 pub mod limits;
 pub mod observability;

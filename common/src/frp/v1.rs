@@ -87,6 +87,14 @@ pub const TYPE_NAT_HOLE_CLIENT: u8 = b'n';
 pub const TYPE_NAT_HOLE_RESP: u8 = b'm';
 pub const TYPE_NAT_HOLE_SID: u8 = b'5';
 pub const TYPE_NAT_HOLE_REPORT: u8 = b'6';
+/// rustunnel 私有的服务端管理命令（对应 v2 的 type_id 100）。
+///
+/// 官方 frp 到 v0.71.0 为止只用小写字母和数字当类型字节，所以这里挑了
+/// **大写** `Z` / `Y`：与官方当前及可预见的取值都不冲突。
+/// 而且它只在双方都声明了 `server_cmd` 能力的会话里出现。
+pub const TYPE_SERVER_CMD: u8 = b'Z';
+/// [`TYPE_SERVER_CMD`] 的回执（对应 v2 的 type_id 101）。
+pub const TYPE_SERVER_CMD_RESP: u8 = b'Y';
 
 /// 单条消息 JSON 体的长度上限（`golib/msg/json` 的 `defaultMaxMsgLength`）。
 ///
@@ -121,6 +129,8 @@ pub fn type_byte(type_id: u16) -> Option<u8> {
         16 => TYPE_NAT_HOLE_RESP,
         17 => TYPE_NAT_HOLE_SID,
         18 => TYPE_NAT_HOLE_REPORT,
+        100 => TYPE_SERVER_CMD,
+        101 => TYPE_SERVER_CMD_RESP,
         _ => return None,
     })
 }
@@ -146,6 +156,8 @@ pub fn type_id(byte: u8) -> Option<u16> {
         TYPE_NAT_HOLE_RESP => 16,
         TYPE_NAT_HOLE_SID => 17,
         TYPE_NAT_HOLE_REPORT => 18,
+        TYPE_SERVER_CMD => 100,
+        TYPE_SERVER_CMD_RESP => 101,
         _ => return None,
     })
 }

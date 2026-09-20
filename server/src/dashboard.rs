@@ -16,9 +16,11 @@ use tokio::{
 use tracing::{debug, warn};
 
 use crate::{
+    admin,
     observability::{encode_json, encode_prometheus, Snapshot},
     registry::Registry,
 };
+use rustunnel_common::config::ServerConfig;
 
 /// 面板的鉴权信息；`None` 表示不校验（只建议在回环地址上这样配）。
 pub type DashboardAuth = Arc<RwLock<Option<(String, String)>>>;
@@ -36,7 +38,12 @@ const METRIC_PREFIX: &str = "rustunnel";
 const MAX_LINE: usize = 8 * 1024;
 
 /// 启动面板服务。
-pub async fn run(listener: TcpListener, registry: Arc<Registry>, auth: DashboardAuth) {
+pub async fn run(
+    listener: TcpListener,
+    registry: Arc<Registry>,
+    auth: DashboardAuth,
+    cfg: Arc<ServerConfig>,
+) {
     let addr = listener.local_addr().ok();
     tracing::info!(
         "面板已启动：{}  （/ 面板、/metrics 指标、/api/status 状态）",
@@ -47,8 +54,9 @@ pub async fn run(listener: TcpListener, registry: Arc<Registry>, auth: Dashboard
             Ok((stream, peer)) => {
                 let registry = registry.clone();
                 let auth = auth.clone();
+                let cfg = cfg.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle(stream, peer, registry, auth).await {
+                    if let Err(e) = handle(stream, peer, registry, auth, cfg).await {
                         debug!(%peer, "面板连接结束：{e:#}");
                     }
                 });
@@ -66,8 +74,17 @@ async fn handle(
     peer: SocketAddr,
     registry: Arc<Registry>,
     auth: DashboardAuth,
+    cfg: Arc<ServerConfig>,
 ) -> anyhow::Result<()> {
-    // 面板只面向自己的运维，请求通常很小，一次读完就够
+    // 读到"请求头结束"为止，如果带了 `Content-Length`，还要把**请求体读全**。
+    //
+    // 只按 `\r\n\r\n` 收尾是不够的，会踩两个坑：
+    // * 请求体被拆到第二个 TCP 段里 → 我们提前收手，body 被截断，
+    //   JSON 解析失败；
+    // * 更隐蔽的：客户端发来了数据而我们没读完就关 socket，
+    //   内核会回 RST 而不是 FIN —— Windows 上表现为客户端拿到
+    //   `ConnectionResetError`，连已经写出去的响应都一起丢了。
+    //   鉴权失败的 POST 就正好卡在这条上：面板明明回了 401，客户端却看不到。
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     loop {
@@ -76,13 +93,24 @@ async fn handle(
             break;
         }
         buf.extend_from_slice(&chunk[..n]);
-        if buf.len() > MAX_LINE * 4 || buf.windows(4).any(|w| w == b"\r\n\r\n") {
+        let head_done = buf.windows(4).any(|w| w == b"\r\n\r\n");
+        if !head_done {
+            if buf.len() > MAX_LINE * 4 {
+                break;
+            }
+            continue;
+        }
+        // 头齐了：按 Content-Length 补齐请求体（没有该字段就当作没有体）
+        let want = content_length_of(&String::from_utf8_lossy(&buf));
+        let have = buf_body_len(&buf);
+        if have >= want || buf.len() > MAX_LINE * 4 {
             break;
         }
     }
     let req = String::from_utf8_lossy(&buf).to_string();
     let (method, path) = parse_request_line(&req);
     let given = basic_auth_of(&req);
+    let body = body_of(&req);
 
     // 健康探针必须在鉴权**之前**处理。
     //
@@ -130,7 +158,7 @@ async fn handle(
         }
     }
 
-    if method != "GET" && method != "HEAD" {
+    if !matches!(method.as_str(), "GET" | "HEAD" | "POST") {
         send(
             &mut stream,
             405,
@@ -140,6 +168,31 @@ async fn handle(
         )
         .await?;
         return Ok(());
+    }
+
+    // 写操作：**所有 POST 都走这里**。
+    //
+    // 位置很关键 —— 必须排在鉴权**之后**。这些接口能开端口、能踢人，
+    // 绝不能因为"没配 dashboard_user"就对全世界敞开。
+    // 路径集中写在 `ADMIN_PATHS` 一张表里，散在 match 里迟早漏一个，
+    // 而漏掉的那一个就是后门。
+    if method == "POST" {
+        if let Some((_, op)) = ADMIN_PATHS.iter().find(|(p, _)| *p == path.as_str()) {
+            let outcome = admin_dispatch(*op, &registry, &cfg, body).await;
+            let (code, payload) = match outcome {
+                Ok(msg) => (200, format!("{{\"ok\":true,\"message\":{:?}}}", msg)),
+                Err(e) => (400, format!("{{\"ok\":false,\"error\":{:?}}}", e)),
+            };
+            send(
+                &mut stream,
+                code,
+                "application/json; charset=utf-8",
+                payload.as_bytes(),
+                &[],
+            )
+            .await?;
+            return Ok(());
+        }
     }
 
     let snapshot = registry.observ.snapshot();
@@ -194,8 +247,93 @@ async fn handle(
 }
 
 // ---------------------------------------------------------------------------
-// 极简 HTTP 解析（够用即可，不为面板引入完整 HTTP 栈）
+// 写操作接口
 // ---------------------------------------------------------------------------
+
+/// 面板支持的写操作路径。
+///
+/// 集中列成一张表，是为了让"哪些路径要 POST + 鉴权"只有一处定义 ——
+/// 散在 match 里迟早会漏一个，那一个就是后门。
+const ADMIN_PATHS: &[(&str, AdminOp)] = &[
+    ("/api/proxies/add", AdminOp::AddProxy),
+    ("/api/proxies/remove", AdminOp::RemoveProxy),
+    ("/api/clients/kick", AdminOp::Kick),
+];
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AdminOp {
+    AddProxy,
+    RemoveProxy,
+    Kick,
+}
+
+async fn admin_dispatch(
+    op: AdminOp,
+    registry: &Arc<Registry>,
+    cfg: &Arc<ServerConfig>,
+    body: &str,
+) -> Result<String, String> {
+    // body 是 JSON：手工取字段，不引 serde 派生 —— 面板的请求体只有三四个键，
+    // 为一个 {"run_id": "..."} 建一整套结构体不划算。
+    let v: serde_json::Value = if body.trim().is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(body).map_err(|e| format!("请求体不是合法 JSON：{e}"))?
+    };
+    let str_field = |k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let run_id = str_field("run_id");
+    if run_id.is_empty() {
+        return Err("缺少 run_id".to_string());
+    }
+
+    match op {
+        AdminOp::AddProxy => {
+            let proxy = v
+                .get("proxy")
+                .ok_or_else(|| "缺少 proxy 配置".to_string())?;
+            let p: rustunnel_common::config::ProxyConfig = serde_json::from_value(proxy.clone())
+                .map_err(|e| format!("proxy 配置解析失败：{e}"))?;
+            admin::add_proxy(cfg, registry, &run_id, p).await
+        }
+        AdminOp::RemoveProxy => {
+            let name = str_field("name");
+            if name.is_empty() {
+                return Err("缺少 name".to_string());
+            }
+            admin::remove_proxy(registry, &run_id, &name).await
+        }
+        AdminOp::Kick => admin::kick(registry, &run_id, &str_field("reason")).await,
+    }
+}
+
+/// 请求头里的 `Content-Length`（没有就当 0）。
+fn content_length_of(req: &str) -> usize {
+    header_value(req, "content-length")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+/// 已经收到的请求体字节数。
+fn buf_body_len(buf: &[u8]) -> usize {
+    let sep = b"\r\n\r\n";
+    match buf.windows(4).position(|w| w == sep) {
+        Some(i) => buf.len() - (i + 4),
+        None => 0,
+    }
+}
+
+/// 取请求体：HTTP 头结束（空行）之后的全部内容。
+fn body_of(req: &str) -> &str {
+    match req.find("\r\n\r\n") {
+        Some(i) => &req[i + 4..],
+        None => "",
+    }
+}
 
 fn parse_request_line(req: &str) -> (String, String) {
     let mut parts = req.split_whitespace();
@@ -275,9 +413,11 @@ fn status_json(registry: &Registry, snap: &Snapshot) -> String {
         if i > 0 {
             clients.push(',');
         }
+        // run_id 必须带上：面板上的"新增代理 / 踢出"是拿它当主键的。
+        // client_id 会重复（同一个 client_id 重连多次），不能当主键用。
         clients.push_str(&format!(
-            "{{\"client_id\":{:?},\"user\":{:?},\"proxies\":{:?},\"backlog\":{},\"idle_work_conns\":{}}}",
-            c.client_id, c.user, c.proxies, c.backlog, c.idle_work_conns
+            "{{\"run_id\":{:?},\"client_id\":{:?},\"user\":{:?},\"proxies\":{:?},\"backlog\":{},\"idle_work_conns\":{},\"managed\":{}}}",
+            c.run_id, c.client_id, c.user, c.proxies, c.backlog, c.idle_work_conns, c.managed
         ));
     }
     clients.push(']');
@@ -344,6 +484,17 @@ fn html_page() -> String {
   tr:last-child td { border-bottom:none; }
   .empty { color:#6e7781; padding:12px; background:#fff; border:1px dashed #d8dee4; border-radius:8px; }
   code { background:#eff1f3; padding:1px 5px; border-radius:4px; }
+  .admin { background:#fff; border:1px solid #d8dee4; border-radius:8px; padding:14px 16px; }
+  .admin .row { display:flex; flex-wrap:wrap; gap:12px; align-items:center; margin-bottom:10px; }
+  .admin label { font-size:12px; color:#57606a; display:flex; gap:6px; align-items:center; }
+  .admin input, .admin select { font:inherit; padding:5px 8px; border:1px solid #d0d7de;
+          border-radius:6px; background:#fff; color:#1f2328; }
+  button { font:inherit; padding:5px 12px; border:1px solid #d0d7de; border-radius:6px;
+           background:#f6f8fa; color:#1f2328; cursor:pointer; }
+  button:hover { background:#eef1f4; }
+  button.danger { border-color:#f0c0c0; color:#a40e26; }
+  pre#outcome { margin:8px 0 0; padding:10px 12px; border-radius:6px; background:#f6f8fa;
+                color:#1f2328; font-size:12px; white-space:pre-wrap; min-height:1.4em; }
   footer { color:#6e7781; font-size:12px; text-align:center; padding:26px 0; }
 </style>
 </head>
@@ -359,7 +510,31 @@ fn html_page() -> String {
     <h2>stcp / xtcp 代理</h2>
     <div id="visitors"></div>
   </section>
-  <footer>Prometheus 指标：<code>GET /metrics</code> · 状态接口：<code>GET /api/status</code></footer>
+  <section>
+    <h2>管理操作</h2>
+    <div class="admin">
+      <div class="row">
+        <label>目标客户端 <select id="target"></select></label>
+      </div>
+      <div class="row">
+        <label>代理名 <input id="p_name" placeholder="web"></label>
+        <label>类型 <select id="p_type">
+          <option value="tcp">tcp</option><option value="udp">udp</option>
+          <option value="http">http</option><option value="https">https</option>
+          <option value="stcp">stcp</option><option value="xtcp">xtcp</option>
+        </select></label>
+        <label>公网端口 <input id="p_port" type="number" placeholder="7000"></label>
+        <label>内网地址 <input id="p_local" placeholder="127.0.0.1:8080"></label>
+      </div>
+      <div class="row">
+        <button id="btn_add">新增代理</button>
+        <button id="btn_del" class="danger">移除代理（按上面的名字）</button>
+      </div>
+      <pre id="outcome"></pre>
+    </div>
+  </section>
+  <footer>Prometheus 指标：<code>GET /metrics</code> · 状态接口：<code>GET /api/status</code>
+    · 管理接口：<code>POST /api/proxies/add</code> / <code>/api/proxies/remove</code> / <code>/api/clients/kick</code></footer>
 </main>
 <script>
 const KB = 1024, MB = 1024*1024, GB = 1024*1024*1024;
@@ -383,9 +558,20 @@ async function refresh(){
       card('下行流量', bytes(st.bytes_down ?? 0)),
       card('被拒连接', st.conns_rejected ?? 0),
     ].join('');
+    window.__clients = s.clients||[];
     document.getElementById('clients').innerHTML = table(
-      ['客户端', 'user', '代理', '排队', '空闲工作连接'],
-      (s.clients||[]).map(c=>[c.client_id, c.user||'-', (c.proxies||[]).join(', ')||'-', c.backlog, c.idle_work_conns]));
+      ['客户端', 'user', '代理', '排队', '空闲', '管理'],
+      (s.clients||[]).map(c=>[c.client_id, c.user||'-', (c.proxies||[]).join(', ')||'-',
+        c.backlog, c.idle_work_conns,
+        '<button data-kick="'+esc(c.run_id)+'">踢出</button>']));
+    // 客户端下拉框（新增代理要选一个客户端）
+    const sel = document.getElementById('target');
+    if (sel) {
+      const keep = sel.value;
+      sel.innerHTML = (s.clients||[]).map(c =>
+        '<option value="'+esc(c.run_id)+'">'+esc(c.client_id)+' / '+esc(c.user||'-')+'</option>').join('');
+      if (keep) sel.value = keep;
+    }
     document.getElementById('visitors').innerHTML = table(
       ['代理名', '类型', 'provider 用户', 'allow_users'],
       (s.visitors||[]).map(v=>[v.proxy_name, v.type, v.provider_user||'-', (v.allow_users||[]).join(', ')||'同 user']));
@@ -393,6 +579,40 @@ async function refresh(){
     document.getElementById('cards').innerHTML = '<div class="empty">读取状态失败：'+e+'</div>';
   }
 }
+function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function val(id){ return (document.getElementById(id)||{}).value || ''; }
+async function call(path, payload){
+  const out = document.getElementById('outcome');
+  out.textContent = '请求中…';
+  try {
+    const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'},
+                                 body: JSON.stringify(payload)});
+    const j = await r.json();
+    out.textContent = j.ok ? ('成功：'+j.message) : ('失败：'+j.error);
+    out.style.background = j.ok ? '#eaf6ec' : '#fdecec';
+    refresh();
+  } catch(e) { out.textContent = '请求失败：'+e; out.style.background = '#fdecec'; }
+}
+document.addEventListener('click', async ev => {
+  const runId = ev.target.getAttribute && ev.target.getAttribute('data-kick');
+  if (runId) {
+    if (!confirm('确定踢出这个客户端？它的所有代理会立刻失效。')) return;
+    await call('/api/clients/kick', {run_id: runId, reason: '面板操作'});
+  }
+});
+const addBtn = document.getElementById('btn_add');
+if (addBtn) addBtn.onclick = async () => {
+  const port = parseInt(val('p_port'), 10);
+  const proxy = {name: val('p_name'), type: val('p_type'), local_addr: val('p_local')};
+  if (!isNaN(port)) proxy.remote_port = port;
+  if (!proxy.name) { document.getElementById('outcome').textContent = '请先填代理名'; return; }
+  await call('/api/proxies/add', {run_id: val('target'), proxy: proxy});
+};
+const delBtn = document.getElementById('btn_del');
+if (delBtn) delBtn.onclick = async () => {
+  if (!val('p_name')) { document.getElementById('outcome').textContent = '请先填代理名'; return; }
+  await call('/api/proxies/remove', {run_id: val('target'), name: val('p_name')});
+};
 refresh(); setInterval(refresh, 3000);
 </script>
 </body>

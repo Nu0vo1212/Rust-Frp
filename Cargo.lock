@@ -981,7 +981,7 @@ dependencies = [
 
 [[package]]
 name = "rustunnel-client"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "base64",
@@ -999,7 +999,7 @@ dependencies = [
 
 [[package]]
 name = "rustunnel-common"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1030,7 +1030,7 @@ dependencies = [
 
 [[package]]
 name = "rustunnel-server"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "base64",
@@ -1038,6 +1038,7 @@ dependencies = [
  "futures",
  "quinn",
  "rustunnel-common",
+ "serde_json",
  "tokio",
  "tokio-util",
  "tracing",

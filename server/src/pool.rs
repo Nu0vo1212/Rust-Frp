@@ -15,7 +15,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rustunnel_common::frp::{conn::FrpConn, msg::FrpMessage, stream::BoxStream, WireVersion};
+use rustunnel_common::frp::{
+    conn::FrpConn,
+    msg::{FrpMessage, RustunnelCaps},
+    stream::BoxStream,
+    WireVersion,
+};
 use tokio::sync::mpsc;
 
 use crate::limits::{Limit, Permit};
@@ -33,6 +38,16 @@ pub enum CtrlCmd {
     /// 装箱是因为 `FrpMessage` 有几十个变体，裸放在这里会把整个枚举撑到几百字节；
     /// 而绝大多数命令都是只有 1 字节语义的 `RequestWork`。
     Send(Box<FrpMessage>),
+    /// 面板下发管理命令，并等客户端的回执。
+    ///
+    /// `ack` 拿到的是客户端**自己报的**结果（成功 / 为什么失败），
+    /// 服务端据此决定要不要把刚开的资源收回去。
+    /// 另一端被 drop（比如控制连接断了）时 `ack` 会返回 Err，
+    /// 调用方据此把这次操作判为失败。
+    ServerCmd {
+        cmd: Box<rustunnel_common::frp::msg::ServerCmd>,
+        ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// 一条已握手完成、等待分配代理的工作连接。
@@ -56,6 +71,11 @@ pub struct PendingUser {
     pub slot: Option<ConnSlot>,
     /// 排队等待工作连接时持有的队列配额。
     pub queue_permit: Option<Permit>,
+    /// group 负载均衡用的"在途连接数"计数。
+    ///
+    /// 与 `slot` 一样靠 drop 归还：只要这条 PendingUser 还在，
+    /// 它选中的那个后端就被记着一条在途连接，下一轮 `pick` 会据此让路。
+    pub load: Option<crate::registry::LoadGuard>,
 }
 
 /// 一条转发连接同时占用的两档配额。
@@ -166,6 +186,11 @@ pub struct ClientState {
     /// 名额必须**活着**：代理一注销就 drop，名额才真正回到池子里。
     /// 同理端口也要记着，客户端主动 `CloseProxy` 时才知道该归还哪一个。
     proxies: Mutex<HashMap<String, ProxyEntry>>,
+    /// 本会话**协商成功**的 rustunnel 私有能力（见 [`RustunnelCaps`]）。
+    ///
+    /// 只有这里为真，服务端才可以往这个客户端发管理命令。
+    /// 官方 frpc 不会声明能力，所以永远是全关。
+    caps: RustunnelCaps,
     /// 本次会话协商出的 UDP 报文编码（true = 二进制），工作连接要跟着用。
     ///
     /// 只有 **v2** 才有这套协商；v1 永远是 JSON。
@@ -193,6 +218,7 @@ impl ClientState {
         user: String,
         req_tx: mpsc::UnboundedSender<CtrlCmd>,
         idle_timeout: Duration,
+        caps: RustunnelCaps,
         udp_binary: bool,
         wire_version: WireVersion,
         conn_limit: Limit,
@@ -206,6 +232,7 @@ impl ClientState {
             req_tx,
             pool: Mutex::new(PoolState::default()),
             proxies: Mutex::new(HashMap::new()),
+            caps,
             udp_binary,
             wire_version,
             work_notify: tokio::sync::Notify::new(),
@@ -219,6 +246,11 @@ impl ClientState {
 
     pub fn udp_codec_is_binary(&self) -> bool {
         self.udp_binary
+    }
+
+    /// 这个客户端能不能收私有管理命令（面板增删代理）。
+    pub fn caps(&self) -> RustunnelCaps {
+        self.caps.clone()
     }
 
     pub fn wire_version(&self) -> WireVersion {
@@ -290,6 +322,11 @@ impl ClientState {
     /// 通知控制连接："我需要一条工作连接"。
     pub fn request_work_conn(&self) {
         let _ = self.req_tx.send(CtrlCmd::RequestWork);
+    }
+
+    /// 控制连接命令通道的发送端（面板下发管理命令时要用它带上 oneshot 回执）。
+    pub fn req_tx(&self) -> &mpsc::UnboundedSender<CtrlCmd> {
+        &self.req_tx
     }
 
     /// 让控制连接把这条消息原样发给客户端（xtcp 打洞协调用）。
@@ -397,6 +434,7 @@ pub(crate) fn dummy_client(run_id: &str) -> Arc<ClientState> {
         String::new(),
         tx,
         Duration::from_secs(60),
+        Default::default(),
         false,
         rustunnel_common::frp::WireVersion::V1,
         Limit::unlimited(),
@@ -425,6 +463,7 @@ mod tests {
             at: now,
             slot: None,
             queue_permit: None,
+            load: None,
         }
     }
 
@@ -443,6 +482,7 @@ mod tests {
             String::new(),
             tx,
             Duration::from_secs(60),
+            Default::default(),
             false,
             rustunnel_common::frp::WireVersion::V1,
             conn,
@@ -492,6 +532,7 @@ mod tests {
             String::new(),
             tx,
             Duration::from_millis(50),
+            Default::default(),
             false,
             rustunnel_common::frp::WireVersion::V1,
             Limit::unlimited(),

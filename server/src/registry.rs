@@ -10,6 +10,7 @@ use std::{
 };
 
 use crate::{
+    guard::SecurityContext,
     limits::Limit,
     observability::{self, Metrics},
     p2p::P2PHub,
@@ -81,7 +82,15 @@ pub struct Registry {
     pub observ: observability::Registry,
     /// xtcp 打洞的牵线中心；未配置 `p2p_port` 时为 None（xtcp 自动退化成中继）。
     p2p: Mutex<Option<Arc<P2PHub>>>,
+    /// VirtualNet 的转发中枢；未配置 `vnet_port` 时为 None。
+    vnet: Mutex<Option<Arc<crate::vnet::VnetHub>>>,
     limits: ServerLimits,
+    /// 安全上下文：认证 / IP 白黑名单 / 角色权限 / 审计日志。
+    ///
+    /// 放在 `Mutex<Arc<..>>` 而不是 `Arc<..>` 里，是为了让**配置热重载**
+    /// 能整体换掉它（改 AclConfig / 审计路径都不该要求重启）。
+    /// 读侧只取一次锁再克隆 Arc，热路径上没有额外开销。
+    security: Mutex<Arc<SecurityContext>>,
 }
 
 impl Registry {
@@ -95,8 +104,29 @@ impl Registry {
             client_limit: Limit::new(limits.max_clients),
             observ: observability::Registry::new(),
             p2p: Mutex::new(None),
+            vnet: Mutex::new(None),
             limits,
+            // 默认上下文 = 不做认证/不限权限/不审计，行为与引入这套东西之前完全一致
+            security: Mutex::new(Arc::new(SecurityContext::default())),
         }
+    }
+
+    /// 取当前安全上下文（克隆 Arc，几乎零成本）。
+    pub fn security(&self) -> Arc<SecurityContext> {
+        self.security
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 整体替换安全上下文（启动时装载配置 / 热重载）。
+    pub fn set_security(&self, ctx: Arc<SecurityContext>) {
+        *self.security.lock().unwrap_or_else(|e| e.into_inner()) = ctx;
+    }
+
+    /// 审计日志句柄。
+    pub fn audit(&self) -> Arc<crate::audit::AuditLog> {
+        self.security().audit.clone()
     }
 
     /// 不限制任何资源的注册表（测试与默认配置用）。
@@ -120,6 +150,16 @@ impl Registry {
     /// 取牵线中心；None 表示未启用 P2P。
     pub fn p2p(&self) -> Option<Arc<P2PHub>> {
         self.p2p.lock().unwrap().clone()
+    }
+
+    /// 挂上 VirtualNet 转发中枢（只有配置了 `vnet_port` 时才调）。
+    pub fn attach_vnet(&self, hub: Arc<crate::vnet::VnetHub>) {
+        *self.vnet.lock().unwrap() = Some(hub);
+    }
+
+    /// 取 VirtualNet 中枢；None 表示未启用虚拟网络。
+    pub fn vnet(&self) -> Option<Arc<crate::vnet::VnetHub>> {
+        self.vnet.lock().unwrap().clone()
     }
 
     pub fn attach_vhosts(&self, table: Arc<VhostTable>) {

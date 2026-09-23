@@ -211,12 +211,117 @@ pub struct ServerConfig {
     /// 是否监听配置文件变化并自动重载可动态生效的字段。
     #[serde(default)]
     pub hot_reload: bool,
+
+    // ================= 以下为 v0.3.4 新增 =================
+    // 全部 `#[serde(default)]`，且默认值都等价于"不启用"——
+    // 老的 server.toml 一个字节都不用改就能继续跑。
+    /// 认证配置（`[auth]`）：`method = "token" | "oidc"` + `auth.oidc.*`。
+    ///
+    /// 不写 `[auth]` 时行为与老版本完全一致（用顶层 `token`）。
+    #[serde(default)]
+    pub auth: crate::security::ServerAuthConfig,
+
+    /// 客户端 IP 白 / 黑名单（`[acl]`）。**先看 deny，再看 allow。**
+    ///
+    /// 这是"连不上"和"连得上但什么都能干"之间的第一道闸：
+    /// 面板/控制端口暴露在公网时，没有它就只能靠 token 硬扛。
+    #[serde(default)]
+    pub acl: crate::security::AclConfig,
+
+    /// 角色表（`[[roles]]`）。留空 = 不做授权限制（与老版本一致）。
+    ///
+    /// 放在**顶层**而不是 `[rbac.roles]`，是为了写起来跟官方 frp 的
+    /// `[[httpPlugins]]` 一样自然：
+    /// ```toml
+    /// [[roles]]
+    /// name = "ops"
+    /// users = ["alice"]
+    /// portRange = "20000-30000"
+    /// ```
+    #[serde(default)]
+    pub roles: Vec<crate::security::RoleConfig>,
+
+    /// 没匹配到任何角色时使用的角色名（留空表示不兜底）。
+    #[serde(
+        default,
+        rename = "defaultRole",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub default_role: String,
+
+    /// 配了角色表但一个都没匹配上时，是否直接拒绝登录。
+    #[serde(default, rename = "denyUnknown")]
+    pub deny_unknown: bool,
+
+    /// 审计日志（`[audit]`）。默认关闭。
+    #[serde(default)]
+    pub audit: crate::security::AuditConfig,
+
+    /// WebSocket 传输（`[transport.websocket]`）。
+    ///
+    /// 服务端只要配了 `websocket` 段就**同时**接受 WebSocket 与裸 TCP 控制连接
+    /// （靠首字节区分：`GET ` = 0x47 / yamux 版本字节 0x00 / v2 魔术字 0x46），
+    /// 不需要单独端口。
+    #[serde(default)]
+    pub websocket: crate::ws::WebSocketConfig,
+
+    /// VirtualNet 虚拟网络（`[vnet]`）。
+    #[serde(default)]
+    pub vnet: crate::vnet::VirtualNetConfig,
+
+    /// VirtualNet 的监听端口。不配 = 不启用虚拟网络。
+    ///
+    /// 单独一个端口而不是复用控制端口：虚拟网络是**长时间高速**的纯数据流，
+    /// 混在控制通道里会拖慢心跳与面板命令，出故障时也不好隔离。
+    #[serde(default)]
+    pub vnet_port: Option<u16>,
 }
 
 impl ServerConfig {
     /// frp 模式实际监听的端口。
     pub fn frp_bind_port(&self) -> u16 {
         self.bind_port.unwrap_or(self.control_port)
+    }
+
+    /// 实际生效的认证配置。
+    ///
+    /// 顶层 `token` 是历史写法（也正好是官方 frps 的 `auth.token` 展开），
+    /// `[auth] token` 是新写法。**新的优先，旧的兜底** —— 于是两种配置
+    /// 混着写不会出现"明明配了 token 却认证失败"。
+    pub fn effective_auth(&self) -> crate::security::ServerAuthConfig {
+        let mut a = self.auth.clone();
+        if a.token.is_empty() {
+            a.token = self.token.clone();
+        }
+        a
+    }
+
+    /// 把顶层的角色 / 兜底项组装成可编译的 RBAC 配置。
+    pub fn rbac_config(&self) -> crate::security::RbacConfig {
+        crate::security::RbacConfig {
+            roles: self.roles.clone(),
+            default_role: self.default_role.clone(),
+            deny_unknown: self.deny_unknown,
+        }
+    }
+
+    /// VirtualNet 是否可用。
+    ///
+    /// 顶层 `vnet_port` 与 `[vnet] serverPort` 等价，写哪个都认；
+    /// 都没写就是不启用（默认），此时一个字节都不监听、老行为完全不变。
+    pub fn vnet_enabled(&self) -> bool {
+        self.vnet_listen_port().is_some()
+    }
+
+    /// 实际生效的 VirtualNet 监听端口。
+    pub fn vnet_listen_port(&self) -> Option<u16> {
+        self.vnet_port
+            .filter(|p| *p != 0)
+            .or(if self.vnet.server_port != 0 {
+                Some(self.vnet.server_port)
+            } else {
+                None
+            })
     }
 }
 
@@ -248,6 +353,15 @@ impl Default for ServerConfig {
             dashboard_user: String::new(),
             dashboard_pwd: String::new(),
             hot_reload: false,
+            auth: Default::default(),
+            acl: Default::default(),
+            roles: Vec::new(),
+            default_role: String::new(),
+            deny_unknown: false,
+            audit: Default::default(),
+            websocket: Default::default(),
+            vnet: Default::default(),
+            vnet_port: None,
         }
     }
 }
@@ -325,6 +439,23 @@ max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
 // 客户端配置
 // ---------------------------------------------------------------------------
 
+/// 单个代理的传输层配置（官方 frp 的 `[proxies.transport]`）。
+///
+/// 只放**真正实现了**的项。没实现的（`useEncryption` / `useCompression`）
+/// 故意不在这里声明 —— 声明了却不生效，等于给用户一个"我加密了"的假象，
+/// 那比配置报错危险得多。至今为止它们是"未知字段被忽略"，行为不变。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProxyTransportConfig {
+    /// 与顶层 `proxyProtocolVersion` 是同一件事，两种写法都认
+    /// （官方 frp 放这里，老式 INI 放代理顶层）。
+    #[serde(
+        default,
+        rename = "proxyProtocolVersion",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub proxy_protocol_version: String,
+}
+
 /// 单个代理的配置。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProxyConfig {
@@ -394,6 +525,32 @@ pub struct ProxyConfig {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub group_key: String,
 
+    // ---- Proxy Protocol ----
+    /// 转发到内网服务时先发一个 PROXY 协议头，把**真实客户端 IP** 告诉后端。
+    ///
+    /// 为什么需要：隧道会在中间插一段，后端看到的对端地址永远变成
+    /// `127.0.0.1`（客户端侧）—— 于是按 IP 做限流、审计、风控的功能全废。
+    /// PROXY 协议就是在业务数据前多一段固定格式的头，把这个信息带过去。
+    ///
+    /// 取值（与官方 frp 的 `proxyProtocolVersion` 一致）：
+    /// - `""`（默认）：不发，行为完全不变；
+    /// - `"v1"`：文本格式 `PROXY TCP4 <src> <dst> <sport> <dport>`；
+    /// - `"v2"`：二进制格式，支持 TLV 扩展、必须能塞进一个 TCP 段。
+    ///
+    /// ★ **后端必须支持它**（Nginx `proxy_protocol`、HAProxy `accept-proxy`、
+    /// MySQL 8.0.29+ 等）。后端不认识时会把这段头当业务数据处理 ——
+    /// 表现是"连上了但协议报错"，所以两端要一起改。
+    #[serde(
+        default,
+        rename = "proxyProtocolVersion",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub proxy_protocol_version: String,
+
+    /// 官方 frp 的写法：`[proxies.transport] proxyProtocolVersion = "v2"`。
+    #[serde(default)]
+    pub transport: ProxyTransportConfig,
+
     // ---- 健康检查 ----
     /// 健康检查类型：`tcp` / `http`；留空表示不检查。
     ///
@@ -447,8 +604,45 @@ pub struct ProxyConfig {
     pub allow_users: Vec<String>,
 }
 
-/// 一个 visitor（访客）的配置，对应 frpc 的 `[[visitors]]` 段。
-///
+impl ProxyConfig {
+    /// 实际生效的 PROXY 协议版本。
+    ///
+    /// 官方 frp 把它放在 `[proxies.transport]` 下，老式 INI 与早期 TOML 放在
+    /// 代理顶层 —— 两种都认，`transport` 优先。
+    ///
+    /// 只认 `"v1"` / `"v2"`；**其它任何值都当"不启用"**（含空串）。
+    /// 官方是"非 v1 即 v2"的写法，那意味着写错一个字母（`"V2"` 大写、
+    /// `"2"`）都会悄悄往用户的后端灌一段二进制垃圾 —— 那比不生效难查得多。
+    pub fn proxy_protocol_version(&self) -> Option<&'static str> {
+        let raw = if self.transport.proxy_protocol_version.trim().is_empty() {
+            self.proxy_protocol_version.trim()
+        } else {
+            self.transport.proxy_protocol_version.trim()
+        };
+        match raw.to_ascii_lowercase().as_str() {
+            "" => None,
+            "v1" => Some("v1"),
+            "v2" => Some("v2"),
+            _ => None,
+        }
+    }
+
+    /// 是否配置了 PROXY 协议但写的是个不认识的值（启动时用来警告）。
+    pub fn has_invalid_proxy_protocol_version(&self) -> Option<&str> {
+        let raw = if self.transport.proxy_protocol_version.trim().is_empty() {
+            self.proxy_protocol_version.trim()
+        } else {
+            self.transport.proxy_protocol_version.trim()
+        };
+        if raw.is_empty() || raw.eq_ignore_ascii_case("v1") || raw.eq_ignore_ascii_case("v2") {
+            None
+        } else {
+            Some(raw)
+        }
+    }
+}
+
+/// 一个 visitor（访客）的配置，对应 frpc 的 `[[visitors]]` 段。///
 /// visitor 是 stcp / xtcp 的**接入方**：它在本地监听一个端口，
 /// 把连上来的流量通过服务端送到远端的 provider，最后到达 provider 的内网服务。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -661,6 +855,39 @@ pub struct ClientConfig {
     /// 需要接入的访客列表（stcp / xtcp）。
     #[serde(default)]
     pub visitors: Vec<VisitorConfig>,
+
+    // ================= 以下为 v0.3.4 新增 =================
+    // 同样全部默认关闭，老的 client.toml 行为不变。
+    /// 认证配置（`[auth]`）：`method = "token" | "oidc"` + `auth.oidc.*`。
+    #[serde(default)]
+    pub auth: crate::security::ClientAuthConfig,
+
+    /// 动态代理的持久化（`[store]`）。
+    ///
+    /// 面板 / 客户端 Web UI 上临时加的代理，默认只活在内存里，进程一重启就没了。
+    /// 配了 `store.path` 之后会落盘，重启时自动恢复 —— 这也是官方 frp
+    /// `frpc store` 的语义。
+    #[serde(default)]
+    pub store: StoreConfig,
+
+    /// 客户端自带的 Web 管理界面（`[webServer]`）。
+    #[serde(default, rename = "webServer")]
+    pub web_server: WebServerConfig,
+
+    /// WebSocket 传输（`[transport.websocket]`）。
+    #[serde(default)]
+    pub websocket: crate::ws::WebSocketConfig,
+
+    /// 是否让控制连接走 WebSocket（`transport.websocket.enable` 的等价开关）。
+    ///
+    /// 有些防火墙只放行 HTTP(S)，裸 TCP 一律丢包；这时把控制连接包进
+    /// WebSocket 帧就能过去。走的是**同一个端口**，服务端自动识别，不用改配置。
+    #[serde(default, rename = "websocketEnable")]
+    pub websocket_enable: bool,
+
+    /// VirtualNet 虚拟网络（`[virtualNet]`）。
+    #[serde(default, rename = "virtualNet")]
+    pub virtual_net: crate::vnet::VirtualNetConfig,
 }
 
 impl Default for ClientConfig {
@@ -693,11 +920,100 @@ impl Default for ClientConfig {
             private_caps: true,
             proxies: Vec::new(),
             visitors: Vec::new(),
+            auth: Default::default(),
+            store: Default::default(),
+            web_server: Default::default(),
+            websocket: Default::default(),
+            websocket_enable: false,
+            virtual_net: Default::default(),
         }
     }
 }
 
+// ---------------------------------------------------------------------------
+// 客户端管理相关配置
+// ---------------------------------------------------------------------------
+
+/// 动态代理的持久化配置（`[store]`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StoreConfig {
+    /// 落盘路径。留空 = 不持久化（与老版本一致）。
+    ///
+    /// 目录会自动创建。文件内容是 JSON，与 rustunnel 自己的格式兼容；
+    /// **官方 frp 的 store 是另一套结构**（Go 的 `configmgmt` 序列化），
+    /// 两者不通用 —— 换实现时需要重新加一遍代理，这一点在 README 里写明了。
+    pub path: String,
+}
+
+/// 客户端 Web 管理界面配置（`[webServer]`）。
+///
+/// 官方 frpc 也有同名段落，字段名保持一致（`addr` / `port` / `user` / `password`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebServerConfig {
+    /// 监听地址。**默认 `127.0.0.1`** —— 这个界面能动态开端口，
+    /// 默认暴露到公网等于把内网敞开，需要远程访问请显式写 `0.0.0.0`
+    /// 并**务必配上 user/password**。
+    pub addr: String,
+    /// 监听端口。0 = 不启用。
+    pub port: u16,
+    /// Basic Auth 用户名。留空表示不鉴权。
+    pub user: String,
+    /// Basic Auth 密码。
+    pub password: String,
+}
+
+fn default_webserver_addr() -> String {
+    "127.0.0.1".into()
+}
+
+impl Default for WebServerConfig {
+    fn default() -> Self {
+        Self {
+            addr: default_webserver_addr(),
+            port: 0,
+            user: String::new(),
+            password: String::new(),
+        }
+    }
+}
+
+impl WebServerConfig {
+    pub fn is_enabled(&self) -> bool {
+        self.port != 0
+    }
+}
+
 impl ClientConfig {
+    /// 是否让控制连接（以及它上面的工作连接）走 WebSocket 传输。
+    ///
+    /// 两种写法等价，都认：
+    /// - 官方原味：`transport.protocol = "websocket"`（或 `"wss"`）；
+    /// - 速记开关：`transport.websocket.enable = true` / `websocketEnable = true`。
+    pub fn websocket_enabled(&self) -> bool {
+        self.websocket_enable
+            || is_websocket(&self.transport_protocol)
+            || is_wss(&self.transport_protocol)
+    }
+
+    /// WebSocket 之前是否要先做 TLS（也就是 `wss`）。
+    pub fn websocket_tls(&self) -> bool {
+        is_wss(&self.transport_protocol)
+    }
+
+    /// 实际生效的共享密钥。
+    ///
+    /// `[auth] token` 与顶层 `token` 都能写；**新的优先、旧的兜底**，
+    /// 与官方 frp 的 `auth.token` 展开式配置兼容。
+    pub fn effective_token(&self) -> &str {
+        if self.auth.token.is_empty() {
+            &self.token
+        } else {
+            &self.auth.token
+        }
+    }
+
     /// 从配置文件加载（**自动识别 TOML / 原版 frpc 的 legacy INI**）。
     ///
     /// 走 [`parse_client`]，因此**原版 frpc 的配置文件可以直接用** ——
@@ -828,6 +1144,23 @@ fn default_transport_protocol() -> String {
 pub fn is_quic(protocol: &str) -> bool {
     let p = protocol.trim().to_ascii_lowercase().replace(['-', '_'], "");
     p == "quic"
+}
+
+/// 是否走**明文** WebSocket 传输（`transport.protocol = "websocket"`）。
+pub fn is_websocket(protocol: &str) -> bool {
+    let p = protocol.trim().to_ascii_lowercase().replace(['-', '_'], "");
+    p == "websocket" || p == "ws"
+}
+
+/// 是否走 **TLS 之上的** WebSocket 传输（`transport.protocol = "wss"`）。
+///
+/// ⚠️ 官方 frps 是在 **TLS 之前**按明文前缀 `GET /~!frp` 嗅探 WebSocket 的
+/// （见 `server/service.go` 的 mux 前缀匹配），所以 `wss` **不能**直连 frps 主端口：
+/// 首字节是 0x16 而不是 `G`，会被当成普通 frp 连接。
+/// 这条路要求前面有个 nginx / caddy 终结 TLS 再转发明文 ws 给 frps。
+pub fn is_wss(protocol: &str) -> bool {
+    let p = protocol.trim().to_ascii_lowercase().replace(['-', '_'], "");
+    p == "wss" || p == "websockets"
 }
 
 fn default_health_timeout() -> u64 {

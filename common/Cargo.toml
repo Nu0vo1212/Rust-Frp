@@ -18,6 +18,9 @@ yamux = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 rcgen = { workspace = true }
+ring = { workspace = true }
+libc = { workspace = true }
+webpki-roots = { workspace = true }
 
 aes-gcm = { workspace = true }
 aes = { workspace = true }

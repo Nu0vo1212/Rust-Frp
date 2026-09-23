@@ -981,7 +981,7 @@ dependencies = [
 
 [[package]]
 name = "rustunnel-client"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "base64",
@@ -991,6 +991,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustunnel-common",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-util",
@@ -999,7 +1000,7 @@ dependencies = [
 
 [[package]]
 name = "rustunnel-common"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1009,10 +1010,12 @@ dependencies = [
  "futures",
  "hkdf",
  "hmac",
+ "libc",
  "md-5",
  "quinn",
  "rand 0.8.8",
  "rcgen",
+ "ring",
  "rustls",
  "serde",
  "serde_json",
@@ -1025,12 +1028,13 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "webpki-roots 0.26.11",
  "yamux",
 ]
 
 [[package]]
 name = "rustunnel-server"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "base64",
@@ -1038,6 +1042,7 @@ dependencies = [
  "futures",
  "quinn",
  "rustunnel-common",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-util",
@@ -1539,6 +1544,24 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.9",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

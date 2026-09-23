@@ -24,6 +24,28 @@
 - ✅ **yamux 多路复用** — 对应 frp `transport.tcpMux`，控制连接与工作连接复用一条 TCP
 - ✅ **TLS 加密** — 对应 frp `transport.tls`，含 frp 自定义首字节 `0x17` 伪装，服务端自动生成自签名证书
 
+### 安全与认证
+
+- ✅ **OIDC 认证** — `auth.method = "oidc"`，对接 Keycloak / Google / Azure AD 等任意标准 IdP。
+  客户端用 **Client Credentials Grant** 换 access token，服务端验签 JWKS（RS256 / PS256 / ES256），
+  支持 `skipExpiryCheck` / `skipIssuerCheck` / `trustedCaFile` / `proxyURL`；内部手写 JWKS→DER 转换，
+  不引入 `jsonwebtoken` 之类的重型依赖
+- ✅ **细粒度访问控制** — `[[roles]]` 角色权限表（按序匹配 + `deny_unknown` / `default_role` 兜底）
+  + `[acl]` 客户端 IP 白/黑名单（CIDR，`deny` 优先，IPv4 / IPv6 分族比较）
+- ✅ **审计日志** — `[audit] enable = true`，JSONL 追加写（不阻塞业务线程）+ 内存环形缓冲便于查询；
+  登录、建代理、断代理、踢人、拒绝访问全部落盘；**关掉时零开销、零事件构造**
+
+### 网络与传输扩展
+
+- ✅ **WebSocket / WSS 传输** — `websocket = true`，服务端在**同一个端口**上按路径 `/~!frp`
+  自动识别 HTTP Upgrade（与官方 frps 行为一致），穿透只放行 HTTP 的防火墙 / 企业代理；
+  手写 RFC 6455 帧编解码，不引第三方 WebSocket 库
+- ✅ **VirtualNet 虚拟网络** — `[vnet]` + `[virtualNet]`，TUN 设备 + 三层 IP 转发，
+  多台客户端组成一个虚拟局域网，服务端按目的 IP 做路由；帧格式与官方 frp `pkg/vnet` 一致
+- ✅ **Proxy Protocol** — 单条代理可配 `proxyProtocolVersion = "v1" / "v2"`，
+  客户端连内网服务前注入 PROXY 头，把真实客户端 IP 透传给 Nginx / HAProxy / 后端应用；
+  v2 支持 LOCAL 头，`sniff` 做了防注入处理
+
 ### 运维与调度
 
 - ✅ **group 负载均衡** — 同 `group` 的多个代理共享一个 `remote_port`，服务端按**最小连接数**分摊
@@ -35,9 +57,19 @@
 - ✅ **面板可写** — 在面板上直接增删代理、踢掉客户端，无需改配置重启（`/api/proxies/add` 等）
 - ✅ **配置热重载** — 改 `log_level` / 面板密码无需重启，静态项变更会明确提示需重启
 
+### 管理与集成
+
+- ✅ **客户端 Store 持久化** — `[store] path = "..."`，把运行时动态添加的代理落盘，
+  重启后自动恢复；配置文件里写的代理**不会**写进 store，避免"删掉的隧道从 store 复活"
+- ✅ **客户端管理 Web UI / API** — `[webServer] port = 7400`，客户端本地起一个轻量 HTTP 界面：
+  查看当前隧道 / 连接 / 流量，并且能直接增删代理、热重载配置；写操作走会话主循环，
+  不会和控制连接抢锁
+- ✅ **Dashboard API v2** — `/api/v2/*` 版本化接口，统一错误信封（`error.code` / `message` / `details`）
+  + 列表分页（`page` / `page_size`）+ 强制稳定排序；v1 接口**行为完全不变**
+
 ### 工程质量
 
-- ✅ **282 个自动化测试** — 含真实 QUIC 栈握手、口令正反用例、端到端集成测试、**与官方 frpc/frps 真实抓包密文的解密回归**
+- ✅ **440 个自动化测试** — 含真实 QUIC 栈握手、口令正反用例、端到端集成测试、**与官方 frpc/frps 真实抓包密文的解密回归**
 - ✅ **CI 流水线** — `fmt` / `clippy` / 测试 / 四目标构建 / 冒烟，PR 必过
 - ✅ **发布可验真** — `SHA256SUMS` + 可选 Ed25519 分离签名与本地验签脚本
 - ✅ **容器就绪** — 多阶段 `Dockerfile`（musl 静态）+ `docker-compose.yml`
@@ -62,17 +94,29 @@ rustunnel/
 │       │   ├── sni.rs         #   TLS ClientHello / SNI 嗅探
 │       │   └── stream.rs      #   统一流抽象 BoxStream
 │       ├── p2p.rs             #   xtcp 打洞：报文字典、口令、ALPN、角色
+│       ├── security.rs        #   ACL(CIDR) / RBAC 角色表 / 审计配置 / 凭证(AuthProvider)
+│       ├── auth/oidc.rs       #   OIDC：JWKS 验签(ring)、TokenSource(Client Credentials)
+│       ├── httpc.rs           #   极简 HTTP(S) 客户端（CONNECT 代理、chunked），供 OIDC 取 token
+│       ├── http1.rs           #   HTTP/1.1 服务端工具（解析 + 响应），面板与客户端界面共用
+│       ├── ws.rs              #   WebSocket：手写 RFC 6455 帧编解码 + Upgrade 握手
+│       ├── proxy_protocol.rs  #   PROXY v1/v2 编解码 + sniff（防注入）
+│       ├── vnet.rs            #   VirtualNet：帧格式、三层路由、地址池
+│       ├── vnet/tun_linux.rs  #   Linux TUN 设备（AsyncRead/AsyncWrite）
 │       ├── throttle.rs        #   令牌桶带宽限流
 │       ├── config.rs          #   两端配置结构与示例生成
 │       └── util.rs            #   地址解析、转发、run_id、日志热重载
 ├── server/                    # frps 等价服务端
 │   └── src/
-│       ├── serve.rs           #   入口分层：TCP / QUIC / vhost / 代理注册
+│       ├── serve.rs           #   入口分层：TCP / QUIC / WS 嗅探 / vhost / 代理注册
 │       ├── registry.rs        #   全局状态：客户端表、端口组（group 负载均衡）
+│       ├── guard.rs           #   安全上下文：ACL → 认证 → RBAC → 审计 一条链
+│       ├── audit.rs           #   审计日志（JSONL 追加 + 内存环形缓冲）
+│       ├── api_v2.rs          #   面板 API v2：版本化 + 统一错误信封 + 分页
+│       ├── vnet.rs            #   VirtualNet 服务端：监听、路由转发、代答 ICMP
 │       ├── pool.rs            #   工作连接池：配对、排队、回收、配额
 │       ├── limits.rs          #   信号量资源上限
 │       ├── observability.rs   #   指标计数器与 Prometheus / JSON 编码
-│       ├── dashboard.rs       #   内置面板 + /metrics + /api/status
+│       ├── dashboard.rs       #   内置面板 + /metrics + /api/status + /api/v2
 │       ├── reload.rs          #   配置热重载（mtime 轮询 + 字段差异判定）
 │       ├── p2p.rs             #   xtcp 牵线中心（UDP rendezvous）
 │       ├── vhost.rs           #   HTTP/HTTPS 虚拟主机路由与反向代理
@@ -82,6 +126,9 @@ rustunnel/
     └── src/
         ├── main.rs            #   会话主循环、ServerLink、工作连接
         ├── p2p.rs             #   xtcp 打洞（QUIC 建连 + 口令握手）
+        ├── store.rs           #   动态代理落盘与启动恢复（`[store]`）
+        ├── web.rs             #   本地管理界面 / API（`[webServer]`）
+        ├── vnet.rs            #   VirtualNet 客户端：TUN 读写循环
         ├── health.rs          #   健康检查监视器（进程级）
         ├── plugin.rs          #   四类客户端插件
         ├── visitor.rs         #   stcp/xtcp：本地监听 → 回源
@@ -533,6 +580,46 @@ curl -u admin:pwd -H 'Content-Type: application/json' \
 配置了 `dashboard_user` 后 `/`、`/metrics`、`/api/status` 需要 HTTP Basic Auth
 （`/api/healthz` 始终免鉴权）。鉴权用常量时间比较，只接受完整的 `user:password`。
 
+### Dashboard API v2
+
+v1 的 `/api/status`、`/api/proxies/add` 等接口**行为完全不变**（老脚本不用动）。
+新增的 `/api/v2/*` 面向程序化调用，三件事做规范：**版本化路径、统一错误信封、列表分页**。
+
+| 端点 | 说明 |
+|---|---|
+| `GET /api/v2/` `GET /api/v2/version` | 版本与能力声明（客户端据此判断字段是否存在） |
+| `GET /api/v2/status` | 汇总快照（客户端数、代理数、连接数、流量） |
+| `GET /api/v2/clients` | 客户端列表（**分页**） |
+| `GET /api/v2/proxies` | 代理列表（**分页**，可按 `client` 过滤） |
+| `GET /api/v2/visitors` | 访客列表（**分页**） |
+| `GET /api/v2/ports` | 已占用端口与归属 |
+| `GET /api/v2/audit` | 审计事件（需开启 `[audit]`；支持 `kind` / `since` 过滤） |
+| `POST /api/v2/proxies/add` | 动态加代理（与 v1 同一套执行顺序：先问客户端、后开端口） |
+| `POST /api/v2/proxies/remove` | 移除代理 |
+| `POST /api/v2/clients/kick` | 断开客户端 |
+
+分页参数：`page`（从 1 开始）、`page_size`（默认 20，上限 500；也接受 camelCase 的 `pageSize`）。
+响应里带 `total` / `page` / `page_size` / `items`。**列表一律强制稳定排序** ——
+注册表内部是 HashMap，不排序的话分页会随机重叠或漏项。
+
+错误信封（所有非 2xx 响应）：
+
+```json
+{ "error": { "code": "bad_request", "message": "page_size 必须是正整数", "details": {} } }
+```
+
+| `code` | HTTP | 含义 |
+|---|---|---|
+| `bad_request` | 400 | 参数缺失 / 格式错 |
+| `not_found` | 404 | 路径或对象不存在 |
+| `method_not_allowed` | 405 | 方法不匹配 |
+| `admin_failed` | 502 | 已转发给客户端但被它拒绝（原因在 `message`） |
+| `internal` | 500 | 服务端内部错误 |
+
+```bash
+curl -u admin:pwd 'http://127.0.0.1:7500/api/v2/clients?page=1&page_size=50'
+```
+
 ### 配置热重载
 
 ```toml
@@ -544,6 +631,222 @@ hot_reload = true    # 需要配合 -c 指定配置文件（服务端会监视�
 | `log_level` | **热生效**，立即切换日志过滤器 |
 | `dashboard_user` / `dashboard_pwd` | **热生效**，面板鉴权立即更新 |
 | 其余字段 | 记一条 WARN，提示这些项需要重启才能生效（不会静默忽略） |
+
+## 安全与访问控制
+
+> 本章所有能力**默认全部关闭**。不写这些段落时，认证仍是原来的 `token` 语义，
+> 行为与老版本**逐字节一致** —— 已有的配置文件一个字都不用改。
+
+### OIDC 认证
+
+用标准 OIDC 取代静态 token。客户端走 **Client Credentials Grant**（无用户交互，
+适合服务与 CI），服务端验签 IdP 的 JWKS。
+
+```toml
+# frps.toml
+[auth]
+method = "oidc"                 # token（默认）| oidc
+
+[auth.oidc]
+issuer = "https://keycloak.example.com/realms/myrealm"
+audience = "rustunnel"
+# skipExpiryCheck = true        # 时钟偏差大 / 令牌有效期短时用
+# skipIssuerCheck = true
+# trustedCaFile = "/etc/ssl/private-ca.pem"   # 私有 CA 签的 IdP
+# insecureSkipVerify = true     # 仅调试
+# proxyURL = "http://127.0.0.1:8080"          # 经 HTTP 代理访问 IdP
+```
+
+```toml
+# frpc.toml
+[auth]
+method = "oidc"
+
+[auth.oidc]
+clientID = "rustunnel-client"
+clientSecret = "见 IdP 控制台"
+tokenEndpointURL = "https://keycloak.example.com/realms/myrealm/protocol/openid-connect/token"
+# additionalScopes = ["profile"]
+```
+
+实现要点：
+
+- OIDC 模式下 `Login.privilege_key` 就是**原样的 access token**（不是 MD5 摘要），
+  控制通道的加密密钥也随之改用 access token —— 两端同源，否则会出现"能登录但后续消息解不开"。
+- `TokenSource` 带缓存与过期预判，重连前才换新 token，不会每次心跳都去打扰 IdP。
+- JWKS 的 RSA `n`/`e` 与 EC `x`/`y` 由内置代码转成 DER，验签用 `ring`，
+  只支持 `RS256` / `PS256` / `ES256`（其余算法直接拒绝，不做算法降级）。
+- 客户端在**启动时**就校验一遍认证字段，写错了立刻报错，而不是等每次连接都失败。
+
+### IP 白 / 黑名单
+
+```toml
+# frps.toml
+[acl]
+allow = ["203.0.113.0/24", "2001:db8::/32"]
+deny  = ["203.0.113.66/32"]
+```
+
+- `deny` **优先于** `allow`；`allow` 为空表示"不限制"。
+- IPv4 与 IPv6 **按各自位宽分别比较**（不是统一升到 u128），跨地址族永不匹配 ——
+  否则 `/0`~`/96` 的白名单会退化成"全部放行"。
+- 判定发生在 TLS / 握手**之前**，被拒的连接不会进入认证流程。
+
+### 角色与权限
+
+```toml
+# frps.toml
+defaultRole = "guest"           # 没匹配到任何角色时用它；留空 = 无权限
+denyUnknown = false             # true = 没匹配到角色就直接拒绝登录
+
+[[roles]]
+name = "ops"
+users = ["alice", "deploy-bot"]     # 比对 Login.user
+allowProxyTypes = ["tcp", "http"]   # 留空 = 不限
+portRange = "6000-6999"             # 可申请的 remote_port 区间
+allowManage = true                  # 允许走面板动态增删代理
+allowVisitors = true                # 允许注册 stcp / xtcp 访客
+maxProxies = 20                     # 该角色下单个客户端的代理数上限
+```
+
+角色**按声明顺序匹配，第一个命中即生效**。被拒的请求会带上可执行的错误原因
+（是类型不允许、还是端口越界），并计入审计。
+
+### 审计日志
+
+```toml
+# frps.toml
+[audit]
+enable = true
+path = "/var/log/rustunnel/audit.jsonl"   # 留空 = 只留内存，重启即失
+maxEntries = 1000                          # 内存环形缓冲条数（面板查询用）
+```
+
+每行一条 JSON（JSONL，可直接喂给 Loki / Filebeat / `jq`），覆盖：登录成功与失败、
+新建 / 关闭代理、踢出客户端、ACL 拒绝、RBAC 拒绝、OIDC 令牌校验失败。
+
+设计取舍：**写文件走追加并不阻塞业务路径**，内存环形缓冲只保留最近 N 条供面板查询；
+`enable = false`（默认）时连事件对象都不构造，开销为零。
+
+## 更多传输方式
+
+### WebSocket / WSS
+
+```toml
+# frpc.toml
+websocketEnable = true
+[websocket]
+path = "/~!frp"       # 默认就是官方路径，改了必须两端一致
+host = ""             # 前置代理按 Host 分流时才需要
+
+# frps.toml —— 服务端无需开关，按路径自动识别
+[websocket]
+path = "/~!frp"
+```
+
+服务端在**同一个端口**上识别 HTTP Upgrade 请求（与官方 frps 行为一致），
+因此不需要额外放行端口。配合普通 TLS 即 `wss://`。
+
+适用场景：企业防火墙 / 云 WAF 只放行 HTTP(S)，或者需要借 Nginx / Cloudflare
+做一层前置转发。实现是手写的 RFC 6455 帧编解码，没有引入第三方 WebSocket 库；
+Ping 会**就地写回 Pong**（不是排队等下一轮），避免对端阻塞在读取上导致死锁。
+
+### VirtualNet 虚拟网络
+
+把多台客户端组成一个虚拟局域网，服务端做三层转发。
+
+```toml
+# frps.toml
+vnet_port = 7501            # VirtualNet 监听端口（不配 = 不启用）
+
+[vnet]
+network = "default"         # 虚拟网络名：同名互通，异名隔离
+subnet = "100.64.0.0/24"    # 服务端用它分配地址
+mtu = 1400
+```
+
+```toml
+# frpc.toml
+[virtualNet]
+network = "default"
+serverPort = 7501           # 指服务端 vnet_port
+autoAssign = true           # 由服务端分配地址
+address = ""                # 也可以自己指定，如 100.64.0.2
+```
+
+- Linux 客户端会创建 **TUN 设备**（`/dev/net/tun`，需 root 或 `CAP_NET_ADMIN`），
+  用 `ip` 命令配好地址 / MTU / up；Windows 上不启用该能力。
+- 帧格式是 `[u32 小端长度][IP 报文]`，与官方 frp `pkg/vnet/message.go` 一致。
+- 地址池**从高地址往低地址分配**并跳过网络号与广播地址；客户端掉线时地址归还并抬回游标。
+- 服务端会替客户端应答 ICMP Echo（ping），这样"通不通"能直接 ping 出来。
+
+> 单独一个端口而不是复用控制端口：虚拟网络是长时间高速的纯数据流，
+> 混在控制通道里会拖慢心跳与面板命令，出故障时也不好隔离。
+
+### Proxy Protocol
+
+让内网服务（或它前面的 Nginx / HAProxy）拿到**真实客户端 IP**，而不是 frp 客户端的地址。
+
+```toml
+# frpc.toml
+[[proxies]]
+name = "web"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8080
+remotePort = 6000
+proxyProtocolVersion = "v2"     # "v1" 文本 / "v2" 二进制；不写 = 不发任何字节
+```
+
+- `v1` 是 `PROXY TCP4 <src> <dst> <sport> <dport>\r\n` 文本行；`v2` 是 16 字节二进制头。
+- 源地址取服务端下发的工作连接信息，目的地址为空时回落 `127.0.0.1`（与官方 frpc 一致）。
+- 解码侧的 `sniff` 做了**逐字节前缀比较**，半截签名不会被当成普通数据漏给后端，
+  避免 PROXY 注入。
+
+## 客户端管理
+
+### Store：动态代理持久化
+
+```toml
+# frpc.toml
+[store]
+path = "C:/Users/me/.rustunnel/proxies.json"   # 留空 = 不持久化（与老版本一致）
+```
+
+- 只存**运行时动态添加**的代理（面板 / 本地界面加的那些）。
+  配置文件里写的代理**永远不会**写进 store —— 否则用户在面板删掉一条隧道后，
+  下次启动它又从 store 里"复活"。
+- 文件内容是 JSON，目录会自动创建；**与官方 frp 的 store 格式不通用**（官方是 Go 的
+  `configmgmt` 序列化结构），换实现时需要重新加一遍代理。
+- 落盘失败**不会**让"这次添加"失败（内存里已经生效、端口已经开了），
+  只记一条 WARN 提示"重启后这条会丢"。
+
+### 本地管理界面（Web UI）
+
+```toml
+# frpc.toml
+[webServer]
+addr = "127.0.0.1"       # 默认只监听本机
+port = 7400              # 0 = 不启用（默认）
+user = "admin"
+password = "change_me"
+```
+
+| 端点 | 说明 |
+|---|---|
+| `GET /` | 当前状态：隧道列表、连接数、上下行流量、健康检查 | 
+| `GET /api/status` | 同源 JSON |
+| `GET /api/proxies` | 代理列表 |
+| `POST /api/proxies/add` | 动态加一条代理（JSON，字段与 `[[proxies]]` 一致） |
+| `POST /api/proxies/remove` | 移除一条代理（`{"name": "..."}`） |
+| `GET /api/reload` / `POST /api/reload` | 重新读取配置文件 |
+
+> ⚠️ 这个界面**能动态开放端口**，默认只绑 `127.0.0.1`。要远程访问请显式写 `0.0.0.0`
+> **并务必配上 user/password** —— 否则等于把内网敞开。
+
+实现上说一句：写操作**不是**直接改内存表，而是通过 mpsc 排进会话主循环。
+因为控制连接被 `select!` 独占，并且"等 `NewProxyResp`"期间**必须顺手处理 `ReqWorkConn`**，
+否则服务端会以为本端掉线、把刚注册的代理收回。
 
 ## 资源上限
 
@@ -588,6 +891,24 @@ max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
 | `max_total_conns` | 全局转发连接数上限 | `0` |
 | `max_pending_per_client` | 单客户端排队请求数上限 | `0` |
 | `heartbeat_timeout` | 心跳超时（秒） | `90` |
+| `websocket.path` | WebSocket Upgrade 路径（须与客户端一致） | `/~!frp` |
+| `websocket.host` | WebSocket 握手的 Host 头（前置代理分流时填） | 空 |
+| `vnet_port` | VirtualNet 监听端口（不配 = 不启用） | 空 |
+| `vnet.network` | 虚拟网络名（同名互通、异名隔离） | `default` |
+| `vnet.subnet` | 虚拟网段，服务端据此分配地址 | `100.64.0.0/24` |
+| `vnet.mtu` | 虚拟网卡 MTU | `1400` |
+| `auth.method` | `token`（默认）或 `oidc` | `token` |
+| `auth.oidc.issuer` / `audience` | IdP 签发者与预期受众 | 空 |
+| `auth.oidc.skipExpiryCheck` / `skipIssuerCheck` | 跳过过期 / 签发者校验（调试用） | `false` |
+| `auth.oidc.trustedCaFile` | 私有 CA 的 PEM 路径 | 空 |
+| `auth.oidc.proxyURL` | 经 HTTP 代理访问 IdP | 空 |
+| `acl.allow` / `acl.deny` | 客户端 IP 的 CIDR 白 / 黑名单（`deny` 优先） | 空（不限） |
+| `roles` | `[[roles]]` 角色权限表（按序匹配） | 空 |
+| `defaultRole` | 未匹配到角色时的兜底角色 | 空（无权限） |
+| `denyUnknown` | 未匹配到角色即拒绝登录 | `false` |
+| `audit.enable` | 开启审计日志 | `false` |
+| `audit.path` | 审计 JSONL 落盘路径（留空 = 仅内存） | 空 |
+| `audit.maxEntries` | 内存环形缓冲条数 | `1000` |
 | `log_level` | `error`/`warn`/`info`/`debug`/`trace` | `info` |
 
 ### 客户端（rustunnel-client）
@@ -610,6 +931,20 @@ max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
 | `user` | 客户端用户名（frp 顶层 `user`），stcp/xtcp 的 `allow_users` 就是比对它 | 空 |
 | `[[proxies]]` | 代理列表，字段见下 | - |
 | `[[visitors]]` | stcp / xtcp 访客列表，字段见下 | - |
+| `websocketEnable` | 用 WebSocket 连接服务端（穿透只放行 HTTP 的防火墙） | `false` |
+| `websocket.path` / `websocket.host` | WS 路径 / Host 头（须与服务端一致） | `/~!frp` / 空 |
+| `auth.method` | `token`（默认）或 `oidc` | `token` |
+| `auth.oidc.clientID` / `clientSecret` | OIDC 客户端凭证（Client Credentials） | 空 |
+| `auth.oidc.tokenEndpointURL` | IdP 的 token 端点 | 空 |
+| `auth.oidc.additionalScopes` | 额外申请的 scope | 空 |
+| `store.path` | 动态代理落盘路径（留空 = 不持久化） | 空 |
+| `webServer.addr` / `port` | 本地管理界面监听地址 / 端口（0 = 关闭） | `127.0.0.1` / `0` |
+| `webServer.user` / `password` | 本地管理界面 Basic Auth | 空 |
+| `virtualNet.network` | 虚拟网络名（须与服务端一致） | `default` |
+| `virtualNet.serverPort` | 服务端 `vnet_port` | 空 |
+| `virtualNet.address` | 本机虚拟地址；留空且 `autoAssign` 时由服务端分配 | 空 |
+| `virtualNet.autoAssign` | 由服务端自动分配地址 | `false` |
+| `virtualNet.mtu` | 虚拟网卡 MTU | `1400` |
 
 `[[proxies]]` 字段：
 
@@ -637,6 +972,7 @@ max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
 | `plugin_user` / `plugin_passwd` | `http_proxy` / `socks5` 的认证 |
 | `secret_key` | stcp / xtcp 的共享密钥（别名 `secretKey`） |
 | `allow_users` | stcp / xtcp 允许的**访客客户端 `user`** 白名单（别名 `allowUsers`）；**留空 = 只允许与 provider 同一 user**，`["*"]` = 全部放行 |
+| `proxyProtocolVersion` | `v1` / `v2`，连内网服务前注入 PROXY 头透传真实客户端 IP；留空 = 不发 |
 
 `[[visitors]]` 字段：
 
@@ -741,23 +1077,31 @@ max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
 > **group 改最小连接数调度**（平局退化为轮询）。顺带修掉两个真 bug：
 > QUIC `Endpoint` 被提前 drop 导致 P2P 刚握完手就 `closed by peer: 0`、
 > 面板不读请求体导致跨 TCP 段的 POST 被截断。
+>
+> v0.3.4 是**安全与生态**的一版：补齐 OIDC 认证、RBAC 角色权限、IP 白/黑名单、审计日志、
+> WebSocket/WSS 传输、VirtualNet 虚拟网络、Proxy Protocol v1/v2、客户端 Store 持久化、
+> 客户端本地管理界面、面板 API v2 共十项能力（默认全关，老配置零改动）。
+> 顺带修掉三个真 bug：Linux 下 `tun_linux.rs` 编译不过（E0716，本机 Windows 编不到那段
+> `cfg(linux)` 代码，是云端构建抓出来的）、`denyUnknown`/角色拒绝时**先回"登录成功"再断开**
+> 导致客户端无限重连而 `loginFailExit` 永不触发、`DELETE /api/v2/*` 被面板总闸拦成纯文本
+> 405 而绕过了 v2 的统一错误信封。
 
 ## 质量保障
 
 ```bash
 cargo fmt --all -- --check          # 格式
 cargo clippy --workspace --all-targets   # 静态检查（当前 0 告警）
-cargo test --workspace              # 282 个测试
+cargo test --workspace              # 440 个测试
 ```
 
 测试分布：
 
 | 目标 | 数量 | 覆盖重点 |
 |---|---|---|
-| `common` 单元测试 | 119 | **v1 线协议**（消息类型字节、帧编解码、AES-128-CFB 密钥派生与流式状态机、**官方抓包密文解密回归**）、v2 线协议编解码、加密、配置解析、**原版 frp 配置兼容层**、打洞报文/口令/端口预测、**KCP（含 30% 丢包下的可靠传输）**、令牌桶、示例配置可加载 |
-| `server` 单元测试（lib） | 100 | 虚拟主机路由表与优先级、chunked 解析、Basic Auth、连接池配对与回收、**端口组最小连接数调度**、资源配额、指标编码、面板鉴权与**写接口**、热重载字段判定、打洞会话 |
+| `common` 单元测试 | 215 | **v1 线协议**（消息类型字节、帧编解码、AES-128-CFB 密钥派生与流式状态机、**官方抓包密文解密回归**）、v2 线协议编解码、加密、配置解析、**原版 frp 配置兼容层**、打洞报文/口令/端口预测、**KCP（含 30% 丢包下的可靠传输）**、令牌桶、示例配置可加载、**OIDC 令牌源与 JWKS 验签**、**CIDR/ACL/RBAC 判定边界**、**WebSocket 帧编解码与 Ping/Pong**、**PROXY v1/v2 编解码与防注入 sniff**、**VirtualNet 帧/路由/地址池**、**HTTP/1.1 请求解析** |
+| `server` 单元测试（lib） | 144 | 虚拟主机路由表与优先级、chunked 解析、Basic Auth、连接池配对与回收、**端口组最小连接数调度**、资源配额、指标编码、面板鉴权与**写接口**、热重载字段判定、打洞会话、**审计日志（JSONL + 环形缓冲 + 过滤）**、**安全上下文（ACL→认证→RBAC→审计）**、**API v2（错误信封 / 分页 / 百分号解码）**、**VirtualNet 服务端路由与代答 ICMP** |
 | `server` 单元测试（bin） | 5 | 命令行与配置装载 |
-| `client` 单元测试 | 46 | QUIC 建连与口令握手、插件（http_proxy / socks5 / static_file）、健康检查状态机、打洞编排、`NewProxy` 字段映射（含与官方 frpc 抓包逐字节对拍）、服务端下发名 → 本地代理的翻译（`resolve_uploaded_proxy`）、**动态代理表** |
+| `client` 单元测试 | 64 | QUIC 建连与口令握手、插件（http_proxy / socks5 / static_file）、健康检查状态机、打洞编排、`NewProxy` 字段映射（含与官方 frpc 抓包逐字节对拍）、服务端下发名 → 本地代理的翻译（`resolve_uploaded_proxy`）、**动态代理表**、**store 落盘与损坏文件容错**、**本地管理界面的路由与本地校验**、**PROXY 头注入** |
 | `server` 端到端集成测试 | 12 | 真握手 + 真转发的 TCP / HTTP / stcp / QUIC 链路、**v1 与 v2 双协议握手**、group 负载均衡、面板鉴权边界 |
 
 CI（`.github/workflows/ci.yml`）在每次 push / PR 上跑：`fmt` → `clippy` → 测试 →
@@ -834,6 +1178,13 @@ cargo build --release --target aarch64-unknown-linux-gnu
   私有消息，面板会把它标为不可管理，其余功能不受影响；
 - v1 线协议已完整实现并且是**默认**（与官方一致）；官方 v2 专有的 **UDP 二进制报文编码**
   （`V2BinaryUDPPacketReadWriter`）在 rustunnel 两端之间 v1/v2 都启用，与官方互通时走 JSON —— 功能等价，仅包体略大。
+- **VirtualNet 仅 Linux 客户端可用**：需要创建 TUN 设备与 `ip` 命令，Windows 上没有对应实现
+  （服务端不受平台限制）。同时需要 root 或 `CAP_NET_ADMIN`。
+- 本章新增的 **OIDC 认证 / ACL / RBAC / 审计 / WebSocket / VirtualNet / Proxy Protocol /
+  API v2 / 客户端本地界面**都是 rustunnel 两端之间的能力：与官方 frp 互通时，官方那一端
+  不认识这些扩展 —— 官方 frpc 连上来时按普通 token 客户端处理，不会因为对方不支持而失败。
+- 客户端 `[store]` 的落盘格式是 rustunnel 自己的 JSON，**与官方 frp 的 store 不通用**
+  （官方是 Go `configmgmt` 的序列化结构），从官方 frpc 迁移过来需要重新加一遍动态代理。
 
 ## License
 

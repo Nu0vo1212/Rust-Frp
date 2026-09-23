@@ -16,7 +16,7 @@ use tokio::{
 use tracing::{debug, warn};
 
 use crate::{
-    admin,
+    admin, api_v2,
     observability::{encode_json, encode_prometheus, Snapshot},
     registry::Registry,
 };
@@ -111,6 +111,7 @@ async fn handle(
     let (method, path) = parse_request_line(&req);
     let given = basic_auth_of(&req);
     let body = body_of(&req);
+    let query = query_of(&req);
 
     // 健康探针必须在鉴权**之前**处理。
     //
@@ -158,7 +159,12 @@ async fn handle(
         }
     }
 
-    if !matches!(method.as_str(), "GET" | "HEAD" | "POST") {
+    // `/api/v2/*` 例外：让 v2 自己回它的统一错误信封。
+    //
+    // 否则 `DELETE /api/v2/clients` 会先撞上这道总闸、拿到一段纯文本 405，
+    // 而调用方（都按信封解析）看到的是"响应体解析不了"—— 版本化 API 的
+    // 错误格式必须是**全路径一致**的，不能一半信封一半纯文本。
+    if !matches!(method.as_str(), "GET" | "HEAD" | "POST") && !path.starts_with(api_v2::PREFIX) {
         send(
             &mut stream,
             405,
@@ -167,6 +173,26 @@ async fn handle(
             &[],
         )
         .await?;
+        return Ok(());
+    }
+
+    // API v2 在这里整段接管。
+    //
+    // 放在这个位置（鉴权之后、v1 的 POST 表之前）有两个理由：
+    // * **鉴权之后** —— v2 里同样有开端口、踢人的写接口，绝不能绕开 Basic Auth；
+    // * **v1 分支之前** —— v2 自带一套完整的路由和错误信封，不需要 v1 的
+    //   路径表参与；而 `route` 对非 `/api/v2/` 的路径返回 `None`，
+    //   v1 那些老路径一个字节都不会被碰到。
+    if let Some(resp) = api_v2::route(&registry, &cfg, &method, &path, &query, body).await {
+        send(
+            &mut stream,
+            resp.status,
+            "application/json; charset=utf-8",
+            resp.body.as_bytes(),
+            &[],
+        )
+        .await?;
+        debug!(%peer, %method, %path, status = resp.status, "面板 v2 请求已处理");
         return Ok(());
     }
 
@@ -344,6 +370,18 @@ fn parse_request_line(req: &str) -> (String, String) {
     (method, if path.is_empty() { "/".into() } else { path })
 }
 
+/// 请求行里的 query string（`?` 之后的部分，不含 `?`）。
+///
+/// `parse_request_line` 会把 query 丢掉（v1 的路径表是按纯路径匹配的），
+/// 但 v2 的分页/过滤全靠它，所以单独再抽一次。没带 query 就是空串。
+fn query_of(req: &str) -> String {
+    let target = req.split_whitespace().nth(1).unwrap_or("");
+    match target.split_once('?') {
+        Some((_, q)) => q.to_string(),
+        None => String::new(),
+    }
+}
+
 fn header_value(req: &str, name: &str) -> Option<String> {
     for line in req.lines() {
         if let Some((k, v)) = line.split_once(':') {
@@ -380,10 +418,17 @@ async fn send(
 ) -> anyhow::Result<()> {
     let reason = match code {
         200 => "OK",
+        400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
-        _ => "OK",
+        409 => "Conflict",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "Status",
     };
     let mut out = format!(
         "HTTP/1.1 {code} {reason}\r\n\
@@ -636,6 +681,108 @@ mod tests {
             ("GET".to_string(), "/".to_string())
         );
         assert_eq!(parse_request_line(""), ("".to_string(), "/".to_string()));
+    }
+
+    /// v2 的分页与过滤全靠 query，抽错了就是"翻页永远翻不动"。
+    #[test]
+    fn query_extraction() {
+        assert_eq!(
+            query_of("GET /api/v2/clients?page=2&page_size=5 HTTP/1.1\r\n"),
+            "page=2&page_size=5"
+        );
+        assert_eq!(query_of("GET /api/v2/clients HTTP/1.1"), "");
+        // 只有一个 `?` 也算"没有 query"，不能把它当成 query 传下去
+        assert_eq!(query_of("GET /api/v2/clients? HTTP/1.1"), "");
+        assert_eq!(query_of(""), "");
+    }
+
+    async fn http_get(addr: SocketAddr, path: &str, auth: Option<(&str, &str)>) -> String {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let mut req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n");
+        if let Some((u, p)) = auth {
+            let cred = STANDARD.encode(format!("{u}:{p}"));
+            req.push_str(&format!("Authorization: Basic {cred}\r\n"));
+        }
+        req.push_str("\r\n");
+        let mut s = TcpStream::connect(addr).await.expect("连上面板");
+        s.write_all(req.as_bytes()).await.expect("写请求");
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.expect("读响应");
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// v2 走**完整 HTTP 链路**（真实 socket + 鉴权）也必须能跑。
+    ///
+    /// 只测 `api_v2::route` 是不够的：那样测不到"query 有没有从请求行抽出来"
+    /// 和"鉴权有没有先拦住"这两件最容易出错的事。
+    #[tokio::test]
+    async fn v2_over_real_http() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("绑端口");
+        let addr = listener.local_addr().unwrap();
+        let registry = Arc::new(Registry::unlimited());
+        let auth: DashboardAuth = Arc::new(RwLock::new(Some(("u".into(), "p".into()))));
+
+        let srv = {
+            let registry = registry.clone();
+            let auth = auth.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, peer)) = listener.accept().await else {
+                        break;
+                    };
+                    let registry = registry.clone();
+                    let auth = auth.clone();
+                    tokio::spawn(async move {
+                        let cfg = Arc::new(ServerConfig::default());
+                        let _ = handle(stream, peer, registry, auth, cfg).await;
+                    });
+                }
+            })
+        };
+
+        // ① 没带鉴权：401。v2 的写接口能开端口能踢人，绝不能绕过 Basic Auth。
+        let resp = http_get(addr, "/api/v2/status", None).await;
+        assert!(resp.starts_with("HTTP/1.1 401"), "未鉴权应当 401：{resp}");
+
+        // ② 带上鉴权：200，且是统一信封。
+        let resp = http_get(addr, "/api/v2/status", Some(("u", "p"))).await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(resp.contains("\"api\":\"v2\""), "缺少版本标识：{resp}");
+
+        // ③ query 要真的生效：非法的分页参数必须被拒，而不是悄悄回第一页。
+        let resp = http_get(addr, "/api/v2/clients?page=0", Some(("u", "p"))).await;
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        assert!(resp.contains("bad_request"), "{resp}");
+
+        // ④ v1 的老路径不受影响（零行为变化）。
+        let resp = http_get(addr, "/api/status", Some(("u", "p"))).await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "v1 必须照常工作：{resp}");
+        assert!(resp.contains("\"clients\""), "{resp}");
+
+        // ⑤ 非 GET/HEAD/POST 的方法打到 `/api/v2/*`，也必须走 v2 的统一错误信封。
+        //
+        // 回归：早先面板的总闸（只允许前三个方法）排在 v2 之前，`DELETE /api/v2/x`
+        // 会拿到一段纯文本 405 —— 按信封解析的调用方只会看到"响应体坏了"。
+        {
+            use base64::{engine::general_purpose::STANDARD, Engine as _};
+            let cred = STANDARD.encode("u:p");
+            let req = format!(
+                "DELETE /api/v2/clients HTTP/1.1\r\nHost: localhost\r\n\
+                 Authorization: Basic {cred}\r\n\r\n"
+            );
+            let mut s = TcpStream::connect(addr).await.expect("连上面板");
+            s.write_all(req.as_bytes()).await.expect("写请求");
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).await.expect("读响应");
+            let resp = String::from_utf8_lossy(&buf).into_owned();
+            assert!(resp.starts_with("HTTP/1.1 405"), "{resp}");
+            assert!(
+                resp.contains("method_not_allowed"),
+                "v2 路径的 405 必须是统一信封：{resp}"
+            );
+        }
+
+        srv.abort();
     }
 
     #[test]

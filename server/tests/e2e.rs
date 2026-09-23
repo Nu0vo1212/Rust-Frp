@@ -184,7 +184,7 @@ async fn login_with(port: u16, token: &str, user: &str, wire: WireVersion) -> (F
     let (conn, run_id, _udp_binary, _caps) = conn::client_handshake(
         Box::pin(stream),
         wire,
-        token,
+        &rustunnel_common::security::Credential::Token(token.to_string()),
         "e2e-client",
         user,
         &empty_metas(),
@@ -349,7 +349,7 @@ async fn login_quic(
     let (frp, run_id, _, _caps) = conn::client_handshake(
         stream,
         WireVersion::V2,
-        token,
+        &rustunnel_common::security::Credential::Token(token.to_string()),
         "e2e-quic",
         user,
         &empty_metas(),
@@ -434,7 +434,7 @@ async fn wrong_token_is_rejected_at_handshake() {
     let r = conn::client_handshake(
         Box::pin(stream),
         WireVersion::V2,
-        "wrong-token",
+        &rustunnel_common::security::Credential::Token("wrong-token".into()),
         "x",
         "",
         &empty_metas(),

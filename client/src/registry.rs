@@ -52,6 +52,16 @@ impl ProxyTable {
         self.read().keys().cloned().collect()
     }
 
+    /// 表里全部代理的副本，**按名字排序**。
+    ///
+    /// 给 Web 界面用：面板上的列表必须顺序稳定，否则每 3 秒刷新一次，
+    /// 行序就会跳来跳去（`HashMap` 的迭代顺序每次都不一样）。
+    pub fn list(&self) -> Vec<ProxyConfig> {
+        let mut v: Vec<ProxyConfig> = self.read().values().cloned().collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
+    }
+
     /// 新增或覆盖一条代理。已存在同名时先记一笔告警再覆盖 ——
     /// 面板上重复点"添加"不该静默产生两条互相打架的隧道。
     pub fn insert(&self, p: ProxyConfig) -> Option<ProxyConfig> {

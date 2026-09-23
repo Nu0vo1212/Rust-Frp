@@ -9,8 +9,11 @@ mod health;
 mod p2p;
 mod plugin;
 mod registry;
+mod store;
 mod udp_proxy;
 mod visitor;
+mod vnet;
+mod web;
 
 use std::{sync::Arc, time::Duration};
 
@@ -26,7 +29,7 @@ use rustunnel_common::{
         stream::BoxStream,
         tls,
     },
-    throttle, util,
+    proxy_protocol, throttle, util, ws,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::{net::TcpStream, time::interval};
@@ -148,6 +151,52 @@ async fn main() -> Result<()> {
         warn!("配置里既没有 [[proxies]] 也没有 [[visitors]]，客户端不会做任何转发");
     }
 
+    // PROXY 协议版本写错是个**静默**故障：不生效、日志里也看不出。
+    // 在这里逐个代理点出来，别让用户对着后端"protocol error"猜半天。
+    for p in &cfg.proxies {
+        if let Some(bad) = p.has_invalid_proxy_protocol_version() {
+            warn!(
+                proxy = %p.name,
+                value = %bad,
+                "proxyProtocolVersion 只认 \"v1\" / \"v2\"（大小写不敏感），\
+                 其它值一律**不启用** PROXY 协议，已按不启用处理"
+            );
+        }
+    }
+
+    // 认证配置先校验一遍：字段写错要在**启动时**就报出来，
+    // 而不是等每次连接都失败、用户对着"登录失败"发呆。
+    cfg.auth.validate()?;
+    let token_source = match cfg.auth.method {
+        rustunnel_common::security::AuthMethod::Oidc => {
+            let ts = rustunnel_common::auth::oidc::TokenSource::new(cfg.auth.oidc.clone())?;
+            info!(
+                endpoint = %cfg.auth.oidc.token_endpoint_url,
+                "OIDC 认证：连接前用 Client Credentials 换取 access token（带缓存）"
+            );
+            Some(ts)
+        }
+        rustunnel_common::security::AuthMethod::Token => None,
+    };
+
+    // 动态代理（面板 / Web API 加过的）从 store 里恢复，**并进 `cfg.proxies`**。
+    //
+    // 并进配置而不是单独维护一张表，是因为后面有四个消费者：健康检查、
+    // 登录时逐条发 NewProxy、工作连接查本地表、面板列表。并一次，
+    // 四处都自然看得见；分开维护就迟早会漏掉其中一处。
+    let store = Arc::new(store::Store::from_config(&cfg)?);
+    if store.is_enabled() {
+        let restored = store.dynamic();
+        if !restored.is_empty() {
+            info!(
+                count = restored.len(),
+                names = %store.dynamic_names().join(", "),
+                "从 store 恢复了动态添加的代理"
+            );
+        }
+        cfg.proxies = store::merge_initial(&cfg.proxies, restored);
+    }
+
     let cfg = Arc::new(cfg);
     // 健康检查是进程级的：跨重连持续探测，状态不随会话重建而丢失
     let health = health::Monitor::start(&cfg);
@@ -176,6 +225,59 @@ async fn main() -> Result<()> {
         });
     }
 
+    // VirtualNet：给本机加一块虚拟网卡，与同网段的其他客户端三层互通。
+    //
+    // 与普通代理不同，它**不是**由控制会话驱动的：控制连接断了虚拟网络照样
+    // 应该重连（两条连接本来就独立），所以单独起一个常驻任务。
+    if cfg.virtual_net.is_enabled() {
+        // 配置写错要在启动时就报出来，而不是等用户对着"网卡没出来"发呆
+        cfg.virtual_net.validate()?;
+        if cfg.virtual_net.server_port == 0 {
+            bail!(
+                "开了 [virtualNet] 但没写 serverPort —— 需要与服务端的 vnet_port 一致。\
+                 服务端配置里那句 `vnet_port = <端口>` 就是要填进来的值。"
+            );
+        }
+        let c = cfg.clone();
+        let ts = token_source.clone();
+        tokio::spawn(async move {
+            if let Err(e) = vnet::run(c, ts).await {
+                error!("VirtualNet 已停止：{e:#}");
+            }
+        });
+    }
+
+    // 代理表是**进程级**的：本地管理界面与会话共用同一张表。
+    //
+    // 各建一张的话，"刚在界面上加的代理"要等下次重连才会被会话看见 ——
+    // 而那期间界面显示"已添加"、流量却进不来。
+    let proxies = registry::ProxyTable::from_iter(cfg.proxies.iter().cloned());
+
+    // 客户端本地管理界面（`[webServer]`）。
+    //
+    // `port` 为 0（默认）时整段都不执行：不绑端口、不起任务，
+    // 与没有这个功能的版本**完全一致**。
+    let hub = if cfg.web_server.is_enabled() {
+        let addr = format!("{}:{}", cfg.web_server.addr, cfg.web_server.port);
+        let listener = tokio::net::TcpListener::bind(&addr)
+            .await
+            .with_context(|| {
+                format!("客户端管理界面绑定 {addr} 失败（检查 [webServer] 的 addr / port）")
+            })?;
+        let hub = web::Hub::new(
+            cfg.clone(),
+            proxies.clone(),
+            store.clone(),
+            health.clone(),
+            session_rx.clone(),
+        );
+        let serving = hub.clone();
+        tokio::spawn(web::run(listener, serving));
+        Some(hub)
+    } else {
+        None
+    };
+
     let shutdown = util::shutdown_signal();
     tokio::pin!(shutdown);
 
@@ -190,12 +292,16 @@ async fn main() -> Result<()> {
     let logged_in_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     loop {
-        let fut = run_session(
-            cfg.clone(),
-            session_tx.clone(),
-            health.clone(),
-            logged_in_once.clone(),
-        );
+        let fut = run_session(SessionDeps {
+            cfg: cfg.clone(),
+            session_tx: session_tx.clone(),
+            health: health.clone(),
+            logged_in_once: logged_in_once.clone(),
+            token_source: token_source.clone(),
+            store: store.clone(),
+            proxies: proxies.clone(),
+            hub: hub.clone(),
+        });
         tokio::select! {
             r = fut => {
                 match r {
@@ -316,7 +422,10 @@ async fn quic_server_addr(cfg: &ClientConfig) -> Result<std::net::SocketAddr> {
         .with_context(|| format!("解析服务端 QUIC 地址 {s} 失败"))
 }
 
-/// 建立一条到服务端的底层连接（TCP，按需 TLS）。
+/// 建立一条到服务端的底层连接（TCP，按需 TLS，按需 WebSocket）。
+///
+/// 套壳顺序与官方 frpc 一致：`TCP -> [TLS] -> [WebSocket]`，
+/// yamux 由 [`ServerLink`] 再套在外面。
 async fn raw_connect(cfg: &ClientConfig) -> Result<BoxStream> {
     let server = format!("{}:{}", cfg.server_addr, cfg.server_port);
     let addr = util::resolve_addr(&server)
@@ -332,7 +441,37 @@ async fn raw_connect(cfg: &ClientConfig) -> Result<BoxStream> {
     } else {
         &cfg.tls_server_name
     };
-    tls::connect_client(stream, cfg.tls_enable, name, !cfg.tls_custom_first_byte).await
+    // `protocol = "wss"` 自带 TLS，不用再写一遍 `transport.tls.enable`。
+    let tls_on = cfg.tls_enable || cfg.websocket_tls();
+    let stream = tls::connect_client(stream, tls_on, name, !cfg.tls_custom_first_byte).await?;
+
+    if !cfg.websocket_enabled() {
+        return Ok(stream);
+    }
+
+    // TLS + WebSocket 同时打开是个真实的坑，必须当场喊出来：
+    // 官方 frps 在 **TLS 之前**按明文前缀 `GET /~!frp` 嗅探 WebSocket，
+    // 套了 TLS 之后首字节变成 0x16，服务端只会把它当成一条普通 frp 连接，
+    // 表现为"连上就断"，而两边日志都看不出所以然。
+    if tls_on && !cfg.websocket_tls() {
+        warn!(
+            "同时打开了 transport.tls 与 WebSocket：官方 frps 在 TLS **之前**嗅探 \
+             WebSocket 前缀，这种组合直连主端口会握手失败；\
+             如果要 wss，请把 protocol 设为 \"wss\" 并由前置代理（nginx 等）终结 TLS"
+        );
+    }
+
+    let host = if cfg.websocket.host.trim().is_empty() {
+        cfg.server_addr.as_str()
+    } else {
+        cfg.websocket.host.as_str()
+    };
+    let path = cfg.websocket.effective_path();
+    let ws = ws::connect(stream, host, path, &[])
+        .await
+        .with_context(|| format!("WebSocket 握手失败（{host}{path}）"))?;
+    info!(%host, %path, tls = tls_on, "控制连接改走 WebSocket 传输");
+    Ok(Box::pin(ws))
 }
 
 /// 建立一次完整的控制连接会话，直到连接断开或出错。
@@ -402,12 +541,59 @@ fn resolve_uploaded_proxy(
     proxies.get(&raw).map(|p| (raw, p))
 }
 
-async fn run_session(
+/// 取本次连接要用的登录凭证。
+///
+/// - token 方式：直接用配置里的共享密钥（真正上线时会派生 `privilege_key`）；
+/// - OIDC 方式：**现取**一次 access token。绝不能缓存到调用方 ——
+///   token 会过期，复用上一次的会让"重连"变成"拿过期 token 再失败一次"。
+///   `TokenSource` 自己带缓存，没到期时不会真去打 IdP。
+///
+/// 抽成函数是因为 VirtualNet 也要用同一套凭证（见 `vnet.rs`）——
+/// 两边各写一遍的话，"OIDC 的 privilege_key 是原样 token"这条语义迟早会在
+/// 其中一边漏掉（这个坑在 `security.rs` 的注释里专门标过）。
+pub(crate) async fn current_credential(
+    cfg: &ClientConfig,
+    token_source: &Option<Arc<rustunnel_common::auth::oidc::TokenSource>>,
+) -> Result<rustunnel_common::security::Credential> {
+    Ok(match token_source {
+        Some(src) => rustunnel_common::security::Credential::Oidc(
+            src.token()
+                .await
+                .context("向 IdP 换取 OIDC access token 失败")?,
+        ),
+        None => rustunnel_common::security::Credential::Token(cfg.effective_token().to_string()),
+    })
+}
+
+/// 一次控制会话需要的全部外部依赖。
+///
+/// 打成一个结构体而不是摊成八个参数：会话每重连一次就要跑一遍，
+/// 而依赖永远只有这一组 —— 摊平只会让调用点越来越难读
+/// （也过不了 clippy 的参数个数上限）。
+struct SessionDeps {
     cfg: Arc<ClientConfig>,
     session_tx: tokio::sync::watch::Sender<Option<Arc<ClientSession>>>,
     health: Arc<health::Monitor>,
     logged_in_once: Arc<std::sync::atomic::AtomicBool>,
-) -> Result<()> {
+    token_source: Option<Arc<rustunnel_common::auth::oidc::TokenSource>>,
+    store: Arc<store::Store>,
+    proxies: registry::ProxyTable,
+    hub: Option<Arc<web::Hub>>,
+}
+
+async fn run_session(deps: SessionDeps) -> Result<()> {
+    // 解构出来而不是满篇写 `deps.cfg` —— 下面这段是本文件最长的一段代码，
+    // 到处加前缀只会让它更难读。
+    let SessionDeps {
+        cfg,
+        session_tx,
+        health,
+        logged_in_once,
+        token_source,
+        store,
+        proxies,
+        hub,
+    } = deps;
     let server = format!("{}:{}", cfg.server_addr, cfg.server_port);
     let link = Arc::new(ServerLink::open(cfg.clone()).await?);
     info!(%server, "已连接到服务端，开始握手");
@@ -419,10 +605,14 @@ async fn run_session(
         udp_binary: cfg.private_caps,
         server_cmd: cfg.private_caps,
     };
+    // 每次（重）连都重新取一次凭证：OIDC 的 access token 会过期，
+    // 复用上一次的会让"重连"变成"用过期 token 再失败一次"。
+    // TokenSource 内部有缓存，没到期时不会真的去打 IdP。
+    let cred = current_credential(&cfg, &token_source).await?;
     let (mut conn, run_id, udp_binary, caps) = conn::client_handshake(
         stream,
         link.wire,
-        &cfg.token,
+        &cred,
         &cfg.client_id,
         &cfg.user,
         &cfg.metas,
@@ -445,6 +635,19 @@ async fn run_session(
     logged_in_once.store(true, std::sync::atomic::Ordering::SeqCst);
 
     let run_id = Arc::new(run_id);
+
+    // 本地管理界面（`[webServer]`）的写请求通道。
+    //
+    // `_web_guard` 负责在会话结束时摘掉通道 —— 包括下面各种提前 `?` 返回。
+    // 不摘的话，重连窗口期的请求会被投进一个没人读的队列，
+    // 用户只能干等 20 秒超时，而不是立刻被告知"客户端没连上"。
+    //
+    // 没开管理界面时 `hub` 是 None：闭包不执行，`web_tx` 随之被丢弃，
+    // `web_rx.recv()` 立刻返回 None，下面那个 select 分支被自动禁用。
+    let (web_tx, mut web_rx) = tokio::sync::mpsc::unbounded_channel::<web::Request>();
+    let _web_guard = hub
+        .as_ref()
+        .map(|h| web::SessionGuard::new(h.clone(), web_tx));
 
     // xtcp 真 P2P：只有配置了 p2p_port 才建立打洞中枢
     let (p2p_route, mut punch_rx) = match p2p::setup(&cfg).await {
@@ -472,8 +675,8 @@ async fn run_session(
     // 服务端回包里的 `proxy_name` 是**线上全名** `{user}.{name}`
     // （我们发上去的就是这个，官方 frps 会原样回显），所以先 `strip_user_prefix`
     // 剥一层再查表；万一遇到不回显前缀的实现，strip 对不带前缀的名字也是恒等的。
-    let proxies = registry::ProxyTable::from_iter(cfg.proxies.iter().cloned());
-
+    // 代理表由 `main` 建好传进来（与本地管理界面共用同一张），这里**不重建** ——
+    // 重建会把界面上刚加进去的代理抹掉。
     for p in &cfg.proxies {
         let msg = NewProxy::from_config(p, &cfg.user);
         conn.send_msg(&FrpMessage::NewProxy(msg)).await?;
@@ -584,7 +787,7 @@ async fn run_session(
                             warn!(op = %cmd.op, "收到未协商的私有管理命令，忽略");
                             continue;
                         }
-                        let resp = apply_server_cmd(&proxies, &cmd, &mut conn).await;
+                        let resp = apply_server_cmd(&proxies, &store, &cmd, &mut conn).await;
                         if let Err(e) = &resp {
                             warn!(op = %cmd.op, "回执发送失败：{e:#}");
                         }
@@ -605,6 +808,24 @@ async fn run_session(
                 }
             } => {
                 conn.send_msg(&FrpMessage::NatHoleVisitor(req)).await?;
+            }
+            // 本地管理界面（`[webServer]`）发来的写请求。
+            //
+            // 必须在这里处理：控制连接被本循环独占，也只有在这里才能
+            // "一边等 `NewProxyResp`、一边顺手处理 `ReqWorkConn`" ——
+            // 服务端正等着工作连接，慢一步它就认为本端掉线了。
+            Some(req) = web_rx.recv() => {
+                web::handle_request(
+                    req,
+                    &mut conn,
+                    &link,
+                    &run_id,
+                    &proxies,
+                    &store,
+                    &health,
+                    &cfg,
+                )
+                .await;
             }
             _ = ticker.tick() => {
                 conn.send_msg(&FrpMessage::Ping(Ping {
@@ -627,11 +848,12 @@ async fn run_session(
 /// 收不到就只能在超时后报「已下发但结果未知」，体验很差。
 async fn apply_server_cmd(
     proxies: &registry::ProxyTable,
+    store: &store::Store,
     cmd: &msg::ServerCmd,
     conn: &mut FrpConn,
 ) -> Result<()> {
     let result = match cmd.op.as_str() {
-        msg::CMD_ADD_PROXY => add_proxy_cmd(proxies, cmd),
+        msg::CMD_ADD_PROXY => add_proxy_cmd(proxies, store, cmd),
         msg::CMD_REMOVE_PROXY => {
             let name = cmd.proxy_name.clone();
             if name.is_empty() {
@@ -649,6 +871,11 @@ async fn apply_server_cmd(
                     }
                 ))
             } else {
+                // store 里也要删 —— 否则下次启动它又"复活"，而用户已经
+                // 在面板上明确删过一次了
+                if let Err(e) = store.remove(&name) {
+                    warn!(proxy = %name, error = %e, "从 store 删除失败（内存里已移除）");
+                }
                 info!(proxy = %name, total = proxies.len(), reason = %cmd.reason, "按服务端命令移除代理");
                 Ok(())
             }
@@ -672,7 +899,11 @@ async fn apply_server_cmd(
 }
 
 /// 面板新增代理：把配置塞进本地表，再补发一条 `NewProxy` 让服务端开端口。
-fn add_proxy_cmd(proxies: &registry::ProxyTable, cmd: &msg::ServerCmd) -> Result<()> {
+fn add_proxy_cmd(
+    proxies: &registry::ProxyTable,
+    store: &store::Store,
+    cmd: &msg::ServerCmd,
+) -> Result<()> {
     // 命令里带的是 `serde_json::Value` 而不是 `ProxyConfig`：
     // 配置结构体将来改字段名时，不该让一条命令因为多/少一个键就整个解析失败。
     let p: ProxyConfig = cmd.proxy_config().map_err(anyhow::Error::msg)?;
@@ -686,6 +917,12 @@ fn add_proxy_cmd(proxies: &registry::ProxyTable, cmd: &msg::ServerCmd) -> Result
     let existed = proxies.insert(p.clone()).is_some();
     if existed {
         warn!(proxy = %name, "覆盖了同名的已有代理");
+    }
+    // 动态加进来的代理要落盘，否则重启就丢（`[store] path` 没配时是空操作）
+    if let Err(e) = store.put(&p) {
+        // 落盘失败不该让"这次添加"失败：内存里已经生效、端口已经开了，
+        // 告诉面板"失败"反而会让用户以为隧道没起来。
+        warn!(proxy = %name, error = %e, "写入 store 失败：重启后这条代理会丢失");
     }
     info!(proxy = %name, r#type = %p.proxy_type, total = proxies.len(), reason = %cmd.reason, "按服务端命令新增代理");
     Ok(())
@@ -755,6 +992,63 @@ async fn work_conn_flow(
     local_stream.set_nodelay(true).ok();
 
     debug!(proxy = %start.proxy_name, %local, "工作连接已建立，开始转发");
+
+    // ---- PROXY 协议：把真实客户端地址告诉内网服务 ----
+    //
+    // 不加这一段，后端看到的对端永远是从 frpc 自己发起的连接，来源地址变成
+    // `127.0.0.1` —— 于是所有按 IP 做的限流 / 审计 / 风控全部失效。
+    //
+    // 头**写在内网服务这一侧**（顺序：先 PROXY 头，再真实业务数据），
+    // 与官方 frpc 的 `HandleTCPWorkConnection` 完全一致：
+    //
+    // ```go
+    // if baseCfg.Transport.ProxyProtocolVersion != "" && m.SrcAddr != "" && m.SrcPort != 0 {
+    //     header := netpkg.BuildProxyProtocolHeaderStruct(connInfo.SrcAddr, connInfo.DstAddr, ...)
+    // }
+    // ...
+    // if connInfo.ProxyProtocolHeader != nil {
+    //     connInfo.ProxyProtocolHeader.WriteTo(localConn)
+    // }
+    // ```
+    //
+    // dst 的取值也照抄官方：`StartWorkConn.dst_addr` 为空时**回落 `127.0.0.1`**
+    // （`if m.DstAddr == "" { m.DstAddr = "127.0.0.1" }`）。别自作聪明改用
+    // `local_addr` 里的主机名 —— 官方就是回落到回环地址，后端收到的目的地址
+    // 与真 frpc 不一致，会让"和官方行为对拍"这件事失去意义。
+    if let Some(ver) = proxy.proxy_protocol_version() {
+        if start.src_addr.is_empty() || start.src_port == 0 {
+            debug!(
+                proxy = %start.proxy_name,
+                "服务端没下发来源地址（官方 frps 才有），PROXY 头跳过"
+            );
+        } else {
+            let dst_ip = if start.dst_addr.trim().is_empty() {
+                "127.0.0.1".to_string()
+            } else {
+                start.dst_addr.clone()
+            };
+            let src = util::resolve_addr(&format!("{}:{}", start.src_addr, start.src_port))
+                .await
+                .with_context(|| format!("解析 PROXY 头源地址 {} 失败", start.src_addr))?;
+            let dst = util::resolve_addr(&format!("{}:{}", dst_ip, start.dst_port))
+                .await
+                .with_context(|| format!("解析 PROXY 头目的地址 {dst_ip} 失败"))?;
+            let head = proxy_protocol::encode(&src, &dst, ver)
+                .with_context(|| format!("生成 PROXY {ver} 头失败"))?;
+            local_stream
+                .write_all(&head)
+                .await
+                .context("向内网服务写 PROXY 头失败")?;
+            debug!(
+                proxy = %start.proxy_name,
+                version = ver,
+                %src,
+                %dst,
+                "已向内网服务发送 PROXY 协议头"
+            );
+        }
+    }
+
     if !leftover.is_empty() {
         local_stream.write_all(&leftover).await?;
     }
@@ -792,6 +1086,8 @@ mod tests {
     /// 一个所有字段都填满独特值的 tcp 代理配置。
     fn full_tcp_config() -> ProxyConfig {
         ProxyConfig {
+            proxy_protocol_version: "v2".into(),
+            transport: Default::default(),
             name: "web-a".into(),
             proxy_type: "tcp".into(),
             local_addr: "127.0.0.1:8080".into(),
@@ -820,6 +1116,72 @@ mod tests {
             secret_key: "sk".into(),
             allow_users: vec!["alice".into()],
         }
+    }
+
+    #[test]
+    fn proxy_protocol_版本解析_两种写法都认() {
+        // 官方写法：[proxies.transport] proxyProtocolVersion = "v2"
+        let official = ProxyConfig {
+            proxy_protocol_version: String::new(),
+            transport: rustunnel_common::config::ProxyTransportConfig {
+                proxy_protocol_version: "v2".into(),
+            },
+            ..full_tcp_config()
+        };
+        assert_eq!(official.proxy_protocol_version(), Some("v2"));
+
+        // 老式 INI / 早期 TOML 写法：代理顶层的 proxy_protocol_version
+        let legacy = ProxyConfig {
+            proxy_protocol_version: "v1".into(),
+            transport: Default::default(),
+            ..full_tcp_config()
+        };
+        assert_eq!(legacy.proxy_protocol_version(), Some("v1"));
+
+        // 两处都写：transport 优先
+        let both = ProxyConfig {
+            proxy_protocol_version: "v1".into(),
+            transport: rustunnel_common::config::ProxyTransportConfig {
+                proxy_protocol_version: "v2".into(),
+            },
+            ..full_tcp_config()
+        };
+        assert_eq!(both.proxy_protocol_version(), Some("v2"));
+    }
+
+    /// 写错的值（大小写、`"2"`、`"v3"`）**必须当作不启用**，而不是"非 v1 即 v2"。
+    ///
+    /// 官方是 `if version != "v1" { use v2 }` 的写法，于是 `"V2"` 这种大小写
+    /// 差一个字母的配置会往用户后端灌一段二进制垃圾 —— 后端把它当业务数据，
+    /// 报出来的是"协议错误"，没人会想到是 frpc 的配置拼错了。
+    #[test]
+    fn proxy_protocol_写错的值宁可不生效() {
+        for bad in ["false", "2", "v3", "yes"] {
+            let c = ProxyConfig {
+                proxy_protocol_version: bad.into(),
+                ..full_tcp_config()
+            };
+            assert_eq!(
+                c.proxy_protocol_version(),
+                None,
+                "{bad:?} 不该被当成任何一版 PROXY 协议"
+            );
+            assert_eq!(c.has_invalid_proxy_protocol_version(), Some(bad.trim()));
+        }
+        // 大小写宽容：跑完 to_ascii_lowercase 之后能认
+        let c = ProxyConfig {
+            proxy_protocol_version: "V2".into(),
+            ..full_tcp_config()
+        };
+        assert_eq!(c.proxy_protocol_version(), Some("v2"));
+
+        // 空串 = 不启用，也不算"写错了"
+        let c = ProxyConfig {
+            proxy_protocol_version: String::new(),
+            ..full_tcp_config()
+        };
+        assert_eq!(c.proxy_protocol_version(), None);
+        assert_eq!(c.has_invalid_proxy_protocol_version(), None);
     }
 
     #[test]
@@ -1131,12 +1493,17 @@ bandwidthLimitMode = 'server'
         }
     }
 
+    /// 测试用的"不落盘"的 store（`[store] path` 没配就是它）。
+    fn no_store() -> store::Store {
+        store::Store::from_config(&ClientConfig::default()).expect("默认配置永远不该失败")
+    }
+
     /// 新增代理：本地表里要真的多出一条，且必须回一条成功回执。
     #[tokio::test]
     async fn 管理命令_新增代理() {
         let (mut me, mut peer) = cmd_pair();
         let table = registry::ProxyTable::default();
-        apply_server_cmd(&table, &add_cmd("panel-web"), &mut me)
+        apply_server_cmd(&table, &no_store(), &add_cmd("panel-web"), &mut me)
             .await
             .expect("新增应当成功");
 
@@ -1163,7 +1530,7 @@ bandwidthLimitMode = 'server'
             proxy_name: "nope".to_string(),
             ..Default::default()
         };
-        apply_server_cmd(&table, &cmd, &mut me)
+        apply_server_cmd(&table, &no_store(), &cmd, &mut me)
             .await
             .expect_err("移除不存在的代理应当失败");
 
@@ -1192,7 +1559,7 @@ bandwidthLimitMode = 'server'
             op: "format_disk".to_string(),
             ..Default::default()
         };
-        apply_server_cmd(&table, &cmd, &mut me)
+        apply_server_cmd(&table, &no_store(), &cmd, &mut me)
             .await
             .expect_err("未知命令必须失败");
         assert!(expect_cmd_resp(&mut peer).await.error.contains("未知命令"));
@@ -1207,7 +1574,7 @@ bandwidthLimitMode = 'server'
             ..Default::default()
         }]);
 
-        apply_server_cmd(&table, &add_cmd("new"), &mut me)
+        apply_server_cmd(&table, &no_store(), &add_cmd("new"), &mut me)
             .await
             .expect("新增");
         let _ = expect_cmd_resp(&mut peer).await;
@@ -1219,7 +1586,9 @@ bandwidthLimitMode = 'server'
             proxy_name: "old".to_string(),
             ..Default::default()
         };
-        apply_server_cmd(&table, &cmd, &mut me).await.expect("移除");
+        apply_server_cmd(&table, &no_store(), &cmd, &mut me)
+            .await
+            .expect("移除");
         let _ = expect_cmd_resp(&mut peer).await;
         assert_eq!(table.len(), 1, "删掉之后只剩新增的那条");
         assert!(table.get("old").is_none());

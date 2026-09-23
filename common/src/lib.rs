@@ -12,17 +12,24 @@
 //!
 //! 本 crate 不含任何平台特定代码，Windows / Linux 行为一致。
 
+pub mod auth;
 pub mod compat;
 pub mod config;
 pub mod error;
 pub mod frp;
 pub mod frp_config;
 pub mod frp_legacy;
+pub mod http1;
+pub mod httpc;
 pub mod p2p;
 pub mod protocol;
+pub mod proxy_protocol;
+pub mod security;
 pub mod throttle;
 pub mod transport;
 pub mod util;
+pub mod vnet;
+pub mod ws;
 
 pub use error::{Error, Result};
 pub use protocol::ControlMessage;

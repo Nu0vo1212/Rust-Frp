@@ -11,7 +11,10 @@
 //! 都有对应的单元测试，集成测试也能直接驱动它们。
 
 pub mod admin;
+pub mod api_v2;
+pub mod audit;
 pub mod dashboard;
+pub mod guard;
 pub mod limits;
 pub mod observability;
 pub mod p2p;
@@ -22,6 +25,7 @@ pub mod serve;
 pub mod udp_proxy;
 pub mod vhost;
 pub mod visitor;
+pub mod vnet;
 
 pub use pool::{ClientState, CtrlCmd};
 pub use registry::{Registry, ServerLimits};

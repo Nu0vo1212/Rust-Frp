@@ -45,10 +45,17 @@ async fn main() -> anyhow::Result<()> {
         println!("\n===== 新连接：{peer} =====");
 
         let stream: rustunnel_common::frp::BoxStream = Box::pin(stream);
-        let mut conn = match server_handshake(stream, "", "dump-run-id").await {
+        let mut conn = match server_handshake(
+            stream,
+            &rustunnel_common::security::AuthProvider::token(""),
+            "dump-run-id",
+        )
+        .await
+        {
             Ok(ServerAccept::Control {
                 conn,
                 login,
+                role: _role,
                 udp_binary,
                 caps: _caps,
             }) => {

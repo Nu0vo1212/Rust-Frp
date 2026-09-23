@@ -19,7 +19,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::ring;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -89,7 +89,13 @@ fn to_server_name(host: &str) -> Result<ServerName<'static>> {
 /// - `0x17`：frp 自定义首字节，该字节被消费掉，随后是真正的 TLS 握手；
 /// - `0x16`：标准 TLS 握手，首字节要还回流里；
 /// - 其他：明文连接，首字节要还回流里。
-pub async fn accept_server(mut stream: TcpStream, enable: bool, force: bool) -> Result<BoxStream> {
+///
+/// 泛型化是为了让调用方在 TLS 之前先做一层探测（WebSocket 嗅探就是），
+/// 探测读掉的字节可以用 [`PrefixedStream`] 还回来，不影响这里的首字节判断。
+pub async fn accept_server<S>(mut stream: S, enable: bool, force: bool) -> Result<BoxStream>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     if !enable && !force {
         return Ok(Box::pin(stream));
     }
@@ -154,8 +160,11 @@ pub async fn connect_client(
 }
 
 /// 不校验服务端证书（等价于 frp 的 `InsecureSkipVerify = true`）。
+///
+/// `pub` 是为了让 OIDC 那边（[`crate::httpc`]）在配了 `insecureSkipVerify`
+/// 时复用同一份实现 —— 两边对"不校验"的理解必须完全一致。
 #[derive(Debug)]
-struct SkipServerVerification;
+pub struct SkipServerVerification;
 
 impl ServerCertVerifier for SkipServerVerification {
     fn verify_server_cert(

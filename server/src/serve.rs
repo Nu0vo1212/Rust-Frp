@@ -23,10 +23,10 @@ use rustunnel_common::{
         },
         stream::{BoxStream, PrefixedStream},
     },
-    util,
+    util, ws,
 };
 use tokio::{net::TcpListener, net::TcpStream, net::UdpSocket};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     dashboard,
@@ -35,7 +35,7 @@ use crate::{
     registry::{ClientGuard, PortClaim, Registry, ServerLimits},
     udp_proxy,
     vhost::{self, VhostRoute, VhostTable},
-    visitor,
+    visitor, vnet,
 };
 
 use visitor::VisitorEntry;
@@ -47,6 +47,27 @@ const YAMUX_VERSION_BYTE: u8 = 0x00;
 
 /// 探测首字节的超时时间。
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// WebSocket 升级请求的前缀：`"GET " + FrpWebsocketPath`。
+///
+/// **与官方 frps 的判定完全一致**（`server/service.go`）：
+///
+/// ```ignore
+/// websocketPrefix := []byte("GET " + netpkg.FrpWebsocketPath)
+/// websocketLn := svr.muxer.Listen(0, uint32(len(websocketPrefix)), func(data []byte) bool {
+///     return bytes.Equal(data, websocketPrefix)
+/// })
+/// ```
+///
+/// 三点要注意，都是照抄官方行为而不是自己发挥：
+///
+/// 1. **服务端不需要任何配置**：官方是在 TCP 层用 mux 做前缀匹配，
+///    所以 frpc 打开 `protocol = "websocket"` 就能连上，frps 侧一行配置都不用改。
+/// 2. **判据是"精确等于这 10 个字节"**，不是解析 HTTP —— 少一个字节都不算。
+/// 3. **必须在 TLS 之前**：这个前缀是明文发在 TCP 端口上的。反过来说，
+///    `tls + websocket` 在官方 frps 上也是连不上的（首字节是 0x16 不是 `G`），
+///    `wss` 要靠前置的 nginx 之类终结 TLS —— 这不是我们偷懒，是官方就这样。
+const WS_PREFIX: &[u8] = b"GET /~!frp";
 
 /// 由 [`ServerConfig`] 里的上限字段折算出来的结构体。
 pub fn limits_from(cfg: &ServerConfig) -> ServerLimits {
@@ -110,17 +131,36 @@ pub async fn serve_on_with(
 ) -> Result<()> {
     let addr = listener.local_addr().context("取不到监听地址")?;
 
+    // 安全上下文：认证方式 / IP 白黑名单 / 角色权限 / 审计日志。
+    //
+    // ★ 编译失败必须**拦住启动**：配置里写错一个 CIDR 就静默退化成
+    //   "没有访问控制"，那比起不来危险得多。
+    let security = Arc::new(crate::guard::SecurityContext::from_config(&cfg)?);
+    registry.set_security(security.clone());
+    // OIDC 模式下顺带拉一次 JWKS。拉不到只告警、不拦启动
+    // （IdP 可能只是暂时不可达），期间登录会被明确拒绝而不是放行。
+    if let Err(e) = security.refresh_oidc().await {
+        error!(
+            error = %e,
+            issuer = %cfg.effective_auth().oidc.issuer,
+            "拉取 OIDC JWKS 失败：暂时没有人能通过 OIDC 登录；\
+             请检查 issuer 与网络，恢复后会自动重试"
+        );
+    }
+
     info!("rustunnel-server 已启动：frp v2 协议，监听 {addr}");
     info!("支持的代理类型：tcp / udp / http / https / stcp / xtcp");
+    let eff = cfg.effective_auth();
     info!(
-        "token = {}（{}）",
-        if cfg.token.is_empty() {
+        "认证方式 = {}，token = {}（{}）",
+        eff.method.as_str(),
+        if eff.token.is_empty() {
             "<空>"
         } else {
             "已设置"
         },
-        if cfg.token.is_empty() {
-            "不安全"
+        if eff.method == rustunnel_common::security::AuthMethod::Token && eff.token.is_empty() {
+            "不安全：任何人都能连"
         } else {
             "已启用"
         }
@@ -196,6 +236,22 @@ pub async fn serve_on_with(
         } else {
             warn!("配置了 hot_reload 但没有传入配置文件路径，已跳过");
         }
+    }
+
+    // VirtualNet 虚拟网络：单独一个端口，不配就完全不启用（默认）。
+    if let Some(vport) = cfg.vnet_listen_port() {
+        // 配置写错必须拦住启动：网段/网关联不对，客户端连上来也只会拿到
+        // 一堆莫名其妙的分配结果，不如当场报出来。
+        let hub = Arc::new(vnet::VnetHub::from_config(&cfg)?);
+        registry.attach_vnet(hub.clone());
+        let addr = util::resolve_addr(&format!("{}:{}", cfg.bind_addr, vport))
+            .await
+            .with_context(|| format!("解析 VirtualNet 地址 {}:{} 失败", cfg.bind_addr, vport))?;
+        let listener = TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("监听 VirtualNet {addr} 失败"))?;
+        info!("VirtualNet 虚拟网络已监听 {addr}（三层转发，客户端需 root/CAP_NET_ADMIN）");
+        tokio::spawn(vnet::run(listener, hub, registry.clone()));
     }
 
     // QUIC 传输：在同一个端口号上额外监听 UDP。
@@ -304,11 +360,66 @@ fn log_limits(registry: &Registry) {
 // ---------------------------------------------------------------------------
 
 async fn handle_conn(
-    stream: TcpStream,
+    mut stream: TcpStream,
     peer: SocketAddr,
     cfg: Arc<ServerConfig>,
     registry: Arc<Registry>,
 ) -> Result<()> {
+    // 第零层：WebSocket 嗅探。**必须在 TLS 之前**，理由见 [`WS_PREFIX`]。
+    //
+    // 只先读 1 个字节：不是 `G` 就立刻还回去、原样往下走，
+    // 非 WebSocket 的客户端因此只多付一次"首字节到达"的等待，与改造前等价
+    // （下面 `tls::accept_server` 本来也要做同样的探测）。
+    let mut first = [0u8; 1];
+    match tokio::time::timeout(
+        PROBE_TIMEOUT,
+        tokio::io::AsyncReadExt::read(&mut stream, &mut first),
+    )
+    .await
+    {
+        Ok(Ok(0)) => return Ok(()),
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => return Err(e).context("读取首字节失败"),
+        Err(_) => {
+            debug!(%peer, "等待首字节超时，断开");
+            return Ok(());
+        }
+    }
+
+    if first[0] == WS_PREFIX[0] {
+        // 可能是 `GET /~!frp`。继续读满前缀长度做逐字节比对，
+        // 对不上一字节不丢 —— 全部塞回去按普通连接处理。
+        let mut head = vec![first[0]];
+        while head.len() < WS_PREFIX.len() {
+            let mut b = [0u8; 1];
+            match tokio::time::timeout(
+                PROBE_TIMEOUT,
+                tokio::io::AsyncReadExt::read(&mut stream, &mut b),
+            )
+            .await
+            {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(_)) => head.push(b[0]),
+                Ok(Err(e)) => return Err(e).context("读取 WebSocket 请求行失败"),
+            }
+        }
+        if head == WS_PREFIX {
+            let raw: BoxStream = Box::pin(PrefixedStream::new(head, stream));
+            let ws = ws::accept(raw)
+                .await
+                .context("WebSocket 升级失败（关闭连接）")?;
+            info!(%peer, "WebSocket 控制连接已建立");
+            // 升级之后就是一条普通流：yamux（若开启）与 frp 握手照旧。
+            return handle_stream(Box::pin(ws), peer, cfg, registry, false).await;
+        }
+        let stream: BoxStream = Box::pin(PrefixedStream::new(head, stream));
+        let stream = frp::tls::accept_server(stream, true, cfg.tls_force)
+            .await
+            .context("TLS 协商失败")?;
+        return handle_stream(stream, peer, cfg, registry, false).await;
+    }
+
+    let stream: BoxStream = Box::pin(PrefixedStream::new(vec![first[0]], stream));
     // 第一层：TLS。靠首字节自动识别（0x17 = frp 自定义首字节，0x16 = 标准 TLS）。
     let stream = frp::tls::accept_server(stream, true, cfg.tls_force)
         .await
@@ -329,7 +440,7 @@ async fn handle_stream(
     secure: bool,
 ) -> Result<()> {
     if secure {
-        return handle_frp_stream(stream, cfg, registry).await;
+        return handle_frp_stream(stream, peer, cfg, registry).await;
     }
 
     // 第二层：yamux（可选）。自动探测，兼容 tcpMux=true / false 的客户端。
@@ -359,7 +470,7 @@ async fn handle_stream(
                 let cfg = cfg.clone();
                 let registry = registry.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_frp_stream(s, cfg, registry).await {
+                    if let Err(e) = handle_frp_stream(s, peer, cfg, registry).await {
                         debug!(%peer, "yamux stream 结束：{e:#}");
                     }
                 });
@@ -367,42 +478,100 @@ async fn handle_stream(
             return Ok(());
         }
         let stream: BoxStream = Box::pin(PrefixedStream::new(vec![first[0]], stream));
-        return handle_frp_stream(stream, cfg, registry).await;
+        return handle_frp_stream(stream, peer, cfg, registry).await;
     }
 
-    handle_frp_stream(stream, cfg, registry).await
+    handle_frp_stream(stream, peer, cfg, registry).await
 }
 
 /// 在一条流上完成 frp v2 握手并分发到控制连接 / 工作连接。
 async fn handle_frp_stream(
     stream: BoxStream,
+    peer: SocketAddr,
     cfg: Arc<ServerConfig>,
     registry: Arc<Registry>,
 ) -> Result<()> {
     let run_id = util::new_run_id();
-    match conn::server_handshake(stream, &cfg.token, &run_id).await {
+    let sec = registry.security();
+
+    // (1) 第一层：IP 白 / 黑名单。
+    //
+    // 刻意放在**握手之前**：认证（尤其 OIDC）要比对签名、可能还要打 IdP，
+    // 而 ACL 只是一次位运算 —— 让不认识的人先撞上最便宜的那道闸。
+    if let Err(reason) = sec.check_ip(peer.ip()) {
+        registry.audit().record(
+            crate::audit::AuditEvent::new(crate::audit::kind::LOGIN_DENIED, false)
+                .ip(peer.ip().to_string())
+                .detail(reason.clone()),
+        );
+        debug!(%peer, "IP 访问控制拒绝：{reason}");
+        anyhow::bail!("连接被拒绝");
+    }
+
+    // (2) 认证 + (3) 授权。
+    //
+    // 授权必须发生在**回 LoginResp 之前**：先回"登录成功"再断开的话，客户端
+    // 会把它当成普通掉线而无限重连（`loginFailExit` 永远不触发，宿主看到的是
+    // "进程活着"= 绿灯，但实际不可用）。所以把 role_for 作为闭包传进握手函数。
+    let authorize = |user: &str| -> std::result::Result<rustunnel_common::security::Role, String> {
+        sec.role_for(user).map_err(|e| {
+            registry.audit().record(
+                crate::audit::AuditEvent::new(crate::audit::kind::LOGIN_DENIED, false)
+                    .client(run_id.clone())
+                    .user(user.to_string())
+                    .ip(peer.ip().to_string())
+                    .detail(e.to_string()),
+            );
+            warn!(user = %user, "角色解析失败，拒绝登录：{e:#}");
+            e.to_string()
+        })
+    };
+    match conn::server_handshake_authz(stream, &sec.auth, &run_id, authorize).await {
         Ok(ServerAccept::Control {
             conn,
             login,
+            role,
             udp_binary,
             caps,
         }) => {
             let wire_version = conn.version();
+            // (4) 审计：登录成功也要记 —— 只记失败的话，
+            //     "这个 IP 到底有没有进来过"就永远查不出来。
+            registry.audit().record(
+                crate::audit::AuditEvent::new(crate::audit::kind::LOGIN, true)
+                    .client(run_id.clone())
+                    .user(login.user.clone())
+                    .ip(peer.ip().to_string())
+                    .detail(format!("role={} wire={wire_version}", role.name)),
+            );
             handle_control(
                 conn,
-                login,
+                *login,
                 run_id,
                 udp_binary,
                 caps,
                 wire_version,
+                peer,
+                role,
                 cfg,
                 registry,
             )
             .await
         }
-        Ok(ServerAccept::Work { conn, msg }) => handle_work(conn, msg, registry).await,
+        Ok(ServerAccept::Work { conn, msg }) => handle_work(conn, msg, &sec, registry).await,
         Ok(ServerAccept::Visitor { conn, msg }) => handle_visitor(conn, msg, registry).await,
         Err(e) => {
+            // 握手失败（含认证失败）也要留痕：这是最需要被看见的一类事件。
+            // 授权失败已经在 authorize 闭包里记过（那条带 user），别记两遍。
+            let text = format!("{e:#}");
+            if !text.starts_with("授权失败") {
+                registry.audit().record(
+                    crate::audit::AuditEvent::new(crate::audit::kind::LOGIN_DENIED, false)
+                        .client(run_id.clone())
+                        .ip(peer.ip().to_string())
+                        .detail(text.clone()),
+                );
+            }
             debug!("握手失败：{e:#}");
             Err(e)
         }
@@ -421,9 +590,12 @@ async fn handle_control(
     udp_binary: bool,
     caps: rustunnel_common::frp::msg::RustunnelCaps,
     wire_version: rustunnel_common::frp::WireVersion,
+    peer: SocketAddr,
+    role: rustunnel_common::security::Role,
     cfg: Arc<ServerConfig>,
     registry: Arc<Registry>,
 ) -> Result<()> {
+    let sec = registry.security();
     let client_id = if login.client_id.is_empty() {
         run_id.clone()
     } else {
@@ -514,11 +686,51 @@ async fn handle_control(
                         );
                         let name = m.proxy_name.clone();
                         let port = m.remote_port;
+                        // (3) 授权：这个角色允许注册这种类型的代理 / 占这个端口吗？
+                        //
+                        // 放在 register_proxy **之前**：注册会真的去占端口、
+                        // 建 vhost 路由，先拦下来才不会有"拒绝了一半"的状态。
+                        if let Err(e) = sec.check_proxy(&role, &name, &m.proxy_type, port) {
+                            registry.metrics().proxy_failures.inc();
+                            registry.audit().record(
+                                crate::audit::AuditEvent::new(
+                                    crate::audit::kind::PROXY_REJECTED,
+                                    false,
+                                )
+                                .client(run_id.clone())
+                                .user(client.user.clone())
+                                .ip(peer.ip().to_string())
+                                .target(name.clone())
+                                .detail(e.to_string()),
+                            );
+                            warn!(proxy = %name, "代理注册被权限模型拒绝：{e:#}");
+                            conn.send_msg(&FrpMessage::NewProxyResp(NewProxyResp {
+                                proxy_name: name,
+                                error: e.to_string(),
+                                ..Default::default()
+                            }))
+                            .await?;
+                            continue;
+                        }
                         let resp = match register_proxy(&cfg, &registry, &client, &m).await {
                             Ok(remote_addr) => {
                                 registry.metrics().proxies_total.inc();
                                 registry.metrics().proxies_active.inc();
                                 info!(proxy = %name, port, remote = %remote_addr, "代理注册成功");
+                                registry.audit().record(
+                                    crate::audit::AuditEvent::new(
+                                        crate::audit::kind::PROXY_ADD,
+                                        true,
+                                    )
+                                    .client(run_id.clone())
+                                    .user(client.user.clone())
+                                    .ip(peer.ip().to_string())
+                                    .target(name.clone())
+                                    .detail(format!(
+                                        "type={} remote_port={port} remote={remote_addr}",
+                                        m.proxy_type
+                                    )),
+                                );
                                 NewProxyResp {
                                     proxy_name: name.clone(),
                                     remote_addr,
@@ -533,12 +745,45 @@ async fn handle_control(
                         };
                         conn.send_msg(&FrpMessage::NewProxyResp(resp)).await?;
                     }
-                    FrpMessage::Ping(_) => {
+                    FrpMessage::Ping(p) => {
+                        // OIDC + additionalScopes 含 HeartBeats 时，每个心跳上的
+                        // token 都要重新验签、且 subject 与登录时一致。
+                        // 少了这一步，"登录时验过一次"就等于之后永久信任。
+                        if sec.auth_cfg.check_heartbeats()
+                            && sec.auth.method()
+                                == rustunnel_common::security::AuthMethod::Oidc
+                        {
+                            if let Err(e) = sec.auth.verify_followup(&p.privilege_key, "心跳") {
+                                registry.audit().record(
+                                    crate::audit::AuditEvent::new(
+                                        crate::audit::kind::LOGIN_DENIED,
+                                        false,
+                                    )
+                                    .client(run_id.clone())
+                                    .user(client.user.clone())
+                                    .ip(peer.ip().to_string())
+                                    .detail(format!("心跳凭证复核失败：{e:#}")),
+                                );
+                                warn!("心跳凭证复核失败，断开控制连接：{e:#}");
+                                break;
+                            }
+                        }
                         conn.send_msg(&FrpMessage::Pong(Pong::default())).await?;
                     }
                     FrpMessage::CloseProxy(m) => {
                         info!(proxy = %m.proxy_name, "客户端关闭代理");
                         registry.metrics().proxies_active.dec();
+                        registry.audit().record(
+                            crate::audit::AuditEvent::new(
+                                crate::audit::kind::PROXY_REMOVE,
+                                true,
+                            )
+                            .client(run_id.clone())
+                            .user(client.user.clone())
+                            .ip(peer.ip().to_string())
+                            .target(m.proxy_name.clone())
+                            .detail("客户端主动关闭"),
+                        );
                         // stcp / xtcp 的代理名
                         registry.visitors.remove(&m.proxy_name);
                         // 客户端主动关代理时，它占的 http/https 域名也得摘掉，
@@ -921,10 +1166,33 @@ pub fn admit_user(user: PendingUser, client: &Arc<ClientState>, registry: &Arc<R
 // 工作连接
 // ---------------------------------------------------------------------------
 
-async fn handle_work(mut conn: FrpConn, msg: NewWorkConn, registry: Arc<Registry>) -> Result<()> {
+async fn handle_work(
+    mut conn: FrpConn,
+    msg: NewWorkConn,
+    sec: &crate::guard::SecurityContext,
+    registry: Arc<Registry>,
+) -> Result<()> {
     let client = registry
         .get(&msg.run_id)
         .ok_or_else(|| anyhow!("找不到 run_id={} 对应的客户端", msg.run_id))?;
+
+    // OIDC + additionalScopes 含 NewWorkConns：工作连接上必须带一个
+    // **与登录同 subject** 的有效 token。
+    //
+    // 这条挡的是：拿到 run_id 的人自己新建一条工作连接，绕过
+    // "工作连接必须来自同一个客户端"这个隐含前提。
+    if sec.auth_cfg.check_new_work_conns()
+        && sec.auth.method() == rustunnel_common::security::AuthMethod::Oidc
+    {
+        if let Err(e) = sec.auth.verify_followup(&msg.privilege_key, "新工作连接") {
+            registry.audit().record(
+                crate::audit::AuditEvent::new(crate::audit::kind::LOGIN_DENIED, false)
+                    .client(msg.run_id.clone())
+                    .detail(format!("工作连接凭证复核失败：{e:#}")),
+            );
+            anyhow::bail!("工作连接凭证复核失败：{e:#}");
+        }
+    }
     // 工作连接必须与控制连接用同一套线协议 —— 与官方 frps 的
     // `work connection wire protocol mismatch` 检查对齐。
     // 对不上的话后面收发消息会直接解析失败，报错信息离原因很远，所以先挡下来。

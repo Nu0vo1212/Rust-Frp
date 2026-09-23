@@ -407,7 +407,7 @@ fn take_frame(buf: &mut Vec<u8>) -> Result<Option<(u16, Vec<u8>)>> {
 /// 的前缀：第三方 frps 与面板会解析这个字段，不认识的写法可能直接被判为
 /// "不支持的客户端版本"。
 fn build_login(
-    token: &str,
+    cred: &crate::security::Credential,
     client_id: &str,
     user: &str,
     metas: &std::collections::HashMap<String, String>,
@@ -421,7 +421,10 @@ fn build_login(
         arch: std::env::consts::ARCH.to_string(),
         // 官方 frps 用 Login.User 匹配 stcp/xtcp 的 allow_users 白名单
         user: user.to_string(),
-        privilege_key: msg::auth_key(token, ts),
+        // ★ 两种认证方式的 privilege_key 语义完全不同：
+        // token = hex(md5(secret+ts))，OIDC = 原样的 access token。
+        // 统一走 Credential 生成，别在这里手写。
+        privilege_key: cred.wire_value(ts),
         timestamp: ts,
         client_id: client_id.to_string(),
         // frp 的 `[metadatas]` 原样透传：不少 frp 平台靠 `metas["token"]`
@@ -441,7 +444,7 @@ fn build_login(
 pub async fn client_handshake(
     stream: BoxStream,
     version: WireVersion,
-    token: &str,
+    cred: &crate::security::Credential,
     client_id: &str,
     user: &str,
     metas: &std::collections::HashMap<String, String>,
@@ -450,7 +453,7 @@ pub async fn client_handshake(
 ) -> Result<(FrpConn, String, bool, msg::RustunnelCaps)> {
     let mut conn = FrpConn::new(stream, version);
     let ts = now_unix_secs() as i64;
-    let mut login = build_login(token, client_id, user, metas, pool_count, ts);
+    let mut login = build_login(cred, client_id, user, metas, pool_count, ts);
     // 只是"声明支持"，真正开不开由服务端在 LoginResp 里回显决定
     login.rustunnel = if caps.any() { Some(caps) } else { None };
 
@@ -469,7 +472,7 @@ pub async fn client_handshake(
             bail!("服务端未下发 run_id");
         }
         // 官方时序：Login / LoginResp 明文，之后的控制消息才走 CFB
-        conn.enable_v1_crypto(token)?;
+        conn.enable_v1_crypto(cred.raw())?;
         // v1 的二进制 UDP 只有在**服务端回显**了才算数：连官方 frps 时
         // 它不会回这个字段，于是这里拿到 default()，行为与以前完全一致。
         let accepted = login_resp.rustunnel.clone().unwrap_or_default();
@@ -521,7 +524,9 @@ pub async fn client_handshake(
 
     // 4) 切换到加密帧流
     let transcript = transcript_hash(&hello_payload, &sh_payload);
-    let (c2s, s2c) = derive_control_keys(token.as_bytes(), &algorithm, &transcript)?;
+    // 加密密钥与"线上凭证"必须同源：token 方式用共享密钥，OIDC 方式用 access token。
+    // 服务端用 `AuthProvider::control_key(login.privilege_key)` 得到同样的字节。
+    let (c2s, s2c) = derive_control_keys(cred.raw().as_bytes(), &algorithm, &transcript)?;
     conn.upgrade(s2c, c2s)?; // 客户端用 s2c 读、c2s 写
 
     // 5) 私有能力：仍然只认服务端回显的那一份
@@ -538,7 +543,11 @@ pub enum ServerAccept {
     /// 控制连接（已通过 token 校验并升级加密）
     Control {
         conn: FrpConn,
-        login: Login,
+        /// 装箱：`Login` 是这个枚举里最大的成员，直接内联会把整个枚举撑大
+        /// （clippy::large_enum_variant）。只有控制连接会用到它，装箱零代价。
+        login: Box<Login>,
+        /// 本次会话的角色（RBAC）。未启用 RBAC 时是「全权」角色。
+        role: crate::security::Role,
         /// 本次会话协商出的 UDP 报文编码（true = 二进制）
         udp_binary: bool,
         /// 服务端**确认**启用的 rustunnel 私有能力。
@@ -558,9 +567,34 @@ pub enum ServerAccept {
 /// * `run_id` —— 本次会话的标识，会写进 LoginResp 下发给客户端。
 pub async fn server_handshake(
     stream: BoxStream,
-    token: &str,
+    auth: &crate::security::AuthProvider,
     run_id: &str,
 ) -> Result<ServerAccept> {
+    // 不做授权：任何通过认证的用户都拿到全权角色，等价于"没启用 RBAC"。
+    server_handshake_authz(stream, auth, run_id, |_| {
+        Ok(crate::security::Role::unrestricted())
+    })
+    .await
+}
+
+/// 带授权的服务端握手。
+///
+/// `authorize` 在**认证通过之后、`LoginResp` 发出之前**被调用 —— 只有它返回
+/// `Ok` 才会回"登录成功"，否则回一条带 `error` 的 `LoginResp`。
+///
+/// 这个顺序是硬要求。把授权放在响应之后（先回 OK 再断开）会出现一个很难查的
+/// 现象：客户端认为自己**登录成功**了，于是这次断开只当成普通掉线，
+/// 转入无限重连 —— 而 `loginFailExit`（默认 true，NetTool 那类宿主靠
+/// "看子进程活没活"判断成败）永远不会触发，表现为"显示绿灯但实际不可用"。
+pub async fn server_handshake_authz<F>(
+    stream: BoxStream,
+    auth: &crate::security::AuthProvider,
+    run_id: &str,
+    authorize: F,
+) -> Result<ServerAccept>
+where
+    F: FnOnce(&str) -> std::result::Result<crate::security::Role, String>,
+{
     // 先用 v1 建连接对象：探测只在 raw 缓冲区上做事，跟协议无关
     let mut conn = FrpConn::new(stream, WireVersion::V1);
     let version = conn.detect_version().await?;
@@ -667,18 +701,42 @@ pub async fn server_handshake(
         _ => unreachable!(),
     };
 
-    // token 校验
-    let expected = msg::auth_key(token, login.timestamp);
-    if !msg::constant_time_eq(&expected, &login.privilege_key) {
-        // 官方 frps 也是明文回这条错误（此时还没建立加密）
-        let _ = conn
-            .send_msg(&FrpMessage::LoginResp(LoginResp {
-                error: "token in login doesn't match token from configuration".into(),
-                ..Default::default()
-            }))
-            .await;
-        bail!("token 校验失败");
+    // 认证：token 方式比 `md5(secret+ts)`，OIDC 方式验签 access token。
+    //
+    // 失败时回的文案与官方 frps **逐字一致**（token 方式下），因为第三方
+    // 平台的错误提示会拿它做匹配 —— 换了措辞用户会以为是自己配置错了。
+    let subject = match auth.verify_login(&login.privilege_key, login.timestamp) {
+        Ok(s) => s,
+        Err(e) => {
+            // 官方 frps 也是明文回这条错误（此时还没建立加密）
+            let _ = conn
+                .send_msg(&FrpMessage::LoginResp(LoginResp {
+                    error: e.to_string(),
+                    ..Default::default()
+                }))
+                .await;
+            bail!("认证失败：{e}");
+        }
+    };
+    if !subject.is_empty() {
+        tracing::debug!(subject = %subject, user = %login.user, "OIDC 登录成功");
     }
+
+    // 授权（RBAC / 用户白名单）。必须在这里做 —— 见函数注释：
+    // 落到 LoginResp 之后，客户端就会把"被拒"当成"连上又掉线"。
+    let role = match authorize(&login.user) {
+        Ok(r) => r,
+        Err(e) => {
+            // 此刻还没升级加密，LoginResp 明文发（与认证失败路径一致）
+            let _ = conn
+                .send_msg(&FrpMessage::LoginResp(LoginResp {
+                    error: e.clone(),
+                    ..Default::default()
+                }))
+                .await;
+            bail!("授权失败：{e}");
+        }
+    };
 
     // 能力协商：客户端声明了、且服务端也支持，才回显 —— 回显了才算生效。
     let declared = login.rustunnel.clone().unwrap_or_default();
@@ -704,6 +762,8 @@ pub async fn server_handshake(
     }))
     .await?;
 
+    // 控制通道加密密钥：token 方式 = 共享密钥，OIDC 方式 = access token
+    let control_key = auth.control_key(&login.privilege_key);
     let udp_binary = crypto_state
         .as_ref()
         .map(|(_, _, _, udp_binary)| *udp_binary)
@@ -712,16 +772,17 @@ pub async fn server_handshake(
         // v2：用 transcript 派生 AEAD 密钥
         Some((ch_payload, sh_payload, algorithm, _)) => {
             let transcript = transcript_hash(&ch_payload, &sh_payload);
-            let (c2s, s2c) = derive_control_keys(token.as_bytes(), &algorithm, &transcript)?;
+            let (c2s, s2c) = derive_control_keys(control_key.as_bytes(), &algorithm, &transcript)?;
             conn.upgrade(c2s, s2c)?; // 服务端用 c2s 读、s2c 写
         }
         // v1：套 PBKDF2 + AES-128-CFB
-        None => conn.enable_v1_crypto(token)?,
+        None => conn.enable_v1_crypto(&control_key)?,
     }
 
     Ok(ServerAccept::Control {
         conn,
-        login,
+        login: Box::new(login),
+        role,
         udp_binary,
         caps,
     })
@@ -852,7 +913,7 @@ mod tests {
             let (conn, run_id, udp, _caps) = client_handshake(
                 Box::pin(client),
                 WireVersion::V1,
-                TOKEN,
+                &crate::security::Credential::Token(TOKEN.to_string()),
                 "cid",
                 "alice",
                 &empty_metas(),
@@ -1000,7 +1061,7 @@ mod tests {
             client_handshake(
                 Box::pin(client),
                 WireVersion::V1,
-                TOKEN,
+                &crate::security::Credential::Token(TOKEN.to_string()),
                 "cid",
                 "alice",
                 &empty_metas(),
@@ -1053,7 +1114,7 @@ mod tests {
             client_handshake(
                 Box::pin(client),
                 WireVersion::V1,
-                TOKEN,
+                &crate::security::Credential::Token(TOKEN.to_string()),
                 "cid",
                 "alice",
                 &empty_metas(),

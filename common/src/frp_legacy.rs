@@ -427,14 +427,14 @@ fn proxy_section_to_table(sec: &IniSection) -> Result<toml::Table> {
             &format!("不是合法的代理类型：{ty:?}"),
         ));
     }
-    // rustunnel 真正实现了 tcp / udp / http / https / stcp / xtcp；
-    // tcpmux 与 sudp 没实现。**宁可报错也不静默当成 tcp** ——
+    // rustunnel 真正实现了 tcp / udp / http / https / stcp / sudp / xtcp；
+    // 仅 tcpmux 没实现。**宁可报错也不静默当成 tcp** ——
     // 静默降级会"看起来跑通了"，实际把用户的流量按错的语义转发，
     // 比在启动阶段报一句清楚的话危险得多。
-    if matches!(ty.as_str(), "tcpmux" | "sudp") {
+    if ty == "tcpmux" {
         return Err(Error::Protocol(format!(
             "代理 [{}] 的类型 {ty} 是原版 frp 的类型，rustunnel 尚未实现；\
-             请改用 tcp/udp/http/https/stcp/xtcp，或在原版 frpc 上运行",
+             请改用 tcp/udp/http/https/stcp/sudp/xtcp，或在原版 frpc 上运行",
             sec.name
         )));
     }
@@ -974,6 +974,47 @@ bandwidth_limit_mode = server
         assert_eq!(p.health_check_url, "/healthz");
         assert_eq!(p.bandwidth_limit, "25MB");
         assert_eq!(p.bandwidth_limit_mode, "server");
+    }
+
+    /// sudp：与 stcp 同一套鉴权（`sk` / `allow_users`），但没有公网端口。
+    ///
+    /// 真机验证抓到的回归：sudp 是后加的类型，凡是"按类型分派"的地方都要
+    /// 记得把它带上 —— 漏了的特征是**配置能解析、注册却被拒**（服务端报
+    /// "必须配置 secret_key"），只在真跑一遍时才暴露。
+    #[test]
+    fn ini_的_sudp() {
+        let cfg = parse_client(
+            r#"
+[common]
+server_addr = x
+user = alice
+
+[p]
+type = sudp
+local_ip = 127.0.0.1
+local_port = 18089
+sk = s3cret
+allow_users = bob
+
+[v]
+type = sudp
+role = visitor
+server_name = p
+sk = s3cret
+bind_addr = 127.0.0.1
+bind_port = 19088
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.proxies.len(), 1);
+        assert_eq!(cfg.proxies[0].proxy_type, "sudp");
+        assert_eq!(cfg.proxies[0].secret_key, "s3cret");
+        assert_eq!(cfg.proxies[0].allow_users, vec!["bob"]);
+
+        assert_eq!(cfg.visitors.len(), 1);
+        assert_eq!(cfg.visitors[0].visitor_type, "sudp");
+        assert_eq!(cfg.visitors[0].secret_key, "s3cret");
     }
 
     /// stcp / xtcp：`sk` → `secret_key`，`allow_users` 逗号分隔。

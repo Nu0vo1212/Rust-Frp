@@ -12,14 +12,15 @@
 
 - ✅ **frp v1 / v2 双线协议** — **默认 v1**（与官方默认值相同），官方 frpc / frps **零配置直连**；需要时可用 `transport.wireProtocol = "v2"` 显式启用 v2
 - ✅ **原版配置直接可用** — 原版 frpc / 第三方 frp 平台下发的配置（camelCase、`[[proxies]]`、`localIP`+`localPort`、`[metadatas]`）无需改写即可运行
-- ✅ **六种代理类型** — `tcp` / `udp` / `http` / `https` / `stcp` / `xtcp`，多代理同时工作
+- ✅ **七种代理类型** — `tcp` / `udp` / `http` / `https` / `stcp` / `sudp` / `xtcp`，多代理同时工作
 - ✅ **UDP 转发** — 每个 UDP 代理只占一条工作连接，靠访客地址区分会话
 - ✅ **HTTP 反向代理** — 按域名路由，支持 `locations` 前缀、Basic Auth、Host 改写、自定义请求/响应头
 - ✅ **HTTPS SNI 透传** — 只嗅探 ClientHello 里的 SNI 做路由，不终止 TLS，证书仍由内网服务提供
 - ✅ **stcp 私密隧道** — 服务端不开放公网端口，需 `secret_key` 校验 + 提供者端 `allow_users` 白名单，与官方 frp 互通
+- ✅ **sudp 秘密 UDP** — 与 stcp 同一套鉴权，但数据面是 UDP：访问方本地开 UDP socket，一条持久工作连接上跑 `UdpPacket` 帧，按访客地址回包；同样不占公网端口
 - ✅ **xtcp 真 P2P** — UDP 打洞 + QUIC / KCP 直连，数据不经服务端；打不通自动回退中继，不会比 stcp 更差
 - ✅ **对称 NAT 端口预测** — 靠多次观测推端口步长，锥型之外的对称 NAT 也有机会打洞成功
-- ✅ **KCP 弱网通道** — `xtcp_transport = "kcp"`，丢包环境下靠重传换来更低延迟
+- ✅ **KCP 弱网通道** — 既可作为 xtcp 的直连通道（`xtcp_transport = "kcp"`），也可作为**独立传输协议**（服务端 `kcp_bind_port` + 客户端 `transport_protocol = "kcp"`），丢包环境下靠重传换来更低延迟
 - ✅ **QUIC 传输** — `transport_protocol = "quic"`，1-RTT 握手、流级多路复用、丢包不阻塞其它流
 - ✅ **yamux 多路复用** — 对应 frp `transport.tcpMux`，控制连接与工作连接复用一条 TCP
 - ✅ **TLS 加密** — 对应 frp `transport.tls`，含 frp 自定义首字节 `0x17` 伪装，服务端自动生成自签名证书
@@ -69,7 +70,7 @@
 
 ### 工程质量
 
-- ✅ **440 个自动化测试** — 含真实 QUIC 栈握手、口令正反用例、端到端集成测试、**与官方 frpc/frps 真实抓包密文的解密回归**
+- ✅ **444 个自动化测试** — 含真实 QUIC 栈握手、口令正反用例、端到端集成测试、**SUDP 端到端与 KCP 传输链路**、**与官方 frpc/frps 真实抓包密文的解密回归**
 - ✅ **CI 流水线** — `fmt` / `clippy` / 测试 / 四目标构建 / 冒烟，PR 必过
 - ✅ **发布可验真** — `SHA256SUMS` + 可选 Ed25519 分离签名与本地验签脚本
 - ✅ **容器就绪** — 多阶段 `Dockerfile`（musl 静态）+ `docker-compose.yml`
@@ -877,7 +878,8 @@ max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
 | `token` | 认证 token，客户端必须一致 | 必填 |
 | `tcp_mux` | 允许 yamux 多路复用（自动探测，不影响非 mux 客户端） | `true` |
 | `tls_force` | 强制客户端使用 TLS | `false` |
-| `transport_protocol` | `tcp` 或 `quic`（需客户端一致） | `tcp` |
+| `transport_protocol` | `tcp` / `quic` / `kcp`（需客户端一致） | `tcp` |
+| `kcp_bind_port` | KCP 传输的 UDP 监听端口（不配 = 不开）；TCP 端口照旧保留 | 空 |
 | `vhost_http_port` | HTTP 代理入口端口（不配则拒绝 http 代理） | 空 |
 | `vhost_https_port` | HTTPS 代理入口端口 | 空 |
 | `subdomain_host` | 泛域名后缀，配合客户端 `subdomain` | 空 |
@@ -922,7 +924,7 @@ max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
 | `tls_enable` | TLS 加密（不校验服务端证书，与 frpc 默认一致） | `false` |
 | `tls_server_name` | TLS SNI，留空用 `server_addr` | 空 |
 | `tls_custom_first_byte` | TLS 握手前发送 frp 伪装字节 `0x17` | `true` |
-| `transport_protocol` | `tcp` 或 `quic`（需服务端一致） | `tcp` |
+| `transport_protocol` | `tcp` / `quic` / `kcp`（需服务端一致）。选 `kcp` 时 `server_port` 填服务端的 `kcp_bind_port` | `tcp` |
 | `p2p_port` | 服务端 xtcp 牵线端口，需与服务端 `p2p_port` 一致 | 空 |
 | `p2p_enable` | 是否允许 xtcp 尝试 P2P（失败自动回退中继） | `true` |
 | `pool_count` | 预建工作连接数（0 = 按需） | `1` |
@@ -1085,24 +1087,32 @@ max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
 > `cfg(linux)` 代码，是云端构建抓出来的）、`denyUnknown`/角色拒绝时**先回"登录成功"再断开**
 > 导致客户端无限重连而 `loginFailExit` 永不触发、`DELETE /api/v2/*` 被面板总闸拦成纯文本
 > 405 而绕过了 v2 的统一错误信封。
+>
+> v0.4.0 是**补齐官方能力**的一版：新增 **sudp 秘密 UDP**（与 stcp 同一套 `sk` /
+> `allow_users` 鉴权，但数据面是 UDP，同样不占公网端口）与 **KCP 独立传输**
+> （服务端 `kcp_bind_port` + 客户端 `transport_protocol = "kcp"`），
+> 代理类型从六种补到七种，与官方 frp 的类型清单对齐。
+> 顺带修掉一个潜伏很久的真 bug：`KcpStream::poll_read` 会把"一次没读完的剩余字节"
+> 直接丢掉 —— 服务端探测 yamux 时只读 1 字节，frp v2 的 8 字节魔术字于是被吃掉 7 个，
+> 握手**静默卡死**（这个 bug 在 xtcp P2P 的 KCP 通道上一直存在，只因那边读写缓冲够大才没暴露）。
 
 ## 质量保障
 
 ```bash
 cargo fmt --all -- --check          # 格式
 cargo clippy --workspace --all-targets   # 静态检查（当前 0 告警）
-cargo test --workspace              # 440 个测试
+cargo test --workspace              # 444 个测试
 ```
 
 测试分布：
 
 | 目标 | 数量 | 覆盖重点 |
 |---|---|---|
-| `common` 单元测试 | 215 | **v1 线协议**（消息类型字节、帧编解码、AES-128-CFB 密钥派生与流式状态机、**官方抓包密文解密回归**）、v2 线协议编解码、加密、配置解析、**原版 frp 配置兼容层**、打洞报文/口令/端口预测、**KCP（含 30% 丢包下的可靠传输）**、令牌桶、示例配置可加载、**OIDC 令牌源与 JWKS 验签**、**CIDR/ACL/RBAC 判定边界**、**WebSocket 帧编解码与 Ping/Pong**、**PROXY v1/v2 编解码与防注入 sniff**、**VirtualNet 帧/路由/地址池**、**HTTP/1.1 请求解析** |
+| `common` 单元测试 | 217 | **v1 线协议**（消息类型字节、帧编解码、AES-128-CFB 密钥派生与流式状态机、**官方抓包密文解密回归**）、v2 线协议编解码、加密、配置解析、**原版 frp 配置兼容层**、打洞报文/口令/端口预测、**KCP（含 30% 丢包下的可靠传输）**、令牌桶、示例配置可加载、**OIDC 令牌源与 JWKS 验签**、**CIDR/ACL/RBAC 判定边界**、**WebSocket 帧编解码与 Ping/Pong**、**PROXY v1/v2 编解码与防注入 sniff**、**VirtualNet 帧/路由/地址池**、**HTTP/1.1 请求解析** |
 | `server` 单元测试（lib） | 144 | 虚拟主机路由表与优先级、chunked 解析、Basic Auth、连接池配对与回收、**端口组最小连接数调度**、资源配额、指标编码、面板鉴权与**写接口**、热重载字段判定、打洞会话、**审计日志（JSONL + 环形缓冲 + 过滤）**、**安全上下文（ACL→认证→RBAC→审计）**、**API v2（错误信封 / 分页 / 百分号解码）**、**VirtualNet 服务端路由与代答 ICMP** |
 | `server` 单元测试（bin） | 5 | 命令行与配置装载 |
 | `client` 单元测试 | 64 | QUIC 建连与口令握手、插件（http_proxy / socks5 / static_file）、健康检查状态机、打洞编排、`NewProxy` 字段映射（含与官方 frpc 抓包逐字节对拍）、服务端下发名 → 本地代理的翻译（`resolve_uploaded_proxy`）、**动态代理表**、**store 落盘与损坏文件容错**、**本地管理界面的路由与本地校验**、**PROXY 头注入** |
-| `server` 端到端集成测试 | 12 | 真握手 + 真转发的 TCP / HTTP / stcp / QUIC 链路、**v1 与 v2 双协议握手**、group 负载均衡、面板鉴权边界 |
+| `server` 端到端集成测试 | 14 | 真握手 + 真转发的 TCP / HTTP / stcp / QUIC 链路、**v1 与 v2 双协议握手**、group 负载均衡、面板鉴权边界、**SUDP 端到端（visitor→provider 的 UdpPacket 往返）**、**KCP 传输上的完整控制连接 + 多会话共端口** |
 
 CI（`.github/workflows/ci.yml`）在每次 push / PR 上跑：`fmt` → `clippy` → 测试 →
 四个目标（windows-msvc / linux-musl / linux-gnu / linux-arm64）构建 → 端到端冒烟。

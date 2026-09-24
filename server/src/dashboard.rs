@@ -566,7 +566,7 @@ fn html_page() -> String {
         <label>类型 <select id="p_type">
           <option value="tcp">tcp</option><option value="udp">udp</option>
           <option value="http">http</option><option value="https">https</option>
-          <option value="stcp">stcp</option><option value="xtcp">xtcp</option>
+          <option value="stcp">stcp</option><option value="sudp">sudp</option><option value="xtcp">xtcp</option>
         </select></label>
         <label>公网端口 <input id="p_port" type="number" placeholder="7000"></label>
         <label>内网地址 <input id="p_local" placeholder="127.0.0.1:8080"></label>

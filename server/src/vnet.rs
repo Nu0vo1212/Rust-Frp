@@ -167,7 +167,7 @@ impl VnetHub {
         want: Option<Ipv4Addr>,
         sink: mpsc::Sender<Vec<u8>>,
     ) -> Result<Joined> {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         // 同一个 client_id 重连（上一次的连接可能还没死透）：先把旧的清掉。
         // 不清的话 `routes` 里会留着指向旧连接的条目，包全打进黑洞。
@@ -213,7 +213,7 @@ impl VnetHub {
 
     /// 客户端离开：路由与地址**一起**回收。
     pub fn leave(&self, client: &str) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         Self::leave_locked(&mut g, client);
     }
 
@@ -233,7 +233,7 @@ impl VnetHub {
             // 我们不是路由器，装作会发 ICMP 只会让人以为链路有问题。
             return false;
         };
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         // ① 网关自己（服务端）：只应答 ICMP echo，TCP/UDP 丢弃
         if h.dst == g.gateway {
@@ -292,7 +292,7 @@ impl VnetHub {
 
     /// 往某个客户端投一个包（网关应答走这条路）。
     fn deliver(&self, to: &str, pkt: &[u8]) -> bool {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         match g.sinks.get(to) {
             Some(tx) => match tx.try_send(pkt.to_vec()) {
                 Ok(()) => true,
@@ -306,7 +306,7 @@ impl VnetHub {
     }
 
     pub fn stats(&self) -> Option<VnetStats> {
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         Some(VnetStats {
             network: g.network.clone(),
             subnet: g.subnet.to_string(),
@@ -321,7 +321,7 @@ impl VnetHub {
 
     /// 某个客户端分到的地址（测试与面板用）。
     pub fn address_of(&self, client: &str) -> Option<Ipv4Addr> {
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.routes.ips_of(&g.network, client).into_iter().next()
     }
 }

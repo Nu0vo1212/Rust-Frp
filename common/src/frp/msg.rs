@@ -504,8 +504,9 @@ impl NewProxy {
                 m.group = p.group.clone();
                 m.group_key = p.group_key.clone();
             }
-            // stcp / xtcp：不带 remote_port，靠共享密钥 + visitor 接入
-            "stcp" | "xtcp" => {
+            // stcp / xtcp / sudp：不带 remote_port，靠共享密钥 + visitor 接入
+            // （sudp 与 stcp 同一套鉴权，只是数据面是 UDP）
+            "stcp" | "xtcp" | "sudp" => {
                 m.sk = p.secret_key.clone();
                 m.allow_users = p.allow_users.clone();
             }

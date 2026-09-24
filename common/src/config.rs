@@ -184,12 +184,22 @@ pub struct ServerConfig {
     pub max_proxies_per_client: usize,
 
     // ---- 传输层 ----
-    /// 客户端与服务端之间的传输协议：`tcp`（默认）或 `quic`。
+    /// 客户端与服务端之间的传输协议：`tcp`（默认）、`quic` 或 `kcp`。
     ///
     /// QUIC 自带加密与多路复用，握手只需 1-RTT、丢包不会阻塞其它流，
     /// 在高延迟 / 弱网链路上明显优于 TCP；代价是需要放行 UDP 端口。
     #[serde(default = "default_transport_protocol")]
     pub transport_protocol: String,
+    /// KCP 传输的监听端口（官方 frps 的 `kcpBindPort`，不配则不启用）。
+    ///
+    /// 与 QUIC 不同，KCP 在官方 frp 里是**独立端口**而不是复用 `bindPort`：
+    /// 它是裸 UDP 上的可靠传输，没有 QUIC 那种"先握手再分流"的能力，
+    /// 只能另开一个 UDP 端口、靠源地址区分客户端。
+    ///
+    /// 配了它之后，客户端把 `transport.protocol` 设成 `kcp` 并连这个端口即可；
+    /// TCP 端口照旧保留，老客户端不受影响。
+    #[serde(default, alias = "kcpBindPort", alias = "kcp_bind_port")]
+    pub kcp_bind_port: Option<u16>,
 
     // ---- xtcp 真 P2P ----
     /// 牵线（rendezvous）用的 UDP 端口。
@@ -343,6 +353,7 @@ impl Default for ServerConfig {
             subdomain_host: String::new(),
             log_level: default_log_level(),
             transport_protocol: default_transport_protocol(),
+            kcp_bind_port: None,
             max_total_conns: 0,
             max_clients: 0,
             max_conns_per_client: 0,
@@ -594,7 +605,16 @@ pub struct ProxyConfig {
 
     // ---- stcp / xtcp 专用 ----
     /// 共享密钥（frpc 里叫 `secretKey`）。provider 与 visitor 必须一致。
-    #[serde(default, alias = "secretKey", skip_serializing_if = "String::is_empty")]
+    ///
+    /// `sk` 是官方 INI 配置里的写法，这里一并接受：TOML 下 serde **不拒绝未知字段**，
+    /// 用户照 INI 习惯写 `sk` 会被静默忽略，`secret_key` 于是为空，
+    /// 直到服务端报「必须配置 secret_key」才暴露 —— 加个别名就消掉了这个静默失败。
+    #[serde(
+        default,
+        alias = "secretKey",
+        alias = "sk",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub secret_key: String,
     /// 允许接入的访客用户列表（对应 frpc 的 `allowUsers`）。
     ///
@@ -664,7 +684,10 @@ pub struct VisitorConfig {
     #[serde(default, alias = "serverUser")]
     pub server_user: String,
     /// 共享密钥，必须与 provider 的 `secret_key` 相同。
-    #[serde(default, alias = "secretKey")]
+    ///
+    /// 同 [`ProxyConfig::secret_key`]：`sk`（官方 INI 写法）一并接受，
+    /// 否则它会被 serde 静默忽略，表现为"密钥永远对不上"。
+    #[serde(default, alias = "secretKey", alias = "sk")]
     pub secret_key: String,
     /// 本地监听地址。
     #[serde(default = "default_bind_addr")]
@@ -1146,6 +1169,12 @@ pub fn is_quic(protocol: &str) -> bool {
     p == "quic"
 }
 
+/// 判断配置是否选择了 KCP 传输（大小写与下划线一律宽容处理）。
+pub fn is_kcp(protocol: &str) -> bool {
+    let p = protocol.trim().to_ascii_lowercase().replace(['-', '_'], "");
+    p == "kcp"
+}
+
 /// 是否走**明文** WebSocket 传输（`transport.protocol = "websocket"`）。
 pub fn is_websocket(protocol: &str) -> bool {
     let p = protocol.trim().to_ascii_lowercase().replace(['-', '_'], "");
@@ -1262,13 +1291,17 @@ pub fn parse_server(raw: &str) -> Result<ServerConfig> {
 
 /// rustunnel 真正实现的代理 / 访客类型。
 ///
-/// 原版 frp 还认 `tcpmux` 与 `sudp`，rustunnel 没实现。**宁可在这里报错，
+/// 原版 frp 还认 `tcpmux`，rustunnel 没实现。**宁可在这里报错，
 /// 也不能静默当成 tcp 放过去** —— 静默降级会"看起来连上了"，实际按错的语义
 /// 转发用户流量，比启动阶段报一句清楚的话危险得多。
 ///
 /// （官方 frp 对未知 `type` 同样是在解码阶段直接报错，所以这也不算额外收紧。）
-const SUPPORTED_PROXY_TYPES: &[&str] = &["tcp", "udp", "http", "https", "stcp", "xtcp"];
-const SUPPORTED_VISITOR_TYPES: &[&str] = &["stcp", "xtcp"];
+///
+/// `sudp`（秘密 UDP，SUDP）和 stcp 同一套 `secret_key` / `allow_users` 鉴权，
+/// 区别只是数据面是 UDP：provider 侧把一条工作连接桥到本地 UDP 服务，
+/// visitor 侧把本地 UDP socket 转发到 secret UDP 通道。
+const SUPPORTED_PROXY_TYPES: &[&str] = &["tcp", "udp", "http", "https", "stcp", "xtcp", "sudp"];
+const SUPPORTED_VISITOR_TYPES: &[&str] = &["stcp", "xtcp", "sudp"];
 
 fn reject_unimplemented_types(cfg: &ClientConfig) -> Result<()> {
     for p in &cfg.proxies {
@@ -1317,6 +1350,43 @@ pub fn parse_server_toml(raw: &str) -> Result<ServerConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `sk` 是官方 INI 里 `secret_key` 的写法，TOML 下也必须接受。
+    ///
+    /// serde **不拒绝未知字段**，漏了这个别名的话用户照 INI 习惯写 `sk`
+    /// 会被静默忽略 —— 注册时才报「必须配置 secret_key」，排查成本很高。
+    #[test]
+    fn sk_别名必须等价于_secret_key() {
+        let toml_str = r#"
+server_addr = "127.0.0.1"
+server_port = 17000
+
+[[proxies]]
+name = "p"
+type = "sudp"
+localIP = "127.0.0.1"
+localPort = 1234
+sk = "abc"
+allowUsers = ["dave"]
+
+[[visitors]]
+name = "v"
+type = "sudp"
+serverName = "p"
+serverUser = "carol"
+sk = "abc"
+bindPort = 2222
+"#;
+        // 走 `parse_client`（也就是 `ClientConfig::load` 的真实路径），
+        // 顺带覆盖 `localIP` + `localPort` → `local_addr` 的原版写法。
+        let cfg: ClientConfig = parse_client(toml_str).expect("sk 必须能解析");
+        assert_eq!(cfg.proxies[0].secret_key, "abc", "proxy 的 sk → secret_key");
+        assert_eq!(
+            cfg.visitors[0].secret_key, "abc",
+            "visitor 的 sk → secret_key"
+        );
+        assert_eq!(cfg.proxies[0].allow_users, vec!["dave".to_string()]);
+    }
 
     /// 示例配置是**手写**的 TOML，一旦字段名与结构体漂移，
     /// 用户 `--gen-config` 出来的文件就根本加载不了 —— 而这类错误

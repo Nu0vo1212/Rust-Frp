@@ -648,7 +648,12 @@ async fn kcp_connect_any(
         tokio::time::sleep(PUNCH_INTERVAL).await;
     }
     debug!(first = %candidates[0], total = candidates.len(), %sid, "KCP 开始建链（未锁定前会轮流试候选）");
-    Ok(KcpStream::spawn_candidates(sock, candidates, conv, None))
+    Ok(KcpStream::spawn_candidates(
+        std::sync::Arc::new(sock),
+        candidates,
+        conv,
+        None,
+    ))
 }
 
 /// KCP 侧 provider：边打洞边等第一个数据报，从中认出 visitor。
@@ -681,7 +686,12 @@ async fn kcp_accept(
                     }
                 }
                 debug!(%from, %sid, "KCP 收到首个数据报，开始建链");
-                return Ok(KcpStream::spawn(sock, from, conv, Some(buf[..n].to_vec())));
+                return Ok(KcpStream::spawn(
+                    std::sync::Arc::new(sock),
+                    from,
+                    conv,
+                    Some(buf[..n].to_vec()),
+                ));
             }
             Ok(Err(e)) => return Err(e).context("读取 P2P 数据报失败"),
             Err(_) => continue,

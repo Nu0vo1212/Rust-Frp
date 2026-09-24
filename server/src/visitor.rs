@@ -24,7 +24,7 @@ pub struct VisitorEntry {
     pub provider_user: String,
     /// provider 所属的客户端，配对工作连接时要用它去要连接。
     pub client: Arc<ClientState>,
-    /// `stcp` 或 `xtcp`（仅用于日志/遥测）。
+    /// `stcp` / `xtcp` / `sudp`（仅用于日志/遥测）。
     pub proxy_type: String,
 }
 
@@ -73,7 +73,7 @@ impl VisitorTable {
     /// 注册一条 stcp / xtcp 代理；同名重复注册会失败（与 frp 的 "repeated" 行为一致）。
     pub fn register(&self, entry: VisitorEntry) -> Result<(), String> {
         let name = entry.proxy_name.clone();
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.contains_key(&name) {
             return Err(format!("custom listener for [{name}] is repeated"));
         }
@@ -83,19 +83,26 @@ impl VisitorTable {
 
     /// 按代理名查一条记录。
     pub fn get(&self, name: &str) -> Option<Arc<VisitorEntry>> {
-        self.inner.lock().unwrap().get(name).cloned()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .cloned()
     }
 
     /// 客户端主动 `CloseProxy` 时摘掉一条记录，之后同名代理可以重新注册。
     pub fn remove(&self, name: &str) -> Option<Arc<VisitorEntry>> {
-        self.inner.lock().unwrap().remove(name)
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name)
     }
 
     /// 全部 stcp / xtcp 代理的快照（面板展示用）。
     pub fn list(&self) -> Vec<VisitorInfo> {
         self.inner
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .values()
             .map(|e| VisitorInfo {
                 proxy_name: e.proxy_name.clone(),
@@ -109,7 +116,7 @@ impl VisitorTable {
 
     /// 客户端断开时回收它的全部 stcp / xtcp 代理。
     pub fn unregister_client(&self, client: &Arc<ClientState>) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.retain(|_, e| !Arc::ptr_eq(&e.client, client));
     }
 }

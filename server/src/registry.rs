@@ -144,30 +144,33 @@ impl Registry {
 
     /// 挂上 xtcp 牵线中心（只有配置了 `p2p_port` 时才调）。
     pub fn attach_p2p(&self, hub: Arc<P2PHub>) {
-        *self.p2p.lock().unwrap() = Some(hub);
+        *self.p2p.lock().unwrap_or_else(|e| e.into_inner()) = Some(hub);
     }
 
     /// 取牵线中心；None 表示未启用 P2P。
     pub fn p2p(&self) -> Option<Arc<P2PHub>> {
-        self.p2p.lock().unwrap().clone()
+        self.p2p.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// 挂上 VirtualNet 转发中枢（只有配置了 `vnet_port` 时才调）。
     pub fn attach_vnet(&self, hub: Arc<crate::vnet::VnetHub>) {
-        *self.vnet.lock().unwrap() = Some(hub);
+        *self.vnet.lock().unwrap_or_else(|e| e.into_inner()) = Some(hub);
     }
 
     /// 取 VirtualNet 中枢；None 表示未启用虚拟网络。
     pub fn vnet(&self) -> Option<Arc<crate::vnet::VnetHub>> {
-        self.vnet.lock().unwrap().clone()
+        self.vnet.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn attach_vhosts(&self, table: Arc<VhostTable>) {
-        *self.vhosts.lock().unwrap() = Some(table);
+        *self.vhosts.lock().unwrap_or_else(|e| e.into_inner()) = Some(table);
     }
 
     pub fn vhosts(&self) -> Option<Arc<VhostTable>> {
-        self.vhosts.lock().unwrap().clone()
+        self.vhosts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// 尝试登记一个客户端；超出 `max_clients` 时返回 `None`。
@@ -175,7 +178,7 @@ impl Registry {
         let permit = self.client_limit.try_acquire()?;
         self.clients
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(client.run_id.clone(), client);
         self.metrics().clients_total.inc();
         self.metrics().clients_active.inc();
@@ -183,16 +186,28 @@ impl Registry {
     }
 
     pub fn get(&self, run_id: &str) -> Option<Arc<ClientState>> {
-        self.clients.lock().unwrap().get(run_id).cloned()
+        self.clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(run_id)
+            .cloned()
     }
 
     /// 按 `run_id` 取一个在线客户端（面板管理操作用）。
     pub fn client(&self, run_id: &str) -> Option<Arc<ClientState>> {
-        self.clients.lock().unwrap().get(run_id).cloned()
+        self.clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(run_id)
+            .cloned()
     }
 
     pub fn remove(&self, run_id: &str) -> Option<Arc<ClientState>> {
-        let c = self.clients.lock().unwrap().remove(run_id);
+        let c = self
+            .clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(run_id);
         if let Some(c) = &c {
             // 这个客户端被回收时还挂着几个代理，`proxies_active` 就得减几个。
             //
@@ -219,7 +234,7 @@ impl Registry {
     }
 
     pub fn client_count(&self) -> usize {
-        self.clients.lock().unwrap().len()
+        self.clients.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// 占用端口（或加入某个 group 共享它）。
@@ -237,7 +252,7 @@ impl Registry {
         proxy_name: &str,
         client: Arc<ClientState>,
     ) -> Result<PortClaim, String> {
-        let mut g = self.ports.lock().unwrap();
+        let mut g = self.ports.lock().unwrap_or_else(|e| e.into_inner());
         match g.entry(port) {
             Entry::Vacant(v) => {
                 v.insert(PortGroup::new(group, client, proxy_name));
@@ -281,14 +296,19 @@ impl Registry {
     /// bind 成功后调它。之后监听器的存活就只跟"端口还有没有后端"有关，
     /// 与创建它的那个客户端是否掉线无关。
     pub fn attach_listener(&self, port: u16, handle: tokio::task::AbortHandle) {
-        if let Some(pg) = self.ports.lock().unwrap().get_mut(&port) {
+        if let Some(pg) = self
+            .ports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&port)
+        {
             pg.handle = Some(handle);
         }
     }
 
     /// 归还端口；同组还有其他后端时只是把自己摘掉。
     pub fn release_port(&self, port: u16, client: &Arc<ClientState>) {
-        let mut g = self.ports.lock().unwrap();
+        let mut g = self.ports.lock().unwrap_or_else(|e| e.into_inner());
         let mut empty = false;
         if let Some(pg) = g.get_mut(&port) {
             pg.remove(client);
@@ -304,7 +324,7 @@ impl Registry {
 
     /// 客户端掉线时把它占的所有端口一次性收回（不用记住它注册过哪些端口）。
     pub fn release_ports_of(&self, client: &Arc<ClientState>) {
-        let mut g = self.ports.lock().unwrap();
+        let mut g = self.ports.lock().unwrap_or_else(|e| e.into_inner());
         let mut dead: Vec<u16> = Vec::new();
         for (port, pg) in g.iter_mut() {
             pg.remove(client);
@@ -327,7 +347,7 @@ impl Registry {
     /// 返回的 [`Backend`] 里带着一份 [`LoadGuard`]：`pick` 的调用方必须把它
     /// 存进 `PendingUser::load`，本次转发结束时才会自动减回去。
     pub fn pick(&self, port: u16) -> Option<Backend> {
-        let g = self.ports.lock().unwrap();
+        let g = self.ports.lock().unwrap_or_else(|e| e.into_inner());
         g.get(&port)?.pick()
     }
 
@@ -345,7 +365,7 @@ impl Registry {
     pub fn backend_loads(&self, port: u16) -> Vec<(String, usize)> {
         self.ports
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&port)
             .map(|pg| {
                 pg.members
@@ -360,7 +380,7 @@ impl Registry {
     pub fn backend_count(&self, port: u16) -> usize {
         self.ports
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&port)
             .map(|pg| pg.len())
             .unwrap_or(0)
@@ -370,7 +390,7 @@ impl Registry {
     pub fn clients(&self) -> Vec<ClientInfo> {
         self.clients
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .values()
             .map(|c| ClientInfo {
                 run_id: c.run_id.clone(),
@@ -402,7 +422,13 @@ impl Registry {
 
     /// 当前占用的公网端口列表（dashboard 展示用）。
     pub fn reserved_ports(&self) -> Vec<u16> {
-        let mut v: Vec<u16> = self.ports.lock().unwrap().keys().copied().collect();
+        let mut v: Vec<u16> = self
+            .ports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .copied()
+            .collect();
         v.sort_unstable();
         v
     }

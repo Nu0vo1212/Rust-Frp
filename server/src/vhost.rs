@@ -89,7 +89,7 @@ pub struct VhostTable {
 impl VhostTable {
     /// 注册路由；同一域名 + 同一路径前缀冲突时报错（与 frp 行为一致）。
     pub fn register(&self, route: Arc<VhostRoute>) -> Result<()> {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let list = if let Some(suffix) = route.domain.strip_prefix("*.") {
             g.wildcard.entry(suffix.to_string()).or_default()
         } else {
@@ -128,7 +128,7 @@ impl VhostTable {
     /// 域名仍然留在表里：重连再注册同一个域名会被判成路径冲突，
     /// 而且请求还会被路由到一个已经关掉的代理上。
     pub fn remove_proxy(&self, proxy_name: &str) -> bool {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut removed = false;
         for list in g.exact.values_mut() {
             let before = list.len();
@@ -147,7 +147,7 @@ impl VhostTable {
 
     /// 客户端断开时清掉它注册的所有路由。
     pub fn unregister_client(&self, client: &Arc<ClientState>) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         for list in g.exact.values_mut() {
             list.retain(|r| !Arc::ptr_eq(&r.client, client));
         }
@@ -167,7 +167,7 @@ impl VhostTable {
         https: bool,
     ) -> Option<(Arc<VhostRoute>, String)> {
         let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         // 在同一域名下可能有**多条**路由都匹配得上（例如 A 的 `/` 和 B 的 `/api`），
         // 必须按"前缀最长者胜"来选。早先这里是"取第一条匹配"，
@@ -218,7 +218,7 @@ impl VhostTable {
     /// 该域名有没有被任何路由占用（用于提示冲突）。
     #[allow(dead_code)]
     pub fn contains_domain(&self, host: &str) -> bool {
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.exact.contains_key(host) || g.wildcard.values().any(|v| !v.is_empty())
     }
 }

@@ -311,7 +311,8 @@ impl OidcVerifier {
             Some(u) => u,
             None => {
                 let discovered = self.discover().await?;
-                *self.jwks_uri.write().unwrap() = Some(discovered.clone());
+                *self.jwks_uri.write().unwrap_or_else(|e| e.into_inner()) =
+                    Some(discovered.clone());
                 discovered
             }
         };
@@ -324,7 +325,7 @@ impl OidcVerifier {
             bail!("JWKS {uri} 里没有任何密钥");
         }
         let n = set.keys.len();
-        *self.jwks.write().unwrap() = Some(Arc::new(Jwks {
+        *self.jwks.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(Jwks {
             set,
             fetched_at: SystemTime::now(),
         }));

@@ -377,6 +377,23 @@ impl FrpConn {
         };
         (self.stream, leftover)
     }
+
+    /// 把一段**已读但未消费**的握手残留字节塞回读缓冲（与 [`FrpConn::into_stream`] 配对）。
+    ///
+    /// 握手函数（`client_visitor_conn` 等）交还的是裸流 + 残留字节：裸字节转发的
+    /// 调用方（stcp）把残留直接写给对端就行，但**还要按消息继续收发**的调用方
+    /// （SUDP 的 visitor 工作连接）必须把这段塞回 `FrpConn`，否则对端在握手响应
+    /// 之后紧接着发来的第一帧会被静默吞掉 —— 症状是"偶发丢第一个包"，极难查。
+    ///
+    /// `encrypted` 表示这段字节是密文还是明文：加密阶段 `into_stream` 交出的是
+    /// 解密后的明文，得塞进 `plain`；明文阶段直接塞进 `raw`。
+    pub fn push_leftover(&mut self, leftover: Vec<u8>, encrypted: bool) {
+        if encrypted {
+            self.plain.extend_from_slice(&leftover);
+        } else {
+            self.raw.extend_from_slice(&leftover);
+        }
+    }
 }
 
 /// 从缓冲区里切出一个 v2 帧（`8 字节头 + payload`）。
@@ -558,7 +575,10 @@ pub enum ServerAccept {
     },
     /// 工作连接（明文，等待分配代理后回 StartWorkConn）
     Work { conn: FrpConn, msg: NewWorkConn },
-    /// visitor 连接（stcp / xtcp 的接入方，明文，等待校验后回 NewVisitorConnResp）
+    /// visitor 连接（stcp / xtcp / sudp 的接入方，明文，等待校验后回 NewVisitorConnResp）。
+    ///
+    /// 注意 `conn` 上已经带着这条控制会话协商出的 UDP 报文编码；配对 SUDP 时
+    /// **不要**再去覆盖它——工作连接那侧也各自继承自己的协商值，两边本就一致。
     Visitor { conn: FrpConn, msg: NewVisitorConn },
 }
 
@@ -688,7 +708,9 @@ where
         }
         let m = FrpMessage::decode(type_id, &body)?;
         match m {
-            FrpMessage::NewVisitorConn(nvc) => return Ok(ServerAccept::Visitor { conn, msg: nvc }),
+            FrpMessage::NewVisitorConn(nvc) => {
+                return Ok(ServerAccept::Visitor { conn, msg: nvc });
+            }
             _ => unreachable!(),
         }
     }

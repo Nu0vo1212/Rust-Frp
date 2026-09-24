@@ -23,7 +23,10 @@
 //! 没做 FEC（kcp-go 里也是可选）和流控的 `nocwnd` 之外的调优开关。
 //! 两端都是 rustunnel，所以不需要与 kcp-go 的字节流严格对齐。
 
-use std::collections::VecDeque;
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
 
 use bytes::Bytes;
 use tokio::{
@@ -694,9 +697,21 @@ const READ_BUF: usize = 2048;
 pub struct KcpStream {
     /// 驱动 → 应用：已经拼完整的应用数据。
     rx: UnboundedReceiver<Bytes>,
+    /// 上一次取出来但**没读完**的剩余部分。
+    ///
+    /// KCP 一次 `recv` 交出的是一整条应用层消息（可能几 KB），而调用方
+    /// 完全可能只读 1 个字节（服务端探测 yamux 版本字节就是这么干的）。
+    /// 早先这里直接按 `buf.remaining()` 截断、多出来的丢掉 —— 于是 frp 的
+    /// 8 字节魔术字被读走 1 个、丢了 7 个，握手永远等不齐，表现是**静默卡死**。
+    /// 字节流语义必须跟 TcpStream 一致：读多少算多少，剩下的留着下次给。
+    pending: Bytes,
     /// 应用 → 驱动：待发送的应用数据。
     tx: UnboundedSender<Bytes>,
     task: Option<tokio::task::JoinHandle<()>>,
+    /// 独占 socket 时的收包任务（服务端共享端口时没有它）。
+    reader: Option<tokio::task::JoinHandle<()>>,
+    /// 会话结束时回调（服务端用它把对端从会话表里摘掉）。
+    on_drop: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Drop for KcpStream {
@@ -704,18 +719,24 @@ impl Drop for KcpStream {
         if let Some(t) = self.task.take() {
             t.abort();
         }
+        if let Some(t) = self.reader.take() {
+            t.abort();
+        }
+        if let Some(f) = self.on_drop.take() {
+            f();
+        }
     }
 }
 
 impl KcpStream {
     /// 客户端侧：向 `peer` 发起一条 KCP 会话。
-    pub async fn connect(sock: UdpSocket, peer: std::net::SocketAddr, conv: u32) -> Self {
+    pub async fn connect(sock: Arc<UdpSocket>, peer: std::net::SocketAddr, conv: u32) -> Self {
         Self::spawn(sock, peer, conv, None)
     }
 
     /// 服务端侧：已经知道对端地址（比如从第一个数据报的源地址学来）。
     pub fn spawn(
-        sock: UdpSocket,
+        sock: Arc<UdpSocket>,
         peer: std::net::SocketAddr,
         conv: u32,
         first: Option<Vec<u8>>,
@@ -729,10 +750,42 @@ impl KcpStream {
     /// 换 `send_to` 的地址。所以这里不"每个候选开一条会话"，而是让驱动任务
     /// 在锁定对端之前**轮流试**每个候选：谁先回包就锁定谁。
     pub fn spawn_candidates(
-        sock: UdpSocket,
+        sock: Arc<UdpSocket>,
         candidates: &[std::net::SocketAddr],
         conv: u32,
         first: Option<Vec<u8>>,
+    ) -> Self {
+        // 独占 socket：起一个收包任务把数据报喂给驱动
+        let (pkt_tx, pkt_rx) = mpsc::unbounded_channel::<(std::net::SocketAddr, Bytes)>();
+        let reader = spawn_reader(Arc::clone(&sock), pkt_tx);
+        Self::drive(sock, candidates, conv, first, pkt_rx, Some(reader), None)
+    }
+
+    /// 服务端（**多个会话共享一个 UDP 端口**）用。
+    ///
+    /// 收包由 [`KcpListener`] 统一做：它按源地址把数据报分派到各会话的
+    /// `pkt_rx`。这里不能让每个会话自己去 `recv_from` —— 多个任务同时读
+    /// 同一个 UDP socket，属于别的会话的数据报会被某个会话"抢到又丢掉"。
+    pub fn spawn_served(
+        sock: Arc<UdpSocket>,
+        peer: std::net::SocketAddr,
+        conv: u32,
+        first: Option<Vec<u8>>,
+        pkt_rx: UnboundedReceiver<(std::net::SocketAddr, Bytes)>,
+        on_drop: Box<dyn FnOnce() + Send>,
+    ) -> Self {
+        Self::drive(sock, &[peer], conv, first, pkt_rx, None, Some(on_drop))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn drive(
+        sock: Arc<UdpSocket>,
+        candidates: &[std::net::SocketAddr],
+        conv: u32,
+        first: Option<Vec<u8>>,
+        mut pkt_rx: UnboundedReceiver<(std::net::SocketAddr, Bytes)>,
+        reader: Option<tokio::task::JoinHandle<()>>,
+        on_drop: Option<Box<dyn FnOnce() + Send>>,
     ) -> Self {
         let mut kcp = Kcp::new(conv, IKCP_MTU_DEF);
         kcp.set_nodelay(true, IKCP_INTERVAL, IKCP_FASTACK_LIMIT);
@@ -747,7 +800,6 @@ impl KcpStream {
 
         let task = tokio::spawn(async move {
             let mut tick = interval(TICK);
-            let mut rbuf = vec![0u8; READ_BUF];
             let start = std::time::Instant::now();
             let mut idx = 0usize;
             let mut locked = false;
@@ -759,28 +811,27 @@ impl KcpStream {
                     Some(data) = net_rx.recv() => {
                         if kcp.send(&data) == 0 { continue; }
                     }
-                    r = sock.recv_from(&mut rbuf) => {
-                        match r {
-                            Ok((n, from)) => {
-                                // 锁定前：候选列表里谁先回包就认定是谁
-                                // （对称 NAT 下源端口未必等于我们发过去的那个目的端口）。
-                                // 锁定后：洞是敞开的，陌生源一律丢掉。
-                                if locked {
-                                    if from != peer { continue; }
-                                } else if let Some(i) = cands.iter().position(|c| *c == from) {
-                                    peer = from;
-                                    idx = i;
-                                    locked = true;
-                                } else {
-                                    continue;
-                                }
-                                if kcp.input(&rbuf[..n]).is_err() { continue; }
-                                while let Some(msg) = kcp.recv() {
-                                    if app_tx.send(Bytes::from(msg)).is_err() { return; }
-                                }
-                            }
-                            Err(e) if transient(&e) => continue,
-                            Err(_) => return,
+                    pkt = pkt_rx.recv() => {
+                        // 数据报来源：独占模式下是自己的收包任务，
+                        // 服务端共享端口模式下是 `KcpListener` 按源地址分派过来的。
+                        let Some((from, data)) = pkt else {
+                            return; // 收包侧没了，这条会话也就结束了
+                        };
+                        // 锁定前：候选列表里谁先回包就认定是谁
+                        // （对称 NAT 下源端口未必等于我们发过去的那个目的端口）。
+                        // 锁定后：洞是敞开的，陌生源一律丢掉。
+                        if locked {
+                            if from != peer { continue; }
+                        } else if let Some(i) = cands.iter().position(|c| *c == from) {
+                            peer = from;
+                            idx = i;
+                            locked = true;
+                        } else {
+                            continue;
+                        }
+                        if kcp.input(&data).is_err() { continue; }
+                        while let Some(msg) = kcp.recv() {
+                            if app_tx.send(Bytes::from(msg)).is_err() { return; }
                         }
                     }
                     _ = tick.tick() => {
@@ -811,8 +862,113 @@ impl KcpStream {
 
         Self {
             rx: app_rx,
+            pending: Bytes::new(),
             tx: net_tx,
             task: Some(task),
+            reader,
+            on_drop,
+        }
+    }
+}
+
+/// 独占 socket 时的收包任务：把收到的每个数据报连同源地址交给驱动。
+fn spawn_reader(
+    sock: Arc<UdpSocket>,
+    tx: UnboundedSender<(std::net::SocketAddr, Bytes)>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; READ_BUF];
+        loop {
+            match sock.recv_from(&mut buf).await {
+                Ok((n, from)) => {
+                    if tx.send((from, Bytes::copy_from_slice(&buf[..n]))).is_err() {
+                        return;
+                    }
+                }
+                Err(e) if transient(&e) => continue,
+                Err(_) => return,
+            }
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 服务端监听：一个 UDP 端口上接多条 KCP 会话
+// ---------------------------------------------------------------------------
+
+/// 服务端侧的 KCP 监听（对应官方 frps 的 `kcpBindPort`）。
+///
+/// 与 TCP 不同：一个 UDP 端口要同时服务**多个客户端**，所以收包只能有一个
+/// 地方做 —— 这里统一 `recv_from`，再按源地址把数据报分派给对应会话。
+/// 要是让每条会话各自 `recv_from`，属于别人的数据报会被某条会话"抢到又丢掉"，
+/// 症状是客户端随机卡死、极难复现。
+/// 一条会话的收包队列：`KcpListener` 往这里投递属于该会话的数据报。
+type SessionTx = UnboundedSender<(std::net::SocketAddr, Bytes)>;
+/// 源地址 → 会话收包队列。
+type SessionTable = Arc<std::sync::Mutex<HashMap<std::net::SocketAddr, SessionTx>>>;
+
+pub struct KcpListener {
+    sock: Arc<UdpSocket>,
+    /// 源地址 → 该会话的收包队列。
+    sessions: SessionTable,
+}
+
+impl KcpListener {
+    pub async fn bind(addr: std::net::SocketAddr) -> std::io::Result<Self> {
+        let sock = UdpSocket::bind(addr).await?;
+        Ok(Self {
+            sock: Arc::new(sock),
+            sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        })
+    }
+
+    pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.sock.local_addr()
+    }
+
+    /// 接一条新会话：等到某个**新的**源地址发来它的第一个 KCP 数据报。
+    ///
+    /// 老会话的数据报在这里直接转发，不会返回。
+    pub async fn accept(&self) -> std::io::Result<(KcpStream, std::net::SocketAddr)> {
+        let mut buf = vec![0u8; READ_BUF];
+        loop {
+            let (n, from) = self.sock.recv_from(&mut buf).await?;
+            // 连 KCP 头（24 字节）都不够，肯定不是 KCP 数据报，丢掉
+            if n < HEADER {
+                continue;
+            }
+            let existing = {
+                let g = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+                g.get(&from).cloned()
+            };
+            if let Some(tx) = existing {
+                if tx.send((from, Bytes::copy_from_slice(&buf[..n]))).is_err() {
+                    // 驱动已经退出但还没来得及摘掉：顺手清理，下一轮重新认作新会话
+                    let mut g = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+                    g.remove(&from);
+                }
+                continue;
+            }
+            // 新会话：conv 由发起方定，从报文头读出来照抄即可
+            let conv = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            let (tx, rx) = mpsc::unbounded_channel();
+            {
+                let mut g = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+                g.insert(from, tx);
+            }
+            let sessions = Arc::clone(&self.sessions);
+            let stream = KcpStream::spawn_served(
+                Arc::clone(&self.sock),
+                from,
+                conv,
+                Some(buf[..n].to_vec()),
+                rx,
+                Box::new(move || {
+                    let mut g = sessions.lock().unwrap_or_else(|e| e.into_inner());
+                    g.remove(&from);
+                }),
+            );
+            return Ok((stream, from));
         }
     }
 }
@@ -859,10 +1015,22 @@ impl AsyncRead for KcpStream {
         cx: &mut std::task::Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
+        if buf.remaining() == 0 {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        // 上次没读完的先给（字节流语义：不丢、不重排）
+        if !self.pending.is_empty() {
+            let n = self.pending.len().min(buf.remaining());
+            buf.put_slice(&self.pending[..n]);
+            self.pending = self.pending.slice(n..);
+            return std::task::Poll::Ready(Ok(()));
+        }
         match self.rx.poll_recv(cx) {
             std::task::Poll::Ready(Some(bytes)) => {
                 let n = bytes.len().min(buf.remaining());
                 buf.put_slice(&bytes[..n]);
+                // 剩下的留到下次，绝不能丢
+                self.pending = bytes.slice(n..);
                 std::task::Poll::Ready(Ok(()))
             }
             std::task::Poll::Ready(None) => std::task::Poll::Ready(Ok(())), // EOF
@@ -1129,7 +1297,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut buf = vec![0u8; READ_BUF];
             let (n, from) = srv.recv_from(&mut buf).await.unwrap();
-            let mut s = KcpStream::spawn(srv, from, conv, Some(buf[..n].to_vec()));
+            let mut s = KcpStream::spawn(Arc::new(srv), from, conv, Some(buf[..n].to_vec()));
             let mut got = vec![0u8; 4];
             s.read_exact(&mut got).await.unwrap();
             assert_eq!(&got, b"ping");
@@ -1139,7 +1307,7 @@ mod tests {
         });
 
         // 客户端要先说一句话，服务端才能从数据报里学到地址
-        let mut c = KcpStream::connect(cli, srv_addr, conv).await;
+        let mut c = KcpStream::connect(Arc::new(cli), srv_addr, conv).await;
         c.write_all(b"ping").await.unwrap();
         let mut reply = vec![0u8; 4];
         tokio::time::timeout(std::time::Duration::from_secs(5), c.read_exact(&mut reply))
@@ -1147,6 +1315,49 @@ mod tests {
             .expect("KCP 往返超时")
             .unwrap();
         assert_eq!(&reply, b"pong");
+        server.await.unwrap();
+    }
+
+    /// 一个 UDP 端口上要能同时接多条会话 —— 这是 `kcpBindPort` 的前提。
+    ///
+    /// 收包只能在 `KcpListener` 一处做：让每条会话各自 `recv_from` 同一个
+    /// socket，属于别的会话的数据报会被"抢到又丢掉"，症状是随机卡死。
+    #[tokio::test]
+    async fn kcp_listener_serves_two_sessions_on_one_port() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let ln = KcpListener::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = ln.local_addr().unwrap();
+
+        // 服务端：接两条会话，各自回一个 pong
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut s, _peer) = ln.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4];
+                    if s.read_exact(&mut buf).await.is_ok() {
+                        let _ = s.write_all(b"pong").await;
+                        // 会话必须活到对端收完回包
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                });
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        });
+
+        for conv in [0x1122u32, 0x3344u32] {
+            let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let mut c = KcpStream::connect(sock, addr, conv).await;
+            c.write_all(b"ping").await.unwrap();
+            let mut reply = [0u8; 4];
+            tokio::time::timeout(std::time::Duration::from_secs(5), c.read_exact(&mut reply))
+                .await
+                .expect("KCP 往返超时：两条会话共用一个 UDP 端口时数据被错领了？")
+                .unwrap();
+            assert_eq!(&reply, b"pong");
+        }
         server.await.unwrap();
     }
 }

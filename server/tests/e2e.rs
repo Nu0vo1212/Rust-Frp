@@ -12,7 +12,9 @@ use rustunnel_common::{
     config::ServerConfig,
     frp::{
         conn::{self, FrpConn},
-        msg::{FrpMessage, NewProxy, NewProxyResp},
+        kcp::KcpStream,
+        msg::{FrpMessage, NewProxy, NewProxyResp, UdpPacket},
+        stream::BoxStream,
         WireVersion,
     },
     util,
@@ -20,7 +22,7 @@ use rustunnel_common::{
 use rustunnel_server::{serve_on, Registry};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UdpSocket},
 };
 
 const TOKEN: &str = "e2e-token";
@@ -572,6 +574,261 @@ async fn stcp_visitor_with_wrong_secret_is_rejected() {
     )
     .await;
     assert!(r.is_err(), "密钥不对时必须拒绝接入，否则 stcp 形同虚设");
+}
+
+/// SUDP 的 provider 侧模拟：工作连接上跑的是 `UdpPacket` 帧而不是裸字节，
+/// 这里把收到的每个报文加 `echo:` 前缀、**按原访客地址**发回去 ——
+/// 等价于一个内网 UDP 服务，只是省掉了真的去 bind 一个 UDP socket。
+///
+/// ⚠️ UDP / SUDP 的工作连接握手方向与 TCP **相反**：`StartWorkConn` 是客户端
+/// 主动发的（见 `client/src/udp_proxy.rs`），服务端 `handle_work` 收到
+/// `NewWorkConn` 后直接把连接丢进池子、**从不回** StartWorkConn。
+/// 所以这里不能用 TCP 用的 `conn::client_work_conn`（它会阻塞等服务端那条）。
+async fn serve_sudp_work_conn(
+    port: u16,
+    run_id: &str,
+    proxy_name: &str,
+    wire: WireVersion,
+) -> anyhow::Result<()> {
+    let stream = TcpStream::connect(("127.0.0.1", port)).await?;
+    let ts = util::now_unix_secs() as i64;
+    //
+    // ★ 握手方向：工作连接由**服务端**下发 `StartWorkConn` 指定代理名，客户端等待。
+    //   这一点对所有代理类型都一样（udp / sudp 也不例外）—— 曾经误以为 UDP 语义下
+    //   是客户端主动发，于是把 SUDP 桥写成了"直接开搬"，真机上的症状是
+    //   provider 侧报「期望 StartWorkConn，收到 UdpPacket」、上行有字节下行永远 0。
+    //   这个用例就是为了锁住这个方向，别再改回去。
+    let (stream, leftover, start) =
+        conn::client_work_conn(Box::pin(stream), wire, run_id, TOKEN, ts).await?;
+    // 服务端下发的一律是**线上全名**（`{user}.{name}`），本地才用原始 name。
+    assert!(
+        start.proxy_name.ends_with(&format!(".{proxy_name}")),
+        "服务端必须用 StartWorkConn 指定这条工作连接服务哪个代理，实际是 {}",
+        start.proxy_name
+    );
+    let mut work = FrpConn::new(stream, wire);
+    // 服务端回完 StartWorkConn 就紧接着把 visitor 的第一帧发过来了，所以
+    // leftover 通常**不为空** —— 必须塞回读缓冲，否则第一个业务报文被吞。
+    work.push_leftover(leftover, false);
+    // 编码必须跟服务端给 provider 这条连接设的一致（本例协商结果是 JSON）
+    work.set_udp_codec(false);
+    while let Ok(Some(msg)) = work.recv_msg().await {
+        let FrpMessage::UdpPacket(pkt) = msg else {
+            continue;
+        };
+        let Some(src) = pkt.remote_addr.as_ref().and_then(|a| a.to_socket()) else {
+            continue;
+        };
+        let reply = format!("echo:{}", String::from_utf8_lossy(pkt.payload()));
+        if work
+            .send_msg(&FrpMessage::UdpPacket(UdpPacket::new(
+                reply.as_bytes(),
+                &src,
+            )))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn sudp_visitor_relays_udp_frames_with_remote_addr() {
+    let port = start_server(base_cfg()).await;
+
+    // ---- provider：注册 sudp 代理（与 stcp 同一套 sk / allow_users 鉴权）----
+    let (mut provider, provider_run) = login(port, TOKEN, "provider").await;
+    let resp = register_proxy(
+        &mut provider,
+        NewProxy {
+            proxy_name: "udpsvc".into(),
+            proxy_type: "sudp".into(),
+            sk: "udp-secret".into(),
+            allow_users: vec!["*".into()],
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(resp.error.is_empty(), "sudp 注册失败：{}", resp.error);
+    assert!(
+        resp.remote_addr.is_empty(),
+        "sudp 不占公网端口，remote_addr 应为空"
+    );
+
+    // provider 的工作连接按 UDP 帧应答（不是裸字节转发，这正是 sudp 与 stcp 的分界线）
+    tokio::spawn(async move {
+        while let Ok(Some(msg)) = provider.recv_msg().await {
+            if matches!(msg, FrpMessage::ReqWorkConn) {
+                let run = provider_run.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        serve_sudp_work_conn(port, &run, "udpsvc", WireVersion::V2).await
+                    {
+                        eprintln!("SUDP 工作连接出错：{e:#}");
+                    }
+                });
+            }
+        }
+    });
+
+    // ---- visitor：按密钥签名接入 ----
+    let (mut _visitor_ctrl, visitor_run) = login(port, TOKEN, "guest").await;
+    tokio::spawn(async move { while _visitor_ctrl.recv_msg().await.ok().flatten().is_some() {} });
+
+    let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let (tunnel, leftover) = conn::client_visitor_conn(
+        Box::pin(stream),
+        WireVersion::V2,
+        &visitor_run,
+        "provider.udpsvc",
+        "udp-secret",
+    )
+    .await
+    .expect("sudp visitor 接入");
+    assert!(leftover.is_empty());
+
+    let mut v = FrpConn::new(tunnel, WireVersion::V2);
+    v.set_udp_codec(false);
+
+    let peer: SocketAddr = "10.9.9.9:4321".parse().unwrap();
+    v.send_msg(&FrpMessage::UdpPacket(UdpPacket::new(b"hello-udp", &peer)))
+        .await
+        .expect("发送 UdpPacket");
+
+    // 回包必须带着**访客地址**原样回来：访问方要靠它把数据交回正确的对端，
+    // 丢掉 remote_addr 的"能通"是假通——UDP 无连接，回包根本没法投递。
+    let reply = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match v.recv_msg().await {
+                Ok(Some(FrpMessage::UdpPacket(pkt))) => break pkt,
+                Ok(Some(_)) => continue, // Ping 之类跳过
+                other => panic!("SUDP 读帧失败：{other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("SUDP 回包超时：服务端没有把 provider 的回包搬回 visitor");
+
+    assert_eq!(
+        reply.payload(),
+        &b"echo:hello-udp"[..],
+        "SUDP 报文必须双向贯通"
+    );
+    assert_eq!(
+        reply.remote_addr.as_ref().and_then(|a| a.to_socket()),
+        Some(peer),
+        "回包必须带回访客地址，否则访问方无法把数据交回正确的对端"
+    );
+}
+
+/// 测试用的 KCP 会话号。
+///
+/// 服务端按**源地址**区分会话（conv 只是该会话内的标识），所以多条流共用
+/// 同一个 conv 不会串味 —— 真客户端也用固定 conv，靠 UDP 端口区分连接。
+const KCP_CONV: u32 = 0x5A5A_0001;
+
+/// 起一个服务端：TCP 在 `port`，**KCP 在独立的 `kport`**。
+///
+/// KCP 与 QUIC 的分工差别就在这一点上：QUIC 复用 `bindPort`，而 KCP 是裸 UDP
+/// 上的可靠传输、没有"先握手再分流"的能力，只能另开端口靠源地址区分客户端
+/// （对应官方 frps 的 `kcpBindPort`）。
+async fn start_server_kcp(cfg: ServerConfig, port: u16) -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .await
+        .expect("bind 指定端口");
+    let registry = Arc::new(Registry::unlimited());
+    tokio::spawn(async move {
+        if let Err(e) = serve_on(listener, Arc::new(cfg), registry).await {
+            eprintln!("服务端退出：{e:#}");
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    port
+}
+
+/// 建一条 KCP 流：每条 frp 连接（控制 / 工作 / visitor）各占一条。
+async fn kcp_stream(kaddr: SocketAddr) -> BoxStream {
+    let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("绑定本地 UDP"));
+    Box::pin(KcpStream::connect(sock, kaddr, KCP_CONV).await)
+}
+
+/// 在 KCP 传输上完成一次 frp v2 登录。
+async fn login_kcp(kaddr: SocketAddr, token: &str, user: &str) -> (FrpConn, String) {
+    let (conn, run_id, _udp_binary, _caps) = conn::client_handshake(
+        kcp_stream(kaddr).await,
+        WireVersion::V2,
+        &rustunnel_common::security::Credential::Token(token.to_string()),
+        "e2e-kcp-client",
+        user,
+        &empty_metas(),
+        0,
+        Default::default(),
+    )
+    .await
+    .expect("KCP 上的 frp 握手");
+    (conn, run_id)
+}
+
+/// 客户端侧的 KCP 工作连接：`NewWorkConn` -> `StartWorkConn` -> 连内网 -> 双向转发。
+async fn serve_work_conn_kcp(
+    kaddr: SocketAddr,
+    run_id: &str,
+    local: SocketAddr,
+) -> anyhow::Result<()> {
+    let ts = util::now_unix_secs() as i64;
+    let (mut work, leftover, _start) =
+        conn::client_work_conn(kcp_stream(kaddr).await, WireVersion::V2, run_id, TOKEN, ts).await?;
+    let mut dst = TcpStream::connect(local).await?;
+    if !leftover.is_empty() {
+        dst.write_all(&leftover).await?;
+    }
+    util::relay_between(&mut work, &mut dst).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn tcp_proxy_roundtrip_over_kcp_transport() {
+    let port = free_port_both();
+    let kport = free_port_both();
+    let remote_port = free_port();
+    let mut cfg = base_cfg();
+    cfg.kcp_bind_port = Some(kport);
+    start_server_kcp(cfg, port).await;
+    let local = echo_service().await;
+    let kaddr = SocketAddr::from(([127, 0, 0, 1], kport));
+
+    // 控制连接走 KCP：验证 yamux / QUIC 之外的这条传输层也能跑完整 frp 握手
+    let (mut conn, run_id) = login_kcp(kaddr, TOKEN, "kcpuser").await;
+    let resp = register_proxy(
+        &mut conn,
+        NewProxy {
+            proxy_name: "kcp".into(),
+            proxy_type: "tcp".into(),
+            remote_port,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(resp.error.is_empty(), "KCP 上注册代理失败：{}", resp.error);
+
+    // provider 的工作连接也走 KCP（新本地端口 → 服务端的一条新会话）
+    tokio::spawn(async move {
+        while let Ok(Some(msg)) = conn.recv_msg().await {
+            if matches!(msg, FrpMessage::ReqWorkConn) {
+                let run = run_id.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = serve_work_conn_kcp(kaddr, &run, local).await {
+                        eprintln!("KCP 工作连接出错：{e:#}");
+                    }
+                });
+            }
+        }
+    });
+
+    let echoed = roundtrip(SocketAddr::from(([127, 0, 0, 1], remote_port)), b"over-kcp").await;
+    assert_eq!(echoed, b"over-kcp", "KCP 传输上的代理数据必须原样往返");
 }
 
 #[tokio::test]

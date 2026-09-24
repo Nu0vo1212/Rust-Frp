@@ -293,18 +293,24 @@ impl ClientState {
     pub fn add_proxy(&self, name: String, port: Option<u16>, slot: Permit) {
         self.proxies
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(name, ProxyEntry { slot, port });
     }
 
     /// 当前登记的代理数。
     pub fn proxy_count(&self) -> usize {
-        self.proxies.lock().unwrap().len()
+        self.proxies.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// 已登记的代理名（面板展示用）。
     pub fn proxy_names(&self) -> Vec<String> {
-        let mut v: Vec<String> = self.proxies.lock().unwrap().keys().cloned().collect();
+        let mut v: Vec<String> = self
+            .proxies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
         v.sort();
         v
     }
@@ -316,7 +322,10 @@ impl ClientState {
 
     /// 当前排队等待工作连接的用户连接数。
     pub fn backlog(&self) -> usize {
-        self.pool.lock().unwrap().backlog()
+        self.pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .backlog()
     }
 
     /// 通知控制连接："我需要一条工作连接"。
@@ -338,7 +347,13 @@ impl ClientState {
     ///
     /// UDP 代理和 HTTP 代理都不是"用户连进来才要连接"，必须自己发起。
     pub async fn acquire_work_conn(self: &Arc<Self>, wait: Duration) -> Option<WorkItem> {
-        if let Some(w) = self.pool.lock().unwrap().work.pop_front() {
+        if let Some(w) = self
+            .pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .work
+            .pop_front()
+        {
             return Some(w);
         }
         let deadline = Instant::now() + wait;
@@ -354,7 +369,13 @@ impl ClientState {
             {
                 return None;
             }
-            if let Some(w) = self.pool.lock().unwrap().work.pop_front() {
+            if let Some(w) = self
+                .pool
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .work
+                .pop_front()
+            {
                 return Some(w);
             }
         }
@@ -365,7 +386,7 @@ impl ClientState {
     /// 队列达到上限时返回 [`Submit::Full`]，由调用方给访客回一个失败，
     /// 而不是让它无限排队（那是另一种形式的资源耗尽）。
     pub fn submit_user(&self, mut user: PendingUser) -> Submit {
-        let mut g = self.pool.lock().unwrap();
+        let mut g = self.pool.lock().unwrap_or_else(|e| e.into_inner());
         g.reap(self.idle_timeout);
         if let Some(w) = g.work.pop_front() {
             return Submit::Paired(Box::new(PairedBox { user, work: w }));
@@ -381,7 +402,7 @@ impl ClientState {
     /// 工作连接到来：有排队的用户就立即配对，否则进池备用并唤醒等待者。
     pub fn submit_work(&self, w: WorkItem) -> Option<PairedBox> {
         let paired = {
-            let mut g = self.pool.lock().unwrap();
+            let mut g = self.pool.lock().unwrap_or_else(|e| e.into_inner());
             g.reap(self.idle_timeout);
             match g.users.pop_front() {
                 Some(u) => Some(PairedBox { user: u, work: w }),
@@ -399,7 +420,11 @@ impl ClientState {
 
     /// 当前空闲池里的工作连接数（测试用）。
     pub fn idle_work_conns(&self) -> usize {
-        self.pool.lock().unwrap().work.len()
+        self.pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .work
+            .len()
     }
 
     /// 注销一个代理并释放它占的名额（客户端主动 `CloseProxy`）。
@@ -408,7 +433,11 @@ impl ClientState {
     /// `Registry::release_port`** —— 端口是注册表管的，客户端这边只是记账；
     /// 不还的话端口会一直被占着，重连同一端口会一直报"已被占用"。
     pub fn stop_proxy(&self, name: &str) -> Option<u16> {
-        let e = self.proxies.lock().unwrap().remove(name)?;
+        let e = self
+            .proxies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name)?;
         // `slot` 在这里被 drop，名额随之归还
         e.port
     }
@@ -416,8 +445,15 @@ impl ClientState {
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Relaxed);
         // 名额随 ProxyEntry 一起 drop；端口由 `Registry::release_ports_of` 统一收回
-        self.proxies.lock().unwrap().clear();
-        self.pool.lock().unwrap().work.clear();
+        self.proxies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .work
+            .clear();
         self.work_notify.notify_waiters();
     }
 }

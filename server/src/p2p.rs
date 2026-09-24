@@ -120,7 +120,7 @@ impl P2PHub {
 
     /// 预建一条会话（visitor 发起 NatHoleVisitor 时建立）。
     pub fn create(&self, sid: &str) {
-        let mut g = self.sessions.lock().unwrap();
+        let mut g = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         self.reap_locked(&mut g);
         g.entry(sid.to_string()).or_insert_with(Session::new);
     }
@@ -136,7 +136,7 @@ impl P2PHub {
         addr: SocketAddr,
         transport: p2p::Transport,
     ) -> Option<(Vec<SocketAddr>, p2p::Transport)> {
-        let mut g = self.sessions.lock().unwrap();
+        let mut g = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         self.reap_locked(&mut g);
         let session = g.get_mut(sid)?;
         session.observe(role, addr, transport);
@@ -170,7 +170,10 @@ impl P2PHub {
 
     /// 会话被双方消费完后主动清理（省内存，也避免 sid 复用带来的串会话）。
     pub fn finish(&self, sid: &str) {
-        self.sessions.lock().unwrap().remove(sid);
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(sid);
     }
 
     #[cfg(test)]

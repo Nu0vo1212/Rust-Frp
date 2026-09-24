@@ -20,7 +20,7 @@ use std::{sync::Arc, time::Duration};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use rustunnel_common::{
-    config::{default_config_path, is_quic, ClientConfig, Protocol, ProxyConfig},
+    config::{default_config_path, is_kcp, is_quic, ClientConfig, Protocol, ProxyConfig},
     frp::{
         self,
         conn::{self, FrpConn},
@@ -32,7 +32,10 @@ use rustunnel_common::{
     proxy_protocol, throttle, util, ws,
 };
 use tokio::io::AsyncWriteExt;
-use tokio::{net::TcpStream, time::interval};
+use tokio::{
+    net::{TcpStream, UdpSocket},
+    time::interval,
+};
 use tracing::{debug, error, info, warn};
 
 #[derive(Parser, Debug)]
@@ -427,6 +430,10 @@ async fn quic_server_addr(cfg: &ClientConfig) -> Result<std::net::SocketAddr> {
 /// 套壳顺序与官方 frpc 一致：`TCP -> [TLS] -> [WebSocket]`，
 /// yamux 由 [`ServerLink`] 再套在外面。
 async fn raw_connect(cfg: &ClientConfig) -> Result<BoxStream> {
+    // KCP 是另一条路：裸 UDP 上的可靠传输，TLS / WebSocket 那几层跟它没关系
+    if is_kcp(&cfg.transport_protocol) {
+        return kcp_connect(cfg).await;
+    }
     let server = format!("{}:{}", cfg.server_addr, cfg.server_port);
     let addr = util::resolve_addr(&server)
         .await
@@ -472,6 +479,32 @@ async fn raw_connect(cfg: &ClientConfig) -> Result<BoxStream> {
         .with_context(|| format!("WebSocket 握手失败（{host}{path}）"))?;
     info!(%host, %path, tls = tls_on, "控制连接改走 WebSocket 传输");
     Ok(Box::pin(ws))
+}
+
+/// 建立一条 KCP 连接（裸 UDP 上的可靠传输）。
+///
+/// 服务端要开 `kcp_bind_port`，客户端把 `transport.protocol` 设成 `kcp` 即可；
+/// 上层照旧套 yamux（`tcp_mux`），所以控制连接和工作连接共用这一条 KCP 会话。
+async fn kcp_connect(cfg: &ClientConfig) -> Result<BoxStream> {
+    let server = format!("{}:{}", cfg.server_addr, cfg.server_port);
+    let addr = util::resolve_addr(&server)
+        .await
+        .with_context(|| format!("解析服务端 KCP 地址 {server} 失败"))?;
+    let sock = Arc::new(
+        UdpSocket::bind("0.0.0.0:0")
+            .await
+            .context("绑定本地 UDP 端口失败（KCP 传输需要）")?,
+    );
+    // conv 由发起方定，服务端从第一个数据报的头里读出来照抄。
+    // 用时间戳派生即可，只要保证非零（0 容易被当成无效会话号）。
+    let conv = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0)
+        | 1;
+    let stream = frp::kcp::KcpStream::connect(sock, addr, conv).await;
+    info!(%addr, conv, "KCP 传输已建立");
+    Ok(Box::pin(stream))
 }
 
 /// 建立一次完整的控制连接会话，直到连接断开或出错。
@@ -966,8 +999,10 @@ async fn work_conn_flow(
         anyhow::bail!("代理 [{proxy_name}] 健康检查未通过，暂不提供服务");
     }
 
-    // UDP 代理：工作连接上跑的是 UdpPacket 消息，交给专门的转发器
-    if proxy.proxy_type == "udp" {
+    // UDP / SUDP 代理：工作连接上跑的是 UdpPacket 消息，交给专门的转发器。
+    // SUDP（secret UDP）的数据面与普通 UDP 完全一致——都是一条专用工作连接
+    // 上跑 UdpPacket 帧；差别只在它没有公网端口、访问方走 visitor 通道进来。
+    if matches!(proxy.proxy_type.as_str(), "udp" | "sudp") {
         // 工作连接握手后是裸字节流，这里重新包一层帧读写器
         // （工作连接本身不加密，所以直接 new 即可）。
         let mut udp_conn = FrpConn::new(work, link.wire);

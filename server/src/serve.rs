@@ -19,7 +19,7 @@ use rustunnel_common::{
         conn::{self, FrpConn, ServerAccept},
         msg::{
             FrpMessage, Login, NewProxyResp, NewVisitorConn, NewVisitorConnResp, NewWorkConn, Pong,
-            StartWorkConn,
+            StartWorkConn, UdpPacket,
         },
         stream::{BoxStream, PrefixedStream},
     },
@@ -149,7 +149,7 @@ pub async fn serve_on_with(
     }
 
     info!("rustunnel-server 已启动：frp v2 协议，监听 {addr}");
-    info!("支持的代理类型：tcp / udp / http / https / stcp / xtcp");
+    info!("支持的代理类型：tcp / udp / http / https / stcp / sudp / xtcp");
     let eff = cfg.effective_auth();
     info!(
         "认证方式 = {}，token = {}（{}）",
@@ -307,6 +307,46 @@ pub async fn serve_on_with(
                         });
                     }
                 });
+            }
+        });
+    }
+
+    // KCP 传输：**独立** UDP 端口（官方 frps 的 `kcpBindPort`）。
+    //
+    // KCP 是裸 UDP 上的可靠传输，没有 QUIC 那种"先握手再分流"的能力，
+    // 只能另开端口靠源地址区分客户端（见 `KcpListener` 的注释）。
+    // 上面跑的仍然是 yamux + frp，所以 `tcp_mux` 开关对它同样生效。
+    if let Some(kport) = cfg.kcp_bind_port {
+        let kaddr = util::resolve_addr(&format!("{}:{}", cfg.bind_addr, kport))
+            .await
+            .with_context(|| format!("解析 KCP 地址 {}:{} 失败", cfg.bind_addr, kport))?;
+        let listener = frp::kcp::KcpListener::bind(kaddr)
+            .await
+            .with_context(|| format!("监听 KCP {kaddr} 失败（端口可能被占用）"))?;
+        info!("KCP 传输已启用，UDP {kaddr}（TCP {addr} 照旧可用）");
+        let cfg2 = cfg.clone();
+        let registry2 = registry.clone();
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, peer)) => {
+                        let cfg = cfg2.clone();
+                        let registry = registry2.clone();
+                        tokio::spawn(async move {
+                            let stream: BoxStream = Box::pin(stream);
+                            // secure=false：KCP 不自带加密，按 tcp_mux 走 yamux 探测
+                            if let Err(e) = handle_stream(stream, peer, cfg, registry, false).await
+                            {
+                                debug!(%peer, "KCP 会话结束：{e:#}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        // 单个收包错误不该把整个监听循环打死
+                        warn!("KCP accept 失败：{e}");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                }
             }
         });
     }
@@ -897,8 +937,11 @@ pub(crate) async fn register_proxy(
         "https" => register_vhost(cfg, registry, client, m, true, slot).await,
         "stcp" => register_visitor_proxy(registry, client, m, "stcp", slot).await,
         "xtcp" => register_visitor_proxy(registry, client, m, "xtcp", slot).await,
+        // SUDP：秘密 UDP。与 stcp 同一套鉴权（secret_key + allow_users），
+        // 只是数据面是 UDP。不需要公网端口，visitor 主动连进来时配对。
+        "sudp" => register_visitor_proxy(registry, client, m, "sudp", slot).await,
         other => anyhow::bail!(
-            "暂不支持的代理类型：{other}（支持 tcp / udp / http / https / stcp / xtcp）"
+            "暂不支持的代理类型：{other}（支持 tcp / udp / http / https / stcp / xtcp / sudp）"
         ),
     }
 }
@@ -1228,6 +1271,7 @@ async fn handle_work(
 /// 处理一条 visitor 连接：校验 -> 回 Resp -> 与 provider 的工作连接配对。
 ///
 /// 配对成功后这条 visitor 连接就变成"用户连接"，转发逻辑与 tcp 完全一样。
+/// SUDP 例外：数据面是 UDP 帧（`UdpPacket` 消息），走 [`sudp_bridge`] 而不是裸字节 relay。
 async fn handle_visitor(
     mut conn: FrpConn,
     msg: NewVisitorConn,
@@ -1341,6 +1385,14 @@ async fn handle_visitor(
         anyhow::bail!("provider [{proxy_name}] 没有可用的工作连接，visitor 连接关闭");
     };
 
+    // SUDP：数据面是 UDP 帧，走专门的搬运路径（与 stcp / xtcp 的裸字节 relay 区分）
+    // UDP 编码用该 visitor 连接所属控制会话协商出的值（`ServerAccept::Visitor` 里带过来）
+    if entry.proxy_type == "sudp" {
+        info!(proxy = %proxy_name, kind = "sudp", "SUDP visitor 接入成功，开始 UDP 帧中继");
+        spawn_sudp_bridge(conn, work, registry.clone(), proxy_name.clone());
+        return Ok(());
+    }
+
     let (stream, leftover) = conn.into_stream();
     let user = PendingUser {
         proxy: proxy_name.clone(),
@@ -1357,7 +1409,6 @@ async fn handle_visitor(
     spawn_bridge(user, work, registry.clone());
     Ok(())
 }
-
 /// 一条转发连接结束时的收尾：归还活跃连接计数与流量统计。
 fn finish_conn(registry: &Registry, up: u64, down: u64) {
     registry.metrics().conns_active.dec();
@@ -1413,6 +1464,152 @@ pub async fn bridge(user: PendingUser, work: WorkItem, registry: &Arc<Registry>)
         }
     }
     Ok(())
+}
+
+/// SUDP 配对：把一条已握手成功的 visitor 连接（`conn`）与 provider 的一条工作连接（`work`）
+/// 组成一条 UDP 帧双向通道。
+///
+/// 与官方 SUDP 一致：
+/// * visitor 侧跑 `UdpPacket` 帧（type 13），`remote_addr` 标识"本地应用进程"；
+/// * provider 侧同样跑 `UdpPacket` 帧（`udp_proxy::run` 里的那套）；
+/// * 服务端只是把**整条 `UdpPacket` 帧（含 `remote_addr`）**原样在两端之间搬过来，
+///   不解析 payload —— 这样 provider 侧仍能按 `remote_addr` 把响应写回正确的本地应用；
+/// * UDP 编码（JSON / 二进制）必须跟控制会话协商值一致。
+fn spawn_sudp_bridge(conn: FrpConn, work: WorkItem, registry: Arc<Registry>, proxy_name: String) {
+    tokio::spawn(async move {
+        if let Err(e) = sudp_bridge(conn, work, &registry, proxy_name).await {
+            debug!("SUDP 转发结束：{e:#}");
+        }
+    });
+}
+
+async fn sudp_bridge(
+    visitor_conn: FrpConn,
+    work: WorkItem,
+    registry: &Arc<Registry>,
+    proxy_name: String,
+) -> Result<()> {
+    let mut provider_conn = work.conn;
+
+    // ★ 与官方 frps 一致：拿到工作连接后**先**发 `StartWorkConn` 告诉客户端
+    //   "这条连接服务哪个代理"，之后才谈业务帧。
+    //   少了这一步，客户端的 `client_work_conn` 还停在等 StartWorkConn，
+    //   收到我们的 UdpPacket 只会报"期望 StartWorkConn"并关掉连接 ——
+    //   症状很迷惑：上行有字节、下行永远 0，通道每隔几秒重建一次。
+    provider_conn
+        .send_msg(&FrpMessage::StartWorkConn(StartWorkConn {
+            // 必须用**线上全名**（带 `{user}.` 前缀），客户端按它查本地代理表
+            proxy_name: proxy_name.clone(),
+            ..Default::default()
+        }))
+        .await
+        .context("发送 StartWorkConn 失败")?;
+
+    // ★ UDP 编码用每条连接**自己**协商出来的值：visitor 连接在握手时定，
+    //   provider 工作连接在 `handle_work` 里已从控制会话继承。这里再覆盖一次
+    //   （哪怕是"正确"的值）都会与官方 frpc 分叉——它只认协商结果。
+    //
+    // 双向搬运整条 UdpPacket 帧（含 remote_addr），直到任一端断开。
+    // 注意这里按值交出连接：relay_sudp_frames 内部要把每条连接独占给一个协程。
+    let (up, down) = relay_sudp_frames(visitor_conn, provider_conn).await?;
+    debug!(proxy = %proxy_name, "SUDP 转发结束：上行 {up}B / 下行 {down}B");
+    finish_conn(registry, up, down);
+    Ok(())
+}
+
+/// 在两条 frp 连接之间双向搬运整条 `UdpPacket` 帧。
+///
+/// 搬运的是**完整帧**（保留 `remote_addr`），`Ping` 不转发（各端自己心跳即可），
+/// 任一端读关闭（`recv_msg` 返回 `None`）即整体结束。
+///
+/// 实现：`FrpConn` 是**单所有者**，读写必须收敛进同一个协程的 `select!`
+/// （与 `udp_proxy::run_session` 一个套路——它的三个分支都在借用同一个 conn）。
+/// 所以这里不是「两读两写四个协程」，而是**两条连接各归一个协程独占**：
+/// 协程 A 独占 visitor 连接、协程 B 独占 provider 工作连接，两者用两条 mpsc
+/// 通道交换报文。任一端退出会 drop 掉自己那侧的 sender，对侧 `recv` 因此
+/// 返回 `None` 而连锁收工，不会留下半边悬挂。
+async fn relay_sudp_frames(a: FrpConn, b: FrpConn) -> Result<(u64, u64)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::sync::mpsc;
+
+    // a -> b 方向：协程 A 读 a，协程 B 写 b（上行，访客请求）
+    let (to_b_tx, to_b_rx) = mpsc::channel::<UdpPacket>(1024);
+    // b -> a 方向：协程 B 读 b，协程 A 写 a（下行，服务回包）
+    let (to_a_tx, to_a_rx) = mpsc::channel::<UdpPacket>(1024);
+
+    let up = std::sync::Arc::new(AtomicU64::new(0));
+    let down = std::sync::Arc::new(AtomicU64::new(0));
+
+    // 协程 A：独占 visitor 连接
+    let side_a = {
+        let mut a = a;
+        let tx = to_b_tx;
+        let mut rx = to_a_rx;
+        let down = std::sync::Arc::clone(&down);
+        async move {
+            loop {
+                tokio::select! {
+                    msg = a.recv_msg() => {
+                        let Ok(Some(m)) = msg else { break };
+                        // 只搬 UdpPacket，Ping 等控制帧各端自己消化
+                        if let FrpMessage::UdpPacket(pkt) = m {
+                            if tx.send(pkt).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    pkt = rx.recv() => match pkt {
+                        Some(pkt) => {
+                            let n = pkt.payload().len() as u64;
+                            if a.send_msg(&FrpMessage::UdpPacket(pkt)).await.is_err() {
+                                break;
+                            }
+                            down.fetch_add(n, Ordering::Relaxed);
+                        }
+                        // 对侧协程已收工，队列不再有数据
+                        None => break,
+                    },
+                }
+            }
+        }
+    };
+
+    // 协程 B：独占 provider 工作连接
+    let side_b = {
+        let mut b = b;
+        let tx = to_a_tx;
+        let mut rx = to_b_rx;
+        let up = std::sync::Arc::clone(&up);
+        async move {
+            loop {
+                tokio::select! {
+                    msg = b.recv_msg() => {
+                        let Ok(Some(m)) = msg else { break };
+                        if let FrpMessage::UdpPacket(pkt) = m {
+                            if tx.send(pkt).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    pkt = rx.recv() => match pkt {
+                        Some(pkt) => {
+                            let n = pkt.payload().len() as u64;
+                            if b.send_msg(&FrpMessage::UdpPacket(pkt)).await.is_err() {
+                                break;
+                            }
+                            up.fetch_add(n, Ordering::Relaxed);
+                        }
+                        None => break,
+                    },
+                }
+            }
+        }
+    };
+
+    // 就地并发（不用 spawn：&mut 借用跨不了 'static，而这里已经按值交出所有权）
+    tokio::join!(side_a, side_b);
+
+    Ok((up.load(Ordering::Relaxed), down.load(Ordering::Relaxed)))
 }
 
 /// 当前服务端支持的线协议校验（保持与原 main 的行为一致）。

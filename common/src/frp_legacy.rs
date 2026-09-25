@@ -12,7 +12,7 @@
 //!   报告 0.52+ 才给 TOML；
 //! * 存量用户的机器上到处都是 `frpc.ini`。
 //!
-//! rustunnel 之前只认 TOML，于是 Sakura 那条路会直接死在解析阶段，报错还
+//! NFrp 之前只认 TOML，于是 Sakura 那条路会直接死在解析阶段，报错还
 //! 完全看不出原因：
 //!
 //! ```text
@@ -41,16 +41,16 @@
 //! | `util.ParseRangeNumbers` | [`parse_range_numbers`] |
 //! | `legacy/conversion.go: Convert_*_To_v1` | 全部键名映射（见下） |
 //!
-//! 中间产物是一棵 **rustunnel 原生键名**的 [`toml::Value`] 值树，再交给
+//! 中间产物是一棵 **NFrp 原生键名**的 [`toml::Value`] 值树，再交给
 //! `config::ClientConfig` 反序列化 —— 这样 INI 与 TOML 两条路最终汇进同一个结构体，
 //! 不会出现"两条路行为不一致"的漂移。
 //!
-//! # 几处**必须显式写默认值**的地方（照抄 frp 的默认值，别跟着 rustunnel 走）
+//! # 几处**必须显式写默认值**的地方（照抄 frp 的默认值，别跟着 NFrp 走）
 //!
 //! frp 的 legacy 路径是「先用 [`GetDefaultClientConf`] 填默认值，再把 INI 覆盖上去」，
-//! 而 rustunnel 自己的默认值有几处和它**不一致甚至相反**：
+//! 而 NFrp 自己的默认值有几处和它**不一致甚至相反**：
 //!
-//! | 配置项 | frp legacy 默认 | rustunnel 自身默认 | 处理 |
+//! | 配置项 | frp legacy 默认 | NFrp 自身默认 | 处理 |
 //! |---|---|---|---|
 //! | `tls_enable` | **true**（v0.50 起） | false | 缺省时显式补 true |
 //! | `disable_custom_tls_first_byte` | **true** | `tls_custom_first_byte = true`（语义相反） | 缺省时显式补 `!true` |
@@ -282,7 +282,7 @@ fn put_bool(out: &mut toml::Table, sec: &IniSection, ini_key: &str, native: &str
     Ok(())
 }
 
-/// 取布尔键，缺省时用 `default` —— 给"frp 默认值与 rustunnel 不同"的几项用。
+/// 取布尔键，缺省时用 `default` —— 给"frp 默认值与 NFrp 不同"的几项用。
 fn bool_or(sec: &IniSection, ini_key: &str, default: bool) -> Result<bool> {
     match sec.non_empty(ini_key) {
         Some(raw) => {
@@ -333,21 +333,21 @@ fn join_host_port(host: &str, port: i64) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// [common] → rustunnel 原生顶层配置
+// [common] → NFrp 原生顶层配置
 // ---------------------------------------------------------------------------
 
-/// 把 `[common]` 段搬成 rustunnel 原生的客户端顶层键。
+/// 把 `[common]` 段搬成 NFrp 原生的客户端顶层键。
 ///
 /// 对应 `legacy.ClientCommonConf` + `Convert_ClientCommonConf_To_v1`，**只搬
-/// rustunnel 真正有对应字段的部分**；剩下的（`admin_*` 面板、`dns_server`、
+/// NFrp 真正有对应字段的部分**；剩下的（`admin_*` 面板、`dns_server`、
 /// `includes`、`start`、`quic_*`、`*_oidc_*` 之类）按 frp 的 `strict=false` 语义忽略。
 ///
-/// 专门说明两个**不能照搬 rustunnel 默认值**的项，理由见模块文档。
+/// 专门说明两个**不能照搬 NFrp 默认值**的项，理由见模块文档。
 fn common_section_to_table(sec: &IniSection, out: &mut toml::Table) -> Result<()> {
     put_str(out, sec, "server_addr", "server_addr");
     put_int(out, sec, "server_port", "server_port")?;
     put_str(out, sec, "user", "user");
-    // `authentication_method` 只支持默认的 token（rustunnel 没实现 OIDC）；
+    // `authentication_method` 只支持默认的 token（NFrp 没实现 OIDC）；
     // 老配置里的 `token` 就是它。
     put_str(out, sec, "token", "token");
 
@@ -360,15 +360,15 @@ fn common_section_to_table(sec: &IniSection, out: &mut toml::Table) -> Result<()
     put_str(out, sec, "tls_server_name", "tls_server_name");
 
     // 传输协议：INI 里叫 `protocol`（tcp / kcp / quic / websocket / wss），
-    // rustunnel 叫 `transport_protocol`（只实现了 tcp / quic）。
+    // NFrp 叫 `transport_protocol`（只实现了 tcp / quic）。
     put_str(out, sec, "protocol", "transport_protocol");
 
-    // ★ frp legacy 的 `tls_enable` 默认 **true**（v0.50 起），rustunnel 自身默认 false。
+    // ★ frp legacy 的 `tls_enable` 默认 **true**（v0.50 起），NFrp 自身默认 false。
     //   缺省时必须显式补 true，否则樱花那种不写 tls_enable 的配置会变成明文握手。
     let tls_enable = bool_or(sec, "tls_enable", true)?;
     out.insert("tls_enable".to_string(), Value::Boolean(tls_enable));
 
-    // ★ `disable_custom_tls_first_byte` 默认 true，而 rustunnel 的
+    // ★ `disable_custom_tls_first_byte` 默认 true，而 NFrp 的
     //   `tls_custom_first_byte` **语义相反**，所以取反后写。
     let disable_first_byte = bool_or(sec, "disable_custom_tls_first_byte", true)?;
     out.insert(
@@ -394,7 +394,7 @@ fn common_section_to_table(sec: &IniSection, out: &mut toml::Table) -> Result<()
 }
 
 // ---------------------------------------------------------------------------
-// 代理段 → rustunnel 原生 [[proxies]]
+// 代理段 → NFrp 原生 [[proxies]]
 // ---------------------------------------------------------------------------
 
 /// 官方 `legacy.proxyConfTypeMap` 里承认的代理类型。
@@ -402,17 +402,17 @@ const LEGACY_PROXY_TYPES: &[&str] = &[
     "tcp", "udp", "tcpmux", "http", "https", "stcp", "xtcp", "sudp",
 ];
 
-/// 把一条代理段搬成 rustunnel 原生的 `[[proxies]]` 记录。
+/// 把一条代理段搬成 NFrp 原生的 `[[proxies]]` 记录。
 ///
 /// 对应 `legacy.NewProxyConfFromIni` + `BaseProxyConf.decorate` +
 /// `Convert_ProxyConf_To_v1`。要点：
 ///
 /// * 段名就是代理名（`decorate` 里的 `cfg.ProxyName = name`）；
-/// * `type` 缺省是 **tcp**（不是 rustunnel 的"必填"）；
+/// * `type` 缺省是 **tcp**（不是 NFrp 的"必填"）；
 /// * `local_ip` + `local_port` 两段 → `local_addr = "ip:port"`；
 ///   `local_ip` 缺省补 `127.0.0.1`（对齐 v1 的 `Complete()`）；
 /// * `meta_xxx` → 代理级 `metas`（进 `NewProxy.metas`，**不是**登录 metas）；
-/// * `plugin_xxx` → rustunnel 的 `plugin_*` 平铺字段。
+/// * `plugin_xxx` → NFrp 的 `plugin_*` 平铺字段。
 fn proxy_section_to_table(sec: &IniSection) -> Result<toml::Table> {
     let mut t = toml::Table::new();
 
@@ -427,13 +427,13 @@ fn proxy_section_to_table(sec: &IniSection) -> Result<toml::Table> {
             &format!("不是合法的代理类型：{ty:?}"),
         ));
     }
-    // rustunnel 真正实现了 tcp / udp / http / https / stcp / sudp / xtcp；
+    // NFrp 真正实现了 tcp / udp / http / https / stcp / sudp / xtcp；
     // 仅 tcpmux 没实现。**宁可报错也不静默当成 tcp** ——
     // 静默降级会"看起来跑通了"，实际把用户的流量按错的语义转发，
     // 比在启动阶段报一句清楚的话危险得多。
     if ty == "tcpmux" {
         return Err(Error::Protocol(format!(
-            "代理 [{}] 的类型 {ty} 是原版 frp 的类型，rustunnel 尚未实现；\
+            "代理 [{}] 的类型 {ty} 是原版 frp 的类型，NFrp 尚未实现；\
              请改用 tcp/udp/http/https/stcp/sudp/xtcp，或在原版 frpc 上运行",
             sec.name
         )));
@@ -503,7 +503,7 @@ fn proxy_section_to_table(sec: &IniSection) -> Result<toml::Table> {
     }
 
     // 插件：`plugin = socks5` + `plugin_xxx` 参数。
-    // rustunnel 的插件字段是平铺的，所以要把 frp 那套按插件不同的参数名
+    // NFrp 的插件字段是平铺的，所以要把 frp 那套按插件不同的参数名
     // （socks5 用 plugin_user / http_proxy 用 plugin_http_user）归一到同一组字段。
     put_str(&mut t, sec, "plugin", "plugin");
     if let Some(v) = sec.non_empty("plugin_local_path") {
@@ -545,7 +545,7 @@ fn proxy_section_to_table(sec: &IniSection) -> Result<toml::Table> {
 }
 
 // ---------------------------------------------------------------------------
-// 访客段 → rustunnel 原生 [[visitors]]
+// 访客段 → NFrp 原生 [[visitors]]
 // ---------------------------------------------------------------------------
 
 /// 官方 `legacy.visitorConfTypeMap` 里承认的访客类型。
@@ -684,7 +684,7 @@ fn expand_range_sections(ini: &Ini) -> Result<Vec<IniSection>> {
 // 入口：INI 文本 → 原生值树
 // ---------------------------------------------------------------------------
 
-/// 一份 legacy INI 客户端配置 → rustunnel 原生键名的 [`toml::Value`]。
+/// 一份 legacy INI 客户端配置 → NFrp 原生键名的 [`toml::Value`]。
 ///
 /// 对应 `legacy.ParseClientConfig` → `Convert_*_To_v1` 的整条链路。
 pub fn legacy_client_to_value(text: &str) -> Result<Value> {
@@ -741,10 +741,10 @@ pub fn legacy_client_to_value(text: &str) -> Result<Value> {
     Ok(Value::Table(root))
 }
 
-/// 一份 legacy INI 服务端配置 → rustunnel 原生键名的 [`toml::Value`]。
+/// 一份 legacy INI 服务端配置 → NFrp 原生键名的 [`toml::Value`]。
 ///
 /// 对应 `legacy.ServerCommonConf` + `Convert_ServerCommonConf_To_v1`。
-/// 同样只搬 rustunnel 有对应字段的部分。
+/// 同样只搬 NFrp 有对应字段的部分。
 pub fn legacy_server_to_value(text: &str) -> Result<Value> {
     let ini = parse_ini(text)
         .ok_or_else(|| Error::Protocol("不是合法的 ini 配置（存在无法解析的行）".to_string()))?;
@@ -764,16 +764,16 @@ pub fn legacy_server_to_value(text: &str) -> Result<Value> {
     put_str(out, common, "subdomain_host", "subdomain_host");
     put_bool(out, common, "tcp_mux", "tcp_mux")?;
     put_int(out, common, "heartbeat_timeout", "heartbeat_timeout")?;
-    // frp 的 `tls_only`（强制客户端走 TLS）对应 rustunnel 的 `tls_force`
+    // frp 的 `tls_only`（强制客户端走 TLS）对应 NFrp 的 `tls_force`
     put_bool(out, common, "tls_only", "tls_force")?;
 
-    // 内置面板：frp 叫 dashboard_*，rustunnel 也叫 dashboard_*
+    // 内置面板：frp 叫 dashboard_*，NFrp 也叫 dashboard_*
     put_int(out, common, "dashboard_port", "dashboard_port")?;
     put_str(out, common, "dashboard_user", "dashboard_user");
     put_str(out, common, "dashboard_pwd", "dashboard_pwd");
 
     // 传输协议：INI 里没有 `protocol`，但老配置有 `kcp_bind_port` / `quic_bind_port`
-    // 这类"用端口开协议"的写法。rustunnel 只实现了 tcp/quic，这里只在
+    // 这类"用端口开协议"的写法。NFrp 只实现了 tcp/quic，这里只在
     // 明确开了 quic 端口时映射，其余保持默认。
     if common
         .non_empty("quic_bind_port")
@@ -848,13 +848,13 @@ remote_port = 27064
     }
 
     /// ★ 关键默认值：INI 不写 `tls_enable` 时，官方 frpc 是**开 TLS** 的
-    /// （v0.50 起默认 true），而 rustunnel 自身默认 false。
+    /// （v0.50 起默认 true），而 NFrp 自身默认 false。
     /// 不显式补这一项，樱花这种配置就会明文握手、被服务端拒掉。
     #[test]
     fn ini_缺省_tls_enable_时按官方默认开_tls() {
         let cfg = parse_client(SAKURA_INI).unwrap();
         assert!(cfg.tls_enable, "legacy ini 缺省 tls_enable = true");
-        // rustunnel 的 `tls_custom_first_byte` 与 frp 的 `disable_custom_tls_first_byte` 相反；
+        // NFrp 的 `tls_custom_first_byte` 与 frp 的 `disable_custom_tls_first_byte` 相反；
         // frp 默认 disable=true → 我们应为 false
         assert!(
             !cfg.tls_custom_first_byte,
@@ -911,7 +911,7 @@ meta_role = proxy-role
         assert!(!cfg.proxies[0].metas.contains_key("token"));
     }
 
-    /// 插件：`plugin_*` 前缀参数要归一到 rustunnel 的平铺字段；
+    /// 插件：`plugin_*` 前缀参数要归一到 NFrp 的平铺字段；
     /// socks5 用 `plugin_user`、http_proxy/static_file 用 `plugin_http_user`。
     #[test]
     fn ini_的插件参数要归一化() {
@@ -1150,7 +1150,7 @@ remote_port = 6000,7000,8000
         assert!(format!("{e:#}").contains("local_port"), "实际报错：{e:#}");
     }
 
-    /// 官方不认的类型要报错；官方认但 rustunnel 没实现的类型也要报错
+    /// 官方不认的类型要报错；官方认但 NFrp 没实现的类型也要报错
     /// （**不能**静默当成 tcp，那会让隧道"看起来通了"但语义是错的）。
     #[test]
     fn ini_类型校验() {
@@ -1259,7 +1259,7 @@ remote_port = 6000,7000,8000
         assert!(cfg.proxies.is_empty(), "DEFAULT 段不该产出代理");
     }
 
-    /// rustunnel 原生 TOML 完全不受影响（两条入口各走各的）
+    /// NFrp 原生 TOML 完全不受影响（两条入口各走各的）
     #[test]
     fn 原生_toml_仍走_toml_路径() {
         let cfg = parse_client_toml(

@@ -30,7 +30,7 @@ use crate::protocol::ControlMessage;
 /// [`crate::frp::FRP_WIRE_VERSION`]，避免两处各写一份、日后悄悄漂掉。
 pub use crate::frp::FRP_WIRE_VERSION as FRP_COMPAT_VERSION;
 
-/// 把 rustunnel 消息映射到 Go frp 的 `msg` 类型名。
+/// 把 NFrp 消息映射到 Go frp 的 `msg` 类型名。
 pub fn frp_msg_type(msg: &ControlMessage) -> &'static str {
     match msg {
         ControlMessage::Login { .. } => "msg.Login",

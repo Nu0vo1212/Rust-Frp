@@ -21,8 +21,8 @@ pub const DEFAULT_WORK_PORT: u16 = 7001;
 ///   无魔术字，`[类型字节][i64 长度][JSON]`，登录后套 AES-128-CFB。
 ///   樱花这类第三方 frps 分支基本只认它。
 /// * `frp-v2`    —— v0.70 引入的新协议，魔术字 + Hello 协商 + AEAD 帧流。
-///   需要服务端也显式启用（官方 frps 会按魔术字自动识别，rustunnel-server 同理）。
-/// * `rustunnel` —— rustunnel 自研的简化协议，尚未实现（配置成它会被直接拒绝）。
+///   需要服务端也显式启用（官方 frps 会按魔术字自动识别，nfrp-server 同理）。
+/// * `nfrp` —— NFrp 自研的简化协议，尚未实现（配置成它会被直接拒绝）。
 ///
 /// 想写哪种都行：`"v1"` / `"v2"` / `"frp-v1"` / `"frp-v2"` 都认，
 /// 也可以直接照抄 frp 配置里的 `[transport] wireProtocol = "v2"`。
@@ -31,7 +31,7 @@ pub enum Protocol {
     #[default]
     FrpV1,
     FrpV2,
-    Rustunnel,
+    Nfrp,
 }
 
 impl Protocol {
@@ -39,16 +39,16 @@ impl Protocol {
         match self {
             Protocol::FrpV1 => "frp-v1",
             Protocol::FrpV2 => "frp-v2",
-            Protocol::Rustunnel => "rustunnel",
+            Protocol::Nfrp => "nfrp",
         }
     }
 
-    /// 对应的 frp 线协议版本；`rustunnel` 自研协议没有对应版本。
+    /// 对应的 frp 线协议版本；`nfrp` 自研协议没有对应版本。
     pub fn wire_version(&self) -> Option<crate::frp::WireVersion> {
         match self {
             Protocol::FrpV1 => Some(crate::frp::WireVersion::V1),
             Protocol::FrpV2 => Some(crate::frp::WireVersion::V2),
-            Protocol::Rustunnel => None,
+            Protocol::Nfrp => None,
         }
     }
 }
@@ -66,9 +66,9 @@ impl std::str::FromStr for Protocol {
             // 照抄 frp 的 `wireProtocol = "v1"` 也认；空值按官方 EmptyOr 的语义落到 v1
             "" | "v1" | "frp-v1" | "frpv1" | "frp" => Ok(Protocol::FrpV1),
             "v2" | "frp-v2" | "frpv2" => Ok(Protocol::FrpV2),
-            "rustunnel" | "native" => Ok(Protocol::Rustunnel),
+            "nfrp" | "native" => Ok(Protocol::Nfrp),
             other => Err(format!(
-                "未知协议 {other}，可选：frp-v1（默认）/ frp-v2 / rustunnel"
+                "未知协议 {other}，可选：frp-v1（默认）/ frp-v2 / nfrp"
             )),
         }
     }
@@ -130,7 +130,7 @@ pub struct ServerConfig {
 
     /// 线协议。服务端**按魔术字自动识别**对端走 v1 还是 v2（与官方 frps 一致），
     /// 所以这一项只是为了"原版 frps 的配置能直接喂进来"；同一端口可以同时
-    /// 服务两种客户端。只有 `rustunnel` 自研协议尚未实现，会被直接拒绝。
+    /// 服务两种客户端。只有 `nfrp` 自研协议尚未实现，会被直接拒绝。
     #[serde(default)]
     pub protocol: Protocol,
 
@@ -162,7 +162,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub subdomain_host: String,
 
-    /// 日志级别，形如 `info` / `debug` / `rustunnel_server=debug`。
+    /// 日志级别，形如 `info` / `debug` / `nfrp_server=debug`。
     #[serde(default = "default_log_level")]
     pub log_level: String,
 
@@ -285,6 +285,14 @@ pub struct ServerConfig {
     /// 混在控制通道里会拖慢心跳与面板命令，出故障时也不好隔离。
     #[serde(default)]
     pub vnet_port: Option<u16>,
+
+    /// 解析时发现的、**官方 frps 支持但 NFrp 未实现**的字段名。
+    ///
+    /// 纯诊断用（`#[serde(skip)]`）：官方 frps 配置里的 `allowPorts` 这类项
+    /// 会被静默忽略，启动日志据此明说。填值见
+    /// [`crate::frp_config::unsupported_server_fields`]。
+    #[serde(skip)]
+    pub unsupported_fields: Vec<String>,
 }
 
 impl ServerConfig {
@@ -373,6 +381,7 @@ impl Default for ServerConfig {
             websocket: Default::default(),
             vnet: Default::default(),
             vnet_port: None,
+            unsupported_fields: Vec::new(),
         }
     }
 }
@@ -399,9 +408,9 @@ impl ServerConfig {
     /// 于是 P2P、面板、资源上限这些"默认关闭但很重要"的能力在示例里根本看不见，
     /// 用户也就永远不知道它们存在。
     pub fn example_toml() -> String {
-        r##"# rustunnel-server 示例配置
-# 用法：rustunnel-server -c server.toml
-# 生成：rustunnel-server --gen-config server.toml
+        r##"# nfrp-server 示例配置
+# 用法：nfrp-server -c server.toml
+# 生成：nfrp-server --gen-config server.toml
 
 # ---- 基础 ----
 bind_addr = "0.0.0.0"
@@ -412,7 +421,7 @@ log_level = "info"
 # ---- 线协议 ----
 # 不需要配：服务端和官方 frps 一样，靠**魔术字自动识别**对端是 v1 还是 v2
 # （读 8 字节比对，不是 v2 魔术字就回填当 v1 的消息前缀）。
-# 所以同一个端口上，官方 frpc（默认 v1）和 rustunnel（可配 v2）都能连。
+# 所以同一个端口上，官方 frpc（默认 v1）和 nfrp（可配 v2）都能连。
 # 这一项留着只是为了"原版 frps 的配置文件能直接喂进来"。
 # protocol = "frp-v1"
 
@@ -860,7 +869,7 @@ pub struct ClientConfig {
     #[serde(default = "default_predict_window")]
     pub xtcp_predict_window: u16,
 
-    /// 是否在 `Login` 里声明 rustunnel 私有能力（默认开）。
+    /// 是否在 `Login` 里声明 NFrp 私有能力（默认开）。
     ///
     /// 开了之后，服务端才能在面板上增删本端的代理、以及让 v1 下的 UDP 报文
     /// 走二进制编码。能力**必须经服务端回显**才生效，所以连官方 frps /
@@ -911,6 +920,17 @@ pub struct ClientConfig {
     /// VirtualNet 虚拟网络（`[virtualNet]`）。
     #[serde(default, rename = "virtualNet")]
     pub virtual_net: crate::vnet::VirtualNetConfig,
+
+    /// 解析时发现的、**官方 frp 支持但 NFrp 未实现**的字段名。
+    ///
+    /// 纯诊断用（`#[serde(skip)]`，不参与序列化/反序列化）：官方 frp 默认
+    /// `--strict-config=true`，未知字段**直接报错**；NFrp 的 serde 不拒绝未知
+    /// 字段，于是用户照官方文档写的 `useEncryption = true` 会**无声失效** ——
+    /// 以为加密了，实际是明文。把名字记下来，让启动日志能明确告知。
+    ///
+    /// 填值见 [`crate::frp_config::unsupported_fields`]。
+    #[serde(skip)]
+    pub unsupported_fields: Vec<String>,
 }
 
 impl Default for ClientConfig {
@@ -949,6 +969,7 @@ impl Default for ClientConfig {
             websocket: Default::default(),
             websocket_enable: false,
             virtual_net: Default::default(),
+            unsupported_fields: Vec::new(),
         }
     }
 }
@@ -963,7 +984,7 @@ impl Default for ClientConfig {
 pub struct StoreConfig {
     /// 落盘路径。留空 = 不持久化（与老版本一致）。
     ///
-    /// 目录会自动创建。文件内容是 JSON，与 rustunnel 自己的格式兼容；
+    /// 目录会自动创建。文件内容是 JSON，与 NFrp 自己的格式兼容；
     /// **官方 frp 的 store 是另一套结构**（Go 的 `configmgmt` 序列化），
     /// 两者不通用 —— 换实现时需要重新加一遍代理，这一点在 README 里写明了。
     pub path: String,
@@ -985,6 +1006,18 @@ pub struct WebServerConfig {
     pub user: String,
     /// Basic Auth 密码。
     pub password: String,
+
+    /// 静态资源目录（官方 frpc 的 `webServer.assetsDir`）。
+    ///
+    /// ★ 官方支持、nfrp **未实现**：声明它只是为了"官方配置能解析通过"——
+    /// 本结构开了 `deny_unknown_fields`，不声明的话官方配置会**直接解析失败**。
+    /// 值不会被使用（NFrp 用内置页面），启动时会明确告警。
+    #[serde(default, alias = "assetsDir")]
+    pub assets_dir: String,
+
+    /// pprof 性能分析开关（官方 frpc 的 `webServer.pprofEnable`）。★ 同上：不生效。
+    #[serde(default, alias = "pprofEnable")]
+    pub pprof_enable: bool,
 }
 
 fn default_webserver_addr() -> String {
@@ -998,6 +1031,8 @@ impl Default for WebServerConfig {
             port: 0,
             user: String::new(),
             password: String::new(),
+            assets_dir: String::new(),
+            pprof_enable: false,
         }
     }
 }
@@ -1056,9 +1091,9 @@ impl ClientConfig {
     /// 示例配置文本。
     /// 示例配置（手写的原因同 [`ServerConfig::example_toml`]）。
     pub fn example_toml() -> String {
-        r##"# rustunnel-client 示例配置
-# 用法：rustunnel-client -c client.toml
-# 生成：rustunnel-client --gen-config client.toml
+        r##"# nfrp-client 示例配置
+# 用法：nfrp-client -c client.toml
+# 生成：nfrp-client --gen-config client.toml
 
 server_addr = "1.2.3.4"
 server_port = 7000
@@ -1068,9 +1103,9 @@ log_level = "info"
 
 # ---- 线协议（对应原版 frp 的 `transport.wireProtocol`，默认就是 v1）----
 # v1：原版 frp 至今的默认协议，无魔术字、消息体是裸 JSON、登录后套 AES-128-CFB。
-#     樱花 / 各类第三方 frps 分支基本只认它 —— 这也是 rustunnel 的默认值。
+#     樱花 / 各类第三方 frps 分支基本只认它 —— 这也是 NFrp 的默认值。
 # v2：v0.70 引入的新协议，魔术字 + Hello 协商 + AES-256-GCM AEAD 帧流，
-#     需要服务端也支持（rustunnel-server 会自动识别，无需配置）。
+#     需要服务端也支持（nfrp-server 会自动识别，无需配置）。
 # 写错的表现是"连上就断"，日志里不会告诉你原因，所以拿不准就别写。
 # protocol = "frp-v1"
 # protocol = "frp-v2"
@@ -1269,14 +1304,21 @@ pub fn default_config_path(file_name: impl AsRef<Path>) -> PathBuf {
 /// （樱花就把同一份隧道同时给 `.ini` 和 `.toml` 两份），而官方 frp 也确实是
 /// 按**内容**判定的。
 pub fn parse_client(raw: &str) -> Result<ClientConfig> {
-    let cfg = if crate::frp_legacy::is_legacy_ini(raw) {
+    let mut cfg = if crate::frp_legacy::is_legacy_ini(raw) {
         let value = crate::frp_legacy::legacy_client_to_value(raw)?;
-        let cfg: ClientConfig = value.try_into()?;
+        // 扫**原文**：`legacy_client_to_value` 只搬认识的键，不认识的丢掉了。
+        let unsupported = crate::frp_config::unsupported_fields_ini(raw);
+        let mut cfg: ClientConfig = value.try_into()?;
+        cfg.unsupported_fields = unsupported;
         cfg
     } else {
         parse_client_toml(raw)?
     };
     reject_unimplemented_types(&cfg)?;
+    // 逐条把"官方有、NFrp 没实现"的字段名打到日志上（见 UNSUPPORTED_CLIENT_FIELDS）。
+    // 这里只是**采集**，打日志交给调用方（库层不该直接往 stdout 写）。
+    cfg.unsupported_fields.sort();
+    cfg.unsupported_fields.dedup();
     Ok(cfg)
 }
 
@@ -1284,14 +1326,17 @@ pub fn parse_client(raw: &str) -> Result<ClientConfig> {
 pub fn parse_server(raw: &str) -> Result<ServerConfig> {
     if crate::frp_legacy::is_legacy_ini(raw) {
         let value = crate::frp_legacy::legacy_server_to_value(raw)?;
-        return Ok(value.try_into()?);
+        let mut cfg: ServerConfig = value.try_into()?;
+        // INI 同样要扫**原文**（转换后的 value 里只剩认识的键）。
+        cfg.unsupported_fields = crate::frp_config::unsupported_server_fields_ini(raw);
+        return Ok(cfg);
     }
     parse_server_toml(raw)
 }
 
-/// rustunnel 真正实现的代理 / 访客类型。
+/// NFrp 真正实现的代理 / 访客类型。
 ///
-/// 原版 frp 还认 `tcpmux`，rustunnel 没实现。**宁可在这里报错，
+/// 原版 frp 还认 `tcpmux`，NFrp 没实现。**宁可在这里报错，
 /// 也不能静默当成 tcp 放过去** —— 静默降级会"看起来连上了"，实际按错的语义
 /// 转发用户流量，比启动阶段报一句清楚的话危险得多。
 ///
@@ -1307,7 +1352,7 @@ fn reject_unimplemented_types(cfg: &ClientConfig) -> Result<()> {
     for p in &cfg.proxies {
         if !SUPPORTED_PROXY_TYPES.contains(&p.proxy_type.as_str()) {
             return Err(crate::error::Error::Protocol(format!(
-                "代理 [{}] 的类型 {:?} 不受支持（rustunnel 实现了 {}）",
+                "代理 [{}] 的类型 {:?} 不受支持（NFrp 实现了 {}）",
                 p.name,
                 p.proxy_type,
                 SUPPORTED_PROXY_TYPES.join(" / ")
@@ -1317,7 +1362,7 @@ fn reject_unimplemented_types(cfg: &ClientConfig) -> Result<()> {
     for v in &cfg.visitors {
         if !SUPPORTED_VISITOR_TYPES.contains(&v.visitor_type.as_str()) {
             return Err(crate::error::Error::Protocol(format!(
-                "访客 [{}] 的类型 {:?} 不受支持（rustunnel 实现了 {}）",
+                "访客 [{}] 的类型 {:?} 不受支持（NFrp 实现了 {}）",
                 v.name,
                 v.visitor_type,
                 SUPPORTED_VISITOR_TYPES.join(" / ")
@@ -1331,20 +1376,29 @@ fn reject_unimplemented_types(cfg: &ClientConfig) -> Result<()> {
 ///
 /// 解析前先过一遍 [`crate::frp_config::normalize_client`]，所以**原版 frpc 的
 /// 配置可以直接拿来用**（`serverAddr` / `localIP` / `localPort` / `auth.token` /
-/// 顶层 `[metadatas]` ...）。rustunnel 自己的写法同时有效，两种写法混用时原生字段优先。
+/// 顶层 `[metadatas]` ...）。NFrp 自己的写法同时有效，两种写法混用时原生字段优先。
 ///
 /// 需要"连 legacy INI 一起认"时用 [`parse_client`]（`ClientConfig::load` 走的那个）。
 pub fn parse_client_toml(raw: &str) -> Result<ClientConfig> {
     let mut value: toml::Value = toml::from_str(raw)?;
+    // 必须在 normalize **之前**扫描：normalize 会按搬家表改键名
+    // （`poolCount` → `pool_count` 之类），拿原始键名对照清单才准。
+    let unsupported = crate::frp_config::unsupported_fields(&value);
     crate::frp_config::normalize_client(&mut value);
-    Ok(value.try_into()?)
+    let mut cfg: ClientConfig = value.try_into()?;
+    cfg.unsupported_fields = unsupported;
+    Ok(cfg)
 }
 
 /// 解析服务端配置文本（**仅 TOML**）。同 [`parse_client_toml`]，兼容原版 `frps.toml` 的字段名。
 pub fn parse_server_toml(raw: &str) -> Result<ServerConfig> {
     let mut value: toml::Value = toml::from_str(raw)?;
+    // 与客户端同理：必须在 normalize **之前**扫（normalize 会改键名）。
+    let unsupported = crate::frp_config::unsupported_server_fields(&value);
     crate::frp_config::normalize_server(&mut value);
-    Ok(value.try_into()?)
+    let mut cfg: ServerConfig = value.try_into()?;
+    cfg.unsupported_fields = unsupported;
+    Ok(cfg)
 }
 
 #[cfg(test)]

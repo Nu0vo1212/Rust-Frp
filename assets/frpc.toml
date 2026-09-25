@@ -1,0 +1,291 @@
+# ============================================================
+# frpc 配置（NFrp 实现，兼容原版 frp v0.70+ 的 v2 协议）
+# 用法： frpc -c frpc.toml
+# 生成： frpc --gen-config frpc.toml   （打印这份带注释的模板）
+# ============================================================
+
+# ---- 直接吃原版 frp 的配置（v0.3.1 起）----
+# 原版 frpc 的配置文件可以**原样**喂给这个 frpc，不需要改写：
+#
+#   serverAddr = "..."        → server_addr
+#   serverPort = 7000         → server_port
+#   [[proxies]]               → 同一段落风格
+#   localIP + localPort       → 自动合并成 local_addr
+#   [proxies.transport]       → bandwidth_limit / bandwidth_limit_mode
+#   [proxies.plugin]          → plugin / plugin_local_path / ...
+#   [proxies.healthCheck]     → health_check_*
+#   [metadatas]               → metas（整表透传，见文件末尾说明）
+#
+# 第三方 frp 平台（LoliaFRP 等）下发的就是这种格式，拷过来即可运行。
+# 本文件用的是 NFrp 自己的写法，**两种写法可以混用**，同名时原生字段优先。
+
+# ---- 连接服务端 ----
+server_addr = "127.0.0.1"
+server_port = 7000
+token = "your_secret_token"
+
+# 客户端用户名（对应 frp 顶层的 user）。
+# stcp / xtcp 的 allow_users 比对的就是这个值，不是 [[visitors]] 的 name。
+# user = "alice"
+
+# ---- 传输层 ----
+# yamux 多路复用：控制连接和所有工作连接复用同一条 TCP，能显著减少连接数
+# 需要服务端允许 yamux（frps 的 tcp_mux）
+tcp_mux = true
+
+# TLS 加密传输（对应 frp 的 transport.tls.enable）
+# 与 frp 行为一致：默认不校验服务端证书，服务端用自签名证书即可
+tls_enable = false
+
+# TLS 握手时使用的 SNI 主机名，留空则使用 server_addr
+# tls_server_name = "example.com"
+
+# 是否在 TLS 握手前发送 frp 自定义首字节 0x17（默认 true，与 frpc 默认一致）
+tls_custom_first_byte = true
+
+# 传输协议：tcp（默认）或 quic，**必须与服务端一致**
+# 选了 quic 之后 TLS / yamux 两层会被自动跳过（QUIC 自带加密与多路复用，
+# 每条双向流就是一条 frp 连接）。需要防火墙放行 UDP。
+transport_protocol = "tcp"
+
+# ---- xtcp 真 P2P：填上服务端的 p2p_port 才会尝试打洞 ----
+# 打洞会先做**端口预测**（多次观测公网端口、推对称 NAT 的分配步长），推不出来的
+# 严格对称 NAT、UDP 被封等情形自动静默回退到中继，
+# 所以 xtcp 在任何网络下都不会比 stcp 更差，放心开着。
+# p2p_port = 7002
+# p2p_enable = true
+
+# 打洞成功后用哪种传输直连：quic（默认）或 kcp。
+# KCP 走 UDP 但自带重传，弱网（丢包 / 高抖动）下比 QUIC 更稳，代价是延迟略高。
+# xtcp_transport = "quic"
+
+# 预先建立的工作连接数量（0 = 完全按需）
+pool_count = 1
+
+log_level = "info"
+
+# 首次登录失败就退出（默认 true，与官方 frp 的 loginFailExit 一致）。
+# **为什么默认要退出**：起隧道的一方通常靠「子进程还活着吗」判断隧道通不通。
+# 配置写错却一直在后台重试，上层只会看到绿灯，错误被吞掉。
+# 一旦**成功登录过**，之后断线仍会无限重连 —— 这个开关只管第一次。
+# login_fail_exit = true
+
+# 断线重连间隔（秒），对应 frp 的 reconnectInterval
+# reconnect_interval = 10
+
+# ---- 要暴露的内网服务，可写多段 ----
+
+# 1) TCP（最常见的端口转发）
+[[proxies]]
+name = "ssh"
+type = "tcp"
+local_addr = "127.0.0.1:22"
+remote_port = 6000
+
+# 2) UDP（比如自建 DNS、游戏服、WireGuard）
+# 一个 UDP 代理只占一条工作连接，靠访客地址区分不同客户端
+# [[proxies]]
+# name = "dns"
+# type = "udp"
+# local_addr = "127.0.0.1:53"
+# remote_port = 6053
+
+# 3) HTTP（按域名路由，走服务端的 vhost_http_port，不需要单独开端口）
+# 访问 http://web.example.com:8080 即转发到内网 80 端口
+# [[proxies]]
+# name = "web"
+# type = "http"
+# local_addr = "127.0.0.1:80"
+# custom_domains = ["web.example.com", "*.web.example.com"]
+# # 可选：路径前缀路由（留空等价于 /）
+# locations = ["/"]
+# # 可选：Basic Auth
+# http_user = "admin"
+# http_pwd = "password"
+# # 可选：转发时改写 Host 头
+# host_header_rewrite = "backend.internal"
+
+# 4) HTTPS（服务端只嗅探 TLS SNI 并原样透传，证书由内网服务自己提供）
+# [[proxies]]
+# name = "tls-web"
+# type = "https"
+# local_addr = "127.0.0.1:443"
+# custom_domains = ["secure.example.com"]
+
+# 5) stcp（私密隧道 —— 提供者侧）
+# 不占用任何公网端口，只有持相同 secret_key、且 user 在白名单里的访客才能连上
+# [[proxies]]
+# name = "secret-ssh"
+# type = "stcp"
+# local_addr = "127.0.0.1:22"
+# secret_key = "abcdefg"            # 双方必须一致
+# allow_users = ["alice"]           # 允许哪些**访客客户端的 user**；留空 = 只允许同 user
+#                                   # 也可写 ["*"] 表示放行所有访客
+
+# 6) xtcp（提供者侧）—— 先试 UDP 打洞 + QUIC 直连，打不通自动回退中继
+# [[proxies]]
+# name = "p2p-ssh"
+# type = "xtcp"
+# local_addr = "127.0.0.1:22"
+# secret_key = "abcdefg"
+
+# 7) 负载均衡：同名 group 的多个代理可以共享同一个 remote_port，
+#    服务端按轮询把用户连接分摊到组内各后端。
+#    注意：没配 group 的代理视为「独占端口」，不能共享也不能加入别人的组。
+# [[proxies]]
+# name = "web-a"
+# type = "tcp"
+# local_addr = "127.0.0.1:8080"
+# remote_port = 6100
+# group = "web"                     # 同组即可共享端口
+# group_key = "shared_secret"       # 组密钥，同组保持一致就行
+# # 健康检查：不通过时拒绝新的工作连接，配合 group 就实现了自动摘除 / 回归
+# health_check_type = "http"        # tcp / http，留空 = 不检查
+# health_check_url = "/healthz"     # http 检查路径，留空用 /
+# health_check_interval_s = 10      # 探测间隔（秒）
+# health_check_timeout_s = 3        # 单次超时（秒）
+# health_check_max_failed = 3       # 连续失败几次判定不健康
+
+# 8) 带宽限流：防止某条代理把整条上行链路吃满
+#    单位是字节/秒，支持 KB（1000）/ KiB（1024）后缀；不填或 0 = 不限
+# [[proxies]]
+# name = "backup"
+# type = "tcp"
+# local_addr = "127.0.0.1:22"
+# remote_port = 6300
+# bandwidth_limit = "1MB"
+# # server = 由服务端限（默认）；client = 由本客户端限。
+# # 对应 frp 的 [proxies.transport] bandwidthLimitMode。留空等价于 client（不上报）。
+# bandwidth_limit_mode = "server"
+
+# 9) 插件：工作连接不再连 local_addr，而是接到插件上 ——
+#    frpc 本身就变成了正向代理 / 静态站点服务器
+#    可选值：http_proxy / socks5 / static_file / unix_domain_socket
+# [[proxies]]
+# name = "outbound-proxy"
+# type = "tcp"
+# remote_port = 6200
+# plugin = "http_proxy"             # 或 "socks5"
+# plugin_user = "u"                 # 可选：认证
+# plugin_passwd = "p"
+#
+# [[proxies]]
+# name = "static-site"
+# type = "tcp"
+# remote_port = 6201
+# plugin = "static_file"
+# plugin_local_path = "/var/www/html"   # 必填：要服务的目录
+# plugin_strip_prefix = "/prefix"       # 可选：回源时剥掉的路径前缀
+
+# ---- stcp / xtcp 访客端，可写多段；提供者侧不需要这段 ----
+# 目标代理名的前缀取 `server_user`，没配才用本文件顶层的 `user`。
+# [[visitors]]
+# name = "alice"                    # 访客的本地标识
+# type = "stcp"                     # stcp 或 xtcp
+# server_name = "secret-ssh"        # 提供者注册的代理名
+# server_user = "alice"             # 提供者所属客户端的 user（本例与顶层 user 相同）
+# secret_key = "abcdefg"
+# bind_addr = "127.0.0.1"
+# bind_port = 9000                  # 本机 9000 → 提供者的 22
+#
+# 要匹配提供者的 allow_users = ["alice"]，必须在文件顶层加：
+# user = "alice"
+#
+# 换成 type = "xtcp" 时，只要两端都配了 p2p_port，就会优先尝试 P2P 直连。
+
+# ---- [metadatas]：随消息带给服务端的附加信息（可选）----
+# 注意它**不参与认证** —— 认证用的是顶层的 token。
+# 整张表会被原样透传：登录时进 Login.metas，
+# 代理级的那份（写在 [[proxies]] 里的 [proxies.metadatas]）进 NewProxy.metas。
+#
+# 第三方 frp 平台常把隧道凭证放在这里，服务端靠它认隧道 —— 所以别删。
+# [metadatas]
+# token = "平台下发的隧道凭证"
+
+# ============================================================
+# v0.3.4 新增：认证 / 持久化 / 本地管理界面 / WebSocket / 虚拟网络 / PROXY 协议
+#
+# 同样地：**不写就是关的**，老配置文件一个字节都不用改。
+# ============================================================
+
+# ---- 认证方式（[auth]）----
+# 不写 [auth] 时用顶层 token（与老版本一致）。method 只认 "token" / "oidc"。
+#
+#   [auth]
+#   method = "oidc"
+#   [auth.oidc]
+#   clientID = "nfrp-client"
+#   clientSecret = "从 IdP 拿到的密钥"
+#   tokenEndpointURL = "https://keycloak.example.com/realms/myrealm/protocol/openid-connect/token"
+#   audience = "nfrp"                   # 有些 IdP 需要
+#   scope = "openid profile"                 # 留空用 IdP 默认
+#   additionalEndpointParams = { k = "v" }   # 少数 IdP 要额外参数
+#   # trustedCaFile = "/etc/ssl/private-ca.pem"
+#   # insecureSkipVerify = false
+#   # proxyURL = "http://10.0.0.1:3128"
+#
+# 客户端会在**每次（重）连之前**用 Client Credentials 换一次 access token
+# （带缓存），所以 token 过期不会变成"重连时拿着旧 token 再失败一次"。
+
+# ---- 动态代理落盘（[store]）----
+# 面板 / 本地管理界面上临时加的代理默认只活在内存里，进程一重启就没了。
+# 配了 path 之后它们会落盘，并在启动时自动恢复。
+# **只存动态加的那些** —— 配置文件里写的代理一个都不会进去，
+# 所以从配置文件里删掉一条隧道时，它不会从 store 里"复活"。
+#
+#   [store]
+#   path = "/var/lib/nfrp/store.json"
+
+# ---- 本地管理界面（[webServer]）----
+# 官方 frpc 也有这一段，但只能看和重载配置；这里**还能直接增删代理**，
+# 走的是与服务端面板下发的管理命令**同一条链路**（注册 NewProxy / 撤销 CloseProxy）。
+#
+#   GET  /                     状态页面（每 3 秒自动刷新）
+#   GET  /api/status           状态 JSON（连接状态 / 代理表 / store / 特性开关）
+#   GET  /api/proxies          代理表 JSON
+#   POST /api/proxies/add      新增代理（body 是代理配置的 JSON）
+#   POST /api/proxies/remove   移除代理（body 是代理名，或 {"name":"…"}）
+#   GET  /api/healthz          存活探针（始终免鉴权，供容器 / LB 用）
+#
+#   [webServer]
+#   addr = "127.0.0.1"        # 默认就是回环地址
+#   port = 7400               # 不写 = 0 = 完全不启用（不监听、不起任务）
+#   user = "admin"            # 配了 user 才校验 Basic Auth
+#   password = "change_me"
+#
+# ⚠️ 这个界面能开端口、能改隧道。把它监听到 0.0.0.0 时**务必配上 user / password**，
+#    否则任何能访问这个端口的人都能增删你的隧道。
+
+# ---- WebSocket / WSS 传输 ----
+# 有些防火墙只放行 HTTP(S)，裸 TCP 一律丢包 —— 把控制连接包进 WebSocket 帧
+# 就能穿过去。走的是**同一个端口**，服务端靠路径自动识别，不用改服务端配置。
+#
+# websocketEnable = true
+#
+# 只有在前置代理（Nginx / CDN）按 Host 或路径分流时才需要改这两项：
+#   [websocket]
+#   host = "frp.example.com"
+#   path = "/~!frp"           # 留空用官方默认路径，改了必须与服务端一致
+
+# ---- VirtualNet 虚拟网络（[virtualNet]）----
+# 让本机拿到一个虚拟内网地址，与同网段的其他客户端**三层互通**。
+# 虚拟网卡（TUN）目前只在 Linux 上实现，需要 root 或 CAP_NET_ADMIN；
+# Windows 上客户端会明确报错，而不是静默不生效。
+#
+#   [virtualNet]
+#   serverPort = 7003         # 必须与服务端的 vnet_port 一致
+#   address = ""              # 留空 + autoAssign = true 时由服务端分配
+#   autoAssign = true
+#   gateway = ""
+#   mtu = 1400
+
+# ---- PROXY Protocol（写在各条 [[proxies]] 里）----
+# 让内网服务能拿到**真实客户端 IP**，而不是"连上来的那个客户端"的地址。
+# 在 [[proxies]] 段里加一行即可：
+#
+#   proxyProtocolVersion = "v1"     # 文本格式，兼容面最广
+#   proxyProtocolVersion = "v2"     # 二进制格式（HAProxy / Nginx 1.13+）
+#
+# 不写、或者写错值，就是**一个字节都不发** —— 后端服务完全无感，
+# 所以给老代理加这一行是安全的。后端要支持解析：
+#   Nginx:  listen … proxy_protocol;   /   HAProxy:  … send-proxy-v2

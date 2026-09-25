@@ -365,21 +365,21 @@ mod tests {
 
     #[test]
     fn prometheus_output_has_help_and_type_lines() {
-        let out = encode_prometheus(&snap_with(7), "rustunnel");
+        let out = encode_prometheus(&snap_with(7), "nfrp");
         // 每个指标都必须有 HELP 与 TYPE，否则 Prometheus 会把它当 untyped
         for line in out.lines() {
             if line.is_empty() {
                 continue;
             }
             assert!(
-                line.starts_with("# ") || line.starts_with("rustunnel_"),
+                line.starts_with("# ") || line.starts_with("nfrp_"),
                 "出现了既不是注释也不带命名空间的指标行：{line:?}"
             );
         }
-        assert!(out.contains("# HELP rustunnel_conns_active "));
-        assert!(out.contains("# TYPE rustunnel_conns_active gauge"));
-        assert!(out.contains("rustunnel_conns_active 7\n"));
-        assert!(out.contains("# TYPE rustunnel_clients_total counter"));
+        assert!(out.contains("# HELP nfrp_conns_active "));
+        assert!(out.contains("# TYPE nfrp_conns_active gauge"));
+        assert!(out.contains("nfrp_conns_active 7\n"));
+        assert!(out.contains("# TYPE nfrp_clients_total counter"));
     }
 
     #[test]

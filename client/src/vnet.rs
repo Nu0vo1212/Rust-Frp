@@ -29,9 +29,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use rustunnel_common::auth::oidc::TokenSource;
-use rustunnel_common::config::ClientConfig;
-use rustunnel_common::vnet::{
+use nfrp_common::auth::oidc::TokenSource;
+use nfrp_common::config::ClientConfig;
+use nfrp_common::vnet::{
     encode_frame, open_tun, read_json_line, take_frame, Subnet, Tun, VnetRegister,
     VnetRegisterResp, MAX_IP_PACKET,
 };
@@ -41,9 +41,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::current_credential;
 
-/// 虚拟网卡名模板。`%d` 交给内核挑号（`rustunnel0`、`rustunnel1`…），
+/// 虚拟网卡名模板。`%d` 交给内核挑号（`nfrp0`、`nfrp1`…），
 /// 免得与用户自己建的 `tun0` 撞名。
-const TUN_NAME: &str = "rustunnel%d";
+const TUN_NAME: &str = "nfrp%d";
 
 /// 注册响应的行上限。
 const MAX_RESP_LINE: usize = 8 * 1024;
@@ -88,7 +88,7 @@ async fn session(
         );
     }
     let server = format!("{}:{}", cfg.server_addr, port);
-    let addr = rustunnel_common::util::resolve_addr(&server)
+    let addr = nfrp_common::util::resolve_addr(&server)
         .await
         .with_context(|| format!("解析 VirtualNet 服务端地址 {server} 失败"))?;
     let mut stream = TcpStream::connect(addr)
@@ -98,7 +98,7 @@ async fn session(
 
     // ① 注册。token 字段放的是**privilege_key**（不是原始密钥）——
     //    与普通控制连接的 `Login.privilege_key` 完全同一套语义。
-    let ts = rustunnel_common::util::now_unix_secs() as i64;
+    let ts = nfrp_common::util::now_unix_secs() as i64;
     let cred = current_credential(cfg, token_source).await?;
     let reg = VnetRegister {
         client: cfg.client_id.clone(),

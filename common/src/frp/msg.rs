@@ -33,10 +33,10 @@ pub const TYPE_NAT_HOLE_REPORT: u16 = 18;
 /// UDP 报文的**二进制**编码（v2 握手协商后默认用它）：
 /// `pkg/msg/udp_binary.go` 的 `V2TypeUDPPacketBinary`。
 pub const TYPE_UDP_PACKET_BINARY: u16 = 19;
-/// rustunnel 私有的服务端管理命令（面板增删代理）。
+/// NFrp 私有的服务端管理命令（面板增删代理）。
 ///
 /// 从 100 起步是故意的：官方 frp 目前只用到 19，留足空间避免将来撞号。
-/// 而且它只会出现在**双方都声明了能力**的会话里（见 [`RustunnelCaps`]），
+/// 而且它只会出现在**双方都声明了能力**的会话里（见 [`NfrpCaps`]），
 /// 官方 frpc 一辈子也不会收到这个 type_id。
 pub const TYPE_SERVER_CMD: u16 = 100;
 /// [`TYPE_SERVER_CMD`] 的回执。
@@ -86,19 +86,15 @@ pub struct Login {
     pub metas: HashMap<String, String>,
     #[serde(default)]
     pub pool_count: i32,
-    /// 本端**支持**的 rustunnel 私有能力（能力清单见 [`RustunnelCaps`]）。
+    /// 本端**支持**的 NFrp 私有能力（能力清单见 [`NfrpCaps`]）。
     ///
     /// 注意这只是"我支持"，**不等于已启用**：必须由服务端在 `LoginResp` 里
-    /// 回显才算协商成功。理由见 [`RustunnelCaps`] 的文档。
-    #[serde(
-        rename = "_rustunnel",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub rustunnel: Option<RustunnelCaps>,
+    /// 回显才算协商成功。理由见 [`NfrpCaps`] 的文档。
+    #[serde(rename = "_nfrp", default, skip_serializing_if = "Option::is_none")]
+    pub nfrp: Option<NfrpCaps>,
 }
 
-/// rustunnel 的**私有能力协商**。
+/// NFrp 的**私有能力协商**。
 ///
 /// # 为什么可以往官方消息里塞字段
 ///
@@ -108,13 +104,13 @@ pub struct Login {
 ///
 /// * 对方是官方 frps → 它看不见这个字段，也就**永远不会回显**能力；
 ///   客户端拿不到回显就不开启，行为与今天完全一致；
-/// * 对方是 rustunnel 服务端 → 双方协商，开启增强能力。
+/// * 对方是 NFrp 服务端 → 双方协商，开启增强能力。
 ///
 /// 反过来说：**绝不能只看客户端自己声明了就启用**。否则连官方 frps 时
 /// 客户端会按"已协商"行事（比如发二进制 UDP），而服务端回的是 JSON，
 /// 两边直接鸡同鸭讲。所以必须由**服务端回显**才算数。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RustunnelCaps {
+pub struct NfrpCaps {
     /// v1 线协议下也用二进制 UDP 报文编码。
     ///
     /// v2 本来就有（握手协商出来的），v1 官方只支持 JSON —— 而 JSON 版要把
@@ -127,7 +123,7 @@ pub struct RustunnelCaps {
     pub server_cmd: bool,
 }
 
-impl RustunnelCaps {
+impl NfrpCaps {
     /// 有没有任何一项被打开；没有就整个字段都不往报文里写。
     pub fn any(&self) -> bool {
         self.udp_binary || self.server_cmd
@@ -142,15 +138,11 @@ pub struct LoginResp {
     pub run_id: String,
     #[serde(default, skip_serializing_if = "is_empty_str")]
     pub error: String,
-    /// 服务端**确认**启用的 rustunnel 私有能力（见 [`RustunnelCaps`]）。
+    /// 服务端**确认**启用的 NFrp 私有能力（见 [`NfrpCaps`]）。
     ///
     /// 只有这里出现了的能力才算协商成功。官方 frps 不会回这个字段。
-    #[serde(
-        rename = "_rustunnel",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub rustunnel: Option<RustunnelCaps>,
+    #[serde(rename = "_nfrp", default, skip_serializing_if = "Option::is_none")]
+    pub nfrp: Option<NfrpCaps>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -422,7 +414,7 @@ pub struct NatHoleReport {
 }
 
 // ---------------------------------------------------------------------------
-// rustunnel 私有的服务端管理命令（面板：增删代理 / 踢人）
+// NFrp 私有的服务端管理命令（面板：增删代理 / 踢人）
 // ---------------------------------------------------------------------------
 //
 // 官方 frp 的消息类型表里没有"服务端让客户端加一条代理"这种东西 ——
@@ -430,7 +422,7 @@ pub struct NatHoleReport {
 // 想让**面板**直接下发，就必须有这条消息。
 //
 // 安全边界很清楚：服务端只会在客户端于 `Login` 里声明了 `server_cmd`
-// 能力时才发它（见 [`RustunnelCaps`]），官方 frpc 永远不会收到。
+// 能力时才发它（见 [`NfrpCaps`]），官方 frpc 永远不会收到。
 
 /// 面板下发的管理命令：新增一条代理。
 pub const CMD_ADD_PROXY: &str = "add_proxy";

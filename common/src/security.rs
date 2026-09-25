@@ -73,6 +73,17 @@ pub struct ServerAuthConfig {
     /// OIDC 提供方配置（`method = "oidc"` 时必填）。
     #[serde(default)]
     pub oidc: ServerOidcConfig,
+    /// 令牌来源（官方 frps 的 `auth.tokenSource`）。
+    ///
+    /// ★ 官方支持、nfrp **未实现**：声明只为"官方配置能解析通过"——
+    /// 本结构开了 `deny_unknown_fields`，不声明的话官方配置会直接解析失败。
+    /// 值不会被使用。
+    #[serde(
+        default,
+        rename = "tokenSource",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub token_source: Option<toml::Value>,
 }
 
 /// 官方 frp 的默认 `additionalScopes`：两个都开。
@@ -131,6 +142,17 @@ pub struct ClientAuthConfig {
     pub additional_scopes: Vec<String>,
     #[serde(default)]
     pub oidc: ClientOidcConfig,
+    /// 令牌来源（官方 frpc 的 `auth.tokenSource`：从文件 / 外部命令读 token）。
+    ///
+    /// ★ 官方支持、nfrp **未实现**：声明它只是为了"官方配置能解析通过"——
+    /// 本结构开了 `deny_unknown_fields`，不声明的话官方配置会**直接解析失败**。
+    /// 值不会被使用，启动时会明确告警（见 `UNSUPPORTED_CLIENT_FIELDS`）。
+    #[serde(
+        default,
+        rename = "tokenSource",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub token_source: Option<toml::Value>,
 }
 
 impl ClientAuthConfig {

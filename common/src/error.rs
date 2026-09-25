@@ -5,7 +5,7 @@
 
 use thiserror::Error;
 
-/// rustunnel 的库级错误。
+/// NFrp 的库级错误。
 #[derive(Debug, Error)]
 pub enum Error {
     /// 底层 IO 错误。

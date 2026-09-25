@@ -15,9 +15,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rustunnel_common::frp::{
+use nfrp_common::frp::{
     conn::FrpConn,
-    msg::{FrpMessage, RustunnelCaps},
+    msg::{FrpMessage, NfrpCaps},
     stream::BoxStream,
     WireVersion,
 };
@@ -45,7 +45,7 @@ pub enum CtrlCmd {
     /// 另一端被 drop（比如控制连接断了）时 `ack` 会返回 Err，
     /// 调用方据此把这次操作判为失败。
     ServerCmd {
-        cmd: Box<rustunnel_common::frp::msg::ServerCmd>,
+        cmd: Box<nfrp_common::frp::msg::ServerCmd>,
         ack: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
 }
@@ -186,11 +186,11 @@ pub struct ClientState {
     /// 名额必须**活着**：代理一注销就 drop，名额才真正回到池子里。
     /// 同理端口也要记着，客户端主动 `CloseProxy` 时才知道该归还哪一个。
     proxies: Mutex<HashMap<String, ProxyEntry>>,
-    /// 本会话**协商成功**的 rustunnel 私有能力（见 [`RustunnelCaps`]）。
+    /// 本会话**协商成功**的 NFrp 私有能力（见 [`NfrpCaps`]）。
     ///
     /// 只有这里为真，服务端才可以往这个客户端发管理命令。
     /// 官方 frpc 不会声明能力，所以永远是全关。
-    caps: RustunnelCaps,
+    caps: NfrpCaps,
     /// 本次会话协商出的 UDP 报文编码（true = 二进制），工作连接要跟着用。
     ///
     /// 只有 **v2** 才有这套协商；v1 永远是 JSON。
@@ -218,7 +218,7 @@ impl ClientState {
         user: String,
         req_tx: mpsc::UnboundedSender<CtrlCmd>,
         idle_timeout: Duration,
-        caps: RustunnelCaps,
+        caps: NfrpCaps,
         udp_binary: bool,
         wire_version: WireVersion,
         conn_limit: Limit,
@@ -249,7 +249,7 @@ impl ClientState {
     }
 
     /// 这个客户端能不能收私有管理命令（面板增删代理）。
-    pub fn caps(&self) -> RustunnelCaps {
+    pub fn caps(&self) -> NfrpCaps {
         self.caps.clone()
     }
 
@@ -472,7 +472,7 @@ pub(crate) fn dummy_client(run_id: &str) -> Arc<ClientState> {
         Duration::from_secs(60),
         Default::default(),
         false,
-        rustunnel_common::frp::WireVersion::V1,
+        nfrp_common::frp::WireVersion::V1,
         Limit::unlimited(),
         Limit::unlimited(),
         Limit::unlimited(),
@@ -520,7 +520,7 @@ mod tests {
             Duration::from_secs(60),
             Default::default(),
             false,
-            rustunnel_common::frp::WireVersion::V1,
+            nfrp_common::frp::WireVersion::V1,
             conn,
             backlog,
             proxy,
@@ -570,7 +570,7 @@ mod tests {
             Duration::from_millis(50),
             Default::default(),
             false,
-            rustunnel_common::frp::WireVersion::V1,
+            nfrp_common::frp::WireVersion::V1,
             Limit::unlimited(),
             Limit::unlimited(),
             Limit::unlimited(),

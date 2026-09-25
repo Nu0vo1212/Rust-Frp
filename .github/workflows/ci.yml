@@ -1,0 +1,108 @@
+name: CI
+
+# 回归全靠本地手跑十个脚本 —— 这是最容易出事的一环：
+# 任何人改一行 `lookup()` 都可能悄悄破坏官方 frp 互通，而本地未必跑得到。
+# 这里把 fmt / clippy / 单测 / 冒烟串成一条流水线，push 和 PR 都拦一次。
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---------------------------------------------------------------
+  # 静态检查：最快失败，别让格式问题占用后面的编译机时
+  # ---------------------------------------------------------------
+  lint:
+    name: fmt / clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy (含测试代码)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # ---------------------------------------------------------------
+  # 单元测试：三个 crate + 两个二进制全部跑
+  # ---------------------------------------------------------------
+  test:
+    name: unit tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test
+        run: cargo test --workspace --all-targets
+        timeout-minutes: 20
+
+  # ---------------------------------------------------------------
+  # 交叉编译发布包（只做产物校验，不上传）
+  # 提前在 CI 里跑一遍，避免 tag 那天才发现某个目标平台编不过
+  # ---------------------------------------------------------------
+  cross-build:
+    name: cross build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+          - target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: build --release
+        run: cross build --release --workspace --target ${{ matrix.target }}
+        timeout-minutes: 30
+
+  # ---------------------------------------------------------------
+  # 端到端冒烟：真跑一次 frps + frpc，验证 TCP / HTTP / stcp 转发能用
+  # 这是唯一能覆盖"握手协议改坏了"的检查 —— 单测再全也测不到
+  # ---------------------------------------------------------------
+  smoke:
+    name: e2e smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: build binaries
+        run: cargo build --release --workspace
+        timeout-minutes: 20
+
+      - name: run integration tests
+        run: cargo test --workspace --release --test '*'
+        timeout-minutes: 10
+
+      - name: check --gen-config works and produced config reloads
+        run: |
+          ./target/release/nfrp-server --gen-config /tmp/frps.toml
+          ./target/release/nfrp-client --gen-config /tmp/frpc.toml
+          ./target/release/nfrp-server --check -c /tmp/frps.toml
+          ./target/release/nfrp-client --print-example > /dev/null

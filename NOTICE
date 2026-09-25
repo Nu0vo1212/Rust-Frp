@@ -1,5 +1,5 @@
-rustunnel
-Copyright 2026 rustunnel contributors
+nfrp
+Copyright 2026 nfrp contributors
 
 This product is licensed under the Apache License, Version 2.0.
 The full license text is in the LICENSE file accompanying this distribution,
@@ -16,8 +16,8 @@ limitations under the License.
 -------------------------------------------------------------------------------
 Third-party components
 
-rustunnel incorporates material from the projects listed below. The original
-copyright notices and the licenses under which rustunnel received such
+nfrp incorporates material from the projects listed below. The original
+copyright notices and the licenses under which nfrp received such
 material are set forth below.
 
 The project links against open-source Rust crates, predominantly under the MIT

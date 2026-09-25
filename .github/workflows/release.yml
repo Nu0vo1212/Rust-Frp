@@ -160,6 +160,10 @@ jobs:
       - name: create release
         uses: softprops/action-gh-release@v2
         with:
+          # ★ 显式给 tag_name：手动触发（workflow_dispatch）时 `github.ref_name` 是
+          # **分支名**，不指定的话会打出个叫 `main` 的 Release。
+          # 打 tag 触发时 ref_name 就是标签本身，表达式的右侧兜底。
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
             out/*
           generate_release_notes: true
@@ -180,7 +184,9 @@ jobs:
 
       - name: resolve version
         id: ver
-        run: echo "tag=${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}" >> "$GITHUB_OUTPUT"
+        # 手动触发时优先用输入的标签；GITHUB_REF_NAME 在 dispatch 下是**分支名**，
+        # 只有打 tag 触发时它才是标签，所以不能把它放在前面当首选。
+        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
 
       - uses: docker/build-push-action@v6
         with:

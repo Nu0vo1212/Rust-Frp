@@ -1,7 +1,7 @@
 //! 面板的**写操作**：增删代理、踢客户端。
 //!
 //! 官方 frp 到 v0.68 才补上"通过 API 操作代理"，而且客户端必须是自家的 frpc。
-//! 这里做成 rustunnel 私有能力：服务端在 `LoginResp` 里回显 `server_cmd`
+//! 这里做成 NFrp 私有能力：服务端在 `LoginResp` 里回显 `server_cmd`
 //! 之后，才往客户端发 [`ServerCmd`]；连着官方 frpc 时能力不开，
 //! 面板直接回一句人话错误，而不是干等到超时。
 //!
@@ -9,7 +9,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use rustunnel_common::{
+use nfrp_common::{
     config::{ProxyConfig, ServerConfig},
     frp::msg::{self, NewProxy, ServerCmd},
 };
@@ -111,13 +111,13 @@ pub async fn remove_proxy(registry: &Arc<Registry>, run_id: &str, name: &str) ->
         .ok_or_else(|| format!("没有在线客户端 [{run_id}]"))?;
 
     // 服务端这侧：端口 / 域名 / visitor 全摘掉（与客户端主动 CloseProxy 同款清理）
-    let wire_name = rustunnel_common::util::add_user_prefix(&client.user, name);
+    let wire_name = nfrp_common::util::add_user_prefix(&client.user, name);
     registry.visitors.remove(&wire_name);
     if let Some(t) = registry.vhosts() {
         t.remove_proxy(&wire_name);
     }
     if let Some(port) = client.stop_proxy(&wire_name) {
-        registry.release_port(port, &client);
+        registry.release_port(port, &client, &wire_name);
     }
     registry.metrics().proxies_active.dec();
 
@@ -184,7 +184,7 @@ async fn ask(client: &Arc<ClientState>, cmd: ServerCmd) -> Result<(), String> {
 }
 
 fn new_cmd_id() -> String {
-    rustunnel_common::util::new_run_id()
+    nfrp_common::util::new_run_id()
 }
 
 #[cfg(test)]
@@ -204,7 +204,7 @@ mod tests {
             Duration::from_secs(60),
             Default::default(),
             false,
-            rustunnel_common::frp::WireVersion::V1,
+            nfrp_common::frp::WireVersion::V1,
             conn,
             backlog,
             proxy,

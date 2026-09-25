@@ -7,7 +7,7 @@
 //! ```text
 //! 本地程序 -> visitor(bind_addr:bind_port)
 //!         -> [新建连接 + magic + NewVisitorConn{sk 签名}]
-//!         -> rustunnel-server（校验 + 与 provider 工作连接配对）
+//!         -> nfrp-server（校验 + 与 provider 工作连接配对）
 //!         -> provider frpc -> provider 的 local_addr
 //! ```
 //!
@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use rustunnel_common::{
+use nfrp_common::{
     config::VisitorConfig,
     frp::{
         conn,

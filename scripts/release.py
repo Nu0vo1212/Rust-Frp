@@ -7,7 +7,7 @@
 # 0) 首次：生成一对 Ed25519 签名密钥（默认落在 dist/keys，私钥自己收好不外传）
 python scripts/release.py keygen
 
-# 1) 打包：每个目标平台的产物目录里找 rustunnel-server / rustunnel-client，
+# 1) 打包：每个目标平台的产物目录里找 nfrp-server / nfrp-client，
 #    统一改名成 frps / frpc 后和示例配置、README 一起打成压缩包
 python scripts/release.py pack \\
     --target windows-amd64:target/release \\
@@ -48,15 +48,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUT = ROOT / "dist" / "release"
 
-# 发布素材（示例配置 / LICENSE）可能放在仓库根的 dist/ 下，也可能跟着源码树走，
-# 两个位置都找一遍。
+# 发布素材（示例配置 / LICENSE）的**单一事实来源**是仓库内的 `assets/` ——
+# Dockerfile 与 docker-compose.yml 都要 COPY 它，所以它必须随源码走
+# （早先放在仓库外的 dist/release/assets 下，gitignore 又把 dist 整个排掉，
+#   结果别人 clone 下来 `docker build` 直接失败、`release.py pack` 也找不到素材）。
+# 后两个位置是历史兼容回退，新素材一律放 `assets/`。
 ASSET_CANDIDATES = [
+    ROOT / "assets",
     ROOT.parent / "dist" / "release" / "assets",
     ROOT / "dist" / "release" / "assets",
 ]
 
 # 包内文件名 -> 构建产物名（按平台补 .exe）
-BINARIES = [("frps", "rustunnel-server"), ("frpc", "rustunnel-client")]
+BINARIES = [("frps", "nfrp-server"), ("frpc", "nfrp-client")]
 # 随包附带的素材文件（README.md 由仓库 README 现场合成，见 build_readme）
 DOCS = ["frps.toml", "frpc.toml", "LICENSE", "NOTICE"]
 # 校验值文件名（Release 里就把这个贴出去）
@@ -86,6 +90,19 @@ def find_assets(explicit: str | None) -> Path:
         "找不到发布素材目录（frps.toml / frpc.toml / LICENSE）。"
         f"找过这些位置：{', '.join(str(c) for c in ASSET_CANDIDATES)}"
     )
+
+
+def resolve_doc(assets: Path, doc: str) -> Path | None:
+    """素材文件优先取 `assets/`，其次回退仓库根。
+
+    LICENSE / NOTICE 在仓库根本来就有一份（且与 assets 里的逐字节相同），
+    没必要为了打包再维护第二份 —— 两份必然漂移。
+    """
+    p = assets / doc
+    if p.is_file():
+        return p
+    p = ROOT / doc
+    return p if p.is_file() else None
 
 
 # ---------------------------------------------------------------------------
@@ -278,21 +295,23 @@ def cmd_keygen(args: argparse.Namespace) -> int:
     seed = os.urandom(32)
     pub = public_key(seed)
     key_file.write_text(
-        "# rustunnel 发布签名私钥（Ed25519 seed）—— 不要提交到仓库，不要外传。\n"
+        "# NFrp 发布签名私钥（Ed25519 seed）—— 不要提交到仓库，不要外传。\n"
         + seed.hex()
         + "\n",
         encoding="utf-8",
+        newline="\n",
     )
     try:
         os.chmod(key_file, 0o600)
     except OSError:
         pass
     pub_file.write_text(
-        f"# rustunnel 发布公钥（Ed25519）—— 随 Release 一起分发，供下载者验签。\n"
+        f"# NFrp 发布公钥（Ed25519）—— 随 Release 一起分发，供下载者验签。\n"
         f"# 指纹（SHA-256/16 字节）: {hashlib.sha256(pub).hexdigest()[:32]}\n"
         + pub.hex()
         + "\n",
         encoding="utf-8",
+        newline="\n",
     )
     log(f"私钥 -> {key_file}（请离线保管）")
     log(f"公钥 -> {pub_file}")
@@ -432,12 +451,12 @@ def collect(targets: list[str], out: Path, assets: Path) -> dict[str, list[Path]
 
         # 素材：assets 里有什么就放什么，缺了不致命（LICENSE 例外，必须齐全）
         for doc in DOCS:
-            src_doc = assets / doc
-            if src_doc.is_file():
+            src_doc = resolve_doc(assets, doc)
+            if src_doc is not None:
                 shutil.copy2(src_doc, dest / doc)
                 files.append(dest / doc)
             elif doc != "LICENSE":
-                log(f"警告：缺少 {assets / doc}，包里不会有它")
+                log(f"警告：缺少 {doc}（在 {assets} 与 {ROOT} 下都没找到），包里不会有它")
 
         (dest / "README.md").write_text(readme, encoding="utf-8", newline="\n")
         files.append(dest / "README.md")
@@ -482,7 +501,7 @@ def cmd_pack(args: argparse.Namespace) -> int:
 
     produced: list[Path] = []
     for platform, files in staged.items():
-        name = f"rustunnel-{platform}"
+        name = f"nfrp-{platform}"
         if platform.startswith("windows"):
             p = out / f"{name}.zip"
             make_zip(files, p)
@@ -518,10 +537,21 @@ def cmd_checksum(args: argparse.Namespace) -> int:
 
     lines = [f"{sha256(p)}  {p.name}" for p in files]
     sums = out / SUMS_NAME
-    sums.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # ★ 必须显式 newline="\n"：Path.write_text 默认会做平台换行转换，Windows 上
+    # 会把 `\n` 写成 CRLF，于是 Linux 用户按 README 执行 `sha256sum -c SHA256SUMS.txt`
+    # 得到的是 `FAILED open or read`（文件名尾巴带了个 `\r`）—— 校验文件自己把验签流程废掉。
+    sums.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
     log(f"已生成 {sums.name}（{len(files)} 个文件）")
     for line in lines:
         print(line)
+
+    # 自检：校验文件里不该出现 CR。上面所有换行处理一旦被改回默认值，
+    # Linux 用户执行 `sha256sum -c SHA256SUMS.txt` 就会得到 FAILED open or read，
+    # 而 README 与发布说明都是这么教用户的 —— 宁可在打包阶段直接报错。
+    if b"\r" in sums.read_bytes():
+        raise SystemExit(
+            f"{sums.name} 里出现了 CR（换行转换没关掉），Linux 上 sha256sum -c 会失败"
+        )
 
     if not args.sign:
         return 0
@@ -541,14 +571,16 @@ def cmd_checksum(args: argparse.Namespace) -> int:
             + signature.hex()
             + "\n",
             encoding="utf-8",
+            newline="\n",
         )
         # 公钥一并落到产物目录，便于随 Release 分发给下载者
         (out / PUB_NAME).write_text(
-            "# rustunnel 发布公钥（Ed25519）\n"
+            "# NFrp 发布公钥（Ed25519）\n"
             f"# 指纹（SHA-256/16 字节）: {hashlib.sha256(pub).hexdigest()[:32]}\n"
             + pub.hex()
             + "\n",
             encoding="utf-8",
+            newline="\n",
         )
         log(f"已用 Ed25519 签名 -> {sig_file.name}")
         log(f"公钥指纹: {hashlib.sha256(pub).hexdigest()[:32]}")
@@ -671,7 +703,7 @@ def verify_signature(sums: Path, sig_file: Path) -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="rustunnel 发布产物打包与校验",
+        description="NFrp 发布产物打包与校验",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = ap.add_subparsers(dest="cmd", required=True)

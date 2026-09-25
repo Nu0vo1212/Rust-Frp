@@ -29,9 +29,9 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use crate::frp::tls::crypto_provider;
 
 /// QUIC 的 ALPN 标识。
-pub const ALPN: &[u8] = b"rustunnel-frp";
+pub const ALPN: &[u8] = b"nfrp-frp";
 /// 服务端名字：证书自签且跳过校验，但 rustls 要求它是合法 DNS 名。
-pub const SERVER_NAME: &str = "rustunnel.frp";
+pub const SERVER_NAME: &str = "nfrp.frp";
 
 /// 与 TCP 传输一致的 QUIC 心跳/空闲参数。
 fn transport_config() -> Arc<quinn::TransportConfig> {

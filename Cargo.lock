@@ -590,6 +590,76 @@ dependencies = [
 ]
 
 [[package]]
+name = "nfrp-client"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "clap",
+ "futures",
+ "nfrp-common",
+ "quinn",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "nfrp-common"
+version = "0.5.0"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "anyhow",
+ "base64",
+ "bytes",
+ "futures",
+ "hkdf",
+ "hmac",
+ "libc",
+ "md-5",
+ "quinn",
+ "rand 0.8.8",
+ "rcgen",
+ "ring",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "webpki-roots 0.26.11",
+ "yamux",
+]
+
+[[package]]
+name = "nfrp-server"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "clap",
+ "futures",
+ "nfrp-common",
+ "quinn",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -977,76 +1047,6 @@ dependencies = [
  "ring",
  "rustls-pki-types",
  "untrusted",
-]
-
-[[package]]
-name = "rustunnel-client"
-version = "0.4.0"
-dependencies = [
- "anyhow",
- "base64",
- "clap",
- "futures",
- "quinn",
- "rcgen",
- "rustls",
- "rustunnel-common",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "rustunnel-common"
-version = "0.4.0"
-dependencies = [
- "aes",
- "aes-gcm",
- "anyhow",
- "base64",
- "bytes",
- "futures",
- "hkdf",
- "hmac",
- "libc",
- "md-5",
- "quinn",
- "rand 0.8.8",
- "rcgen",
- "ring",
- "rustls",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "thiserror",
- "tokio",
- "tokio-rustls",
- "tokio-util",
- "toml",
- "tracing",
- "tracing-subscriber",
- "webpki-roots 0.26.11",
- "yamux",
-]
-
-[[package]]
-name = "rustunnel-server"
-version = "0.4.0"
-dependencies = [
- "anyhow",
- "base64",
- "clap",
- "futures",
- "quinn",
- "rustunnel-common",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
 ]
 
 [[package]]

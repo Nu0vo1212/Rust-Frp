@@ -28,8 +28,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use rustunnel_common::config::ServerConfig;
-use rustunnel_common::vnet::{
+use nfrp_common::config::ServerConfig;
+use nfrp_common::vnet::{
     self, encode_frame, take_frame, IpPool, Subnet, Switch, VnetRegister, VnetRegisterResp,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -541,7 +541,7 @@ pub fn gateway_ip(cfg: &ServerConfig) -> Option<Ipv4Addr> {
 }
 
 /// 客户端用的：`[virtualNet] serverPort` 与 `vnet_port` 哪个都没写就没法连。
-pub fn client_server_port(cfg: &rustunnel_common::config::ClientConfig) -> Option<u16> {
+pub fn client_server_port(cfg: &nfrp_common::config::ClientConfig) -> Option<u16> {
     let p = cfg.virtual_net.server_port;
     (p != 0).then_some(p)
 }
@@ -553,7 +553,7 @@ mod tests {
     fn hub() -> VnetHub {
         let cfg = ServerConfig {
             vnet_port: Some(17020),
-            vnet: rustunnel_common::vnet::VirtualNetConfig {
+            vnet: nfrp_common::vnet::VirtualNetConfig {
                 subnet: "100.64.0.0/24".into(),
                 ..Default::default()
             },
@@ -587,7 +587,7 @@ mod tests {
     fn 网关默认取网段第一个可用地址() {
         let cfg = ServerConfig {
             vnet_port: Some(17020),
-            vnet: rustunnel_common::vnet::VirtualNetConfig {
+            vnet: nfrp_common::vnet::VirtualNetConfig {
                 subnet: "10.10.0.0/24".into(),
                 ..Default::default()
             },

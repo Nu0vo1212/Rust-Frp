@@ -1,7 +1,7 @@
-//! `rustunnel-common`：服务端与客户端共享的公共库。
+//! `nfrp-common`：服务端与客户端共享的公共库。
 //!
 //! 包含八部分：
-//! - [`protocol`]：rustunnel 原生线协议（4 字节大端长度前缀 + JSON）；
+//! - [`protocol`]：NFrp 原生线协议（4 字节大端长度前缀 + JSON）；
 //! - [`frp`]：**Go 版 frp wire protocol v2** 的完整实现，用于与原版 frpc/frps 互通；
 //! - [`config`]：TOML 配置结构与示例模板；
 //! - [`frp_config`]：原版 frp 的 TOML **字段名**兼容层（`serverAddr` / `localIP` 等）；

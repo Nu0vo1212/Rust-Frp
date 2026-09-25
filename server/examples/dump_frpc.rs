@@ -6,20 +6,20 @@
 //! 或读 frp 的 Go 源码都不够 —— 各版本之间字段差异很大，服务端到底在校验
 //! 什么、客户端到底发了什么，只有抓下来看最准。
 //!
-//! 好消息是 rustunnel 自己实现了完整的 frp v2 握手与 AES-GCM 控制通道，
+//! 好消息是 NFrp 自己实现了完整的 frp v2 握手与 AES-GCM 控制通道，
 //! 所以只要把它当成一个"假 frps"，就能把 frpc 的明文消息直接读出来，
 //! 不需要证书、也不需要中间人。
 //!
 //! # 用法
 //!
 //! ```text
-//! cargo run -p rustunnel-server --example dump_frpc -- 17777
+//! cargo run -p nfrp-server --example dump_frpc -- 17777
 //! ```
 //!
 //! 然后把待测 frpc 的 `serverAddr` / `serverPort` 改成 `127.0.0.1:17777` 跑起来。
 //! token 故意留空 —— 与多数 frp 平台的服务端一致（它们靠 `metas` 认隧道）。
 
-use rustunnel_common::frp::{
+use nfrp_common::frp::{
     msg::{self, FrpMessage},
     server_handshake, wire, FrpConn, ServerAccept,
 };
@@ -44,10 +44,10 @@ async fn main() -> anyhow::Result<()> {
         };
         println!("\n===== 新连接：{peer} =====");
 
-        let stream: rustunnel_common::frp::BoxStream = Box::pin(stream);
+        let stream: nfrp_common::frp::BoxStream = Box::pin(stream);
         let mut conn = match server_handshake(
             stream,
-            &rustunnel_common::security::AuthProvider::token(""),
+            &nfrp_common::security::AuthProvider::token(""),
             "dump-run-id",
         )
         .await
@@ -84,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
 
 /// 逐帧读取并打印。
 ///
-/// 用 `read_frame` 而不是 `recv_msg`：后者按 rustunnel 自己的结构体反序列化，
+/// 用 `read_frame` 而不是 `recv_msg`：后者按 NFrp 自己的结构体反序列化，
 /// **会丢掉我们不认识、但服务端可能要求的字段**，而这次的目的恰恰是看清
 /// "到底有哪些字段"。所以这里拿原始 JSON 字节直接打。
 async fn dump_session(conn: &mut FrpConn) {

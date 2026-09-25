@@ -31,8 +31,8 @@ pub struct VisitorEntry {
 impl VisitorEntry {
     /// 校验 visitor 的签名：`hex(md5(secret_key + timestamp))`。
     pub fn check_sign(&self, sign_key: &str, timestamp: i64) -> bool {
-        let expected = rustunnel_common::frp::msg::auth_key(&self.secret_key, timestamp);
-        rustunnel_common::frp::msg::constant_time_eq(&expected, sign_key)
+        let expected = nfrp_common::frp::msg::auth_key(&self.secret_key, timestamp);
+        nfrp_common::frp::msg::constant_time_eq(&expected, sign_key)
     }
 
     /// 校验访客用户是否被允许，语义与官方 frps 完全一致：

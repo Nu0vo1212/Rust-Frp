@@ -21,8 +21,8 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use rustunnel_common::config::ServerConfig;
-use rustunnel_common::security::{
+use nfrp_common::config::ServerConfig;
+use nfrp_common::security::{
     AclConfig, AuthProvider, CompiledAcl, CompiledRbac, Role, ServerAuthConfig,
 };
 
@@ -102,7 +102,7 @@ impl SecurityContext {
         }
 
         // token 为空又开着 OIDC？那 OIDC 才是实际生效的，不用说"没有认证"。
-        if auth.method() == rustunnel_common::security::AuthMethod::Token
+        if auth.method() == nfrp_common::security::AuthMethod::Token
             && cfg.effective_auth().token.is_empty()
         {
             tracing::warn!(
@@ -176,7 +176,7 @@ pub type AclSource = AclConfig;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustunnel_common::security::{AuditConfig, RoleConfig};
+    use nfrp_common::security::{AuditConfig, RoleConfig};
 
     fn cfg_with<F: FnOnce(&mut ServerConfig)>(f: F) -> ServerConfig {
         let mut c = ServerConfig::default();
@@ -254,7 +254,7 @@ mod tests {
 
         // ② 认证：正确的 md5 才过
         let ts = 1700000000;
-        let good = rustunnel_common::frp::msg::auth_key("s3cret", ts);
+        let good = nfrp_common::frp::msg::auth_key("s3cret", ts);
         assert!(ctx.verify_login(&good, ts).is_ok());
         assert!(ctx.verify_login("wrong", ts).is_err());
 
@@ -269,8 +269,8 @@ mod tests {
     fn oidc_未就绪时拒绝登录而不是放行() {
         let c = cfg_with(|c| {
             c.auth = ServerAuthConfig {
-                method: rustunnel_common::security::AuthMethod::Oidc,
-                oidc: rustunnel_common::auth::oidc::ServerOidcConfig {
+                method: nfrp_common::security::AuthMethod::Oidc,
+                oidc: nfrp_common::auth::oidc::ServerOidcConfig {
                     issuer: "https://idp.example.com".into(),
                     ..Default::default()
                 },
@@ -284,14 +284,14 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("OIDC"), "{e}");
-        assert!(ctx.auth.method() == rustunnel_common::security::AuthMethod::Oidc);
+        assert!(ctx.auth.method() == nfrp_common::security::AuthMethod::Oidc);
     }
 
     #[test]
     fn oidc_配置缺_issuer_时构造就失败() {
         let c = cfg_with(|c| {
             c.auth = ServerAuthConfig {
-                method: rustunnel_common::security::AuthMethod::Oidc,
+                method: nfrp_common::security::AuthMethod::Oidc,
                 ..Default::default()
             };
         });

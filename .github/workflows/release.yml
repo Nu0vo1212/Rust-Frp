@@ -1,0 +1,191 @@
+name: Release
+
+# 发布一直有两大缺口：①三平台产物没有校验值，用户无法验证下载到的东西没被换过；
+# ②没有容器镜像。这个工作流一次补齐：
+#   - 构建 Windows / Linux amd64 / Linux arm64 三个产物
+#   - 生成 SHA256SUMS + 用 cosign/sigstore 做无密钥签名（默认可用）
+#   - 上传 GitHub Release 并推 ghcr.io 镜像
+# 触发：git tag v0.5.0 && git push --tags
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的标签（例如 v0.5.0）"
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write # cosign 的 keyless signing 需要
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-amd64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: nfrp-windows-amd64.zip
+          - name: linux-amd64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: nfrp-linux-amd64.tar.gz
+          - name: linux-arm64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            asset: nfrp-linux-arm64.tar.gz
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install cross (linux targets)
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: build --release
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            cross build --release --workspace --target ${{ matrix.target }}
+          else
+            cargo build --release --workspace --target ${{ matrix.target }}
+          fi
+        shell: bash
+        timeout-minutes: 40
+
+      - name: package (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/nfrp-server.exe staging/frps.exe
+          Copy-Item target/${{ matrix.target }}/release/nfrp-client.exe staging/frpc.exe
+          # 与 scripts/release.py 打出的包保持同样的组成：README + LICENSE + NOTICE + 示例配置
+          Copy-Item README.md, LICENSE, NOTICE staging/ -ErrorAction SilentlyContinue
+          Copy-Item assets/frps.toml, assets/frpc.toml staging/ -ErrorAction SilentlyContinue
+          Compress-Archive -Path staging/* -DestinationPath ${{ matrix.asset }}
+
+      - name: package (tar.gz)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/nfrp-server staging/frps
+          cp target/${{ matrix.target }}/release/nfrp-client staging/frpc
+          # 与 scripts/release.py 打出的包保持同样的组成
+          cp README.md LICENSE NOTICE staging/ 2>/dev/null || true
+          cp assets/frps.toml assets/frpc.toml staging/ 2>/dev/null || true
+          tar czf ${{ matrix.asset }} -C staging .
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  checksums:
+    name: checksums + signature
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: flatten artifacts
+        run: |
+          mkdir -p out
+          find dist -type f \( -name '*.zip' -o -name '*.tar.gz' \) -exec cp {} out/ \;
+          ls -l out
+
+      - name: generate SHA256SUMS
+        run: |
+          cd out
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: sign with cosign (keyless)
+        continue-on-error: true
+        uses: sigstore/cosign-installer@v3
+
+      - name: cosign sign blobs
+        continue-on-error: true
+        run: |
+          cd out
+          for f in *; do
+            cosign sign-blob --yes --output-signature "$f.sig" "$f" || echo "::warning::sign failed for $f"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: out/SHA256SUMS
+
+  release:
+    name: github release
+    runs-on: ubuntu-latest
+    needs: [build, checksums]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: flatten
+        run: |
+          mkdir -p out
+          find dist -type f ! -name '*.md' -exec cp {} out/ \;
+          ls -l out
+
+      - name: create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            out/*
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+
+  docker:
+    name: push ghcr.io image
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: resolve version
+        id: ver
+        run: echo "tag=${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

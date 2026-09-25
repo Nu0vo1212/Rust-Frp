@@ -8,7 +8,7 @@
 //!
 //! ```text
 //!   visitor ──HELLO──▶ ┌────────────┐ ◀──HELLO── provider
-//!                      │ rustunnel  │
+//!                      │ nfrp  │
 //!   visitor ◀──PEER─── │ rendezvous │ ───PEER──▶ provider
 //! ```
 //!
@@ -163,10 +163,10 @@ impl Role {
 pub const PUNCH_MAGIC: &[u8] = b"RTNL-PUNCH";
 
 /// QUIC 的 ALPN 标识；两端不一致会握手失败。
-pub const ALPN: &[u8] = b"rustunnel-xtcp";
+pub const ALPN: &[u8] = b"nfrp-xtcp";
 
 /// 服务端名字：证书是自签且跳过校验的，但 rustls 仍要求它是合法 DNS 名。
-pub const SERVER_NAME: &str = "xtcp.rustunnel.local";
+pub const SERVER_NAME: &str = "xtcp.nfrp.local";
 
 /// 应用握手成功时回的字节。
 pub const HANDSHAKE_OK: &[u8] = b"RTNL-OK";

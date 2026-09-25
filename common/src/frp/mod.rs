@@ -1,6 +1,6 @@
 //! Go 版 frp **线协议 v1 / v2** 的完整 Rust 实现。
 //!
-//! 这是 rustunnel 与原版 frp 互通的核心。所有细节都对照官方源码实现，
+//! 这是 NFrp 与原版 frp 互通的核心。所有细节都对照官方源码实现，
 //! 字段名 / 编码 / 密钥派生保持逐字节一致：
 //!
 //! # 两套线协议
@@ -16,7 +16,7 @@
 //!
 //! 关键事实：**官方 frpc/frps 到 v0.71.0 为止的默认线协议仍然是 v1**
 //! （`pkg/config/v1/client.go`：`WireProtocol = util.EmptyOr(..., "v1")`）。
-//! 所以只实现 v2 等于"和原版 frp 默认配置连不上" —— 这也是 rustunnel 之前
+//! 所以只实现 v2 等于"和原版 frp 默认配置连不上" —— 这也是 NFrp 之前
 //! 连不上樱花等第三方 frps 的根因。现在两套都实现，默认走 v1。
 //!
 //! 服务端与官方 frps 一样**自动探测**：先按 `wire.CheckMagic` 读 8 字节，
@@ -140,7 +140,7 @@ impl std::str::FromStr for WireVersion {
     }
 }
 
-/// rustunnel 这套 wire protocol 实现所**对齐的上游 frp 版本**。
+/// NFrp 这套 wire protocol 实现所**对齐的上游 frp 版本**。
 ///
 /// 两个用途，都不是"装饰性"的：
 ///

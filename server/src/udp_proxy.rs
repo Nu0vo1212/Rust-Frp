@@ -15,7 +15,7 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
-use rustunnel_common::frp::{
+use nfrp_common::frp::{
     conn::FrpConn,
     msg::{FrpMessage, Ping, StartWorkConn, UdpPacket},
 };
@@ -144,8 +144,7 @@ async fn run_session(mut conn: FrpConn, udp: Arc<UdpSocket>, proxy_name: &str) -
 
 /// 绑定 UDP 端口。
 pub async fn bind_udp(bind_addr: &str, port: u16) -> Result<UdpSocket> {
-    let addr: SocketAddr =
-        rustunnel_common::util::resolve_addr(&format!("{bind_addr}:{port}")).await?;
+    let addr: SocketAddr = nfrp_common::util::resolve_addr(&format!("{bind_addr}:{port}")).await?;
     UdpSocket::bind(addr)
         .await
         .with_context(|| format!("监听 UDP {addr} 失败"))

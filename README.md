@@ -1126,6 +1126,19 @@ max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
 > 服务端只有这两类代理会注册 visitor 监听器；指向 xtcp 代理只会得到
 > 「custom listener for [x] doesn't exist」，xtcp 代理本身**永远无法被中继**
 > （官方 frpc 的 `XTCPProxy::InWorkConn` 一上来只读 `NatHoleSid`）。）
+> ④ 仓库公开之后第一次看到 CI 的真实结果，发现 **musl 目标**（也就是
+> `release.yml` 和 Docker 镜像用的那个目标）**一直编不过**：
+> `common/src/vnet/tun_linux.rs` 把 `TUNSETIFF` 的请求码写死成 `libc::c_ulong`，
+> 而 libc 的 `ioctl(fd, request: Ioctl, …)` 里 `Ioctl` 是**按目标 libc 分的**
+> —— glibc / uclibc 是 `c_ulong`(u64)，**musl 与 android 是 `c_int`(i32)**
+> （libc `unix/linux_like/linux/musl/mod.rs`）。于是同一份代码 glibc 编得过、
+> musl 直接 `error[E0308]: expected i32, found u64`。这段又是
+> `cfg(target_os = "linux")`，本机 Windows 永远编不到 ⇒ 只有 CI 的交叉编译能发现。
+> 改成用 libc 自己的别名 `libc::Ioctl`，两个 libc 都对（`0x400454ca` 只有 31 位，
+> 窄化到 i32 不丢信息）。已发布的三平台包走的是 glibc 静态链接，**不受影响**。
+> （★ 记一笔坑：`cargo check --target *-musl` 在 Windows 上做不了 —— `ring` 的
+> 构建脚本要 `aarch64-linux-musl-gcc`。用一个**只依赖 `libc`** 的最小工程可以
+> 精确复现/验证这个类型差异，不需要交叉 C 工具链。）
 
 ## 质量保障
 
@@ -1145,8 +1158,14 @@ cargo test --workspace              # 459 个测试
 | `client` 单元测试 | 64 | QUIC 建连与口令握手、插件（http_proxy / socks5 / static_file）、健康检查状态机、打洞编排、`NewProxy` 字段映射（含与官方 frpc 抓包逐字节对拍）、服务端下发名 → 本地代理的翻译（`resolve_uploaded_proxy`）、**动态代理表**、**store 落盘与损坏文件容错**、**本地管理界面的路由与本地校验**、**PROXY 头注入** |
 | `server` 端到端集成测试 | 14 | 真握手 + 真转发的 TCP / HTTP / stcp / QUIC 链路、**v1 与 v2 双协议握手**、group 负载均衡、面板鉴权边界、**SUDP 端到端（visitor→provider 的 UdpPacket 往返）**、**KCP 传输上的完整控制连接 + 多会话共端口** |
 
-CI（`.github/workflows/ci.yml`）在每次 push / PR 上跑：`fmt` → `clippy` → 测试 →
-四个目标（windows-msvc / linux-musl / linux-gnu / linux-arm64）构建 → 端到端冒烟。
+CI（`.github/workflows/ci.yml`）在每次 push / PR 上跑：`cargo fmt --check` +
+`cargo clippy -- -D warnings` → **Linux / Windows / macOS** 三个系统的全量测试 →
+**两个 musl 目标的交叉构建**（x86_64 / aarch64，提前拦住"tag 那天才发现编不过"）→
+端到端冒烟（真建连真转发的集成测试，外加 `--gen-config` / `--check` 自检）。
+
+打 tag（或手动触发 `.github/workflows/release.yml`）会构建三平台产物 +
+cosign 无密钥签名 + 推 ghcr.io 镜像。**本地 `scripts/release.py` 与 CI 是两条独立的
+发布路线**，签名体系不同（本地是 Ed25519 分离签名），同一版本只用一条。
 
 ## 发布与部署
 

@@ -29,7 +29,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rustunnel_common::{
+use nfrp_common::{
     config::{ClientConfig, ProxyConfig},
     frp::{
         conn::FrpConn,
@@ -101,6 +101,11 @@ pub struct Hub {
     session: tokio::sync::watch::Receiver<Option<Arc<ClientSession>>>,
     /// 与**当前**会话之间的写请求通道。会话重建时会被换掉。
     req_tx: Mutex<Option<mpsc::UnboundedSender<Request>>>,
+    /// `stop` 的触发点：`POST /api/stop` 置 true，主循环据此退出。
+    ///
+    /// 用 `watch` 而不是 `Notify`：watch 的**值会留存**，所以 stop 请求即使在
+    /// 主循环还没进 `select!` 时到达也不会丢（`Notify` 只在恰好有 waiter 时生效）。
+    stop: tokio::sync::watch::Sender<bool>,
 }
 
 impl Hub {
@@ -111,6 +116,7 @@ impl Hub {
         health: Arc<health::Monitor>,
         session: tokio::sync::watch::Receiver<Option<Arc<ClientSession>>>,
     ) -> Arc<Self> {
+        let (stop, _) = tokio::sync::watch::channel(false);
         Arc::new(Self {
             cfg,
             proxies,
@@ -118,7 +124,18 @@ impl Hub {
             health,
             session,
             req_tx: Mutex::new(None),
+            stop,
         })
+    }
+
+    /// `stop` 的信号接收端（`[webServer]` 启用时由主循环监听）。
+    pub fn stop_receiver(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.stop.subscribe()
+    }
+
+    /// 请求客户端退出 —— `POST /api/stop` 的落点，对应原版 `frpc stop`。
+    fn request_stop(&self) {
+        let _ = self.stop.send(true);
     }
 
     /// 会话建立时挂上请求通道。
@@ -288,7 +305,7 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, hub: Arc<Hub>) -> anyho
             401,
             "application/json; charset=utf-8",
             body.as_bytes(),
-            &[("WWW-Authenticate", "Basic realm=\"rustunnel-client\"")],
+            &[("WWW-Authenticate", "Basic realm=\"nfrp-client\"")],
         )
         .await?;
         return Ok(());
@@ -334,6 +351,11 @@ async fn route(
             Ok(m) => (200, CT_JSON, ok_body(&m)),
             Err(e) => (400, CT_JSON, err_body("remove_failed", &e)),
         },
+        // 等价原版 `frpc stop`：官方也是打本地 admin API 让进程退出。
+        ("POST", "/api/stop") => {
+            hub.request_stop();
+            (200, CT_JSON, ok_body("客户端正在停止"))
+        }
         _ => {
             const KNOWN: &[&str] = &[
                 "/",
@@ -342,6 +364,7 @@ async fn route(
                 "/api/proxies",
                 "/api/proxies/add",
                 "/api/proxies/remove",
+                "/api/stop",
             ];
             if KNOWN.contains(&path) {
                 (
@@ -594,7 +617,7 @@ fn html_page() -> String {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>rustunnel 客户端</title>
+<title>NFrp 客户端</title>
 <style>
   :root { color-scheme: light; }
   body { margin:0; font:14px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif;
@@ -621,7 +644,7 @@ fn html_page() -> String {
 </style>
 </head>
 <body>
-<header>rustunnel 客户端管理</header>
+<header>NFrp 客户端管理</header>
 <main>
   <div class="cards" id="cards"></div>
   <section>
@@ -790,7 +813,7 @@ mod tests {
             "content-type 要是 html：{}",
             r.1
         );
-        assert!(r.2.contains("rustunnel"), "页面里要有标题");
+        assert!(r.2.to_lowercase().contains("nfrp"), "页面里要有标题");
         assert!(r.2.contains("/api/status"), "页面要真的去拉状态接口");
     }
 

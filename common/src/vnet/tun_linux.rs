@@ -361,11 +361,21 @@ impl AsyncWrite for Tun {
 /// Linux 的 `_IOW('T', 202, int)`：`dir=1(write)`、`size=4`、`type='T'`、`nr=202`
 /// ⇒ `0x400454ca`。直接写常量而不是引 `libc` 的宏，是因为 libc 里这个宏
 /// 在部分架构上被定义成函数式的，取值反而更绕。
-fn tunsetiff() -> libc::c_ulong {
-    const DIR_WRITE: libc::c_ulong = 1;
-    const SIZE_INT: libc::c_ulong = 4;
-    const TYPE_T: libc::c_ulong = b'T' as libc::c_ulong;
-    const NR: libc::c_ulong = 202;
+///
+/// ★ **返回类型必须是 `libc::Ioctl`，不能写死 `c_ulong`**：libc 的
+/// `ioctl(fd: c_int, request: Ioctl, ...)` 里 `Ioctl` 是按目标 libc 分的
+/// —— glibc / uclibc 是 `c_ulong`(u64)，**musl 与 android 是 `c_int`(i32)**
+/// （见 libc `unix/linux_like/linux/musl/mod.rs`）。写死 `c_ulong` 时
+/// glibc 目标编得过、musl 目标直接
+/// `error[E0308]: mismatched types —— expected i32, found u64`。
+/// 而这段又是 `cfg(target_os = "linux")`，本机 Windows 编不到它，
+/// 只有 CI 的 musl 交叉编译才会暴露 ⇒ 用 libc 自己的别名，两边都对。
+/// 取值 `0x400454ca` 只有 31 位，窄化到 i32 不丢信息。
+fn tunsetiff() -> libc::Ioctl {
+    const DIR_WRITE: libc::Ioctl = 1;
+    const SIZE_INT: libc::Ioctl = 4;
+    const TYPE_T: libc::Ioctl = b'T' as libc::Ioctl;
+    const NR: libc::Ioctl = 202;
     (DIR_WRITE << 30) | (SIZE_INT << 16) | (TYPE_T << 8) | NR
 }
 

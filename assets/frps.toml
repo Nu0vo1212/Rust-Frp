@@ -1,0 +1,177 @@
+# ============================================================
+# frps 配置（NFrp 实现，兼容原版 frp v0.70+ 的 v2 协议）
+# 用法： frps -c frps.toml
+# 生成： frps --gen-config frps.toml   （打印这份带注释的模板）
+# ============================================================
+
+# ---- 基础 ----
+bind_addr = "0.0.0.0"
+# 控制连接与工作连接复用同一个端口（与原版 frp 一致）
+bind_port = 7000
+
+# 认证 token，客户端必须一致
+token = "your_secret_token"
+
+# ---- 传输层 ----
+# 是否允许客户端使用 yamux 多路复用（对应 frp 的 transport.tcpMux）
+# 开启后服务端会自动探测：yamux 客户端和非 yamux 客户端都能正常连接
+tcp_mux = true
+
+# 是否强制客户端必须使用 TLS（对应 frp 的 transport.tls.force）
+# false 时服务端依然接受 TLS 连接，靠首字节 0x17 / 0x16 自动识别
+tls_force = false
+
+# 传输协议：tcp（默认）或 quic
+#   quic 会在**同一个端口号**上额外监听 UDP，同时保留 TCP 监听 ——
+#   所以切换协议不会一刀切，老客户端照旧能连。
+#   QUIC 自带 TLS1.3 与流多路复用，1-RTT 握手、丢包不阻塞其它流；
+#   代价是防火墙 / 安全组要放行 UDP。客户端需配成一致的 quic。
+#   注意：官方 frp 的 transport.protocol 语义不同，与官方互通时保持 tcp。
+transport_protocol = "tcp"
+
+# ---- HTTP / HTTPS 虚拟主机 ----
+# 客户端用 http / https 类型代理时，按域名路由到对应内网服务。
+# 不配置这两项则 http / https 代理会被拒绝。
+vhost_http_port = 8080
+vhost_https_port = 8443
+# 泛域名后缀（对应 frp 的 subdomainHost）：客户端可只写 subdomain = "abc"
+# subdomain_host = "example.com"
+
+# ---- xtcp 真 P2P（UDP 打洞 + QUIC 直连）----
+# 牵线用的 UDP 端口。配置后 xtcp 才会尝试打洞，打通了两端数据不再经过本机；
+# 不配置时 xtcp 退化为中继（与 stcp 相同），并会明确拒绝打洞请求，
+# 让访客快速失败而不是干等超时。
+# 注意：防火墙 / 云安全组要放行这个 UDP 端口。
+# p2p_port = 7002
+
+# ---- 内置面板与 Prometheus 指标 ----
+#   GET /             面板（在线客户端 / 代理 / 访客 / 占用端口 / 实时指标）
+#   GET /metrics      Prometheus exposition format
+#   GET /api/status   JSON 快照
+#   GET /api/healthz  存活探针（始终免鉴权，供 k8s / 负载均衡器用）
+# 配了 dashboard_user 之后，前三个端点需要 HTTP Basic Auth。
+#
+# 面板还能**写**（同样需要 Basic Auth，未鉴权返回 401）：
+#   POST /api/proxies/add     给某个客户端动态加一条代理（JSON: run_id + proxy）
+#   POST /api/proxies/remove  移除某条代理（JSON: run_id + name），端口随即收回
+#   POST /api/clients/kick    断开某个客户端（JSON: run_id）
+# 动态管理依赖对端也是 nfrp frpc（能力协商，官方 frpc 连上来会被标为不可管理）。
+# dashboard_port = 7500
+# dashboard_user = "admin"
+# dashboard_pwd = "change_me"
+#
+# API v2（v0.3.4 新增；v1 的路径与响应**一个字节都没改**）：
+#   GET  /api/v2/version        API 版本与本进程支持的线协议
+#   GET  /api/v2/status         概览（指标 / 计数 / 上限 / 特性开关）
+#   GET  /api/v2/clients        客户端列表，分页 ?page=1&page_size=20
+#   GET  /api/v2/proxies        代理列表，分页，可加 ?user= ?client= ?q=
+#   GET  /api/v2/visitors       访客（stcp/xtcp 接入）列表
+#   GET  /api/v2/ports          已占端口及其背后的客户端
+#   GET  /api/v2/audit          审计日志查询，可加 ?kind= ?user= ?ok=
+#   POST /api/v2/proxies/add    同 v1 的三条写接口，但错误码统一
+#   POST /api/v2/proxies/remove
+#   POST /api/v2/clients/kick
+#   成功： {"api":"v2","data":…,"pagination":{"page":1,"page_size":20,"total":…}}
+#   失败： {"api":"v2","error":{"code":"not_found","message":"…"}}
+#   错误码是**稳定契约**（bad_request / not_found / method_not_allowed /
+#   admin_failed / internal），文案可以随便改，脚本请按 code 分支。
+#   单页上限 500；非法分页参数直接 400，不会悄悄退回第一页。
+
+# ---- 配置热重载 ----
+# 需配合 -c 指定配置文件（服务端会监视它的 mtime）。
+# log_level 与面板密码是**热生效**的；其余字段变更会记一条 WARN 提示需重启。
+hot_reload = false
+
+# ---- 资源上限（0 或不填 = 不限）----
+# 超限时拒绝并计入指标（clients_rejected / conns_rejected / proxy_failures），
+# 不会静默丢弃。配额是 RAII 的：令牌随连接 / 代理存活，注销即归还。
+# max_clients = 100            # 同时在线的客户端数
+# max_proxies_per_client = 50  # 单个客户端可注册的代理数
+# max_conns_per_client = 200   # 单个客户端同时转发的连接数
+# max_total_conns = 5000       # 全局同时转发的连接数
+# max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
+
+# 心跳超时（秒），超时未收到客户端消息则断开
+heartbeat_timeout = 90
+
+# ============================================================
+# v0.3.4 新增：认证 / 权限 / 审计 / 虚拟网络
+#
+# 下面每一段**不写就是关的** —— 老配置文件一个字节都不用改，
+# 行为与升级前完全一致。想开哪项再取消对应的注释。
+# ============================================================
+
+# ---- 认证方式（[auth]）----
+# 不写 [auth] 时用上面的顶层 token（与老版本一致）。
+# method 只认 "token"（默认）和 "oidc"。
+#
+#   [auth]
+#   method = "oidc"
+#   [auth.oidc]
+#   issuer = "https://keycloak.example.com/realms/myrealm"
+#   audience = "nfrp"
+#   # 只在对接自签 / 内网 IdP 时才需要下面几项：
+#   # skipExpiryCheck = false     # 调试用：跳过 token 过期检查（生产别开）
+#   # skipIssuerCheck = false
+#   # trustedCaFile = "/etc/ssl/private-ca.pem"
+#   # insecureSkipVerify = false
+#   # proxyURL = "http://10.0.0.1:3128"
+#
+# 注意 OIDC 模式下的两处语义差别（写在这里免得调试时踩）：
+#   * 客户端的凭证是 IdP 签发的 **access token 原样**，不做 md5 派生；
+#   * 控制通道的加密密钥也改用 access token（两端同源），
+#     否则会出现"能登录、但之后每条消息都解不开"。
+
+# ---- IP 白 / 黑名单（[acl]）----
+# 在**认证之前**执行，所以被拒的连接连 token 都不用发。
+# deny 优先于 allow；两边都不写 = 不限制。
+# 支持单个 IP 与 CIDR，IPv4 / IPv6 都可以。
+#
+#   [acl]
+#   allow = ["10.0.0.0/8", "192.168.0.0/16", "2001:db8::/32"]
+#   deny = ["10.1.2.3"]
+
+# ---- 角色与权限（[[roles]]）----
+# 按**顺序**匹配，先命中先用 —— 所以把最具体的角色写在前面。
+# 没有任何角色匹配时，看 defaultRole / denyUnknown：
+#   defaultRole = "guest"  → 套用这个角色
+#   denyUnknown = true     → 直接拒绝登录
+#
+#   [[roles]]
+#   name = "ops"
+#   users = ["alice", "bob"]            # 匹配客户端 Login 里声明的 user
+#   allowProxyTypes = ["tcp", "http"]   # 留空 = 不限类型
+#   portRange = "7000-7999"             # 留空 = 不限端口
+#   allowManage = true                  # 是否允许面板动态增删它的代理
+#   allowVisitors = true                # 是否允许开 stcp / xtcp 访客
+#   maxProxies = 20                     # 0 = 不限
+#
+# defaultRole = ""
+# denyUnknown = false
+
+# ---- 审计日志（[audit]）----
+# 默认**关**：不落文件、不占内存，开启时的开销也只有"一次追加写"。
+# 记录登录（成功与失败都会记）、建代理、断代理、踢人等事件。
+#
+#   [audit]
+#   enable = true
+#   path = "/var/log/nfrp/audit.jsonl"   # 留空 = 只留内存，重启即失
+#   maxEntries = 1000                          # 面板查询用的内存条数
+
+# ---- VirtualNet 虚拟网络 ----
+# 给客户端分配虚拟内网地址，让它们在**三层**上互通（而不只是端口转发）。
+#
+# 单独占一个端口，刻意不与控制端口复用：虚拟网络是长时间高速的纯数据流，
+# 混进控制通道会拖慢心跳与面板命令，出故障时也不好隔离。
+#
+#   vnet_port = 7003
+#   [vnet]
+#   network = "100.64.0.0"        # 地址池起点
+#   subnet = "100.64.0.0/24"
+#   mtu = 1400                    # 隧道有额外开销，取小了比被分片强
+#
+# 客户端侧要写 [virtualNet] 并填 serverPort = 7003。
+# 虚拟网卡（TUN）目前只在 Linux 上实现；Windows 上客户端会明确报错而不是静默不生效。
+
+# 日志级别：error / warn / info / debug / trace
+log_level = "info"

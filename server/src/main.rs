@@ -1,4 +1,4 @@
-//! `rustunnel-server` 的命令行入口。
+//! `nfrp-server` 的命令行入口。
 //!
 //! 这里只负责：**解析参数 -> 读配置 -> 组装 Registry -> 交棒给 [`serve`]**。
 //! 全部业务逻辑都在库里，方便测试也方便复用。
@@ -7,23 +7,19 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use rustunnel_common::{
+use nfrp_common::{
     config::{default_config_path, ServerConfig},
     util,
 };
-use rustunnel_server::{limits_from, Registry};
+use nfrp_server::{limits_from, Registry};
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "rustunnel-server",
-    version,
-    about = "rustunnel 服务端（兼容原版 frp）"
-)]
+#[command(name = "nfrp-server", version, about = "NFrp 服务端（兼容原版 frp）")]
 struct Cli {
     /// 打印**上游 frp 兼容版本号**（等价于原版 frps 的 `frps -v`）
     ///
     /// 只输出裸版本号（如 `0.71.0`），方便脚本解析。
-    /// 想看 rustunnel 自己的版本请用 `--version`。
+    /// 想看 NFrp 自己的版本请用 `--version`。
     #[arg(short = 'v', long = "frp-version")]
     frp_version: bool,
 
@@ -43,7 +39,7 @@ struct Cli {
     #[arg(long, value_name = "LEVEL")]
     log_level: Option<String>,
 
-    /// 覆盖配置里的线协议（frp-v2 / rustunnel）
+    /// 覆盖配置里的线协议（frp-v2 / nfrp）
     #[arg(long, value_name = "PROTOCOL")]
     protocol: Option<String>,
 
@@ -66,7 +62,7 @@ async fn main() -> Result<()> {
 
     // 与原版 frps 一致：`-v` 只打印版本号就退出（脚本/面板会解析它）
     if cli.frp_version {
-        println!("{}", rustunnel_common::frp::FRP_WIRE_VERSION);
+        println!("{}", nfrp_common::frp::FRP_WIRE_VERSION);
         return Ok(());
     }
 
@@ -90,7 +86,7 @@ async fn main() -> Result<()> {
             path.display(),
             std::env::args()
                 .next()
-                .unwrap_or_else(|| "rustunnel-server".into()),
+                .unwrap_or_else(|| "nfrp-server".into()),
             path.display()
         );
     }
@@ -98,7 +94,7 @@ async fn main() -> Result<()> {
         ServerConfig::load(&path).with_context(|| format!("读取配置 {} 失败", path.display()))?;
     if let Some(p) = &cli.protocol {
         cfg.protocol = p
-            .parse::<rustunnel_common::config::Protocol>()
+            .parse::<nfrp_common::config::Protocol>()
             .map_err(anyhow::Error::msg)?;
     }
     if let Some(port) = cli.port {
@@ -123,7 +119,21 @@ async fn main() -> Result<()> {
         None
     };
 
-    rustunnel_server::serve::ensure_protocol(&cfg)?;
+    // 官方 frp 支持、但 nfrp **未实现**的字段：官方 frps 默认 strict 解析，
+    // 未知字段直接报错；NFrp 的 serde 不拒绝未知字段，于是它们被**静默吞掉**。
+    // 其中 allowPorts / maxPortsPerClient 这类是**限流/鉴权**语义，静默忽略会让
+    // 管理员以为已经限制住了、实际全部放开 —— 必须在日志里明说。
+    // 注意放在 init_tracing 之后，否则日志根本没被订阅。
+    if !cfg.unsupported_fields.is_empty() {
+        tracing::warn!(
+            "配置里有 {} 项字段是官方 frps 支持、但 nfrp **未实现**的，已按默认值忽略：{} \
+             —— 它们不会生效（尤其是 allowPorts / maxPortsPerClient 这类限制项）",
+            cfg.unsupported_fields.len(),
+            cfg.unsupported_fields.join(", ")
+        );
+    }
+
+    nfrp_server::serve::ensure_protocol(&cfg)?;
 
     if cli.check {
         // 配置能被解析 + 通过静态合法性校验就够格了，不需要真的绑端口
@@ -135,11 +145,11 @@ async fn main() -> Result<()> {
 
     let cfg = Arc::new(cfg);
     let registry = Arc::new(Registry::new(limits_from(&cfg)));
-    let extras = rustunnel_server::ServeExtras {
+    let extras = nfrp_server::ServeExtras {
         config_path: Some(path.clone()),
         log_handle,
     };
-    rustunnel_server::serve_with(cfg, registry, extras).await
+    nfrp_server::serve_with(cfg, registry, extras).await
 }
 
 /// 启动前把明显不合理 / 互相冲突的配置挡下来。

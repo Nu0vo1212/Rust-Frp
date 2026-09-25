@@ -307,11 +307,14 @@ impl Registry {
     }
 
     /// 归还端口；同组还有其他后端时只是把自己摘掉。
-    pub fn release_port(&self, port: u16, client: &Arc<ClientState>) {
+    ///
+    /// `proxy_name` 是**配置里的原始名**（本地表用的那个），用于在组里精确定位
+    /// 要摘掉的那一个成员 —— 同一客户端可能在这个端口上注册了多个组的成员。
+    pub fn release_port(&self, port: u16, client: &Arc<ClientState>, proxy_name: &str) {
         let mut g = self.ports.lock().unwrap_or_else(|e| e.into_inner());
         let mut empty = false;
         if let Some(pg) = g.get_mut(&port) {
-            pg.remove(client);
+            pg.remove(client, proxy_name);
             empty = pg.is_empty();
         }
         // 最后一个后端走了，端口和它的监听器一起收回
@@ -327,7 +330,7 @@ impl Registry {
         let mut g = self.ports.lock().unwrap_or_else(|e| e.into_inner());
         let mut dead: Vec<u16> = Vec::new();
         for (port, pg) in g.iter_mut() {
-            pg.remove(client);
+            pg.remove_all_of(client);
             if pg.is_empty() {
                 dead.push(*port);
             }
@@ -488,6 +491,17 @@ impl Drop for LoadGuard {
     }
 }
 
+/// 两个 `ClientState` 是不是**同一个控制会话**。
+///
+/// 同一个连接上的对象必然 `Arc::ptr_eq`；跨重连时靠 `run_id` 认亲
+/// （`run_id` 由服务端在 `LoginResp` 里下发，同一次会话内不变）。
+///
+/// ★ 注意这是"客户端级"的判据，**不能**用来判断"同一个代理" ——
+/// 一个客户端可以注册多个代理，判代理要再加上 `proxy_name`。
+fn same_client(a: &Arc<ClientState>, b: &Arc<ClientState>) -> bool {
+    Arc::ptr_eq(a, b) || a.run_id == b.run_id
+}
+
 /// 端口申领的结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortClaim {
@@ -532,8 +546,15 @@ impl PortGroup {
     }
 
     fn push(&mut self, client: Arc<ClientState>, proxy_name: &str) {
-        // 同一个客户端重复注册（重连场景）不该把成员表撑爆
-        self.remove(&client);
+        // 同一个代理重复注册（重连 / 重复 NewProxy）不该把成员表撑爆。
+        //
+        // ★ 去重键必须是 **(客户端, 代理名)**，不能只看客户端。
+        // 官方 frp 允许**同一个 frpc** 注册多个同 group 的代理（一份配置里两条
+        // `[[proxies]]` 共用一个 remotePort、group 相同），那时两条的 run_id 一样；
+        // 早先按 run_id 去重会把兄弟成员一起删掉，于是组里永远只剩最后一个，
+        // 表现为"配了 group 却完全不负载均衡"（真机实测：24 次连接全打到同一个后端）。
+        self.members
+            .retain(|b| !(same_client(&b.client, &client) && b.proxy_name == proxy_name));
         self.members.push(Backend {
             client,
             proxy_name: proxy_name.to_string(),
@@ -541,9 +562,18 @@ impl PortGroup {
         });
     }
 
-    fn remove(&mut self, client: &Arc<ClientState>) {
+    /// 摘掉**某一个**成员（同组其他成员要留着）。
+    ///
+    /// 与 [`PortGroup::push`] 同理：按 (客户端, 代理名) 精确定位，不能把同一
+    /// 客户端的其它 group 成员一起摘掉。
+    fn remove(&mut self, client: &Arc<ClientState>, proxy_name: &str) {
         self.members
-            .retain(|b| !Arc::ptr_eq(&b.client, client) && b.client.run_id != client.run_id);
+            .retain(|b| !(same_client(&b.client, client) && b.proxy_name == proxy_name));
+    }
+
+    /// 客户端整个掉线时，把它在这个端口上的**所有**成员一次摘掉。
+    fn remove_all_of(&mut self, client: &Arc<ClientState>) {
+        self.members.retain(|b| !same_client(&b.client, client));
     }
 
     fn is_empty(&self) -> bool {
@@ -639,7 +669,7 @@ mod tests {
             Duration::from_secs(60),
             Default::default(),
             false,
-            rustunnel_common::frp::WireVersion::V1,
+            nfrp_common::frp::WireVersion::V1,
             conn,
             backlog,
             proxy,
@@ -752,13 +782,45 @@ mod tests {
         );
         assert!(r.reserve_port(6001, "", "a", a.clone()).is_ok());
         assert_eq!(r.reserved_ports(), vec![6000, 6001]);
-        r.release_port(6000, &a);
+        r.release_port(6000, &a, "a");
         assert!(
             r.reserve_port(6000, "", "b", b.clone()).is_ok(),
             "release 之后应可再次申领"
         );
         // release 一个没占过的端口不应 panic
-        r.release_port(65535, &a);
+        r.release_port(65535, &a, "a");
+    }
+
+    /// ★ 同一个客户端注册的**多个 group 成员**必须都留在组里。
+    ///
+    /// 这是真机上抓到的 bug：`PortGroup::push` 早先按 `run_id` 去重，同一次会话的
+    /// 第二个成员会把第一个成员删掉，于是组里永远只剩最后一个 —— 表现为
+    /// "配了 group 却完全不负载均衡"（实测 24 次连接全打到同一个后端）。
+    #[test]
+    fn 同一客户端的多个组成员都要留在组里() {
+        let r = Registry::unlimited();
+        let one = client("same-session");
+        assert_eq!(
+            r.reserve_port(6000, "web", "a", one.clone()).unwrap(),
+            PortClaim::Fresh
+        );
+        assert_eq!(
+            r.reserve_port(6000, "web", "b", one.clone()).unwrap(),
+            PortClaim::Joined
+        );
+        assert_eq!(r.backend_count(6000), 2, "同一客户端的两个成员都要在组里");
+
+        // 摘掉其中一个，另一个必须留着（端口不能跟着收回）
+        r.release_port(6000, &one, "a");
+        assert_eq!(r.backend_count(6000), 1, "只摘掉指名的那一个成员");
+
+        // 重复注册同一个代理名才应该去重
+        r.reserve_port(6000, "web", "b", one.clone()).unwrap();
+        assert_eq!(r.backend_count(6000), 1, "同名代理重复注册不该撑大成员表");
+
+        // 整个客户端掉线才清空
+        r.release_ports_of(&one);
+        assert_eq!(r.backend_count(6000), 0);
     }
 
     /// group 的全部意义：同名组的多个代理共享一个端口，实现负载均衡。
@@ -953,7 +1015,7 @@ mod tests {
         });
         r.attach_listener(6000, h.abort_handle());
 
-        r.release_port(6000, &a);
+        r.release_port(6000, &a, "a");
         assert_eq!(r.backend_count(6000), 1, "只摘掉一个，端口还得继续服务");
         assert!(r.reserved_ports().contains(&6000));
         assert!(
@@ -961,7 +1023,7 @@ mod tests {
             "组里还有成员在服务，创建者掉线不能把监听器一起带走"
         );
 
-        r.release_port(6000, &b);
+        r.release_port(6000, &b, "b");
         assert!(
             !r.reserved_ports().contains(&6000),
             "最后一个后端走了，端口必须释放"

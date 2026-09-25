@@ -1,6 +1,6 @@
 [package]
-name = "rustunnel-common"
-description = "rustunnel 公共库：协议、配置、错误、工具与传输层抽象"
+name = "nfrp-common"
+description = "NFrp 公共库：协议、配置、错误、工具与传输层抽象"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

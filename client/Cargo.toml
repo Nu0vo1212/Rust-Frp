@@ -1,6 +1,6 @@
 [package]
-name = "rustunnel-client"
-description = "rustunnel 客户端：注册代理、按需建立工作连接"
+name = "nfrp-client"
+description = "NFrp 客户端：注册代理、按需建立工作连接"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,11 +13,11 @@ keywords = ["frp", "proxy", "tunnel", "client", "nat"]
 categories = ["network-programming"]
 
 [[bin]]
-name = "rustunnel-client"
+name = "nfrp-client"
 path = "src/main.rs"
 
 [dependencies]
-rustunnel-common = { workspace = true }
+nfrp-common = { workspace = true }
 
 # xtcp 真 P2P 用 QUIC 承载直连流量（打洞成功后不再经过服务端）
 quinn = { workspace = true }

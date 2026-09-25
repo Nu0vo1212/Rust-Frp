@@ -136,7 +136,11 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: checksums
-          path: out/SHA256SUMS
+          # ★ 必须连 `*.sig` 一起传：只传 SHA256SUMS 的话，上面 cosign 签出来的
+          # 分离签名会随着 job 结束一起消失，Release 里只剩一个没人能验证的校验和文件。
+          path: |
+            out/SHA256SUMS
+            out/*.sig
 
   release:
     name: github release

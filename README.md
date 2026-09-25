@@ -1,4 +1,4 @@
-# rustunnel
+# NFrp
 
 用 Rust 实现的内网穿透工具，**完整兼容 [fatedier/frp](https://github.com/fatedier/frp) 的 wire protocol v1 与 v2**，可以和官方 `frps` / `frpc`（v0.71.0 实测）直接互通。
 
@@ -70,7 +70,7 @@
 
 ### 工程质量
 
-- ✅ **444 个自动化测试** — 含真实 QUIC 栈握手、口令正反用例、端到端集成测试、**SUDP 端到端与 KCP 传输链路**、**与官方 frpc/frps 真实抓包密文的解密回归**
+- ✅ **459 个自动化测试** — 含真实 QUIC 栈握手、口令正反用例、端到端集成测试、**SUDP 端到端与 KCP 传输链路**、**与官方 frpc/frps 真实抓包密文的解密回归**
 - ✅ **CI 流水线** — `fmt` / `clippy` / 测试 / 四目标构建 / 冒烟，PR 必过
 - ✅ **发布可验真** — `SHA256SUMS` + 可选 Ed25519 分离签名与本地验签脚本
 - ✅ **容器就绪** — 多阶段 `Dockerfile`（musl 静态）+ `docker-compose.yml`
@@ -79,7 +79,7 @@
 ## 架构
 
 ```
-rustunnel/
+nfrp/
 ├── common/                    # 公共库（协议实现核心）
 │   └── src/
 │       ├── frp/
@@ -155,10 +155,10 @@ QUIC 模式下服务端会在**同一个端口号**上额外监听 UDP，TCP 监
 ### 从源码构建
 
 ```bash
-git clone https://github.com/<you>/rustunnel.git
-cd rustunnel
+git clone https://github.com/<you>/nfrp.git
+cd nfrp
 cargo build --release
-# 产物：target/release/rustunnel-server（frps）、target/release/rustunnel-client（frpc）
+# 产物：target/release/nfrp-server（frps）、target/release/nfrp-client（frpc）
 ```
 
 Rust 1.75+。Windows 用 MSVC toolchain；Linux arm64 静态编译见下文。
@@ -186,9 +186,9 @@ hot_reload = true
 ```
 
 ```bash
-./rustunnel-server -c frps.toml
+./nfrp-server -c frps.toml
 # 也可以直接生成带注释的示例配置：
-./rustunnel-server --gen-config frps.toml
+./nfrp-server --gen-config frps.toml
 ```
 
 ### 启动客户端（内网机器）
@@ -209,34 +209,34 @@ remote_port = 6000
 ```
 
 ```bash
-./rustunnel-client -c frpc.toml
+./nfrp-client -c frpc.toml
 ```
 
 之后 `your.server.com:6000` 即映射到内网机器的 22 端口。
 
 ### 与官方 frp 互通
 
-rustunnel 可运行在官方 frp 的任一侧：
+NFrp 可运行在官方 frp 的任一侧：
 
 | 服务端 | 客户端 | 状态 |
 |---|---|---|
-| rustunnel frps | 官方 frpc（tcpMux on/off、TLS on） | ✅ 实测通过 |
-| 官方 frps | rustunnel frpc（tcp_mux on/off、TLS on） | ✅ 实测通过 |
-| rustunnel frps | 官方 frpc（udp / http / https 代理） | ✅ 实测通过 |
-| 官方 frps | rustunnel frpc（udp / http / https 代理） | ✅ 实测通过 |
-| rustunnel frps | 官方 frpc（stcp 提供者 / 访客，tcpMux on/off、TLS on） | ✅ 实测通过 |
-| rustunnel frps | 官方 frpc（stcp `allow_users`：`user=alice` 放行 / `user=mallory` 被拒，错误文本可回传） | ✅ 实测通过 |
-| 官方 frps | rustunnel frpc（stcp 提供者 / 访客，tcp_mux on/off、TLS on） | ✅ 实测通过 |
-| 官方 frps | rustunnel frpc（stcp `allow_users=["alice"]`，`user=alice` 放行） | ✅ 实测通过 |
-| rustunnel frps | rustunnel frpc（含 TLS、关 yamux 组合、stcp / xtcp、`allow_users` 空/名单/`*` 三种语义） | ✅ 实测通过 |
-| 第三方 frp 平台（LoliaFRP） | rustunnel frpc（用平台下发的**原版配置**直接启动） | ✅ 实测通过（v0.3.1） |
-| 官方 frps v0.71.0 | rustunnel frpc（**v1，零配置**） | ✅ 实测通过（v0.3.3） |
-| rustunnel frps | 官方 frpc v0.71.0（**v1，零配置**） | ✅ 实测通过（v0.3.3） |
+| nfrp frps | 官方 frpc（tcpMux on/off、TLS on） | ✅ 实测通过 |
+| 官方 frps | nfrp frpc（tcp_mux on/off、TLS on） | ✅ 实测通过 |
+| nfrp frps | 官方 frpc（udp / http / https 代理） | ✅ 实测通过 |
+| 官方 frps | nfrp frpc（udp / http / https 代理） | ✅ 实测通过 |
+| nfrp frps | 官方 frpc（stcp 提供者 / 访客，tcpMux on/off、TLS on） | ✅ 实测通过 |
+| nfrp frps | 官方 frpc（stcp `allow_users`：`user=alice` 放行 / `user=mallory` 被拒，错误文本可回传） | ✅ 实测通过 |
+| 官方 frps | nfrp frpc（stcp 提供者 / 访客，tcp_mux on/off、TLS on） | ✅ 实测通过 |
+| 官方 frps | nfrp frpc（stcp `allow_users=["alice"]`，`user=alice` 放行） | ✅ 实测通过 |
+| nfrp frps | nfrp frpc（含 TLS、关 yamux 组合、stcp / xtcp、`allow_users` 空/名单/`*` 三种语义） | ✅ 实测通过 |
+| 第三方 frp 平台（LoliaFRP） | nfrp frpc（用平台下发的**原版配置**直接启动） | ✅ 实测通过（v0.3.1） |
+| 官方 frps v0.71.0 | nfrp frpc（**v1，零配置**） | ✅ 实测通过（v0.3.3） |
+| nfrp frps | 官方 frpc v0.71.0（**v1，零配置**） | ✅ 实测通过（v0.3.3） |
 
 ### 线协议：默认 v1，和官方一致（v0.3.2 起）
 
 官方 frp 的 `transport.wireProtocol` **缺省值就是 `v1`**（见 `pkg/config/v1/client.go`），
-v2 只有显式配置才会启用。所以"兼容 frp"的实现必须以 v1 为默认 —— v0.3.2 起 rustunnel
+v2 只有显式配置才会启用。所以"兼容 frp"的实现必须以 v1 为默认 —— v0.3.2 起 NFrp
 也照此默认，**官方 frpc / frps 不需要改任何配置**就能互通：
 
 ```toml
@@ -246,17 +246,17 @@ v2 只有显式配置才会启用。所以"兼容 frp"的实现必须以 v1 为�
 想用 v2 时就显式打开（两端都要）：
 
 ```toml
-# 官方 frpc 侧 / rustunnel 侧均可
+# 官方 frpc 侧 / NFrp 侧均可
 transport.wireProtocol = "v2"
 ```
 
-rustunnel 服务端**不需要预先知道对端用哪个版本**：它读满 8 字节与 v2 的魔术字逐字节比较
+NFrp 服务端**不需要预先知道对端用哪个版本**：它读满 8 字节与 v2 的魔术字逐字节比较
 （`pkg/proto/wire/wire.go` 的 `CheckMagic` 语义），相同就走 v2，不同就**把这 8 字节原样留在
 缓冲区里**按 v1 解析 —— 那 8 字节本来就是 v1 的类型字节 + 长度前缀。所以同一个端口
 同时接待 v1 与 v2 客户端。
 
 > **注意**：官方 frp 没有 QUIC 传输（只有 TCP/KCP/QUIC 三选一的 `transport.protocol`），
-> 所以 `transport_protocol = "quic"` 只在 rustunnel 两端之间可用；
+> 所以 `transport_protocol = "quic"` 只在 NFrp 两端之间可用；
 > 与官方互通时请保持 `tcp`。
 
 ### 直接使用原版 frp 的配置文件（v0.3.1 起）
@@ -264,7 +264,7 @@ rustunnel 服务端**不需要预先知道对端用哪个版本**：它读满 8 
 原版 frp 的配置**不需要改写**就能直接喂给这个 `frpc` —— 第三方 frp 平台
 （LoliaFRP / OpenFrp / SakuraFrp 等）下发的就是这种格式，拷过来即可运行。
 
-解析前会过一遍 `common/src/frp_config.rs` 的兼容层，把原版字段名规范化成 rustunnel 风格：
+解析前会过一遍 `common/src/frp_config.rs` 的兼容层，把原版字段名规范化成 NFrp 风格：
 
 | 原版 frp 写法 | 归一化成 |
 |---|---|
@@ -277,7 +277,7 @@ rustunnel 服务端**不需要预先知道对端用哪个版本**：它读满 8 
 | `[proxies.healthCheck]` 子表 | `health_check_*` 平铺 |
 | `[proxies.plugin]` 子表 | `plugin` / `plugin_local_path` / `plugin_strip_prefix` / … |
 
-原则是「只补不覆盖」：rustunnel 自己的写法同时有效，两种写法混用时**原生字段优先**。
+原则是「只补不覆盖」：NFrp 自己的写法同时有效，两种写法混用时**原生字段优先**。
 
 两个容易搞反的地方：
 
@@ -562,10 +562,10 @@ curl -u admin:pwd -H 'Content-Type: application/json' \
   http://127.0.0.1:7500/api/proxies/add
 ```
 
-> 动态管理走 rustunnel 两端之间的私有消息，**客户端先是 rustunnel frpc 才支持**
+> 动态管理走 NFrp 两端之间的私有消息，**客户端先是 nfrp frpc 才支持**
 > （官方 frpc 连上来时面板会把它标为不可管理的，对应接口返回明确错误）。
 
-指标（前缀 `rustunnel_`）：
+指标（前缀 `nfrp_`）：
 
 | 指标 | 类型 | 含义 |
 |---|---|---|
@@ -650,7 +650,7 @@ method = "oidc"                 # token（默认）| oidc
 
 [auth.oidc]
 issuer = "https://keycloak.example.com/realms/myrealm"
-audience = "rustunnel"
+audience = "nfrp"
 # skipExpiryCheck = true        # 时钟偏差大 / 令牌有效期短时用
 # skipIssuerCheck = true
 # trustedCaFile = "/etc/ssl/private-ca.pem"   # 私有 CA 签的 IdP
@@ -664,7 +664,7 @@ audience = "rustunnel"
 method = "oidc"
 
 [auth.oidc]
-clientID = "rustunnel-client"
+clientID = "nfrp-client"
 clientSecret = "见 IdP 控制台"
 tokenEndpointURL = "https://keycloak.example.com/realms/myrealm/protocol/openid-connect/token"
 # additionalScopes = ["profile"]
@@ -719,7 +719,7 @@ maxProxies = 20                     # 该角色下单个客户端的代理数上
 # frps.toml
 [audit]
 enable = true
-path = "/var/log/rustunnel/audit.jsonl"   # 留空 = 只留内存，重启即失
+path = "/var/log/nfrp/audit.jsonl"   # 留空 = 只留内存，重启即失
 maxEntries = 1000                          # 内存环形缓冲条数（面板查询用）
 ```
 
@@ -811,7 +811,7 @@ proxyProtocolVersion = "v2"     # "v1" 文本 / "v2" 二进制；不写 = 不发
 ```toml
 # frpc.toml
 [store]
-path = "C:/Users/me/.rustunnel/proxies.json"   # 留空 = 不持久化（与老版本一致）
+path = "C:/Users/me/.nfrp/proxies.json"   # 留空 = 不持久化（与老版本一致）
 ```
 
 - 只存**运行时动态添加**的代理（面板 / 本地界面加的那些）。
@@ -869,7 +869,7 @@ max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
 
 ## 配置参考
 
-### 服务端（rustunnel-server）
+### 服务端（nfrp-server）
 
 | 项 | 说明 | 默认 |
 |---|---|---|
@@ -913,7 +913,7 @@ max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
 | `audit.maxEntries` | 内存环形缓冲条数 | `1000` |
 | `log_level` | `error`/`warn`/`info`/`debug`/`trace` | `info` |
 
-### 客户端（rustunnel-client）
+### 客户端（nfrp-client）
 
 | 项 | 说明 | 默认 |
 |---|---|---|
@@ -996,7 +996,7 @@ max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
 |---|---|
 | Go 官方 frps（默认） | 31.8 MB |
 | Go 官方 frps（GOGC/GOMEMLIMIT 调优后） | 28.8 MB |
-| **rustunnel-server（Rust）** | **~3.5 MB** |
+| **nfrp-server（Rust）** | **~3.5 MB** |
 
 ### 吞吐实测（iperf3）
 
@@ -1005,7 +1005,7 @@ max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
 `127.0.0.1` 上跑 iperf3 服务端，两种实现各自把 `5201` 投放到远端端口，再从同一台机器连过去，
 即数据全程不出本机 —— 测的是代理链路的纯开销。单位 Mbps，5 次取**中位数**，括号内为最好值：
 
-| 场景 | 直连（无隧道） | 官方 frp 0.71.0 | rustunnel |
+| 场景 | 直连（无隧道） | 官方 frp 0.71.0 | nfrp |
 |---|---|---|---|
 | yamux，单流 `-P1`，客户端→服务端 | 17813.0 (21956.9) | 1053.3 (1130.0) | **2034.6** (3941.1) |
 | yamux，单流 `-P1`，服务端→客户端 `-R` | 20417.8 (21674.3) | 1154.6 (1456.3) | 1090.5 (1097.8) |
@@ -1014,9 +1014,9 @@ max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
 | 关闭 yamux，单流 `-P1`，客户端→服务端 | 25886.3 (26113.4) | 412.6 (441.2) | **1388.9** (1424.3) |
 | 关闭 yamux，单流 `-P1`，服务端→客户端 `-R` | 25430.2 (26085.6) | 415.1 (432.6) | **1390.5** (1471.7) |
 
-结论：**多流场景（`-P4`）rustunnel 是官方 frp 的约 3.8~4 倍**（12.6 Gbps vs 3.3 Gbps）；
-单流场景两者同一量级（rustunnel 单向量测波动较大，中位数略优于官方）；
-关闭 yamux 时 rustunnel 约 1.39 Gbps，是官方（约 0.41 Gbps）的 **3.4 倍**。
+结论：**多流场景（`-P4`）NFrp 是官方 frp 的约 3.8~4 倍**（12.6 Gbps vs 3.3 Gbps）；
+单流场景两者同一量级（NFrp 单向量测波动较大，中位数略优于官方）；
+关闭 yamux 时 NFrp 约 1.39 Gbps，是官方（约 0.41 Gbps）的 **3.4 倍**。
 
 > 这一版把 yamux 的 `split_send_size` 从默认 16 KiB 提到 **128 KiB**、并把转发缓冲区从 tokio 默认的
 > 8 KiB 提到 **128 KiB**（`RELAY_BUF`）。前者是单流吞吐的主要瓶颈，这正是这里拉开差距的原因。
@@ -1027,12 +1027,12 @@ max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
 本机 iperf3 服务端 → 本机客户端 → 云端服务端 → 云端 iperf3 客户端，每档 3 次 × 10s 取最好值。
 **跑了两次**，下表两个数字分别是两次的结果：
 
-| 方向 | 官方 frp 0.71.0 | rustunnel |
+| 方向 | 官方 frp 0.71.0 | nfrp |
 |---|---|---|
 | 云端→本机（下行） | 222.8 / 210.0 Mbps | 223.8 / 205.9 Mbps |
 | 本机→云端（上行 `-R`） | 51.6 / 51.7 Mbps | 52.3 / 52.0 Mbps |
 
-**结论要说实话：两次跑各有胜负（第一次 rustunnel 略高、第二次官方略高），差值都在 2% 以内，
+**结论要说实话：两次跑各有胜负（第一次 NFrp 略高、第二次官方略高），差值都在 2% 以内，
 属于链路抖动。** 真实公共链路的瓶颈是家庭宽带本身（下行约 200~220 Mbps、上行约 50 Mbps），
 两种实现都能跑满，说明协议开销在公网上可忽略 —— 差距只在回环（本机内）场景才看得出来。
 
@@ -1060,11 +1060,11 @@ max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
 > v0.3.1 是一个**第三方平台兼容性补丁**：`frpc` 现在能直接吃下原版 frp 平台下发的配置
 > （camelCase 字段名、`[[proxies]]` 分段、`localIP` + `localPort`），并且**线协议行为与官方
 > frpc 逐字节对齐**（`proxy_name` 带 `{user}.` 前缀、`bandwidthLimitMode` 字段）。
-> 已用 LoliaFRP 真实服务端跑通端到端隧道（公网端口 → 平台 → rustunnel → 本地服务）。
+> 已用 LoliaFRP 真实服务端跑通端到端隧道（公网端口 → 平台 → nfrp → 本地服务）。
 > 同版还修掉一个 xtcp 回归：provider 侧漏剥 `{user}.` 前缀，导致打洞通知被当「未知代理」
 > 忽略、P2P 静默退化成中继（本机冒烟 12/12 已覆盖"是否真走直连"）。
 >
-> v0.3.2 补上了**官方默认的 v1 线协议**：在此之前 rustunnel 只讲 v2，官方客户端必须显式
+> v0.3.2 补上了**官方默认的 v1 线协议**：在此之前 NFrp 只讲 v2，官方客户端必须显式
 > 写 `transport.wireProtocol = "v2"` 才能连 —— 而第三方 frp 平台一律走 v1，这正是上一版
 > 在樱花上失败的原因。现在 v1 是默认，官方 frpc / frps 零配置直连，服务端还能在同一个
 > 端口上同时接待 v1 与 v2。踩过的最大的坑写进了源码注释：**v1 控制通道的 PBKDF2 盐是
@@ -1095,20 +1095,51 @@ max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
 > 顺带修掉一个潜伏很久的真 bug：`KcpStream::poll_read` 会把"一次没读完的剩余字节"
 > 直接丢掉 —— 服务端探测 yamux 时只读 1 字节，frp v2 的 8 字节魔术字于是被吃掉 7 个，
 > 握手**静默卡死**（这个 bug 在 xtcp P2P 的 KCP 通道上一直存在，只因那边读写缓冲够大才没暴露）。
+>
+> v0.5.0 是**改名与配置兼容**的一版：项目从 `rustunnel` 更名为 **NFrp**
+> （crate `nfrp-common` / `nfrp-server` / `nfrp-client`，源码目录 `nfrp/`）。
+> **对官方 frp 的兼容标识一个都没动** —— `-v` 仍输出裸 `0.71.0`、线协议魔术字/版本串、
+> 包内 `frps`/`frpc` 命名全部保持，所以官方 frpc / frps 与第三方 frp 平台的对接不受影响。
+> 同时补上两处"静默忽略"的缺口：**官方 frpc / frps 支持、但 NFrp 未实现的配置字段**
+> 现在会在启动日志里逐条列出（`useEncryption` / `useCompression` / `allowPorts` /
+> `maxPortsPerClient` 这类"配了没生效"最危险），并新增 `verify` / `status` / `stop`
+> 三个与原版 frpc 同名的子命令。私有能力协商字段由 `_rustunnel` 改为 `_nfrp`，
+> 因此**新旧版本混用时不协商私有能力**（退化为纯 frp 行为，不会出错）。
+>
+> 改名之后又拿官方 0.71.0 做了一轮**逐项对拍**（协议、七种代理类型、配置兼容层），
+> 又抓出三个真 bug：
+> ① **官方文档里的配置键 `subDomainHost` 不生效** —— NFrp 的键名搬家表是**精确匹配**，
+> 而官方 frp 读配置走 `toml → json → json.Unmarshal`，Go 的 `encoding/json` 匹配字段名
+> 是**大小写不敏感**的（`strings.EqualFold`），所以 `subDomainHost` / `subdomainHost`
+> 官方都认。NFrp 于是把官方文档和 `frps_full_example.toml` 里那个拼写当未知键**静默丢掉**，
+> 表现是客户端只得到一句「代理注册失败：客户端用了 subdomain，但服务端未配置
+> subdomain_host」。现在键名匹配折叠 ASCII 大小写（★ **不折叠下划线**，与官方一致：
+> 官方同样不认 `subdomain_host`），同一处理也覆盖子表路径、`[proxies.plugin]`
+> 与"未实现字段"告警的识别；
+> ② **负载均衡组永远只用一个后端** —— 组成员去重只看 `run_id`，同一客户端的第二个同组
+> 代理会把兄弟成员挤掉，于是组里只剩一个后端（官方同配置会轮询到两个）。去重键改成
+> 「客户端 + 代理名」；
+> ③ **官方 frpc 的 xtcp visitor 打洞会干等 20 秒** —— NFrp 未实现官方 frp 的 NatHole
+> UDP 地址交换协议，现在会**明确拒绝**未签名的 `NatHoleVisitor`，官方 frpc 因此立刻转走
+> 它自己的 `fallbackTo` 中继（1 秒），而不是卡满 20 秒才放弃。
+> （★ 顺带纠正一个认知：官方 frp 的 xtcp "回退中继"只能指向 **stcp / sudp** 代理 ——
+> 服务端只有这两类代理会注册 visitor 监听器；指向 xtcp 代理只会得到
+> 「custom listener for [x] doesn't exist」，xtcp 代理本身**永远无法被中继**
+> （官方 frpc 的 `XTCPProxy::InWorkConn` 一上来只读 `NatHoleSid`）。）
 
 ## 质量保障
 
 ```bash
 cargo fmt --all -- --check          # 格式
 cargo clippy --workspace --all-targets   # 静态检查（当前 0 告警）
-cargo test --workspace              # 444 个测试
+cargo test --workspace              # 459 个测试
 ```
 
 测试分布：
 
 | 目标 | 数量 | 覆盖重点 |
 |---|---|---|
-| `common` 单元测试 | 217 | **v1 线协议**（消息类型字节、帧编解码、AES-128-CFB 密钥派生与流式状态机、**官方抓包密文解密回归**）、v2 线协议编解码、加密、配置解析、**原版 frp 配置兼容层**、打洞报文/口令/端口预测、**KCP（含 30% 丢包下的可靠传输）**、令牌桶、示例配置可加载、**OIDC 令牌源与 JWKS 验签**、**CIDR/ACL/RBAC 判定边界**、**WebSocket 帧编解码与 Ping/Pong**、**PROXY v1/v2 编解码与防注入 sniff**、**VirtualNet 帧/路由/地址池**、**HTTP/1.1 请求解析** |
+| `common` 单元测试 | 230 | **v1 线协议**（消息类型字节、帧编解码、AES-128-CFB 密钥派生与流式状态机、**官方抓包密文解密回归**）、v2 线协议编解码、加密、配置解析、**原版 frp 配置兼容层**、打洞报文/口令/端口预测、**KCP（含 30% 丢包下的可靠传输）**、令牌桶、示例配置可加载、**OIDC 令牌源与 JWKS 验签**、**CIDR/ACL/RBAC 判定边界**、**WebSocket 帧编解码与 Ping/Pong**、**PROXY v1/v2 编解码与防注入 sniff**、**VirtualNet 帧/路由/地址池**、**HTTP/1.1 请求解析** |
 | `server` 单元测试（lib） | 144 | 虚拟主机路由表与优先级、chunked 解析、Basic Auth、连接池配对与回收、**端口组最小连接数调度**、资源配额、指标编码、面板鉴权与**写接口**、热重载字段判定、打洞会话、**审计日志（JSONL + 环形缓冲 + 过滤）**、**安全上下文（ACL→认证→RBAC→审计）**、**API v2（错误信封 / 分页 / 百分号解码）**、**VirtualNet 服务端路由与代答 ICMP** |
 | `server` 单元测试（bin） | 5 | 命令行与配置装载 |
 | `client` 单元测试 | 64 | QUIC 建连与口令握手、插件（http_proxy / socks5 / static_file）、健康检查状态机、打洞编排、`NewProxy` 字段映射（含与官方 frpc 抓包逐字节对拍）、服务端下发名 → 本地代理的翻译（`resolve_uploaded_proxy`）、**动态代理表**、**store 落盘与损坏文件容错**、**本地管理界面的路由与本地校验**、**PROXY 头注入** |
@@ -1141,7 +1172,7 @@ python scripts/release.py verify --dir dist/release
 ### Docker
 
 ```bash
-docker build -t rustunnel .                # 多阶段构建，产物是 musl 静态二进制
+docker build -t nfrp .                # 多阶段构建，产物是 musl 静态二进制
 docker compose up -d                       # 或直接用 compose（含配置挂载与端口映射）
 ```
 
@@ -1149,13 +1180,13 @@ docker compose up -d                       # 或直接用 compose（含配置挂
 
 三个 crate 的 `description` / `license` / `repository` / `keywords` / `categories` 元数据已就位，
 `LICENSE`（Apache License 2.0）与 `NOTICE`（版权声明 + 第三方组件许可）随源码树分发。
-发布前把 `Cargo.toml` 里的 `repository` / `homepage`
-从占位地址改成你自己的仓库地址即可：
+`Cargo.toml` 里的 `repository` / `homepage` 已指向
+<https://github.com/Nu0vo1212/Rust-Frp>，直接发布即可：
 
 ```bash
-cargo publish -p rustunnel-common
-cargo publish -p rustunnel-server
-cargo publish -p rustunnel-client
+cargo publish -p nfrp-common
+cargo publish -p nfrp-server
+cargo publish -p nfrp-client
 ```
 
 ## 交叉编译（Linux ARM64 静态链接）
@@ -1183,22 +1214,22 @@ cargo build --release --target aarch64-unknown-linux-gnu
 - `xtcp` 已实现 UDP 打洞 + QUIC / KCP 直连，并对**对称 NAT 做端口预测**，但仍有一类
   严格对称 NAT（每次分配完全随机、无步长可推）打不通，此时照旧回退中继；
   `p2p_port` 需要放行 UDP，否则只能走中继；
-- **QUIC 传输仅限 rustunnel 两端之间** —— 官方 frp 的 `transport.protocol` 语义不同，互通时用 `tcp`；
-- 面板的动态管理（增删代理 / 踢人）需要**对端也是 rustunnel frpc**：官方 frpc 不支持这套
+- **QUIC 传输仅限 NFrp 两端之间** —— 官方 frp 的 `transport.protocol` 语义不同，互通时用 `tcp`；
+- 面板的动态管理（增删代理 / 踢人）需要**对端也是 nfrp frpc**：官方 frpc 不支持这套
   私有消息，面板会把它标为不可管理，其余功能不受影响；
 - v1 线协议已完整实现并且是**默认**（与官方一致）；官方 v2 专有的 **UDP 二进制报文编码**
-  （`V2BinaryUDPPacketReadWriter`）在 rustunnel 两端之间 v1/v2 都启用，与官方互通时走 JSON —— 功能等价，仅包体略大。
+  （`V2BinaryUDPPacketReadWriter`）在 NFrp 两端之间 v1/v2 都启用，与官方互通时走 JSON —— 功能等价，仅包体略大。
 - **VirtualNet 仅 Linux 客户端可用**：需要创建 TUN 设备与 `ip` 命令，Windows 上没有对应实现
   （服务端不受平台限制）。同时需要 root 或 `CAP_NET_ADMIN`。
 - 本章新增的 **OIDC 认证 / ACL / RBAC / 审计 / WebSocket / VirtualNet / Proxy Protocol /
-  API v2 / 客户端本地界面**都是 rustunnel 两端之间的能力：与官方 frp 互通时，官方那一端
+  API v2 / 客户端本地界面**都是 NFrp 两端之间的能力：与官方 frp 互通时，官方那一端
   不认识这些扩展 —— 官方 frpc 连上来时按普通 token 客户端处理，不会因为对方不支持而失败。
-- 客户端 `[store]` 的落盘格式是 rustunnel 自己的 JSON，**与官方 frp 的 store 不通用**
+- 客户端 `[store]` 的落盘格式是 NFrp 自己的 JSON，**与官方 frp 的 store 不通用**
   （官方是 Go `configmgmt` 的序列化结构），从官方 frpc 迁移过来需要重新加一遍动态代理。
 
 ## License
 
-Copyright 2026 rustunnel contributors
+Copyright 2026 nfrp contributors
 
 遵循 **Apache License 2.0**，全文见 [`LICENSE`](LICENSE)，版权与第三方组件许可见 [`NOTICE`](NOTICE)。
 

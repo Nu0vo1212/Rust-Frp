@@ -1,4 +1,4 @@
-//! 端到端集成测试：进程内起一个**真的** rustunnel-server，
+//! 端到端集成测试：进程内起一个**真的** nfrp-server，
 //! 再用一个"最小 frp 客户端"按 frp v2 线协议连上来，验证转发是真通的。
 //!
 //! 为什么要这一层：单元测试再全也只能证明"每个零件符合预期"，
@@ -8,7 +8,7 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use rustunnel_common::{
+use nfrp_common::{
     config::ServerConfig,
     frp::{
         conn::{self, FrpConn},
@@ -19,7 +19,7 @@ use rustunnel_common::{
     },
     util,
 };
-use rustunnel_server::{serve_on, Registry};
+use nfrp_server::{serve_on, Registry};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
@@ -186,7 +186,7 @@ async fn login_with(port: u16, token: &str, user: &str, wire: WireVersion) -> (F
     let (conn, run_id, _udp_binary, _caps) = conn::client_handshake(
         Box::pin(stream),
         wire,
-        &rustunnel_common::security::Credential::Token(token.to_string()),
+        &nfrp_common::security::Credential::Token(token.to_string()),
         "e2e-client",
         user,
         &empty_metas(),
@@ -207,7 +207,7 @@ async fn login_with(port: u16, token: &str, user: &str, wire: WireVersion) -> (F
 /// - 客户端 `NewProxy.proxy_name` 发的是**线上全名** `"{user}.{name}"`
 ///   （官方 frpc 的 `wireName` 就是这么算的：`naming.AddUserPrefix(user, name)`）；
 /// - 注册表里的键与 `NewProxyResp.proxy_name` 同样是这个全名；
-/// - rustunnel 服务端还额外做了层幂等（收到原始名也会补成全名），
+/// - NFrp 服务端还额外做了层幂等（收到原始名也会补成全名），
 ///   所以本文件里传原始名进来也能跑通；
 /// - 所以 visitor 的 `serverName` 必须自己拼上前缀（`serverUser` 或本机 `user`）。
 async fn register_proxy(conn: &mut FrpConn, proxy: NewProxy) -> NewProxyResp {
@@ -343,15 +343,15 @@ async fn login_quic(
     user: &str,
 ) -> (quinn::Endpoint, quinn::Connection, FrpConn, String) {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let (endpoint, conn) = rustunnel_common::frp::quic::connect(&addr, None)
+    let (endpoint, conn) = nfrp_common::frp::quic::connect(&addr, None)
         .await
         .expect("QUIC 连接");
     let (send, recv) = conn.open_bi().await.expect("开控制流");
-    let stream = Box::pin(rustunnel_common::frp::quic::QuicStream::new(send, recv));
+    let stream = Box::pin(nfrp_common::frp::quic::QuicStream::new(send, recv));
     let (frp, run_id, _, _caps) = conn::client_handshake(
         stream,
         WireVersion::V2,
-        &rustunnel_common::security::Credential::Token(token.to_string()),
+        &nfrp_common::security::Credential::Token(token.to_string()),
         "e2e-quic",
         user,
         &empty_metas(),
@@ -373,7 +373,7 @@ async fn serve_work_conn_quic(
     let (send, recv) = conn.open_bi().await?;
     let ts = util::now_unix_secs() as i64;
     let (mut work, leftover, _start) = conn::client_work_conn(
-        Box::pin(rustunnel_common::frp::quic::QuicStream::new(send, recv)),
+        Box::pin(nfrp_common::frp::quic::QuicStream::new(send, recv)),
         WireVersion::V2,
         run_id,
         TOKEN,
@@ -436,7 +436,7 @@ async fn wrong_token_is_rejected_at_handshake() {
     let r = conn::client_handshake(
         Box::pin(stream),
         WireVersion::V2,
-        &rustunnel_common::security::Credential::Token("wrong-token".into()),
+        &nfrp_common::security::Credential::Token("wrong-token".into()),
         "x",
         "",
         &empty_metas(),
@@ -759,7 +759,7 @@ async fn login_kcp(kaddr: SocketAddr, token: &str, user: &str) -> (FrpConn, Stri
     let (conn, run_id, _udp_binary, _caps) = conn::client_handshake(
         kcp_stream(kaddr).await,
         WireVersion::V2,
-        &rustunnel_common::security::Credential::Token(token.to_string()),
+        &nfrp_common::security::Credential::Token(token.to_string()),
         "e2e-kcp-client",
         user,
         &empty_metas(),
@@ -1123,7 +1123,7 @@ async fn tcp_proxy_roundtrip_over_wire_v1() {
 
 /// 同一个端口上 v1 与 v2 客户端必须能**共存**。
 ///
-/// 官方 frps 就是靠魔术字自动分流（`wire.CheckMagic`），rustunnel-server 同理。
+/// 官方 frps 就是靠魔术字自动分流（`wire.CheckMagic`），nfrp-server 同理。
 /// 这条测试的价值：证明"接到一个 frp 服务端上，不用问它支持哪一版"。
 #[tokio::test]
 async fn wire_v1_and_v2_coexist_on_one_port() {

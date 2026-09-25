@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use rustunnel_common::config::{ClientConfig, ProxyConfig};
+use nfrp_common::config::{ClientConfig, ProxyConfig};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -264,7 +264,7 @@ mod tests {
 
     #[test]
     fn 落盘并能在新进程里读回() {
-        let dir = std::env::temp_dir().join(format!("rustunnel-store-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nfrp-store-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("store.json");
         let c = cfg_with_path(&path);
@@ -293,7 +293,7 @@ mod tests {
 
     #[test]
     fn 文件损坏不拦启动() {
-        let dir = std::env::temp_dir().join(format!("rustunnel-store-bad-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nfrp-store-bad-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("store.json");
@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn 目录不存在会自动创建() {
-        let dir = std::env::temp_dir().join(format!("rustunnel-store-mk-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nfrp-store-mk-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("deep").join("store.json");
         let c = cfg_with_path(&path);

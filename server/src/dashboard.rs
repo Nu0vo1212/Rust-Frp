@@ -20,7 +20,7 @@ use crate::{
     observability::{encode_json, encode_prometheus, Snapshot},
     registry::Registry,
 };
-use rustunnel_common::config::ServerConfig;
+use nfrp_common::config::ServerConfig;
 
 /// 面板的鉴权信息；`None` 表示不校验（只建议在回环地址上这样配）。
 pub type DashboardAuth = Arc<RwLock<Option<(String, String)>>>;
@@ -32,7 +32,7 @@ pub type DashboardAuth = Arc<RwLock<Option<(String, String)>>>;
 pub const HEALTHZ_PATH: &str = "/api/healthz";
 
 /// Prometheus 指标名前缀。
-const METRIC_PREFIX: &str = "rustunnel";
+const METRIC_PREFIX: &str = "nfrp";
 
 /// 单条请求行的最大长度。
 const MAX_LINE: usize = 8 * 1024;
@@ -151,7 +151,7 @@ async fn handle(
                     401,
                     "text/plain; charset=utf-8",
                     b"Unauthorized\n".as_slice(),
-                    &[("WWW-Authenticate", "Basic realm=\"rustunnel\"")],
+                    &[("WWW-Authenticate", "Basic realm=\"nfrp\"")],
                 )
                 .await?;
                 return Ok(());
@@ -322,7 +322,7 @@ async fn admin_dispatch(
             let proxy = v
                 .get("proxy")
                 .ok_or_else(|| "缺少 proxy 配置".to_string())?;
-            let p: rustunnel_common::config::ProxyConfig = serde_json::from_value(proxy.clone())
+            let p: nfrp_common::config::ProxyConfig = serde_json::from_value(proxy.clone())
                 .map_err(|e| format!("proxy 配置解析失败：{e}"))?;
             admin::add_proxy(cfg, registry, &run_id, p).await
         }
@@ -406,7 +406,7 @@ fn basic_auth_of(req: &str) -> Option<String> {
 
 /// 定长比较：避免通过响应时间推测密码。
 fn constant_time_eq(a: &str, b: &str) -> bool {
-    rustunnel_common::frp::msg::constant_time_eq(a, b)
+    nfrp_common::frp::msg::constant_time_eq(a, b)
 }
 
 async fn send(
@@ -509,7 +509,7 @@ fn html_page() -> String {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>rustunnel 面板</title>
+<title>NFrp 面板</title>
 <style>
   :root { color-scheme: light; }
   body { margin:0; font:14px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif;
@@ -544,7 +544,7 @@ fn html_page() -> String {
 </style>
 </head>
 <body>
-<header>rustunnel 面板</header>
+<header>NFrp 面板</header>
 <main>
   <div class="cards" id="cards"></div>
   <section>
@@ -878,7 +878,7 @@ Authorization: Basic ",
         let registry = Registry::unlimited();
         let snap = registry.observ.snapshot();
         let out = encode_prometheus(&snap, METRIC_PREFIX);
-        assert!(out.contains("rustunnel_uptime_seconds"));
-        assert!(out.contains("# TYPE rustunnel_conns_active gauge"));
+        assert!(out.contains("nfrp_uptime_seconds"));
+        assert!(out.contains("# TYPE nfrp_conns_active gauge"));
     }
 }

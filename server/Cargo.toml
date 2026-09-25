@@ -1,6 +1,6 @@
 [package]
-name = "rustunnel-server"
-description = "rustunnel 服务端：控制连接 + 工作连接，TCP 端口转发"
+name = "nfrp-server"
+description = "NFrp 服务端：控制连接 + 工作连接，TCP 端口转发"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,13 +13,13 @@ keywords = ["frp", "proxy", "tunnel", "server", "nat"]
 categories = ["network-programming"]
 
 [[bin]]
-name = "rustunnel-server"
+name = "nfrp-server"
 path = "src/main.rs"
 
 [dependencies]
 quinn = { workspace = true }
 base64.workspace = true
-rustunnel-common = { workspace = true }
+nfrp-common = { workspace = true }
 
 anyhow = { workspace = true }
 serde = { workspace = true }
@@ -31,7 +31,7 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 
 [lib]
-name = "rustunnel_server"
+name = "nfrp_server"
 path = "src/lib.rs"
 
 [dev-dependencies]

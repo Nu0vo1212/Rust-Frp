@@ -17,7 +17,7 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
-use rustunnel_common::frp::{
+use nfrp_common::frp::{
     conn::FrpConn,
     msg::{FrpMessage, StartWorkConn},
 };
@@ -295,7 +295,7 @@ async fn handle_https(
     registry: Arc<Registry>,
 ) -> Result<()> {
     // 读出 ClientHello（返回原始字节，之后要原样转发给内网服务）
-    let (sni, hello_bytes) = rustunnel_common::frp::sni::sniff_client_hello(&mut visitor)
+    let (sni, hello_bytes) = nfrp_common::frp::sni::sniff_client_hello(&mut visitor)
         .await
         .context("读取 TLS ClientHello 失败")?;
     let Some(sni) = sni else {
@@ -337,7 +337,7 @@ async fn handle_https(
     }
     upstream.write_all(&hello_bytes).await?;
     let mut visitor = visitor;
-    let r = rustunnel_common::util::relay_between(&mut visitor, &mut upstream).await;
+    let r = nfrp_common::util::relay_between(&mut visitor, &mut upstream).await;
     record_bytes(&registry, &r);
     if let Err(e) = r {
         debug!(%peer, %sni, "HTTPS 透传中断：{e}");

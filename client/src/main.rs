@@ -1,4 +1,4 @@
-//! `rustunnel-client`：frp v2 兼容的客户端（等价于原版 frpc）。
+//! `nfrp-client`：frp v2 兼容的客户端（等价于原版 frpc）。
 //!
 //! 支持的代理类型：`tcp` / `udp` / `http` / `https` / `stcp` / `xtcp`。
 //! 其中 http / https 在客户端侧与 tcp 无差别（服务端已经把 HTTP 语义处理完了，
@@ -19,7 +19,7 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
-use rustunnel_common::{
+use nfrp_common::{
     config::{default_config_path, is_kcp, is_quic, ClientConfig, Protocol, ProxyConfig},
     frp::{
         self,
@@ -39,12 +39,15 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "rustunnel-client",
-    version,
-    about = "rustunnel 客户端（兼容原版 frp）"
-)]
+#[command(name = "nfrp-client", version, about = "NFrp 客户端（兼容原版 frp）")]
 struct Cli {
+    /// 子命令：`verify` / `status` / `reload` / `stop`，对应原版 frpc 的同名命令。
+    ///
+    /// **不写子命令时行为与以前完全一致**（读配置、跑隧道）—— 只是多了一层
+    /// 可选的分支，老脚本、启动器拉的 `nfrp-client -c xxx.toml` 不受影响。
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// 打印**上游 frp 兼容版本号**（等价于原版 frpc 的 `frpc -v`）
     ///
     /// 只输出裸版本号（如 `0.71.0`），一个多余的字都不加 —— 因为面板和启动器
@@ -52,7 +55,7 @@ struct Cli {
     /// 报给平台，平台据此决定下发 **legacy INI** 还是 **TOML** 配置。
     /// 这一项解析不出来时对方会当我们是远古版本，于是丢来一份 INI。
     ///
-    /// 想看 rustunnel 自己的版本请用 `--version`。
+    /// 想看 NFrp 自己的版本请用 `--version`。
     #[arg(short = 'v', long = "frp-version")]
     frp_version: bool,
 
@@ -72,7 +75,7 @@ struct Cli {
     #[arg(long, value_name = "LEVEL")]
     log_level: Option<String>,
 
-    /// 覆盖配置里的线协议（frp-v2 / rustunnel）
+    /// 覆盖配置里的线协议（frp-v2 / nfrp）
     #[arg(long, value_name = "PROTOCOL")]
     protocol: Option<String>,
 
@@ -89,6 +92,38 @@ struct Cli {
     token: Option<String>,
 }
 
+/// 子命令（对齐原版 frpc 的命令面）。
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// 校验配置文件（等价原版 `frpc verify -c <配置>`）
+    ///
+    /// 解析配置并检查语义（代理类型是否支持、必填项是否齐全），**不建立任何连接**。
+    /// 退出码 0 = 通过，非 0 = 有问题 —— 启动器/脚本可以据此判断。
+    Verify(VerifyArgs),
+
+    /// 查看运行中的客户端状态（走本地管理界面的 API，需配置里开了 [webServer]）
+    Status(AdminArgs),
+
+    /// 停止运行中的客户端（等价原版 `frpc stop`）
+    Stop(AdminArgs),
+}
+
+/// `verify` 的参数。
+#[derive(clap::Args, Debug)]
+struct VerifyArgs {
+    /// 要校验的配置文件（默认 ./client.toml）
+    #[arg(short, long, value_name = "PATH")]
+    config: Option<std::path::PathBuf>,
+}
+
+/// `status` / `stop` 共享的参数：都要从配置里找到管理界面地址。
+#[derive(clap::Args, Debug)]
+struct AdminArgs {
+    /// 客户端配置文件（用于取 [webServer] 的地址，默认 ./client.toml）
+    #[arg(short, long, value_name = "PATH")]
+    config: Option<std::path::PathBuf>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -96,8 +131,16 @@ async fn main() -> Result<()> {
     // 必须**第一个**处理：原版 frpc 的 `-v` 就是"打印版本号然后退出"，
     // 面板/启动器会在拉起隧道之前先跑它做格式协商。
     if cli.frp_version {
-        println!("{}", rustunnel_common::frp::FRP_WIRE_VERSION);
+        println!("{}", nfrp_common::frp::FRP_WIRE_VERSION);
         return Ok(());
+    }
+    // 子命令不跑隧道：处理完直接退出。
+    if let Some(cmd) = &cli.command {
+        return match cmd {
+            Command::Verify(a) => cmd_verify(a),
+            Command::Status(a) => cmd_status(a).await,
+            Command::Stop(a) => cmd_stop(a).await,
+        };
     }
 
     if cli.print_example {
@@ -120,7 +163,7 @@ async fn main() -> Result<()> {
             path.display(),
             std::env::args()
                 .next()
-                .unwrap_or_else(|| "rustunnel-client".into()),
+                .unwrap_or_else(|| "nfrp-client".into()),
             path.display()
         );
     }
@@ -145,10 +188,23 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| cfg.log_level.clone());
     util::init_tracing(&level);
 
+    // 官方 frp 支持、但 nfrp **未实现**的字段：官方 frpc 默认 strict 解析，
+    // 未知字段**直接报错**；NFrp 的 serde 不拒绝未知字段，于是它们被**静默
+    // 吞掉**。最危险的是 useEncryption / useCompression —— 用户以为加密了，
+    // 实际跑的是明文，日志里一个字都没有。这里必须明说，不能留"配了就等于生效"的错觉。
+    if !cfg.unsupported_fields.is_empty() {
+        warn!(
+            "配置里有 {} 项字段是官方 frp 支持、但 nfrp **未实现**的，已按默认值忽略：{} \
+             —— 它们不会生效（尤其是 useEncryption / useCompression：写了也仍是明文、不压缩）",
+            cfg.unsupported_fields.len(),
+            cfg.unsupported_fields.join(", ")
+        );
+    }
+
     // 线协议：默认 v1，与官方 frpc 的 `transport.wireProtocol` 默认值一致。
     // 樱花这类第三方 frps 分支只认 v1，配成 v2 会连不上（报错通常是"连上就断"）。
     let wire = cfg.protocol.wire_version().ok_or_else(|| {
-        anyhow!("当前版本尚未实现 rustunnel 自研协议，请把 protocol 设为 frp-v1（默认）或 frp-v2")
+        anyhow!("当前版本尚未实现 NFrp 自研协议，请把 protocol 设为 frp-v1（默认）或 frp-v2")
     })?;
     if cfg.proxies.is_empty() && cfg.visitors.is_empty() {
         warn!("配置里既没有 [[proxies]] 也没有 [[visitors]]，客户端不会做任何转发");
@@ -171,15 +227,15 @@ async fn main() -> Result<()> {
     // 而不是等每次连接都失败、用户对着"登录失败"发呆。
     cfg.auth.validate()?;
     let token_source = match cfg.auth.method {
-        rustunnel_common::security::AuthMethod::Oidc => {
-            let ts = rustunnel_common::auth::oidc::TokenSource::new(cfg.auth.oidc.clone())?;
+        nfrp_common::security::AuthMethod::Oidc => {
+            let ts = nfrp_common::auth::oidc::TokenSource::new(cfg.auth.oidc.clone())?;
             info!(
                 endpoint = %cfg.auth.oidc.token_endpoint_url,
                 "OIDC 认证：连接前用 Client Credentials 换取 access token（带缓存）"
             );
             Some(ts)
         }
-        rustunnel_common::security::AuthMethod::Token => None,
+        nfrp_common::security::AuthMethod::Token => None,
     };
 
     // 动态代理（面板 / Web API 加过的）从 store 里恢复，**并进 `cfg.proxies`**。
@@ -205,7 +261,7 @@ async fn main() -> Result<()> {
     let health = health::Monitor::start(&cfg);
 
     info!(
-        "rustunnel-client 启动：连接 {}:{}（线协议 {}），共 {} 个代理 / {} 个访客",
+        "nfrp-client 启动：连接 {}:{}（线协议 {}），共 {} 个代理 / {} 个访客",
         cfg.server_addr,
         cfg.server_port,
         wire,
@@ -281,6 +337,9 @@ async fn main() -> Result<()> {
         None
     };
 
+    // `stop` 子命令的信号源（[webServer] 没启用时为 None，永远不触发）。
+    let mut stop_rx = hub.as_ref().map(|h| h.stop_receiver());
+
     let shutdown = util::shutdown_signal();
     tokio::pin!(shutdown);
 
@@ -331,6 +390,10 @@ async fn main() -> Result<()> {
                 info!("客户端已停止");
                 return Ok(());
             }
+            _ = wait_stop(&mut stop_rx) => {
+                info!("收到 stop 命令（来自本地管理界面），客户端退出");
+                return Ok(());
+            }
         }
         // 会话已失效，visitor 在拿到新会话之前不要再用旧连接
         let _ = session_tx.send(None);
@@ -342,8 +405,139 @@ async fn main() -> Result<()> {
                 info!("客户端已停止");
                 return Ok(());
             }
+            _ = wait_stop(&mut stop_rx) => {
+                info!("收到 stop 命令（来自本地管理界面），客户端退出");
+                return Ok(());
+            }
         }
     }
+}
+
+/// 等 `stop` 信号；没启用 `[webServer]` 时（None）永远挂起。
+///
+/// 先看**当前值**再等变化：`watch` 的 `changed()` 只等下一次变化，
+/// 若 stop 请求在订阅之前就到了，光等 `changed()` 会永远等下去。
+async fn wait_stop(rx: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    match rx.as_mut() {
+        Some(r) => {
+            if *r.borrow() {
+                return;
+            }
+            let _ = r.changed().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// `verify` 子命令：解析配置并报告结果，**不建立任何连接**。
+///
+/// 等价原版 `frpc verify -c <配置>`：官方默认 strict 解析、有问题就非 0 退出，
+/// 启动器据此判断"这份配置能不能用"。这里把 `unsupported_fields` 一并报出来 ——
+/// 官方 frpc 对未知字段会**直接报错**，NFrp 只是忽略，得让用户知道差在哪。
+fn cmd_verify(a: &VerifyArgs) -> Result<()> {
+    let path = a
+        .config
+        .clone()
+        .unwrap_or_else(|| default_config_path("client.toml"));
+    if !path.exists() {
+        bail!("配置文件不存在：{}", path.display());
+    }
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("读取配置 {} 失败", path.display()))?;
+    match nfrp_common::config::parse_client(&raw) {
+        Ok(cfg) => {
+            println!("配置校验通过：{}", path.display());
+            println!("  服务端：{}:{}", cfg.server_addr, cfg.server_port);
+            println!(
+                "  代理 {} 个 / 访客 {} 个",
+                cfg.proxies.len(),
+                cfg.visitors.len()
+            );
+            for p in &cfg.proxies {
+                println!("    - [{}] {} -> {}", p.name, p.proxy_type, p.local_addr);
+            }
+            for v in &cfg.visitors {
+                println!(
+                    "    - [{}] {} -> {}.{}",
+                    v.name, v.visitor_type, v.server_user, v.server_name
+                );
+            }
+            if !cfg.unsupported_fields.is_empty() {
+                println!(
+                    "  警告：{} 项是官方 frp 支持、但 NFrp 未实现的字段（已忽略）：{}",
+                    cfg.unsupported_fields.len(),
+                    cfg.unsupported_fields.join(", ")
+                );
+            }
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("配置校验失败：{}", path.display());
+            eprintln!("{e:#}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// 从配置的 `[webServer]` 取本地管理界面地址。
+///
+/// `status` / `stop` 靠它定位运行中的进程 —— 官方 frpc 也是这个路子
+/// （读配置里的 `webServer.addr/port`，再打本地 API）。
+fn admin_base(cfg: &ClientConfig) -> Result<String> {
+    if !cfg.web_server.is_enabled() {
+        bail!(
+            "配置里没有启用 [webServer]，无法定位运行中的客户端。\n\
+             请在配置里加上：\n  [webServer]\n  addr = \"127.0.0.1\"\n  port = 7400"
+        );
+    }
+    let host = if cfg.web_server.addr.trim().is_empty() {
+        "127.0.0.1"
+    } else {
+        cfg.web_server.addr.trim()
+    };
+    Ok(format!("http://{host}:{}", cfg.web_server.port))
+}
+
+/// 读配置、算出管理界面地址。
+fn load_admin_base(a: &AdminArgs) -> Result<String> {
+    let path = a
+        .config
+        .clone()
+        .unwrap_or_else(|| default_config_path("client.toml"));
+    if !path.exists() {
+        bail!("配置文件不存在：{}", path.display());
+    }
+    let cfg =
+        ClientConfig::load(&path).with_context(|| format!("读取配置 {} 失败", path.display()))?;
+    admin_base(&cfg)
+}
+
+/// `status` 子命令：打印运行中客户端的状态（走本地管理界面 API）。
+async fn cmd_status(a: &AdminArgs) -> Result<()> {
+    let base = load_admin_base(a)?;
+    let url = format!("{base}/api/status");
+    let resp = nfrp_common::httpc::get(&url, &[], &Default::default())
+        .await
+        .with_context(|| format!("请求 {url} 失败（客户端没在跑？或 [webServer] 地址不对）"))?;
+    println!("{}", String::from_utf8_lossy(&resp.body));
+    if resp.status != 200 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `stop` 子命令：让运行中的客户端退出（走本地管理界面 API）。
+async fn cmd_stop(a: &AdminArgs) -> Result<()> {
+    let base = load_admin_base(a)?;
+    let url = format!("{base}/api/stop");
+    let resp = nfrp_common::httpc::request("POST", &url, &[], None, &Default::default())
+        .await
+        .with_context(|| format!("请求 {url} 失败（客户端没在跑？或 [webServer] 地址不对）"))?;
+    println!("{}", String::from_utf8_lossy(&resp.body).trim());
+    if resp.status != 200 {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// 当前有效的控制会话。visitor 需要用它开新连接、拿 run_id。
@@ -377,7 +571,7 @@ struct ServerLink {
 impl ServerLink {
     async fn open(cfg: Arc<ClientConfig>) -> Result<Self> {
         let wire = cfg.protocol.wire_version().ok_or_else(|| {
-            anyhow!("当前版本尚未实现 rustunnel 自研协议，请把 protocol 设为 frp-v1 或 frp-v2")
+            anyhow!("当前版本尚未实现 NFrp 自研协议，请把 protocol 设为 frp-v1 或 frp-v2")
         })?;
         // QUIC 自带加密与多路复用，所以 tls / tcp_mux 这两层都跳过
         let quic = if is_quic(&cfg.transport_protocol) {
@@ -536,7 +730,7 @@ async fn kcp_connect(cfg: &ClientConfig) -> Result<BoxStream> {
 /// ## 怎么才不会再搞错
 ///
 /// 别读日志猜，**抓包**：用 [`server/examples/dump_frpc.rs`] 当假 frps
-/// （`cargo run -p rustunnel-server --example dump_frpc -- 17777`），把官方 frpc 的
+/// （`cargo run -p nfrp-server --example dump_frpc -- 17777`），把官方 frpc 的
 /// `serverAddr` 指过去，它会把你收到的每个消息原样打成 JSON，`proxy_name`
 /// 带不带前缀一眼就能看清。
 ///
@@ -586,15 +780,15 @@ fn resolve_uploaded_proxy(
 /// 其中一边漏掉（这个坑在 `security.rs` 的注释里专门标过）。
 pub(crate) async fn current_credential(
     cfg: &ClientConfig,
-    token_source: &Option<Arc<rustunnel_common::auth::oidc::TokenSource>>,
-) -> Result<rustunnel_common::security::Credential> {
+    token_source: &Option<Arc<nfrp_common::auth::oidc::TokenSource>>,
+) -> Result<nfrp_common::security::Credential> {
     Ok(match token_source {
-        Some(src) => rustunnel_common::security::Credential::Oidc(
+        Some(src) => nfrp_common::security::Credential::Oidc(
             src.token()
                 .await
                 .context("向 IdP 换取 OIDC access token 失败")?,
         ),
-        None => rustunnel_common::security::Credential::Token(cfg.effective_token().to_string()),
+        None => nfrp_common::security::Credential::Token(cfg.effective_token().to_string()),
     })
 }
 
@@ -608,7 +802,7 @@ struct SessionDeps {
     session_tx: tokio::sync::watch::Sender<Option<Arc<ClientSession>>>,
     health: Arc<health::Monitor>,
     logged_in_once: Arc<std::sync::atomic::AtomicBool>,
-    token_source: Option<Arc<rustunnel_common::auth::oidc::TokenSource>>,
+    token_source: Option<Arc<nfrp_common::auth::oidc::TokenSource>>,
     store: Arc<store::Store>,
     proxies: registry::ProxyTable,
     hub: Option<Arc<web::Hub>>,
@@ -634,7 +828,7 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
     let stream = link.connect().await?;
     // 私有能力只是**声明支持**，真正开不开看服务端回显 ——
     // 连官方 frps / 第三方 frps 时对方不会回显，行为与不开完全一致。
-    let declared = msg::RustunnelCaps {
+    let declared = msg::NfrpCaps {
         udp_binary: cfg.private_caps,
         server_cmd: cfg.private_caps,
     };
@@ -1158,7 +1352,7 @@ mod tests {
         // 官方写法：[proxies.transport] proxyProtocolVersion = "v2"
         let official = ProxyConfig {
             proxy_protocol_version: String::new(),
-            transport: rustunnel_common::config::ProxyTransportConfig {
+            transport: nfrp_common::config::ProxyTransportConfig {
                 proxy_protocol_version: "v2".into(),
             },
             ..full_tcp_config()
@@ -1176,7 +1370,7 @@ mod tests {
         // 两处都写：transport 优先
         let both = ProxyConfig {
             proxy_protocol_version: "v1".into(),
-            transport: rustunnel_common::config::ProxyTransportConfig {
+            transport: nfrp_common::config::ProxyTransportConfig {
                 proxy_protocol_version: "v2".into(),
             },
             ..full_tcp_config()
@@ -1274,7 +1468,7 @@ mod tests {
     /// **金标准测试**：报文必须和官方 frpc v0.71.0 抓到的那一帧**逐字节一致**。
     ///
     /// 下面这串 JSON 是从
-    /// `cargo run -p rustunnel-server --example dump_frpc -- 17777`
+    /// `cargo run -p nfrp-server --example dump_frpc -- 17777`
     /// 抓到的原文（Lolia 下发的那份配置，一字未改）：
     ///
     /// ```text
@@ -1288,7 +1482,7 @@ mod tests {
     /// 谁把字段顺序挪了、漏了、多发了，这条都会红。
     #[test]
     fn 与官方_frpc_抓包逐字节一致() {
-        let cfg = rustunnel_common::config::parse_client_toml(LOLIA_FRPC).unwrap();
+        let cfg = nfrp_common::config::parse_client_toml(LOLIA_FRPC).unwrap();
         let m = NewProxy::from_config(&cfg.proxies[0], &cfg.user);
 
         assert_eq!(
@@ -1367,7 +1561,7 @@ bandwidthLimitMode = 'server'
     /// 平台一旦校验就报错，而且很难看出是"多发了一个键"。
     #[test]
     fn 代理级_metas_才上进注册报文() {
-        let cfg = rustunnel_common::config::parse_client_toml(LOLIA_FRPC).unwrap();
+        let cfg = nfrp_common::config::parse_client_toml(LOLIA_FRPC).unwrap();
         // 登录 metas 里有 token
         assert_eq!(
             cfg.metas.get("token").map(String::as_str),

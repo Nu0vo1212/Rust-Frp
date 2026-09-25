@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
-use rustunnel_common::{
+use nfrp_common::{
     config::{is_quic, ServerConfig},
     frp::{
         self,
@@ -86,7 +86,7 @@ pub struct ServeExtras {
     /// 配置文件路径：填了才会启用热重载。
     pub config_path: Option<PathBuf>,
     /// 日志热重载句柄：填了才能热改 `log_level`。
-    pub log_handle: Option<rustunnel_common::util::LogFilterHandle>,
+    pub log_handle: Option<nfrp_common::util::LogFilterHandle>,
 }
 
 /// 启动服务端主循环（含 HTTP/HTTPS vhost 端口），直到收到退出信号。
@@ -148,7 +148,7 @@ pub async fn serve_on_with(
         );
     }
 
-    info!("rustunnel-server 已启动：frp v2 协议，监听 {addr}");
+    info!("nfrp-server 已启动：frp v2 协议，监听 {addr}");
     info!("支持的代理类型：tcp / udp / http / https / stcp / sudp / xtcp");
     let eff = cfg.effective_auth();
     info!(
@@ -159,7 +159,7 @@ pub async fn serve_on_with(
         } else {
             "已设置"
         },
-        if eff.method == rustunnel_common::security::AuthMethod::Token && eff.token.is_empty() {
+        if eff.method == nfrp_common::security::AuthMethod::Token && eff.token.is_empty() {
             "不安全：任何人都能连"
         } else {
             "已启用"
@@ -553,7 +553,7 @@ async fn handle_frp_stream(
     // 授权必须发生在**回 LoginResp 之前**：先回"登录成功"再断开的话，客户端
     // 会把它当成普通掉线而无限重连（`loginFailExit` 永远不触发，宿主看到的是
     // "进程活着"= 绿灯，但实际不可用）。所以把 role_for 作为闭包传进握手函数。
-    let authorize = |user: &str| -> std::result::Result<rustunnel_common::security::Role, String> {
+    let authorize = |user: &str| -> std::result::Result<nfrp_common::security::Role, String> {
         sec.role_for(user).map_err(|e| {
             registry.audit().record(
                 crate::audit::AuditEvent::new(crate::audit::kind::LOGIN_DENIED, false)
@@ -628,10 +628,10 @@ async fn handle_control(
     login: Login,
     run_id: String,
     udp_binary: bool,
-    caps: rustunnel_common::frp::msg::RustunnelCaps,
-    wire_version: rustunnel_common::frp::WireVersion,
+    caps: nfrp_common::frp::msg::NfrpCaps,
+    wire_version: nfrp_common::frp::WireVersion,
     peer: SocketAddr,
-    role: rustunnel_common::security::Role,
+    role: nfrp_common::security::Role,
     cfg: Arc<ServerConfig>,
     registry: Arc<Registry>,
 ) -> Result<()> {
@@ -714,7 +714,7 @@ async fn handle_control(
                         //   `"proxy_name":"2569.c0462d9ce7e44bce97e626c4ae880905"`。
                         //
                         //   这里额外做一次「先 strip 再 add」是为了**幂等**：
-                        //   收原始名（老版 rustunnel 客户端、手写报文）也会被补成
+                        //   收原始名（老版 NFrp 客户端、手写报文）也会被补成
                         //   全名，收带前缀的名字也不会叠成 `2569.2569.xxx`。
                         //
                         //   之所以要兜这一层：早期判断反了 —— 以为客户端该发原始名，
@@ -791,7 +791,7 @@ async fn handle_control(
                         // 少了这一步，"登录时验过一次"就等于之后永久信任。
                         if sec.auth_cfg.check_heartbeats()
                             && sec.auth.method()
-                                == rustunnel_common::security::AuthMethod::Oidc
+                                == nfrp_common::security::AuthMethod::Oidc
                         {
                             if let Err(e) = sec.auth.verify_followup(&p.privilege_key, "心跳") {
                                 registry.audit().record(
@@ -834,7 +834,7 @@ async fn handle_control(
                         // tcp / udp 的公网端口同理：客户端这边只是记账，
                         // 端口是注册表管的，必须显式还回去
                         if let Some(port) = client.stop_proxy(&m.proxy_name) {
-                            registry.release_port(port, &client);
+                            registry.release_port(port, &client, &m.proxy_name);
                         }
                     }
                     FrpMessage::NatHoleVisitor(m) => {
@@ -917,7 +917,7 @@ pub(crate) async fn register_proxy(
     cfg: &Arc<ServerConfig>,
     registry: &Arc<Registry>,
     client: &Arc<ClientState>,
-    m: &rustunnel_common::frp::msg::NewProxy,
+    m: &nfrp_common::frp::msg::NewProxy,
 ) -> Result<String> {
     if m.proxy_name.is_empty() {
         anyhow::bail!("代理名为空");
@@ -954,7 +954,7 @@ pub(crate) async fn register_proxy(
 async fn register_visitor_proxy(
     registry: &Arc<Registry>,
     client: &Arc<ClientState>,
-    m: &rustunnel_common::frp::msg::NewProxy,
+    m: &nfrp_common::frp::msg::NewProxy,
     kind: &str,
     slot: Permit,
 ) -> Result<String> {
@@ -982,7 +982,7 @@ async fn register_tcp(
     cfg: &Arc<ServerConfig>,
     registry: &Arc<Registry>,
     client: &Arc<ClientState>,
-    m: &rustunnel_common::frp::msg::NewProxy,
+    m: &nfrp_common::frp::msg::NewProxy,
     slot: Permit,
 ) -> Result<String> {
     if m.remote_port == 0 {
@@ -1001,7 +1001,7 @@ async fn register_tcp(
         let listener = match TcpListener::bind(addr).await {
             Ok(l) => l,
             Err(e) => {
-                registry.release_port(m.remote_port, client);
+                registry.release_port(m.remote_port, client, &m.proxy_name);
                 return Err(e).with_context(|| format!("监听 {addr} 失败"));
             }
         };
@@ -1025,7 +1025,7 @@ async fn register_udp(
     cfg: &Arc<ServerConfig>,
     registry: &Arc<Registry>,
     client: &Arc<ClientState>,
-    m: &rustunnel_common::frp::msg::NewProxy,
+    m: &nfrp_common::frp::msg::NewProxy,
     slot: Permit,
 ) -> Result<String> {
     if m.remote_port == 0 {
@@ -1040,7 +1040,7 @@ async fn register_udp(
         .reserve_port(m.remote_port, &m.group, &m.proxy_name, client.clone())
         .map_err(|e| anyhow!("{e}"))?;
     if claim == PortClaim::Joined {
-        registry.release_port(m.remote_port, client);
+        registry.release_port(m.remote_port, client, &m.proxy_name);
         anyhow::bail!(
             "端口 {} 已被同组 [{}] 的其他代理占用；UDP 暂不支持 group 负载均衡，请改用 tcp",
             m.remote_port,
@@ -1051,7 +1051,7 @@ async fn register_udp(
     let udp = match udp_proxy::bind_udp(&cfg.bind_addr, m.remote_port).await {
         Ok(u) => u,
         Err(e) => {
-            registry.release_port(m.remote_port, client);
+            registry.release_port(m.remote_port, client, &m.proxy_name);
             return Err(e);
         }
     };
@@ -1066,7 +1066,7 @@ async fn register_vhost(
     cfg: &Arc<ServerConfig>,
     registry: &Arc<Registry>,
     client: &Arc<ClientState>,
-    m: &rustunnel_common::frp::msg::NewProxy,
+    m: &nfrp_common::frp::msg::NewProxy,
     is_https: bool,
     slot: Permit,
 ) -> Result<String> {
@@ -1225,7 +1225,7 @@ async fn handle_work(
     // 这条挡的是：拿到 run_id 的人自己新建一条工作连接，绕过
     // "工作连接必须来自同一个客户端"这个隐含前提。
     if sec.auth_cfg.check_new_work_conns()
-        && sec.auth.method() == rustunnel_common::security::AuthMethod::Oidc
+        && sec.auth.method() == nfrp_common::security::AuthMethod::Oidc
     {
         if let Err(e) = sec.auth.verify_followup(&msg.privilege_key, "新工作连接") {
             registry.audit().record(
@@ -1620,11 +1620,11 @@ async fn relay_sudp_frames(a: FrpConn, b: FrpConn) -> Result<(u64, u64)> {
 /// 同时服务两种客户端 —— 这一项对服务端而言只是"别配错"。官方 frps 也是这样：
 /// 它的 `transport.wireProtocol` 在接收侧实际上不参与判断。
 ///
-/// 只有 `rustunnel` 自研协议还没实现，必须显式拒绝（否则用户会以为配了就生效）。
+/// 只有 `nfrp` 自研协议还没实现，必须显式拒绝（否则用户会以为配了就生效）。
 pub fn ensure_protocol(cfg: &ServerConfig) -> Result<()> {
     if cfg.protocol.wire_version().is_none() {
         anyhow::bail!(
-            "当前版本服务端尚未实现 rustunnel 自研协议，\
+            "当前版本服务端尚未实现 NFrp 自研协议，\
              请把 protocol 设为 frp-v1（默认）或 frp-v2"
         );
     }
@@ -1665,7 +1665,7 @@ mod tests {
             Duration::from_secs(60),
             Default::default(),
             false,
-            rustunnel_common::frp::WireVersion::V1,
+            nfrp_common::frp::WireVersion::V1,
             conn_limit,
             backlog,
             proxy,
@@ -1740,11 +1740,11 @@ mod tests {
         assert_eq!(registry.metrics().conns_rejected.get(), 0);
     }
 
-    /// 只有 `rustunnel` 自研协议会被拒；v1 / v2 都放行 ——
+    /// 只有 `nfrp` 自研协议会被拒；v1 / v2 都放行 ——
     /// 服务端本来就按魔术字自动识别对端，同一端口同时服务两种客户端。
     #[test]
     fn ensure_protocol_allows_both_frp_wire_versions() {
-        use rustunnel_common::config::Protocol;
+        use nfrp_common::config::Protocol;
         // 默认就是 frp-v1（跟随官方 frpc 的默认值）
         let mut cfg = ServerConfig::default();
         assert_eq!(cfg.protocol, Protocol::FrpV1);
@@ -1753,7 +1753,7 @@ mod tests {
         cfg.protocol = Protocol::FrpV2;
         assert!(ensure_protocol(&cfg).is_ok(), "v2 也必须被接受");
 
-        cfg.protocol = Protocol::Rustunnel;
+        cfg.protocol = Protocol::Nfrp;
         assert!(ensure_protocol(&cfg).is_err());
     }
 }

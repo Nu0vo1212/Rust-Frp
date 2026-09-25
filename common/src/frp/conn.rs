@@ -137,7 +137,7 @@ impl FrpConn {
 
     /// v1 下改用二进制 UDP 报文编码。
     ///
-    /// 只能在**双方都声明了该能力**之后调用（见 `msg::RustunnelCaps`）：
+    /// 只能在**双方都声明了该能力**之后调用（见 `msg::NfrpCaps`）：
     /// v1 没有握手协商这一步，官方 frps 只会发 JSON，
     /// 单方面开启会让两端的编码对不上。
     pub fn set_v1_udp_binary(&mut self, binary: bool) {
@@ -420,7 +420,7 @@ fn take_frame(buf: &mut Vec<u8>) -> Result<Option<(u16, Vec<u8>)>> {
 
 /// 构造登录消息（两套协议共用）。
 ///
-/// `version` 必须是**官方的裸版本号**（如 `0.71.0`），不能带 `rustunnel/` 之类
+/// `version` 必须是**官方的裸版本号**（如 `0.71.0`），不能带 `nfrp/` 之类
 /// 的前缀：第三方 frps 与面板会解析这个字段，不认识的写法可能直接被判为
 /// "不支持的客户端版本"。
 fn build_login(
@@ -466,13 +466,13 @@ pub async fn client_handshake(
     user: &str,
     metas: &std::collections::HashMap<String, String>,
     pool_count: i32,
-    caps: msg::RustunnelCaps,
-) -> Result<(FrpConn, String, bool, msg::RustunnelCaps)> {
+    caps: msg::NfrpCaps,
+) -> Result<(FrpConn, String, bool, msg::NfrpCaps)> {
     let mut conn = FrpConn::new(stream, version);
     let ts = now_unix_secs() as i64;
     let mut login = build_login(cred, client_id, user, metas, pool_count, ts);
     // 只是"声明支持"，真正开不开由服务端在 LoginResp 里回显决定
-    login.rustunnel = if caps.any() { Some(caps) } else { None };
+    login.nfrp = if caps.any() { Some(caps) } else { None };
 
     // ---------------------------------------------------------------- v1
     if version == WireVersion::V1 {
@@ -492,7 +492,7 @@ pub async fn client_handshake(
         conn.enable_v1_crypto(cred.raw())?;
         // v1 的二进制 UDP 只有在**服务端回显**了才算数：连官方 frps 时
         // 它不会回这个字段，于是这里拿到 default()，行为与以前完全一致。
-        let accepted = login_resp.rustunnel.clone().unwrap_or_default();
+        let accepted = login_resp.nfrp.clone().unwrap_or_default();
         conn.set_v1_udp_binary(accepted.udp_binary);
         return Ok((conn, login_resp.run_id, accepted.udp_binary, accepted));
     }
@@ -547,7 +547,7 @@ pub async fn client_handshake(
     conn.upgrade(s2c, c2s)?; // 客户端用 s2c 读、c2s 写
 
     // 5) 私有能力：仍然只认服务端回显的那一份
-    let accepted = login_resp.rustunnel.clone().unwrap_or_default();
+    let accepted = login_resp.nfrp.clone().unwrap_or_default();
     Ok((conn, login_resp.run_id, udp_binary, accepted))
 }
 
@@ -567,11 +567,11 @@ pub enum ServerAccept {
         role: crate::security::Role,
         /// 本次会话协商出的 UDP 报文编码（true = 二进制）
         udp_binary: bool,
-        /// 服务端**确认**启用的 rustunnel 私有能力。
+        /// 服务端**确认**启用的 NFrp 私有能力。
         ///
         /// 官方 frpc 不会在 Login 里声明能力，所以这里永远是 `default()`
         /// （全关）—— 于是它发这些私有消息的路径根本不会打开。
-        caps: msg::RustunnelCaps,
+        caps: msg::NfrpCaps,
     },
     /// 工作连接（明文，等待分配代理后回 StartWorkConn）
     Work { conn: FrpConn, msg: NewWorkConn },
@@ -761,8 +761,8 @@ where
     };
 
     // 能力协商：客户端声明了、且服务端也支持，才回显 —— 回显了才算生效。
-    let declared = login.rustunnel.clone().unwrap_or_default();
-    let mut caps = msg::RustunnelCaps::default();
+    let declared = login.nfrp.clone().unwrap_or_default();
+    let mut caps = msg::NfrpCaps::default();
     if declared.server_cmd {
         caps.server_cmd = true;
     }
@@ -774,12 +774,12 @@ where
     }
 
     // LoginResp 必须明文发送（客户端此时还没升级加密）。
-    // 多挂一个 `_rustunnel` 字段：官方 frpc 会忽略未知字段，而 rustunnel 客户端
+    // 多挂一个 `_nfrp` 字段：官方 frpc 会忽略未知字段，而 NFrp 客户端
     // 只认**回显**过来的能力 —— 这是"连官方 frps 时行为不变"的关键。
     conn.send_msg(&FrpMessage::LoginResp(LoginResp {
         version: super::FRP_WIRE_VERSION.to_string(),
         run_id: run_id.to_string(),
-        rustunnel: if caps.any() { Some(caps.clone()) } else { None },
+        nfrp: if caps.any() { Some(caps.clone()) } else { None },
         ..Default::default()
     }))
     .await?;
@@ -940,7 +940,7 @@ mod tests {
                 "alice",
                 &empty_metas(),
                 0,
-                msg::RustunnelCaps::default(),
+                msg::NfrpCaps::default(),
             )
             .await
             .unwrap();
@@ -1074,7 +1074,7 @@ mod tests {
     #[tokio::test]
     async fn v1_能力协商_服务端不回显就不启用() {
         let (client, mut server) = tokio::io::duplex(64 * 1024);
-        let declared = msg::RustunnelCaps {
+        let declared = msg::NfrpCaps {
             udp_binary: true,
             server_cmd: true,
         };
@@ -1099,8 +1099,8 @@ mod tests {
         assert_eq!(byte, v1::TYPE_LOGIN);
         let login: Login = serde_json::from_slice(&body).unwrap();
         assert_eq!(
-            login.rustunnel,
-            Some(msg::RustunnelCaps {
+            login.nfrp,
+            Some(msg::NfrpCaps {
                 udp_binary: true,
                 server_cmd: true
             }),
@@ -1141,7 +1141,7 @@ mod tests {
                 "alice",
                 &empty_metas(),
                 0,
-                msg::RustunnelCaps {
+                msg::NfrpCaps {
                     udp_binary: true,
                     server_cmd: true,
                 },
@@ -1154,7 +1154,7 @@ mod tests {
         let resp = serde_json::to_vec(&LoginResp {
             version: crate::frp::FRP_WIRE_VERSION.to_string(),
             run_id: RUN_ID.to_string(),
-            rustunnel: Some(msg::RustunnelCaps {
+            nfrp: Some(msg::NfrpCaps {
                 udp_binary: true,
                 server_cmd: true,
             }),

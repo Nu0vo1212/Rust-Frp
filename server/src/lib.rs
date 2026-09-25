@@ -1,4 +1,4 @@
-//! `rustunnel-server`：frp v2 兼容的服务端。
+//! `nfrp-server`：frp v2 兼容的服务端。
 //!
 //! 与原版 frps 一致，控制连接与工作连接复用**同一个端口**，靠首帧消息类型区分：
 //! `Login` 走控制连接流程，`NewWorkConn` 走工作连接流程，

@@ -14,7 +14,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use rustunnel_common::config::ProxyConfig;
+use nfrp_common::config::ProxyConfig;
 
 /// 一份可变的代理表。`clone` 出来的是同一个表的另一个句柄，很便宜。
 #[derive(Clone, Default)]
@@ -88,7 +88,7 @@ impl ProxyTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustunnel_common::config::ProxyConfig;
+    use nfrp_common::config::ProxyConfig;
 
     fn p(name: &str) -> ProxyConfig {
         ProxyConfig {

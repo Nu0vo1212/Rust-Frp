@@ -10,7 +10,7 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use rustunnel_common::{config::ClientConfig, util};
+use nfrp_common::{config::ClientConfig, util};
 use tokio::{io::AsyncWriteExt, net::TcpStream};
 use tracing::{info, warn};
 

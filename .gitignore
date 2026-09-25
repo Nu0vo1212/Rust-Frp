@@ -1,0 +1,20 @@
+# 构建产物
+/target
+
+# 本地草稿配置与日志
+*.log
+/tmp
+
+# 发布产物与**签名私钥**（dist/keys/release.key 绝不入库）。
+# 整目录忽略，不做任何否定放行 —— 万一有人手滑加个 `!dist/...`，
+# 私钥就有被提交的风险；随源码走的示例配置请放 `assets/`。
+/dist
+
+# Python 工具脚本的缓存
+__pycache__/
+*.pyc
+
+# 编辑器
+.idea/
+.vscode/
+*.swp

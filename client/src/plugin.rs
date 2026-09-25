@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
-use rustunnel_common::{config::ProxyConfig, frp::stream::BoxStream, util};
+use nfrp_common::{config::ProxyConfig, frp::stream::BoxStream, util};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, warn};
 
@@ -220,7 +220,7 @@ fn basic_ok(header_value: Option<&str>, user: &str, passwd: &str) -> bool {
 }
 
 fn constant_time_eq(a: &str, b: &str) -> bool {
-    rustunnel_common::frp::msg::constant_time_eq(a, b)
+    nfrp_common::frp::msg::constant_time_eq(a, b)
 }
 
 // ---------------------------------------------------------------------------
@@ -491,7 +491,7 @@ mod static_file {
         };
         let rel = rel.trim_start_matches('/');
         if rel.is_empty() {
-            return ("200 OK", b"rustunnel static_file".to_vec(), "text/plain");
+            return ("200 OK", b"nfrp static_file".to_vec(), "text/plain");
         }
 
         let candidate = root.join(rel);
@@ -628,7 +628,7 @@ mod tests {
 
     #[test]
     fn static_file_blocks_path_traversal() {
-        let dir = std::env::temp_dir().join("rustunnel_plugin_test");
+        let dir = std::env::temp_dir().join("nfrp_plugin_test");
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("ok.txt"), b"hello").unwrap();
         std::fs::write(dir.join("sub/deep.txt"), b"deep").unwrap();
@@ -667,7 +667,7 @@ mod tests {
 
     #[test]
     fn request_with_query_string_still_finds_the_file() {
-        let dir = std::env::temp_dir().join("rustunnel_plugin_q");
+        let dir = std::env::temp_dir().join("nfrp_plugin_q");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.txt"), b"x").unwrap();
         let (st, _, _) = static_file::build_response(&dir, "", "/a.txt?v=1");

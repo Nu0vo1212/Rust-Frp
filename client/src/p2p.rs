@@ -30,7 +30,7 @@
 //! 根本不是 peer 之间通信用的那个。官方 frp 到这里就放弃、回退中继。
 //!
 //! 但现实里的对称 NAT 绝大多数是**顺序分配**（每条新流端口 +1 / +2），
-//! 于是 [`rustunnel_common::p2p::predict_ports`] 用服务端观察到的端口序列
+//! 于是 [`nfrp_common::p2p::predict_ports`] 用服务端观察到的端口序列
 //! 推步长、预测接下来会拿到哪些端口，两端把整批候选端口一起打 ——
 //! 命中任何一个就握手成功。
 //!
@@ -54,8 +54,7 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context as _, Result};
-use quinn::{Connection, Endpoint, EndpointConfig, RecvStream, SendStream, TokioRuntime};
-use rustunnel_common::{
+use nfrp_common::{
     config::{ClientConfig, ProxyConfig},
     frp::{
         kcp::{self, KcpStream},
@@ -63,6 +62,7 @@ use rustunnel_common::{
     },
     p2p::{self, Packet, Role, Transport, HANDSHAKE_OK, SERVER_NAME},
 };
+use quinn::{Connection, Endpoint, EndpointConfig, RecvStream, SendStream, TokioRuntime};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::UdpSocket,
@@ -286,7 +286,7 @@ pub async fn setup(
     if !cfg.p2p_enable {
         return None;
     }
-    let addr = rustunnel_common::util::resolve_addr(&format!("{}:{}", cfg.server_addr, port))
+    let addr = nfrp_common::util::resolve_addr(&format!("{}:{}", cfg.server_addr, port))
         .await
         .ok()?;
     let (bus, rx) = PunchBus::new();
@@ -325,11 +325,11 @@ pub async fn serve_as_provider(
     let Some(port) = cfg.p2p_port else {
         bail!("收到打洞请求但未配置 p2p_port，忽略");
     };
-    let server_udp = rustunnel_common::util::resolve_addr(&format!("{}:{}", cfg.server_addr, port))
+    let server_udp = nfrp_common::util::resolve_addr(&format!("{}:{}", cfg.server_addr, port))
         .await
         .with_context(|| format!("解析牵线地址 {}:{} 失败", cfg.server_addr, port))?;
 
-    let local_addr = rustunnel_common::util::resolve_addr(&proxy.local_addr)
+    let local_addr = nfrp_common::util::resolve_addr(&proxy.local_addr)
         .await
         .with_context(|| format!("解析内网地址 {} 失败", proxy.local_addr))?;
 
@@ -345,7 +345,7 @@ pub async fn serve_as_provider(
         .with_context(|| format!("连接内网服务 {local_addr} 失败"))?;
     local.set_nodelay(true).ok();
     let mut stream = stream;
-    match rustunnel_common::util::relay_between(&mut local, &mut stream).await {
+    match nfrp_common::util::relay_between(&mut local, &mut stream).await {
         Ok((up, down)) => debug!(proxy = %m.proxy_name, "P2P 转发结束：上行 {up}B / 下行 {down}B"),
         Err(e) => debug!(proxy = %m.proxy_name, "P2P 转发中断：{e}"),
     }
@@ -361,13 +361,13 @@ pub async fn try_punch_as_visitor(
     target: &str,
     secret_key: &str,
 ) -> Result<P2PStream> {
-    let txn = rustunnel_common::util::new_run_id();
-    let ts = rustunnel_common::util::now_unix_secs() as i64;
+    let txn = nfrp_common::util::new_run_id();
+    let ts = nfrp_common::util::now_unix_secs() as i64;
     let req = NatHoleVisitor {
         transaction_id: txn.clone(),
         proxy_name: target.to_string(),
         // 服务端用与 stcp 相同的规则校验：hex(md5(secret_key + timestamp))
-        sign_key: rustunnel_common::frp::msg::auth_key(secret_key, ts),
+        sign_key: nfrp_common::frp::msg::auth_key(secret_key, ts),
         timestamp: ts,
         protocol: match route.transport {
             Transport::Quic => "quic".to_string(),
@@ -839,7 +839,7 @@ fn client_config() -> Result<quinn::ClientConfig> {
 }
 
 fn common_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
-    rustunnel_common::frp::tls::crypto_provider()
+    nfrp_common::frp::tls::crypto_provider()
 }
 
 /// 两端共用的传输参数：P2P 链路上要有心跳，否则 NAT 的洞会悄悄关掉。

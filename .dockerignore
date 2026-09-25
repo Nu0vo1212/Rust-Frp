@@ -1,0 +1,9 @@
+target/
+dist/
+tmp/
+.git/
+.github/
+.workbuddy/
+*.log
+# 注意：`assets/` 不能排除 —— Dockerfile 末尾要 COPY assets/frps.toml。
+# 签名私钥在 dist/keys/ 下，靠上面的 dist/ 一并挡在构建上下文之外。

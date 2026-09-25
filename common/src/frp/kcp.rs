@@ -21,7 +21,7 @@
 //! 这是 `ikcp` / `kcp-go` 的精简移植，**只做 Rust 侧两端都用得到的部分**：
 //! 分片与重组、UNA + ACK、快速重传、RTO 计算、窗口探测。
 //! 没做 FEC（kcp-go 里也是可选）和流控的 `nocwnd` 之外的调优开关。
-//! 两端都是 rustunnel，所以不需要与 kcp-go 的字节流严格对齐。
+//! 两端都是 nfrp，所以不需要与 kcp-go 的字节流严格对齐。
 
 use std::{
     collections::{HashMap, VecDeque},

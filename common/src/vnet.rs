@@ -29,7 +29,7 @@
 //! 官方 frp 从 v0.62.0 起有同名的 Alpha 特性。**帧格式一致，但控制面不同**：
 //! 官方把注册消息混在 frp 控制通道里，这里走的是一条独立的 `vnet_port`
 //! 长连接（见 [`crate::vnet::VnetRegister`]），因此**两端不能混搭**
-//! （rustunnel 客户端只能连 rustunnel 服务端）。这点在 README 的"当前限制"里
+//! （NFrp 客户端只能连 NFrp 服务端）。这点在 README 的"当前限制"里
 //! 也写明了。
 //!
 //! # 平台支持
@@ -1081,7 +1081,7 @@ mod tests {
     fn 网关能正确回_ping() {
         let me = Ipv4Addr::new(100, 64, 0, 2);
         let gw = Ipv4Addr::new(100, 64, 0, 1);
-        let req = echo_request(me, gw, b"hello-rustunnel!"); // 载荷为奇数长
+        let req = echo_request(me, gw, b"hello-nfrp!"); // 载荷为奇数长
 
         assert!(is_icmp_echo_request(&req));
         let rep = icmp_echo_reply(&req).expect("网关应当应答发往自己的 echo request");

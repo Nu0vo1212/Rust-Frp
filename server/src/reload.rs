@@ -19,7 +19,7 @@ use std::{
     time::{Duration, UNIX_EPOCH},
 };
 
-use rustunnel_common::{config::ServerConfig, util::LogFilterHandle};
+use nfrp_common::{config::ServerConfig, util::LogFilterHandle};
 use tracing::{info, warn};
 
 use crate::dashboard::DashboardAuth;
@@ -51,7 +51,7 @@ pub fn apply_dynamic(
     // ---- 可热生效 ----
     if old.log_level != new.log_level {
         match log {
-            Some(h) if rustunnel_common::util::reload_log_level(h, &new.log_level) => {
+            Some(h) if nfrp_common::util::reload_log_level(h, &new.log_level) => {
                 info!("日志级别已热更新：{} -> {}", old.log_level, new.log_level);
             }
             Some(_) => warn!(
@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn mtime_of_existing_file_is_stable() {
-        let dir = std::env::temp_dir().join("rustunnel-reload-test");
+        let dir = std::env::temp_dir().join("nfrp-reload-test");
         std::fs::create_dir_all(&dir).ok();
         let p = dir.join("c.toml");
         std::fs::write(&p, "bind_port = 7000\n").unwrap();

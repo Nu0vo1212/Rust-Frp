@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rustunnel_common::{
+use nfrp_common::{
     frp::msg::{FrpMessage, NatHoleClient, NatHoleDetectBehavior, NatHoleResp, NatHoleVisitor},
     p2p::{self, Packet, Role},
 };
@@ -267,7 +267,31 @@ pub async fn handle_nat_hole_visitor(
         return Ok(());
     };
 
-    // 2) 密钥校验（与 stcp 完全一致：hex(md5(secret_key + timestamp))）
+    // 2) 准入：**NFrp 的打洞协调是自有协议，只服务自家客户端**。
+    //
+    // ★ 这里必须**明确拒绝**，不能"装作成功"。官方 frpc 的 xtcp visitor 走的是
+    //   frp 自己的 UDP `NatHoleSid` 交换（在 `p2p_port` 上发 JSON 报文要地址），
+    //   NFrp 目前没实现那套交换。若我们回一个 `error` 为空的 `NatHoleResp`，
+    //   官方 frpc 会认为打洞可用 → 一直等地址直到超时 → **连中继回退都不会发生**，
+    //   结果是 xtcp 完全不通（比 stcp 还差）。
+    //   回一条明确的错误，客户端才能按 `fallbackTo = "stcp"` 退回中继。
+    //
+    //   判据就是"有没有带签名"：NFrp 客户端一定会带
+    //   （`client/src/p2p.rs` 用 `auth_key(secret_key, ts)`），
+    //   而官方 frpc 的 NatHoleVisitor 实测只有
+    //   `{"transaction_id":…,"proxy_name":…,"pre_check":true}`（无 sign_key/timestamp）。
+    if m.sign_key.is_empty() {
+        refuse(
+            visitor_client,
+            &m.transaction_id,
+            format!(
+                "xtcp hole punching on this nfrp-server requires the NFrp client \
+                 (visitor [{proxy_name}] sent no signature); falling back to relay is required"
+            ),
+        );
+        return Ok(());
+    }
+    // 带了签名就必须对（NFrp↔NFrp 的保证一点没放松）
     if !entry.check_sign(&m.sign_key, m.timestamp) {
         refuse(
             visitor_client,
@@ -293,12 +317,12 @@ pub async fn handle_nat_hole_visitor(
         refuse(
             visitor_client,
             &m.transaction_id,
-            "nat hole is not enabled on this rustunnel-server (set p2p_port to enable xtcp)",
+            "nat hole is not enabled on this nfrp-server (set p2p_port to enable xtcp)",
         );
         return Ok(());
     };
 
-    let sid = rustunnel_common::util::new_run_id();
+    let sid = nfrp_common::util::new_run_id();
     hub.create(&sid);
 
     // 5) 回给 visitor：拿到 sid 后去 UDP 端口发 HELLO
@@ -350,7 +374,7 @@ mod tests {
             Duration::from_secs(60),
             Default::default(),
             false,
-            rustunnel_common::frp::WireVersion::V1,
+            nfrp_common::frp::WireVersion::V1,
             conn,
             backlog,
             proxy,
@@ -361,7 +385,7 @@ mod tests {
         NatHoleVisitor {
             transaction_id: "txn-1".into(),
             proxy_name: proxy_name.into(),
-            sign_key: rustunnel_common::frp::msg::auth_key(sk, ts),
+            sign_key: nfrp_common::frp::msg::auth_key(sk, ts),
             timestamp: ts,
             ..Default::default()
         }
@@ -443,6 +467,51 @@ mod tests {
         assert_eq!(hub.len(), before, "密钥不对时不能创建会话");
     }
 
+    /// ★ **官方 frpc 的 `NatHoleVisitor` 不带 `sign_key` / `timestamp`。**
+    ///
+    /// 实测抓包（frpc 0.71.0，本仓库 `--example dump_frpc`）原文：
+    /// `{"transaction_id":"...","proxy_name":"xt","pre_check":true}`。
+    ///
+    /// 它走的是 frp 自己的 UDP `NatHoleSid` 地址交换（NFrp 尚未实现），所以
+    /// 服务端必须**明确拒绝**、而不是回一个空错误的"成功"应答 —— 后者会让
+    /// 官方 frpc 一直等地址直到超时，**连 `fallbackTo = "stcp"` 的中继回退都不触发**，
+    /// 最终 xtcp 一个字节都不通。
+    #[tokio::test]
+    async fn 官方_frpc_访客被明确拒绝以便回退中继() {
+        let registry = Arc::new(Registry::unlimited());
+        let provider = client("bob");
+        registry
+            .visitors
+            .register(VisitorEntry {
+                proxy_name: "p2p".into(),
+                secret_key: "real-key".into(),
+                allow_users: vec![],
+                provider_user: "bob".into(),
+                client: provider.clone(),
+                proxy_type: "xtcp".into(),
+            })
+            .unwrap();
+        let hub = P2PHub::new();
+        registry.attach_p2p(hub.clone());
+
+        let visitor = client("bob");
+        // 官方 frpc 的样子：只有 transaction_id / proxy_name / pre_check
+        let m = NatHoleVisitor {
+            transaction_id: "txn-official".into(),
+            proxy_name: "p2p".into(),
+            pre_check: true,
+            ..Default::default()
+        };
+        handle_nat_hole_visitor(&registry, &visitor, &m)
+            .await
+            .expect("处理过程不应返回 IO 错误");
+        assert_eq!(
+            hub.len(),
+            0,
+            "没有签名的访客不该建立打洞会话（否则官方 frpc 会一直等地址、不回退中继）"
+        );
+    }
+
     #[tokio::test]
     async fn happy_path_creates_session_and_notifies_provider() {
         let registry = Arc::new(Registry::unlimited());
@@ -458,7 +527,7 @@ mod tests {
             Duration::from_secs(60),
             Default::default(),
             false,
-            rustunnel_common::frp::WireVersion::V1,
+            nfrp_common::frp::WireVersion::V1,
             conn,
             backlog,
             proxy,
@@ -488,7 +557,7 @@ mod tests {
             Duration::from_secs(60),
             Default::default(),
             false,
-            rustunnel_common::frp::WireVersion::V1,
+            nfrp_common::frp::WireVersion::V1,
             vconn,
             vbacklog,
             vproxy,
@@ -575,7 +644,7 @@ mod tests {
             Duration::from_secs(60),
             Default::default(),
             false,
-            rustunnel_common::frp::WireVersion::V1,
+            nfrp_common::frp::WireVersion::V1,
             vconn,
             vbacklog,
             vproxy,

@@ -87,7 +87,7 @@ pub const TYPE_NAT_HOLE_CLIENT: u8 = b'n';
 pub const TYPE_NAT_HOLE_RESP: u8 = b'm';
 pub const TYPE_NAT_HOLE_SID: u8 = b'5';
 pub const TYPE_NAT_HOLE_REPORT: u8 = b'6';
-/// rustunnel 私有的服务端管理命令（对应 v2 的 type_id 100）。
+/// NFrp 私有的服务端管理命令（对应 v2 的 type_id 100）。
 ///
 /// 官方 frp 到 v0.71.0 为止只用小写字母和数字当类型字节，所以这里挑了
 /// **大写** `Z` / `Y`：与官方当前及可预见的取值都不冲突。

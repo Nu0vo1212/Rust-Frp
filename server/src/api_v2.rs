@@ -22,7 +22,7 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use rustunnel_common::config::{ProxyConfig, ServerConfig};
+use nfrp_common::config::{ProxyConfig, ServerConfig};
 
 use crate::{admin, audit::AuditFilter, observability::encode_json, registry::Registry};
 
@@ -211,7 +211,7 @@ impl Page {
 /// 实现放在 `common::http1` 里，客户端的管理面板用同一份 ——
 /// 解析规则各写一遍，迟早会在"`+` 算不算空格"这种细节上漂移。
 pub fn parse_query(raw: &str) -> Query {
-    rustunnel_common::http1::parse_query(raw)
+    nfrp_common::http1::parse_query(raw)
 }
 
 /// 只接受 GET 的路径。
@@ -330,7 +330,7 @@ fn version_response() -> Response {
         "server": env!("CARGO_PKG_VERSION"),
         // 本进程能说哪几代 frp 线协议。客户端据此决定要不要降级。
         "wire_protocols": ["v1", "v2"],
-        "frp_wire_version": rustunnel_common::frp::FRP_WIRE_VERSION,
+        "frp_wire_version": nfrp_common::frp::FRP_WIRE_VERSION,
     }))
 }
 
@@ -813,7 +813,7 @@ mod tests {
     /// 两个面板共用同一份实现，这里只确认引用接对了。
     #[test]
     fn 非法百分号序列原样保留() {
-        use rustunnel_common::http1::percent_decode;
+        use nfrp_common::http1::percent_decode;
         assert_eq!(percent_decode("a%zzb"), "a%zzb");
         assert_eq!(percent_decode("100%"), "100%");
         assert_eq!(percent_decode("%4"), "%4");

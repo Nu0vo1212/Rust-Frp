@@ -18,7 +18,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use rustunnel_common::{
+use nfrp_common::{
     frp::{
         conn::FrpConn,
         msg::{FrpMessage, Ping, UdpAddr, UdpPacket},

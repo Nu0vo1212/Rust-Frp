@@ -425,10 +425,10 @@ mod tests {
     /// 而不是 panic 或者返回一个不能用的设备。
     #[test]
     fn 无权限时报错而不是恐慌() {
-        match Tun::create("rustunnel-test-%d", 1400, None) {
+        match Tun::create("nfrp-test-%d", 1400, None) {
             Ok(t) => {
                 // 有权限的环境（root）下真的建出来了，至少要能 self-consistent
-                assert!(t.name().starts_with("rustunnel-test-"), "{}", t.name());
+                assert!(t.name().starts_with("nfrp-test-"), "{}", t.name());
                 assert!(t.raw_fd() >= 0);
             }
             Err(e) => {

@@ -14,7 +14,7 @@
 //! # 两种留存方式，都不启用时零开销
 //!
 //! - 内存环形缓冲：面板 `/api/audit` 可查最近 N 条，重启即失；
-//! - JSONL 文件：`[audit] path = "/var/log/rustunnel/audit.jsonl"`，
+//! - JSONL 文件：`[audit] path = "/var/log/nfrp/audit.jsonl"`，
 //!   追加写、每行一个 JSON，直接 `jq` / Filebeat 就能吃。
 //!
 //! `enable = false`（默认）时**连事件对象都不构造**，与老版本零差异。
@@ -138,7 +138,7 @@ pub struct AuditLog {
 
 impl AuditLog {
     /// 构造。`enable = false` 时返回一个**空操作**实例，调用方不用到处判空。
-    pub fn from_config(cfg: &rustunnel_common::security::AuditConfig) -> anyhow::Result<Self> {
+    pub fn from_config(cfg: &nfrp_common::security::AuditConfig) -> anyhow::Result<Self> {
         if !cfg.enable {
             return Ok(Self::disabled());
         }
@@ -367,12 +367,12 @@ fn url_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustunnel_common::security::AuditConfig;
+    use nfrp_common::security::AuditConfig;
 
     fn tmp_path(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!(
-            "rustunnel-audit-test-{}-{}.jsonl",
+            "nfrp-audit-test-{}-{}.jsonl",
             std::process::id(),
             name
         ));
@@ -531,7 +531,7 @@ mod tests {
     #[test]
     fn 自动创建父目录() {
         let mut dir = std::env::temp_dir();
-        dir.push(format!("rustunnel-audit-dir-{}", std::process::id()));
+        dir.push(format!("nfrp-audit-dir-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut path = dir.clone();
         path.push("sub");

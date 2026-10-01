@@ -1,5 +1,5 @@
 # ============================================================
-# frpc 配置（NFrp 实现，兼容原版 frp v0.70+ 的 v2 协议）
+# frpc 配置（NFrp 实现，兼容原版 frp 的 v1 / v2 线协议）
 # 用法： frpc -c frpc.toml
 # 生成： frpc --gen-config frpc.toml   （打印这份带注释的模板）
 # ============================================================
@@ -63,6 +63,14 @@ transport_protocol = "tcp"
 pool_count = 1
 
 log_level = "info"
+
+# ---- 日志落盘（可选）----
+# 默认写标准输出；配了 to 就写文件，按天轮转、按 maxDays 清理老备份。
+# ★ 配了它之后 stdout 上**就没有日志了**（与官方 frpc 一样是"控制台或文件"二选一），
+#   NetTool 这类按行读 stdout 的启动器面板上会看不到日志。
+# [log]
+# to = "frpc.log"
+# maxDays = 3
 
 # 首次登录失败就退出（默认 true，与官方 frp 的 loginFailExit 一致）。
 # **为什么默认要退出**：起隧道的一方通常靠「子进程还活着吗」判断隧道通不通。
@@ -160,7 +168,9 @@ remote_port = 6000
 
 # 9) 插件：工作连接不再连 local_addr，而是接到插件上 ——
 #    frpc 本身就变成了正向代理 / 静态站点服务器
-#    可选值：http_proxy / socks5 / static_file / unix_domain_socket
+#    可选值：http_proxy / socks5 / static_file / unix_domain_socket /
+#            http2http / http2https / https2http / https2https / tls2raw
+#            （后 5 个是 v0.5.1 新增，官方 9 种现在全支持）
 # [[proxies]]
 # name = "outbound-proxy"
 # type = "tcp"
@@ -176,6 +186,34 @@ remote_port = 6000
 # plugin = "static_file"
 # plugin_local_path = "/var/www/html"   # 必填：要服务的目录
 # plugin_strip_prefix = "/prefix"       # 可选：回源时剥掉的路径前缀
+#
+# http2http 一族（v0.5.1 新增）：插件自己扮演前端，收明文或 TLS，再送到后端。
+# 用 type = "tcp" 这类外层类型 + plugin 指定方向即可，local_addr 仍是后端地址：
+#
+# [[proxies]]
+# name = "web-tls"
+# type = "tcp"
+# remote_port = 6202
+# plugin = "https2http"                 # https 进、http 出
+# local_addr = "127.0.0.1:80"           # 后端
+# plugin_crt_path = "/etc/ssl/site.crt" # https2* / tls2raw 必填：对外证书
+# plugin_key_path = "/etc/ssl/site.key"
+# plugin_host_header_rewrite = "backend.internal"   # 可选：改写 Host
+# plugin_headers = { X-From = "frp" }               # 可选：加自定义请求头
+
+# 10) tcpmux（HTTP CONNECT 复用）—— 多条代理**共用一个公网端口**
+#    服务端要先配 tcpmux_http_connect_port（对应官方 tcpmuxHTTPConnectPort）。
+#    客户端连上来时发 `CONNECT <域名>:<端口>`，服务端按 authority 分发到对应后端。
+#    route_by_http_user 可做二级路由（同一个域名按 Proxy-Authorization 的用户名分给不同后端）。
+# [[proxies]]
+# name = "mux-ssh"
+# type = "tcpmux"
+# multiplexer = "httpconnect"           # 目前只有这一种
+# local_addr = "127.0.0.1:22"
+# custom_domains = ["mux.example.com"]  # tcpmux 不绑端口，必须给域名或 subdomain
+# route_by_http_user = "alice"           # 可选：CONNECT 的 Basic 用户名
+# http_user = "u"                        # 可选：要求 CONNECT 携带 Basic 认证
+# http_pwd = "p"
 
 # ---- stcp / xtcp 访客端，可写多段；提供者侧不需要这段 ----
 # 目标代理名的前缀取 `server_user`，没配才用本文件顶层的 `user`。

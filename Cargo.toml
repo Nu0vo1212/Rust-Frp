@@ -3,7 +3,7 @@ resolver = "2"
 members = ["common", "server", "client"]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 rust-version = "1.75"
 authors = ["nfrp contributors"]
@@ -17,7 +17,7 @@ homepage = "https://github.com/Nu0vo1212/Rust-Frp"
 
 [workspace.dependencies]
 # 内部 crate
-nfrp-common = { path = "common", version = "0.5.0" }
+nfrp-common = { path = "common", version = "0.5.1" }
 
 # 外部依赖（统一在此处锁定版本，保证各 crate 一致）
 # frp v2 控制通道加密，对应官方 go 实现的 HKDF-SHA256 + AES-256-GCM

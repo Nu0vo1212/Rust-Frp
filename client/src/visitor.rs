@@ -78,9 +78,15 @@ pub async fn run(
     if cfg.secret_key.is_empty() {
         bail!("visitor [{}] 未配置 secret_key", cfg.name);
     }
-    if cfg.bind_port == 0 {
-        // 与 frp 一致：bindPort = 0 表示不监听本地端口（只用于给别的 visitor 做 fallback）
-        info!(visitor = %cfg.name, "bind_port 为 0，visitor 不监听本地端口");
+    if cfg.bind_port <= 0 {
+        // 与官方 frp 一致：`bindPort <= 0` 表示不监听本地端口（只用于给别的 visitor 做 fallback）。
+        // ★ 判据必须是 `<= 0` 而不是 `== 0` —— 官方用 `-1` 表达这件事，
+        // 只判 0 的话 `-1` 会一路走到 `TcpListener::bind("127.0.0.1:-1")` 报一个看不懂的错。
+        info!(
+            visitor = %cfg.name,
+            bind_port = cfg.bind_port,
+            "bind_port <= 0，visitor 不监听本地端口"
+        );
         return Ok(());
     }
 

@@ -113,23 +113,35 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| cfg.log_level.clone());
     // 开了热重载就用可替换的日志过滤器，这样改 log_level 不用重启
     let log_handle = if cfg.hot_reload {
-        util::init_tracing_reloadable(&level)
+        util::init_tracing_reloadable(&level, &cfg.log_to, cfg.max_days)
     } else {
-        util::init_tracing(&level);
+        util::init_tracing(&level, &cfg.log_to, cfg.max_days);
         None
     };
 
     // 官方 frp 支持、但 nfrp **未实现**的字段：官方 frps 默认 strict 解析，
     // 未知字段直接报错；NFrp 的 serde 不拒绝未知字段，于是它们被**静默吞掉**。
-    // 其中 allowPorts / maxPortsPerClient 这类是**限流/鉴权**语义，静默忽略会让
-    // 管理员以为已经限制住了、实际全部放开 —— 必须在日志里明说。
+    // 其中既有"限流/鉴权"语义的（静默忽略会让管理员以为已经限制住了，
+    // 实际全部放开），也有纯功能项 —— 必须在日志里明说。
     // 注意放在 init_tracing 之后，否则日志根本没被订阅。
     if !cfg.unsupported_fields.is_empty() {
         tracing::warn!(
-            "配置里有 {} 项字段是官方 frps 支持、但 nfrp **未实现**的，已按默认值忽略：{} \
-             —— 它们不会生效（尤其是 allowPorts / maxPortsPerClient 这类限制项）",
+            "配置里有 {} 项字段是官方 frps 支持、但 nfrp **未实现**的，已按默认值忽略：{}",
             cfg.unsupported_fields.len(),
             cfg.unsupported_fields.join(", ")
+        );
+    }
+    // 端口白名单是安全项：配了就明确说一句"生效范围"，免得用户不确定到底拦没拦住。
+    if !cfg.allow_ports.is_empty() {
+        tracing::info!(
+            "allowPorts 已生效：客户端只能申请这些远端端口 {}",
+            nfrp_common::config::format_port_ranges(&cfg.allow_ports)
+        );
+    }
+    if cfg.max_ports_per_client > 0 {
+        tracing::info!(
+            "maxPortsPerClient 已生效：单客户端最多占用 {} 个端口",
+            cfg.max_ports_per_client
         );
     }
 
@@ -170,12 +182,19 @@ fn validate(cfg: &ServerConfig) -> Result<()> {
             "dashboard_port({d}) 不能与控制端口 {frp_port} 相同"
         );
     }
-    if let Some(h) = cfg.vhost_http_port {
-        if let Some(hs) = cfg.vhost_https_port {
-            anyhow::ensure!(
-                h != hs,
-                "vhost_http_port 与 vhost_https_port 不能相同（{h}）"
-            );
+    // 三个虚拟主机端口各自绑一个监听器，撞在一起只会在 bind 时报"地址被占用"，
+    // 完全指不到配置上，所以在这里先拦掉。
+    let vhost_ports = [
+        ("vhost_http_port", cfg.vhost_http_port),
+        ("vhost_https_port", cfg.vhost_https_port),
+        ("tcpmux_http_connect_port", cfg.tcpmux_http_connect_port),
+    ];
+    for (i, (name_a, a)) in vhost_ports.iter().enumerate() {
+        let Some(a) = a else { continue };
+        for (name_b, b) in &vhost_ports[i + 1..] {
+            if let Some(b) = b {
+                anyhow::ensure!(a != b, "{name_a} 与 {name_b} 不能相同（{a}）");
+            }
         }
     }
     if cfg.max_total_conns > 0 && cfg.max_conns_per_client > cfg.max_total_conns {

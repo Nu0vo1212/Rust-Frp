@@ -206,6 +206,16 @@ pub struct NewProxy {
     #[serde(default, skip_serializing_if = "is_empty_str")]
     pub route_by_http_user: String,
 
+    // ---- tcpmux 使用（Go: NewProxy 的 Multiplexer）----
+    /// 多路复用器类型，官方目前只有 `httpconnect` 一种。
+    ///
+    /// ★ 这是 `tcpmux` 代理**必须有**的字段：`tcpmux` 本身不绑端口，它把工作连接
+    /// 挂到服务端 `tcpmuxHTTPConnectPort` 那个 HTTP CONNECT 复用器上，
+    /// 由复用器按 CONNECT 的 host 分发。少了它服务端会报
+    /// `unknown multiplexer []`（官方 `server/proxy/tcpmux.go` 的 `Run()`）。
+    #[serde(default, skip_serializing_if = "is_empty_str")]
+    pub multiplexer: String,
+
     // ---- stcp / xtcp / sudp 使用（Go: NewProxy 的 Sk / AllowUsers）----
     /// 共享密钥：visitor 必须提供相同的 `sk` 算出签名才能接入。
     #[serde(default, skip_serializing_if = "is_empty_str")]
@@ -501,6 +511,19 @@ impl NewProxy {
             "stcp" | "xtcp" | "sudp" => {
                 m.sk = p.secret_key.clone();
                 m.allow_users = p.allow_users.clone();
+            }
+            // tcpmux：和 http 一样靠**域名**路由（服务端那个 CONNECT 复用器按 host 分发），
+            // 但没有 `locations` —— 官方 `TCPMuxProxyConfig` 里确实没有这个字段，
+            // 多发一个空 `locations` 反而会和官方 frpc 的报文对不上。
+            "tcpmux" => {
+                m.custom_domains = p.custom_domains.clone();
+                m.subdomain = p.subdomain.clone();
+                m.multiplexer = p.multiplexer.clone();
+                m.http_user = p.http_user.clone();
+                m.http_pwd = p.http_pwd.clone();
+                m.route_by_http_user = p.route_by_http_user.clone();
+                m.group = p.group.clone();
+                m.group_key = p.group_key.clone();
             }
             // tcp / udp：remote_port + 负载均衡分组
             _ => {

@@ -1,6 +1,7 @@
 //! `nfrp-client`：frp v2 兼容的客户端（等价于原版 frpc）。
 //!
-//! 支持的代理类型：`tcp` / `udp` / `http` / `https` / `stcp` / `xtcp`。
+//! 支持的代理类型：`tcp` / `udp` / `http` / `https` / `tcpmux` / `stcp` /
+//! `xtcp` / `sudp`（与官方 frpc 一致；对应的 visitor 侧是 `stcp` / `xtcp` / `sudp`）。
 //! 其中 http / https 在客户端侧与 tcp 无差别（服务端已经把 HTTP 语义处理完了，
 //! 客户端只负责把裸字节转给内网服务）；stcp / xtcp 还额外支持 `[[visitors]]`
 //! （作为接入方）。
@@ -8,6 +9,7 @@
 mod health;
 mod p2p;
 mod plugin;
+mod plugin_bridge;
 mod registry;
 mod store;
 mod udp_proxy;
@@ -186,7 +188,7 @@ async fn main() -> Result<()> {
         .log_level
         .clone()
         .unwrap_or_else(|| cfg.log_level.clone());
-    util::init_tracing(&level);
+    util::init_tracing(&level, &cfg.log_to, cfg.max_days);
 
     // 官方 frp 支持、但 nfrp **未实现**的字段：官方 frpc 默认 strict 解析，
     // 未知字段**直接报错**；NFrp 的 serde 不拒绝未知字段，于是它们被**静默
@@ -454,7 +456,21 @@ fn cmd_verify(a: &VerifyArgs) -> Result<()> {
                 cfg.visitors.len()
             );
             for p in &cfg.proxies {
-                println!("    - [{}] {} -> {}", p.name, p.proxy_type, p.local_addr);
+                if p.plugin.is_empty() {
+                    println!("    - [{}] {} -> {}", p.name, p.proxy_type, p.local_addr);
+                } else {
+                    // 插件代理不看 `localIP` / `localPort`，工作连接是交给插件的。
+                    // 照直打会得到 `127.0.0.1:0`，看着像配错了 —— 显示插件的上游。
+                    let up = if p.plugin_local_addr.is_empty() {
+                        &p.local_addr
+                    } else {
+                        &p.plugin_local_addr
+                    };
+                    println!(
+                        "    - [{}] {} + 插件 [{}] -> {}",
+                        p.name, p.proxy_type, p.plugin, up
+                    );
+                }
             }
             for v in &cfg.visitors {
                 println!(
@@ -1208,7 +1224,20 @@ async fn work_conn_flow(
     if let Some(built) = plugin::Plugin::from_proxy(&proxy) {
         let plug = built.with_context(|| format!("代理 [{}] 的插件配置有误", proxy.name))?;
         debug!(proxy = %start.proxy_name, "工作连接交给插件处理");
-        return plug.serve(work, leftover, &start.proxy_name).await;
+        // 真实客户端地址来自服务端下发的 `src_addr/src_port`：只有它能写进
+        // `X-Forwarded-For`（工作连接的对端是 frps 自己，那是 `127.0.0.1`）。
+        let src = if start.src_addr.is_empty() || start.src_port == 0 {
+            None
+        } else {
+            util::resolve_addr(&format!("{}:{}", start.src_addr, start.src_port))
+                .await
+                .ok()
+        };
+        let ctx = plugin::Ctx {
+            proxy_name: &start.proxy_name,
+            src,
+        };
+        return plug.serve(work, leftover, &ctx).await;
     }
 
     let local_addr = &proxy.local_addr;
@@ -1327,6 +1356,8 @@ mod tests {
             http_user: "hu".into(),
             http_pwd: "hp".into(),
             host_header_rewrite: "backend.internal".into(),
+            route_by_http_user: "hu-route".into(),
+            multiplexer: "httpconnect".into(),
             bandwidth_limit: "1MB".into(),
             bandwidth_limit_mode: "server".into(),
             metas: [("pk".to_string(), "pv".to_string())].into_iter().collect(),
@@ -1342,6 +1373,13 @@ mod tests {
             plugin_strip_prefix: "/p".into(),
             plugin_user: "pu".into(),
             plugin_passwd: "pp".into(),
+            plugin_local_addr: "127.0.0.1:9000".into(),
+            plugin_crt_path: "/tmp/c.crt".into(),
+            plugin_key_path: "/tmp/c.key".into(),
+            plugin_host_header_rewrite: "plugin.internal".into(),
+            plugin_request_headers: [("X-Plugin".to_string(), "yes".to_string())]
+                .into_iter()
+                .collect(),
             secret_key: "sk".into(),
             allow_users: vec!["alice".into()],
         }
@@ -1463,6 +1501,31 @@ mod tests {
         // stcp / xtcp 不占公网端口，带上 remote_port 会让服务端误判
         assert_eq!(m.remote_port, 0);
         assert!(m.group.is_empty(), "stcp 不走端口组，不该带 group");
+    }
+
+    /// tcpmux 上报的字段对齐官方 `TCPMuxProxyConfig.MarshalToMsg`：
+    /// `customDomains` / `subdomain` / `multiplexer` / `httpUser` / `httpPwd` /
+    /// `routeByHTTPUser` —— **不带 `locations`**（官方那个结构体里没有这个字段）。
+    #[test]
+    fn tcpmux_carries_multiplexer_and_domain_routing() {
+        let c = ProxyConfig {
+            proxy_type: "tcpmux".into(),
+            ..full_tcp_config()
+        };
+        let m = NewProxy::from_config(&c, USER);
+        assert_eq!(m.proxy_name, "alice.web-a");
+        assert_eq!(m.multiplexer, "httpconnect");
+        assert_eq!(m.custom_domains, vec!["a.example.com".to_string()]);
+        assert_eq!(m.subdomain, "sub");
+        assert_eq!(m.http_user, "hu");
+        assert_eq!(m.http_pwd, "hp");
+        assert_eq!(m.route_by_http_user, "hu-route");
+        // 不占端口、也没有路径前缀
+        assert_eq!(m.remote_port, 0);
+        assert!(
+            m.locations.is_empty(),
+            "官方 tcpmux 没有 locations，不能多发"
+        );
     }
 
     /// **金标准测试**：报文必须和官方 frpc v0.71.0 抓到的那一帧**逐字节一致**。

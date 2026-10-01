@@ -280,9 +280,7 @@ const UNSUPPORTED_CLIENT_FIELDS: &[&str] = &[
     "dnsServer",
     "includes",
     // ---- 日志 ----
-    // 官方 `[log]` 段的 `to`（日志落盘）、`maxDays`、`disablePrintColor`
-    "to",
-    "maxDays",
+    // 官方 `[log]` 段的 `disablePrintColor`（`to` / `maxDays` 已实现，见 logfile.rs）
     "disablePrintColor",
     // ---- 管理界面 ----
     "pprofEnable",
@@ -317,11 +315,6 @@ const UNSUPPORTED_SERVER_FIELDS: &[&str] = &[
     // 端口 / 监听
     "quicBindPort",
     "proxyBindAddr",
-    "tcpmuxHTTPConnectPort",
-    "tcpmuxPassthrough",
-    // ★ 安全相关：配了不生效最危险
-    "allowPorts",
-    "maxPortsPerClient",
     // 传输层调优
     "maxPoolCount",
     "tcpMuxKeepaliveInterval",
@@ -329,19 +322,14 @@ const UNSUPPORTED_SERVER_FIELDS: &[&str] = &[
     "certFile",
     "keyFile",
     "trustedCaFile",
-    // HTTP 虚拟主机
-    "vhostHTTPTimeout",
-    "custom404Page",
+    // HTTP 虚拟主机（`vhostHTTPTimeout` / `custom404Page` 已实现）
     // 面板 / 观测
     "assetsDir",
     "pprofEnable",
     "enablePrometheus",
-    // 日志
-    "to",
-    "maxDays",
+    // 日志（`to` / `maxDays` 已实现，见 common/src/logfile.rs）
     "disablePrintColor",
     // 行为
-    "detailedErrorsToClient",
     "userConnTimeout",
     "udpPacketSize",
     "natholeAnalysisDataReserveHours",
@@ -486,6 +474,10 @@ const PROXY_FIELDS: Renames = &[
     ("hostHeaderRewrite", "host_header_rewrite"),
     ("secretKey", "secret_key"),
     ("allowUsers", "allow_users"),
+    // tcpmux：`multiplexer` 两边同名，但官方是 camelCase 小写开头、TEngine 那种
+    // 平台偶尔会写成 `multiplexer`/`Multiplexer` 两种；走搬家表就能统一折叠。
+    ("multiplexer", "multiplexer"),
+    ("routeByHTTPUser", "route_by_http_user"),
 ];
 
 /// `[[visitors]]` 一条记录里的键名映射。
@@ -511,15 +503,36 @@ fn extract_plugin(p: &mut toml::Table) {
     };
     let pairs: Renames = &[
         ("type", "plugin"),
+        // 官方 `static_file` 用的是 `localPath`，`unix_domain_socket` 用的是 `unixPath`，
+        // 两者在 NFrp 里是同一个字段 —— 漏了 `unixPath` 会让一份合法的官方配置
+        // 报"必须配置 plugin_local_path"，而用户明明配了。
         ("localPath", "plugin_local_path"),
+        ("unixPath", "plugin_local_path"),
         ("stripPrefix", "plugin_strip_prefix"),
         ("username", "plugin_user"),
+        ("httpUser", "plugin_user"),
         ("password", "plugin_passwd"),
+        ("httpPassword", "plugin_passwd"),
+        ("localAddr", "plugin_local_addr"),
+        ("crtPath", "plugin_crt_path"),
+        ("keyPath", "plugin_key_path"),
+        ("hostHeaderRewrite", "plugin_host_header_rewrite"),
     ];
     for (from, to) in pairs {
         if let Some(v) = sub.remove(*from) {
             if !p.contains_key(*to) {
                 p.insert((*to).to_string(), v);
+            }
+        }
+    }
+
+    // `requestHeaders` 在官方是 `{ set = { "K" = "V" } }`，NFrp 只要里面那张 `set` 表。
+    // 官方 `HeaderOperations` 目前只有 `set` 一个字段，但**不能假定**它永远只有它 ——
+    // 所以只取 `set`，遇到别的字段就当没配（而不是把整张表塞进字符串 map 里炸掉）。
+    if let Some(Value::Table(mut rh)) = sub.remove("requestHeaders") {
+        if let Some(set @ Value::Table(_)) = rh.remove("set") {
+            if !p.contains_key("plugin_request_headers") {
+                p.insert("plugin_request_headers".to_string(), set);
             }
         }
     }
@@ -579,8 +592,16 @@ pub fn normalize_client(root: &mut toml::Value) {
     //   「token in login doesn't match token from configuration」。
     rename(t, "metadatas", "metas");
 
-    // 日志：`[log] level` 与顶层 `logLevel` 等价
-    hoist(t, &["log"], &[("level", "log_level")]);
+    // 日志：`[log] level` 与顶层 `logLevel` 等价；`to` / `maxDays` 只在 `[log]` 里
+    hoist(
+        t,
+        &["log"],
+        &[
+            ("level", "log_level"),
+            ("to", "log_to"),
+            ("maxDays", "max_days"),
+        ],
+    );
 
     for_each_record(root, "proxies", |p| {
         rename_all(p, PROXY_FIELDS);
@@ -636,6 +657,19 @@ const SERVER_TOP: Renames = &[
     ("logLevel", "log_level"),
     ("vhostHTTPPort", "vhost_http_port"),
     ("vhostHTTPSPort", "vhost_https_port"),
+    // tcpmux：官方 frps.toml 里是 camelCase，NFrp 里是 snake_case。
+    // ★ 少这一行就会**静默忽略** —— 用户配了 tcpmuxHTTPConnectPort 却启动不了
+    //   CONNECT 复用器，然后 tcpmux 代理一条都注册不上，报错还指向代理而不是配置。
+    ("tcpmuxHTTPConnectPort", "tcpmux_http_connect_port"),
+    ("tcpmuxPassthrough", "tcpmux_passthrough"),
+    // 虚拟主机 / 端口管控（官方 frps.toml 里都是顶层 camelCase）
+    ("vhostHTTPTimeout", "vhost_http_timeout"),
+    ("custom404Page", "custom_404_page"),
+    // ★ 安全相关：少了这两行，"端口白名单 + 单客户端端口数上限"会**静默失效** ——
+    //   用户以为锁住了 22 / 3306，实际任何客户端都能申请。
+    ("allowPorts", "allow_ports"),
+    ("maxPortsPerClient", "max_ports_per_client"),
+    ("detailedErrorsToClient", "detailed_errors_to_client"),
     ("subdomainHost", "subdomain_host"),
     ("transportProtocol", "transport_protocol"),
 ];
@@ -672,7 +706,15 @@ pub fn normalize_server(root: &mut toml::Value) {
     hoist(t, &["transport", "tls"], &[("force", "tls_force")]);
 
     hoist(t, &["auth"], &[("token", "token")]);
-    hoist(t, &["log"], &[("level", "log_level")]);
+    hoist(
+        t,
+        &["log"],
+        &[
+            ("level", "log_level"),
+            ("to", "log_to"),
+            ("maxDays", "max_days"),
+        ],
+    );
 
     // 内置面板：frp 放在 `[webServer]`
     hoist(
@@ -810,9 +852,9 @@ secretKey = "sk"
     }
 
     /// `allowPorts` / `maxPortsPerClient` 是**安全相关**：配了不生效比不配更危险
-    /// （管理员以为端口被限制住了，实际全放开）。TOML camelCase 必须认出来。
+    /// （管理员以为端口被限制住了，实际全放开）。TOML camelCase 必须真读进来。
     #[test]
-    fn tom_能识别未实现的服务端_allow_ports() {
+    fn 服务端的_allow_ports_与_max_ports_per_client_能读进来() {
         let raw = r#"
 bindPort = 7000
 allowPorts = [
@@ -823,31 +865,85 @@ maxPortsPerClient = 20
 "#;
         let cfg = parse_server_toml(raw).unwrap();
         assert!(
-            cfg.unsupported_fields.contains(&"allowPorts".to_string()),
-            "实际：{:?}",
+            cfg.unsupported_fields.is_empty(),
+            "这两项已经实现，不该再报未实现：{:?}",
             cfg.unsupported_fields
         );
-        assert!(cfg
-            .unsupported_fields
-            .contains(&"maxPortsPerClient".to_string()));
+        assert_eq!(cfg.allow_ports.len(), 2);
+        assert_eq!(cfg.allow_ports[0].to_string(), "2000-3000");
+        assert_eq!(cfg.allow_ports[1].to_string(), "3001");
+        assert!(cfg.port_allowed(2500));
+        assert!(cfg.port_allowed(3001));
+        assert!(!cfg.port_allowed(3002), "名单外的端口必须被拒");
+        assert!(!cfg.port_allowed(22), "22 不能被放行");
+        assert_eq!(cfg.max_ports_per_client, 20);
     }
 
-    /// 官方 legacy INI 用 snake_case（`allow_ports`），且必须扫**原文** ——
-    /// INI 转换器只搬认识的键，扫转换后的 value 一个也扫不到。
+    /// 官方 frps_full_example 里的字符串写法（legacy `--allow_ports` 的形式）也要认。
     #[test]
-    fn ini能识别未实现的服务端_allow_ports() {
+    fn 服务端的_allow_ports_也认字符串写法() {
+        let raw = r#"
+bindPort = 7000
+allowPorts = ["20000-30000", "8443"]
+"#;
+        let cfg = parse_server_toml(raw).unwrap();
+        assert_eq!(
+            crate::config::format_port_ranges(&cfg.allow_ports),
+            "20000-30000,8443"
+        );
+        assert!(cfg.port_allowed(20000));
+        assert!(cfg.port_allowed(8443));
+        assert!(!cfg.port_allowed(8442));
+    }
+
+    /// 空名单 = 不限制（与官方 `ports.Manager` 一致），不能变成"全禁止"。
+    #[test]
+    fn 未配_allow_ports_等于不限制() {
+        let cfg = parse_server_toml("bindPort = 7000").unwrap();
+        assert!(cfg.allow_ports.is_empty());
+        assert!(cfg.port_allowed(22));
+        assert!(cfg.port_allowed(65535));
+    }
+
+    /// 官方 legacy INI 用 snake_case + 逗号串，且必须真的搬过 allow_ports
+    /// （INI 转换器只搬认识的键）。
+    #[test]
+    fn ini能搬服务端的_allow_ports_与端口上限() {
         let raw = r#"
 [common]
 bind_port = 7000
 allow_ports = 2000-3000,3001
 max_ports_per_client = 20
+vhost_http_timeout = 30
+detailed_errors_to_client = false
+log_file = /var/log/frps.log
+log_max_days = 7
 "#;
         let cfg = crate::config::parse_server(raw).unwrap();
         assert!(
-            cfg.unsupported_fields.iter().any(|f| f == "allow_ports"),
-            "实际：{:?}",
+            cfg.unsupported_fields.is_empty(),
+            "已实现的字段不该报未实现：{:?}",
             cfg.unsupported_fields
         );
+        assert_eq!(
+            crate::config::format_port_ranges(&cfg.allow_ports),
+            "2000-3000,3001"
+        );
+        assert_eq!(cfg.max_ports_per_client, 20);
+        assert_eq!(cfg.vhost_http_timeout, 30);
+        assert!(!cfg.detailed_errors_to_client);
+        assert_eq!(cfg.log_to, "/var/log/frps.log");
+        assert_eq!(cfg.max_days, 7);
+    }
+
+    /// ★ 写错的 `allow_ports` 必须报错，不能静默变成"不限制"。
+    /// 官方 INI 转换器把解析错误吞掉 → AllowPorts 为空 → **全端口放开**，
+    /// 这是"配了安全策略却等于没配"的经典翻车现场。
+    #[test]
+    fn ini里写错的_allow_ports_要报错而不是放开全部() {
+        let raw = "[common]\nbind_port = 7000\nallow_ports = 3000-2000\n";
+        let err = crate::config::parse_server(raw).unwrap_err().to_string();
+        assert!(err.contains("allow_ports"), "错误里要点名字段：{err}");
     }
 
     /// 已实现的服务端字段不能被误报。`bindPort` / `logLevel` 都在搬家表里。
@@ -1126,6 +1222,53 @@ bindPort = 9001
         assert_eq!(v.bind_port, 9001);
     }
 
+    /// ★ 回归：官方 `frpc_full_example.toml` 的 `vnet-visitor` 写的是 `bindPort = -1`，
+    /// 官方语义为"不监听本地端口"。这里用 `u16` 会让**整份官方配置解析失败**。
+    #[test]
+    fn visitor_的_bind_port_接受官方的负数写法() {
+        let text = r#"
+server_addr = "x"
+[[visitors]]
+name = "vnet-visitor"
+type = "stcp"
+serverName = "vnet-server"
+secretKey = "your-secret-key"
+bindPort = -1
+"#;
+        let cfg = parse_client_toml(text).expect("官方的 bindPort = -1 必须能解析");
+        assert_eq!(cfg.visitors[0].bind_port, -1);
+        assert!(cfg.visitors[0].bind_port <= 0, "负数表示不监听");
+    }
+
+    /// 官方整份 `frpc_full_example.toml` 里 visitor 之外还有 `bindPort = -1` 之外的坑，
+    /// 这里只锁"解析阶段不被 u16 拦住"这一条 —— 用官方原文里的那一段做逐字回归。
+    #[test]
+    fn 官方示例里的_visitors_段能整体解析() {
+        let text = r#"
+serverAddr = "x"
+serverPort = 7000
+
+[[visitors]]
+name = "secret_tcp_visitor"
+type = "stcp"
+serverName = "secret_tcp"
+secretKey = "abcdefg"
+bindAddr = "127.0.0.1"
+bindPort = 9000
+
+[[visitors]]
+name = "vnet-visitor"
+type = "stcp"
+serverName = "vnet-server"
+secretKey = "your-secret-key"
+bindPort = -1
+"#;
+        let cfg = parse_client_toml(text).expect("官方 visitors 段必须能整体解析");
+        assert_eq!(cfg.visitors.len(), 2);
+        let ports: Vec<i32> = cfg.visitors.iter().map(|v| v.bind_port).collect();
+        assert_eq!(ports, vec![9000, -1]);
+    }
+
     #[test]
     fn 插件代理省略本机地址时按_frp_默认值补齐() {
         let text = r#"
@@ -1227,11 +1370,28 @@ enable = true
     }
 
     /// "官方支持、NFrp 未实现"的字段识别也要折叠大小写 ——
-    /// 用户写 `AllowPorts`（官方照样认），NFrp 的告警就不能漏。
+    /// 用户写 `proxyBindAddr`（官方照样认），NFrp 的告警就不能漏。
+    ///
+    /// 注意这里挑的是**至今确实没实现**的字段；`AllowPorts` 曾经是这条用例的
+    /// 主角，但它已经实现了（改用 `代理绑定地址` 这个还没做的）。
     #[test]
     fn 未实现字段识别也要折叠大小写() {
-        let text = "bindPort = 7000\nAllowPorts = [{ start = 6000, end = 6010 }]\n";
+        let text = "bindPort = 7000\nProxyBindAddr = \"127.0.0.1\"\n";
         let cfg = parse_server_toml(text).unwrap();
-        assert_eq!(cfg.unsupported_fields, vec!["AllowPorts".to_string()]);
+        assert_eq!(cfg.unsupported_fields, vec!["ProxyBindAddr".to_string()]);
+    }
+
+    /// 已实现的字段即使写成**别的大小写**也不能再被误报。
+    #[test]
+    fn 已实现的字段换个大小写也不报未实现() {
+        let text = "bindPort = 7000\nAllowPorts = [{ single = 8443 }]\nMaxPortsPerClient = 3\n";
+        let cfg = parse_server_toml(text).unwrap();
+        assert!(
+            cfg.unsupported_fields.is_empty(),
+            "实际：{:?}",
+            cfg.unsupported_fields
+        );
+        assert!(cfg.port_allowed(8443));
+        assert_eq!(cfg.max_ports_per_client, 3);
     }
 }

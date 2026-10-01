@@ -2,6 +2,7 @@
 //!
 //! 所有路径相关参数统一使用 [`std::path::PathBuf`]，不在代码中硬编码路径分隔符。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -91,6 +92,220 @@ pub const DEFAULT_HEARTBEAT_TIMEOUT: u64 = 90;
 pub const DEFAULT_WORK_CONN_IDLE_TIMEOUT: u64 = 60;
 pub const DEFAULT_RECONNECT_INTERVAL: u64 = 5;
 pub const DEFAULT_LOG_LEVEL: &str = "info";
+/// 官方 `LogConfig.Complete()`：`MaxDays = util.EmptyOr(c.MaxDays, 3)`。
+pub const DEFAULT_LOG_MAX_DAYS: i64 = 3;
+/// 官方 `ServerConfig.Complete()`：`VhostHTTPTimeout = util.EmptyOr(…, 60)`。
+pub const DEFAULT_VHOST_HTTP_TIMEOUT: u64 = 60;
+
+// ---------------------------------------------------------------------------
+// allowPorts：允许客户端申请的远端端口白名单
+// ---------------------------------------------------------------------------
+
+/// `allowPorts` 里的一条端口区间，对应官方 `pkg/config/types.PortsRange`。
+///
+/// 官方把它设计成"单端口 / 区间"两个可选字段：
+///
+/// ```toml
+/// allowPorts = [
+///   { start = 2000, end = 3000 },
+///   { single = 3001 },
+///   { start = 4000, end = 5000 },
+/// ]
+/// ```
+///
+/// 内部统一成闭区间 `[start, end]`（单端口就是 `start == end`），
+/// 判断"端口是否被允许"只需一次比较。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortRange {
+    pub start: u16,
+    pub end: u16,
+}
+
+impl PortRange {
+    /// 单个端口。
+    pub fn single(port: u16) -> Self {
+        Self {
+            start: port,
+            end: port,
+        }
+    }
+
+    /// 闭区间；`end < start` 时自动交换，调用方不用先排好序。
+    pub fn new(a: u16, b: u16) -> Self {
+        if a <= b {
+            Self { start: a, end: b }
+        } else {
+            Self { start: b, end: a }
+        }
+    }
+
+    pub fn contains(&self, port: u16) -> bool {
+        self.start <= port && port <= self.end
+    }
+}
+
+impl std::fmt::Display for PortRange {
+    /// 与官方 `PortsRangeSlice.String()` 一致：单端口写 `3000`，区间写 `1000-2000`。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.start == self.end {
+            write!(f, "{}", self.start)
+        } else {
+            write!(f, "{}-{}", self.start, self.end)
+        }
+    }
+}
+
+/// 反序列化 `allowPorts`：每一项可以是官方那种表，也可以直接写字符串。
+///
+/// 官方 TOML 只认表（`{ start = …, end = … }`），字符串写法只在 legacy INI /
+/// 命令行 `--allow_ports` 里出现。这里两种都收 —— 用户把
+/// `allow_ports = 1000-2000,3000` 从 frps.ini 抄到 frps.toml 时不会撞墙。
+///
+/// ★ 每一项用 [`PortSpec`]（自己实现 `deserialize_any`）而**不是**
+///   `#[serde(untagged)]`：untagged 会把内层错误整个吞掉，只留下一句
+///   "data did not match any variant"，于是"区间反了"这种能一句话说清的
+///   配置错误，用户要查半天。自实现 visitor 后错误信息可以原样透出。
+fn de_port_ranges<'de, D>(d: D) -> std::result::Result<Vec<PortRange>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let specs: Vec<PortSpec> = Vec::deserialize(d)?;
+    Ok(specs.into_iter().flat_map(|s| s.0).collect())
+}
+
+/// `allowPorts` 数组里的一项：表 **或** 字符串。
+///
+/// 字符串可以带逗号（`"1000-2000,3000"`），所以一项可能展开成多条区间 ——
+/// 这也是它不叫 `PortRange` 的原因。
+struct PortSpec(Vec<PortRange>);
+
+impl<'de> Deserialize<'de> for PortSpec {
+    fn deserialize<D>(d: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = PortSpec;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(
+                    "allowPorts 的每一项：{ start = …, end = … } / { single = … }，\
+                     或 \"1000-2000,3000\" 这样的字符串",
+                )
+            }
+
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> std::result::Result<PortSpec, E> {
+                parse_port_ranges(s).map(PortSpec).map_err(E::custom)
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<PortSpec, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                use serde::de::Error as _;
+                let (mut start, mut end, mut single) = (None, None, None);
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "start" => start = Some(map.next_value::<u16>()?),
+                        "end" => end = Some(map.next_value::<u16>()?),
+                        "single" => single = Some(map.next_value::<u16>()?),
+                        // 官方走 Go 的 encoding/json，未知键是**忽略**的，这里照做
+                        // （但必须把值消费掉，否则 map 走不下去）。
+                        _ => {
+                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                match (single, start, end) {
+                    (Some(s), None, None) => Ok(PortSpec(vec![PortRange::single(s)])),
+                    // `{ start = 1000 }`（官方没这么写，但语义无歧义）
+                    (None, Some(a), None) => Ok(PortSpec(vec![PortRange::single(a)])),
+                    (None, Some(a), Some(b)) => {
+                        if b < a {
+                            Err(A::Error::custom(format!(
+                                "allowPorts 区间反了：start={a} end={b}"
+                            )))
+                        } else {
+                            Ok(PortSpec(vec![PortRange::new(a, b)]))
+                        }
+                    }
+                    _ => Err(A::Error::custom(
+                        "allowPorts 每一项要么是 { start = …, end = … }，要么是 { single = … }",
+                    )),
+                }
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// 解析 `"1000-2000,3000,4000-5000"` 这种逗号分隔的端口列表。
+///
+/// 逐条对齐官方 `types.NewPortsRangeSliceFromString`：按 `,` 切、每项按 `-` 切，
+/// 切成 1 段当单端口、2 段当区间、其它段数报错；区间反过来（`2000-1000`）也报错。
+pub fn parse_port_ranges(s: &str) -> std::result::Result<Vec<PortRange>, String> {
+    let mut out = Vec::new();
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Ok(out);
+    }
+    for item in trimmed.split(',') {
+        let item = item.trim();
+        let parts: Vec<&str> = item.split('-').collect();
+        let num = |t: &str| -> std::result::Result<u16, String> {
+            t.trim()
+                .parse::<u16>()
+                .map_err(|_| format!("allowPorts 里的数字非法：{t:?}"))
+        };
+        match parts.len() {
+            1 => out.push(PortRange::single(num(parts[0])?)),
+            2 => {
+                let a = num(parts[0])?;
+                let b = num(parts[1])?;
+                if b < a {
+                    return Err(format!("allowPorts 区间反了：{item}"));
+                }
+                out.push(PortRange::new(a, b));
+            }
+            _ => return Err(format!("allowPorts 的分段数非法：{item}")),
+        }
+    }
+    Ok(out)
+}
+
+/// 反向格式化（官方 `PortsRangeSlice.String()`），给面板 / API 展示用。
+pub fn format_port_ranges(rs: &[PortRange]) -> String {
+    rs.iter()
+        .map(|r| r.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+impl Serialize for PortRange {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct as _;
+        if self.start == self.end {
+            // 官方单端口的写法是 `{ single = 3000 }`
+            let mut st = s.serialize_struct("PortsRange", 1)?;
+            st.serialize_field("single", &self.start)?;
+            st.end()
+        } else {
+            let mut st = s.serialize_struct("PortsRange", 2)?;
+            st.serialize_field("start", &self.start)?;
+            st.serialize_field("end", &self.end)?;
+            st.end()
+        }
+    }
+}
+
+/// 端口是否落在白名单里。
+///
+/// `allow_ports` 为空 = **不限制**（与官方 `ports.Manager` 在
+/// `len(allowPorts) == 0` 时把 1..65535 全放进 freePorts 一致）。
+pub fn port_allowed(allow: &[PortRange], port: u16) -> bool {
+    allow.is_empty() || allow.iter().any(|r| r.contains(port))
+}
 
 // ---------------------------------------------------------------------------
 // 服务端配置
@@ -157,6 +372,36 @@ pub struct ServerConfig {
     #[serde(default)]
     pub vhost_https_port: Option<u16>,
 
+    /// tcpmux 代理的 HTTP CONNECT 复用端口（对应 frp `tcpmuxHTTPConnectPort`）。
+    ///
+    /// 这是**一个共享端口**：所有 tcpmux 代理都挂在它上面，靠 CONNECT 请求里的
+    /// host 分发。留空表示不启用 tcpmux 类型代理。
+    #[serde(default)]
+    pub tcpmux_http_connect_port: Option<u16>,
+
+    /// tcpmux 的 CONNECT 请求是否**原样透传**给内网服务（对应 frp `tcpmuxPassthrough`）。
+    ///
+    /// * `false`（默认，与官方一致）：服务端自己回 `HTTP/1.1 200 OK`，再把后续字节
+    ///   转发给内网服务 —— 内网服务看到的是一条**已经建好**的裸 TCP 连接。
+    /// * `true`：连 CONNECT 请求本身都转发过去，由内网服务自己回 200。
+    ///   适合内网本身就是一个 HTTP 代理的场景。
+    #[serde(default)]
+    pub tcpmux_passthrough: bool,
+
+    /// vhost HTTP **等待内网服务响应头**的超时（秒，对应 frp `vhostHTTPTimeout`，默认 60）。
+    ///
+    /// 0 = 不限。对应官方 `vhost.HTTPReverseProxyOptions.ResponseHeaderTimeoutS`：
+    /// 内网服务连上了却迟迟不回响应头时，服务端不会一直挂着这条用户连接。
+    #[serde(default = "default_vhost_http_timeout")]
+    pub vhost_http_timeout: u64,
+
+    /// 自定义 404 页面文件路径（对应 frp `custom404Page`）。空 = 用内置提示。
+    ///
+    /// 与官方 `vhost.NotFoundPagePath` 一致：没有代理能匹配该域名时，
+    /// 把这个文件的**原文**当作 404 响应体返回（不改变状态码）。
+    #[serde(default)]
+    pub custom_404_page: String,
+
     /// 泛域名后缀（对应 frp `subdomainHost`），形如 `example.com`。
     /// 配置后客户端可用 `subdomain = "abc"` 注册 `abc.example.com`。
     #[serde(default)]
@@ -165,6 +410,18 @@ pub struct ServerConfig {
     /// 日志级别，形如 `info` / `debug` / `nfrp_server=debug`。
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// 日志落盘路径（对应 frp `log.to`）。空 / `console` = 写标准输出（默认）。
+    ///
+    /// 配了非 console 的值就写文件，并在**跨天**时把当前文件改名成
+    /// `<名>.<YYYYMMDD-HHMMSS><扩展名>`、再建一个新的，按 `max_days` 清理老备份。
+    /// 细节与与官方的一处时区差异见 [`crate::logfile`]。
+    #[serde(default)]
+    pub log_to: String,
+
+    /// 日志保留天数（对应 frp `log.maxDays`，默认 3；`<= 0` = 不清理）。
+    #[serde(default = "default_log_max_days")]
+    pub max_days: i64,
 
     // ---- 资源上限（0 = 不限，默认全部不限制以保持向后兼容）----
     /// 全局同时活跃的转发连接数上限。
@@ -182,6 +439,44 @@ pub struct ServerConfig {
     /// 单个客户端可注册的代理数上限。
     #[serde(default)]
     pub max_proxies_per_client: usize,
+
+    /// **端口白名单**（对应 frp `allowPorts`）：客户端能申请的**公网远端端口**。
+    ///
+    /// 空 = 不限制（与官方一致）。这是一项**安全**配置 —— 不配的话任何拿到 token
+    /// 的客户端都能把 22 / 3306 这类端口映射到公网，配了却静默失效比不配更危险。
+    ///
+    /// ```toml
+    /// allowPorts = [
+    ///   { start = 20000, end = 30000 },
+    ///   { single = 8443 },
+    /// ]
+    /// ```
+    ///
+    /// 也接受字符串写法（legacy INI / 官方 `--allow_ports` 的形式）：
+    /// `allowPorts = ["20000-30000", "8443"]`。
+    #[serde(default, deserialize_with = "de_port_ranges")]
+    pub allow_ports: Vec<PortRange>,
+
+    /// 单个客户端可占用的远端端口数上限（对应 frp `maxPortsPerClient`，0 = 不限）。
+    ///
+    /// 与 `max_proxies_per_client` 不是一回事：http / https / tcpmux / stcp 这些
+    /// **不占公网端口**的代理只算代理数、不占端口数。官方也是这么分的
+    /// （`Control.RegisterProxy` 里累加的是 `pxy.GetUsedPortsNum()`）。
+    #[serde(default)]
+    pub max_ports_per_client: i64,
+
+    /// 是否把**详细**失败原因回给客户端（对应 frp `detailedErrorsToClient`，默认 true）。
+    ///
+    /// 关掉之后的文案与官方逐字对齐（官方 `util.GenerateResponseErrorString`）：
+    ///
+    /// * 注册代理失败 → `new proxy [<名字>] error`
+    /// * 心跳校验失败 → `invalid ping`
+    ///
+    /// 这是一项**安全**配置：默认的详细错误里会带上"域名 xxx 已被代理 yyy 占用"
+    /// 这类**别人的代理名**，多方共用一个 frps 时等于把别人的隧道名泄露出去。
+    /// 单租户自用没必要关；对外提供服务时建议关掉。
+    #[serde(default = "default_true")]
+    pub detailed_errors_to_client: bool,
 
     // ---- 传输层 ----
     /// 客户端与服务端之间的传输协议：`tcp`（默认）、`quic` 或 `kcp`。
@@ -341,6 +636,29 @@ impl ServerConfig {
                 None
             })
     }
+
+    /// 客户端申请的远端端口是否被 `allowPorts` 放行（空名单 = 全放行）。
+    pub fn port_allowed(&self, port: u16) -> bool {
+        port_allowed(&self.allow_ports, port)
+    }
+
+    /// 回给客户端的错误文案：`detailed_errors_to_client = false` 时换成短句。
+    ///
+    /// `summary` 与官方 `util.GenerateResponseErrorString` 的第一个参数对齐
+    /// （官方写法见 `server/control.go` 的 `handleNewProxy` / `handlePing`）。
+    pub fn error_to_client(&self, summary: &str, detail: &str) -> String {
+        if self.detailed_errors_to_client {
+            detail.to_string()
+        } else {
+            summary.to_string()
+        }
+    }
+
+    /// vhost HTTP 等待内网响应头的超时；0 表示不限。
+    pub fn vhost_http_timeout(&self) -> Option<std::time::Duration> {
+        (self.vhost_http_timeout > 0)
+            .then(|| std::time::Duration::from_secs(self.vhost_http_timeout))
+    }
 }
 
 impl Default for ServerConfig {
@@ -358,8 +676,14 @@ impl Default for ServerConfig {
             tls_force: false,
             vhost_http_port: None,
             vhost_https_port: None,
+            tcpmux_http_connect_port: None,
+            tcpmux_passthrough: false,
+            vhost_http_timeout: default_vhost_http_timeout(),
+            custom_404_page: String::new(),
             subdomain_host: String::new(),
             log_level: default_log_level(),
+            log_to: String::new(),
+            max_days: default_log_max_days(),
             transport_protocol: default_transport_protocol(),
             kcp_bind_port: None,
             max_total_conns: 0,
@@ -367,6 +691,9 @@ impl Default for ServerConfig {
             max_conns_per_client: 0,
             max_pending_per_client: 0,
             max_proxies_per_client: 0,
+            allow_ports: Vec::new(),
+            max_ports_per_client: 0,
+            detailed_errors_to_client: true,
             p2p_port: None,
             dashboard_port: None,
             dashboard_user: String::new(),
@@ -450,6 +777,33 @@ max_proxies_per_client = 50  # 单个客户端可注册的代理数
 max_conns_per_client = 200   # 单个客户端同时转发的连接数
 max_total_conns = 5000       # 全局同时转发的连接数
 max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
+
+# ---- 端口管控（安全相关，对外提供服务时强烈建议配）----
+# ★ 不配 allow_ports 的话，**任何**拿到 token 的客户端都能申请 22 / 3306
+#   这类端口并直接暴露到公网。写法与官方 frps.toml 一致，也接受字符串形式。
+allow_ports = [
+  { start = 20000, end = 30000 },
+  # { single = 8443 },
+]
+# 单个客户端最多占用几个公网端口（0 = 不限）。注意它与 max_proxies_per_client
+# 不是一回事：http / https / tcpmux / stcp 这些不占公网端口的只算代理数。
+max_ports_per_client = 20
+
+# ---- 虚拟主机行为 ----
+vhost_http_timeout = 60          # 等内网服务**响应头**的秒数（0 = 不限）
+# custom_404_page = "/etc/nfrp/404.html"   # 没有代理匹配时返回这个文件
+
+# ---- 回给客户端的错误要不要带上细节 ----
+# false 时只回 `new proxy [xxx] error` / `invalid ping`，不会把
+# "这个域名已被别的代理占用"这类**别人的隧道名**泄露出去。默认 true（与官方一致）。
+# detailed_errors_to_client = true
+
+# ---- 日志 ----
+# log_level 也可以写在下面这个 [log] 段里（与官方 frps.toml 一致）：
+# [log]
+# to = "/var/log/nfrps.log"   # 默认 console；配了文件就写文件，按天轮转
+# maxDays = 3                 # 备份日志保留天数（<=0 = 不清理）
+# level = "info"
 "##
         .to_string()
     }
@@ -508,6 +862,22 @@ pub struct ProxyConfig {
     /// 转发到内网服务时重写 Host 头。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub host_header_rewrite: String,
+    /// 按 HTTP Basic Auth 的**用户名**路由（官方 `routeByHTTPUser`）。
+    ///
+    /// 作用：让多条代理共用一个域名 + 路径，只按访问者用的用户名区分。
+    /// http / https / tcpmux 都用得上 —— tcpmux 那个 CONNECT 复用器尤其依赖它，
+    /// 因为 CONNECT 请求没有路径，域名撞车时只剩用户名这一个区分维度。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub route_by_http_user: String,
+
+    // ---- tcpmux 专用 ----
+    /// 多路复用器类型（官方 `multiplexer`）。官方只有 `httpconnect` 一种。
+    ///
+    /// `tcpmux` 代理不绑端口：若干条 tcpmux 代理共用服务端的
+    /// `tcpmuxHTTPConnectPort`，靠 CONNECT 请求里的 host 分发。所以这个字段
+    /// **是必填的**，留空服务端会报 `unknown multiplexer`。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub multiplexer: String,
 
     // ---- 带宽限流 ----
     /// 带宽上限，形如 `1MB` / `500KB`；留空或 `0` 表示不限。
@@ -611,6 +981,31 @@ pub struct ProxyConfig {
     /// `socks5` / `http_proxy` 插件的密码。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub plugin_passwd: String,
+    /// 插件的**上游地址**（官方 `plugin.localAddr`）。
+    ///
+    /// `http2http` / `http2https` / `https2http` / `https2https` / `tls2raw` 用它，
+    /// 与 [`Self::local_addr`] 的区别是：配了插件之后工作连接不再直连 `local_addr`，
+    /// 由插件自己去连 `plugin_local_addr`。两者都留着是有意的 —— 用户把插件删掉时
+    /// `local_addr` 还在，不用重新填一遍。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub plugin_local_addr: String,
+    /// `https2http` / `https2https` / `tls2raw`：frpc 侧**终止** TLS 用的证书链。
+    ///
+    /// 注意这与 https 代理相反 —— 那种是服务端只嗅探 SNI、不终止 TLS。
+    /// 这三个插件是 frpc 自己当 TLS 服务端，所以证书得由用户给。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub plugin_crt_path: String,
+    /// 与 [`Self::plugin_crt_path`] 配套的私钥。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub plugin_key_path: String,
+    /// 回源时把 `Host` 改写成什么（官方 `plugin.hostHeaderRewrite`）。
+    ///
+    /// 留空 = 原样透传客户端发来的 `Host`（与官方一致）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub plugin_host_header_rewrite: String,
+    /// 回源时额外设置/覆盖的请求头（官方 `requestHeaders.set`）。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub plugin_request_headers: BTreeMap<String, String>,
 
     // ---- stcp / xtcp 专用 ----
     /// 共享密钥（frpc 里叫 `secretKey`）。provider 与 visitor 必须一致。
@@ -701,9 +1096,16 @@ pub struct VisitorConfig {
     /// 本地监听地址。
     #[serde(default = "default_bind_addr")]
     pub bind_addr: String,
-    /// 本地监听端口。为 0 时不监听（仅用于给别的 visitor 做 fallback 目标）。
+    /// 本地监听端口。
+    ///
+    /// **`<= 0` 表示不监听本地端口**（仅用于给别的 visitor 做 fallback 目标）。
+    ///
+    /// ★ 这里必须是**有符号**类型。官方 frp 的文档与自带示例都用 `-1` 表达同一件事
+    /// （`conf/frpc_full_example.toml` 的 `vnet-visitor` 就是 `bindPort = -1`），
+    /// 官方代码的判据是 `if cfg.BindPort > 0 { listen }` —— 写成 `u16` 会让整份
+    /// 官方配置在解析阶段就 `invalid value: integer -1, expected u16` 直接失败。
     #[serde(default, alias = "bindPort")]
-    pub bind_port: u16,
+    pub bind_port: i32,
 }
 
 impl Default for VisitorConfig {
@@ -828,6 +1230,18 @@ pub struct ClientConfig {
     /// 日志级别。
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// 日志落盘路径（对应 frp `log.to`）。空 / `console` = 写标准输出（默认）。
+    ///
+    /// 注意：**配了文件之后 stdout 就没有日志了**（与官方 frpc 一样是
+    /// "控制台**或**文件"）。第三方启动器（NetTool 之类）是按行读 stdout 的，
+    /// 配了它面板上会看不到日志 —— 这是官方语义，不是 bug。
+    #[serde(default)]
+    pub log_to: String,
+
+    /// 日志保留天数（对应 frp `log.maxDays`，默认 3；`<= 0` = 不清理）。
+    #[serde(default = "default_log_max_days")]
+    pub max_days: i64,
 
     // ---- 传输层 ----
     /// 与服务端之间的传输协议：`tcp`（默认）或 `quic`，需与服务端一致。
@@ -954,6 +1368,8 @@ impl Default for ClientConfig {
             tls_server_name: String::new(),
             tls_custom_first_byte: true,
             log_level: default_log_level(),
+            log_to: String::new(),
+            max_days: default_log_max_days(),
             transport_protocol: default_transport_protocol(),
             p2p_port: None,
             p2p_enable: true,
@@ -1100,6 +1516,14 @@ server_port = 7000
 token = "your_secret_token"
 user = "alice"          # stcp / xtcp 的 allow_users 比对的就是它
 log_level = "info"
+
+# ---- 日志落盘（可选）----
+# 默认写标准输出；配了 to 就写文件，按天轮转、按 maxDays 清理老备份。
+# ★ 配了它之后 stdout 上**就没有日志了**（与官方 frpc 一样是"控制台或文件"），
+#   NetTool 这类按行读 stdout 的启动器面板上会看不到日志。
+# [log]
+# to = "frpc.log"
+# maxDays = 3
 
 # ---- 线协议（对应原版 frp 的 `transport.wireProtocol`，默认就是 v1）----
 # v1：原版 frp 至今的默认协议，无魔术字、消息体是裸 JSON、登录后套 AES-128-CFB。
@@ -1263,6 +1687,12 @@ fn default_reconnect_interval() -> u64 {
 fn default_log_level() -> String {
     DEFAULT_LOG_LEVEL.to_string()
 }
+fn default_log_max_days() -> i64 {
+    DEFAULT_LOG_MAX_DAYS
+}
+fn default_vhost_http_timeout() -> u64 {
+    DEFAULT_VHOST_HTTP_TIMEOUT
+}
 /// 代理类型默认 tcp。
 fn default_proxy_type() -> String {
     "tcp".to_string()
@@ -1345,8 +1775,64 @@ pub fn parse_server(raw: &str) -> Result<ServerConfig> {
 /// `sudp`（秘密 UDP，SUDP）和 stcp 同一套 `secret_key` / `allow_users` 鉴权，
 /// 区别只是数据面是 UDP：provider 侧把一条工作连接桥到本地 UDP 服务，
 /// visitor 侧把本地 UDP socket 转发到 secret UDP 通道。
-const SUPPORTED_PROXY_TYPES: &[&str] = &["tcp", "udp", "http", "https", "stcp", "xtcp", "sudp"];
+const SUPPORTED_PROXY_TYPES: &[&str] = &[
+    "tcp", "udp", "http", "https", "tcpmux", "stcp", "xtcp", "sudp",
+];
 const SUPPORTED_VISITOR_TYPES: &[&str] = &["stcp", "xtcp", "sudp"];
+
+/// 官方 frp 的客户端插件类型全集（`pkg/config/v1/plugin.go` 的 `UnmarshalJSON` 分支）。
+///
+/// 放在这里是为了让「支持清单」与「官方全集」的差集能被**自动算出来**：
+/// 以后补实现时只改 [`SUPPORTED_PLUGIN_TYPES`]，报错文案和自检结果跟着走，
+/// 不会出现"代码支持了但提示还写着不支持"的漂移。
+pub const OFFICIAL_PLUGIN_TYPES: &[&str] = &[
+    "http_proxy",
+    "socks5",
+    "static_file",
+    "unix_domain_socket",
+    "http2http",
+    "http2https",
+    "https2http",
+    "https2https",
+    "tls2raw",
+];
+
+/// NFrp 真正实现的客户端插件类型。
+pub const SUPPORTED_PLUGIN_TYPES: &[&str] = &[
+    "http_proxy",
+    "socks5",
+    "static_file",
+    "unix_domain_socket",
+    "http2http",
+    "http2https",
+    "https2http",
+    "https2https",
+    "tls2raw",
+];
+
+/// 插件类型名的归一化键：小写 + 去下划线。
+///
+/// 官方的类型名只认下划线写法，但 NFrp 历来也认 `staticfile` 这类紧凑写法
+/// （见 `client/src/plugin.rs`）。把归一化放在公共层，**列表与匹配用同一个键**，
+/// 省得两处各写一套等价判断、慢慢长歪。
+fn plugin_key(raw: &str) -> String {
+    raw.trim().to_ascii_lowercase().replace('_', "")
+}
+
+/// 这个插件类型 NFrp 实现了吗。
+pub fn plugin_type_supported(raw: &str) -> bool {
+    let k = plugin_key(raw);
+    SUPPORTED_PLUGIN_TYPES.iter().any(|t| plugin_key(t) == k)
+}
+
+/// 「官方有、NFrp 没有」的插件类型（用于把报错话说全）。
+pub fn unimplemented_plugin_types() -> Vec<&'static str> {
+    OFFICIAL_PLUGIN_TYPES
+        .iter()
+        .copied()
+        .filter(|t| !plugin_type_supported(t))
+        .collect()
+}
 
 fn reject_unimplemented_types(cfg: &ClientConfig) -> Result<()> {
     for p in &cfg.proxies {
@@ -1358,6 +1844,8 @@ fn reject_unimplemented_types(cfg: &ClientConfig) -> Result<()> {
                 SUPPORTED_PROXY_TYPES.join(" / ")
             )));
         }
+        reject_unimplemented_plugin(p)?;
+        reject_bad_tcpmux(p)?;
     }
     for v in &cfg.visitors {
         if !SUPPORTED_VISITOR_TYPES.contains(&v.visitor_type.as_str()) {
@@ -1368,6 +1856,75 @@ fn reject_unimplemented_types(cfg: &ClientConfig) -> Result<()> {
                 SUPPORTED_VISITOR_TYPES.join(" / ")
             )));
         }
+    }
+    Ok(())
+}
+
+/// 单条代理的插件类型自检。
+///
+/// # 为什么必须在**解析阶段**就报错
+///
+/// 插件类型的匹配原先只发生在**客户端** `plugin::Plugin::from_proxy` —— 那是
+/// **每条工作连接**到来时才走的路径。于是 `frpc verify` 对着一份
+/// `plugin.type = "tls2raw"` 的配置会回**「配置校验通过」**，用户拿着这个绿灯去上线，
+/// 全量连接才逐个失败。绿灯是假的，比红灯危险得多。
+///
+/// 官方 frp 对未知插件类型是在**解码阶段**直接 `unknown plugin type: %s`
+/// （`pkg/config/v1/decode.go:115`）—— 这里对齐它的时机。
+fn reject_unimplemented_plugin(p: &ProxyConfig) -> Result<()> {
+    let kind = p.plugin.trim();
+    if kind.is_empty() {
+        return Ok(());
+    }
+    if plugin_type_supported(kind) {
+        return Ok(());
+    }
+    let missing = unimplemented_plugin_types();
+    // 分两种情况说清楚，别让用户拿"支持的清单"去猜自己是拼错了还是官方有而这里没有。
+    if missing.iter().any(|t| plugin_key(t) == plugin_key(kind)) {
+        return Err(crate::error::Error::Protocol(format!(
+            "代理 [{}] 的插件 {:?} 是官方 frp 有、但 NFrp **尚未实现**的插件 —— \
+             现在放行只会让每条连接在运行期逐个失败，所以在这里直接拒绝。\n\
+             官方有而 NFrp 没有的插件：{}",
+            p.name,
+            kind,
+            missing.join(" / ")
+        )));
+    }
+    Err(crate::error::Error::Protocol(format!(
+        "代理 [{}] 的插件 {:?} 不认识（NFrp 实现了 {}）",
+        p.name,
+        kind,
+        SUPPORTED_PLUGIN_TYPES.join(" / ")
+    )))
+}
+
+/// `tcpmux` 的两条必填约束，对齐官方 `validateTCPMuxProxyConfigForClient`。
+///
+/// 1. `multiplexer` 只认 `httpconnect`（官方报 `not support multiplexer: %s`）。
+///    留空也算不认识 —— 官方那边空串同样过不了 `slices.Contains`。
+/// 2. 必须配 `customDomains` 或 `subdomain`。tcpmux **不绑端口**，全靠 CONNECT
+///    请求里的域名分发，没有域名就等于这条代理没有任何入口。
+///
+/// 两条都放在**解析阶段**：不然 `frpc verify` 回绿灯，用户拿去上线才发现服务端
+/// 拒绝 —— 和之前那批"假绿灯"是同一个坑（见 [`reject_unimplemented_plugin`]）。
+fn reject_bad_tcpmux(p: &ProxyConfig) -> Result<()> {
+    if p.proxy_type != "tcpmux" {
+        return Ok(());
+    }
+    if p.multiplexer != "httpconnect" {
+        return Err(crate::error::Error::Protocol(format!(
+            "代理 [{}] 的 multiplexer 是 {:?}，只支持 \"httpconnect\"（官方也只有这一种）",
+            p.name, p.multiplexer
+        )));
+    }
+    let no_domain = p.custom_domains.iter().all(|d| d.trim().is_empty());
+    if no_domain && p.subdomain.trim().is_empty() {
+        return Err(crate::error::Error::Protocol(format!(
+            "代理 [{}] 是 tcpmux：它不绑端口、只按 CONNECT 请求里的域名分发，\
+             所以 customDomains 和 subdomain 至少要配一个",
+            p.name
+        )));
     }
     Ok(())
 }
@@ -1404,6 +1961,180 @@ pub fn parse_server_toml(raw: &str) -> Result<ServerConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // allowPorts（PortRange / parse_port_ranges / port_allowed）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn 端口列表解析对齐官方的逗号串写法() {
+        let rs = parse_port_ranges("1000-2000,3000,4000-5000").unwrap();
+        assert_eq!(rs.len(), 3);
+        assert_eq!(rs[0], PortRange::new(1000, 2000));
+        assert_eq!(rs[1], PortRange::single(3000));
+        assert_eq!(rs[2], PortRange::new(4000, 5000));
+        assert_eq!(format_port_ranges(&rs), "1000-2000,3000,4000-5000");
+        // 允许空格（官方 `strings.TrimSpace` 每段都 trim）
+        assert_eq!(
+            format_port_ranges(&parse_port_ranges(" 1000 - 2000 , 3000 ").unwrap()),
+            "1000-2000,3000"
+        );
+        // 空串 = 空列表（不是错误）
+        assert!(parse_port_ranges("   ").unwrap().is_empty());
+    }
+
+    #[test]
+    fn 端口列表的非法写法要报错() {
+        // 区间反了：官方 `NewPortsRangeSliceFromString` 也报错
+        assert!(parse_port_ranges("3000-2000").is_err());
+        // 不是数字
+        assert!(parse_port_ranges("abc").is_err());
+        // 超出 u16
+        assert!(parse_port_ranges("70000").is_err());
+        // 三段（`1-2-3`）
+        assert!(parse_port_ranges("1-2-3").is_err());
+        // 半截区间
+        assert!(parse_port_ranges("1000-").is_err());
+    }
+
+    #[test]
+    fn 端口白名单为空等于不限制() {
+        assert!(port_allowed(&[], 22));
+        assert!(port_allowed(&[], 65535));
+        let only = parse_port_ranges("8000-9000").unwrap();
+        assert!(port_allowed(&only, 8000));
+        assert!(port_allowed(&only, 9000));
+        assert!(!port_allowed(&only, 7999));
+        assert!(!port_allowed(&only, 9001));
+    }
+
+    /// 官方 TOML 的 `{ start = …, end = … }` / `{ single = … }` 两种表都要认。
+    #[test]
+    fn 官方表写法的_allow_ports_能读进来() {
+        let raw = r#"
+bindPort = 7000
+allowPorts = [
+  { start = 2000, end = 3000 },
+  { single = 3001 },
+  { start = 4000, end = 5000 },
+]
+"#;
+        let cfg = parse_server_toml(raw).unwrap();
+        assert_eq!(cfg.allow_ports.len(), 3);
+        assert_eq!(
+            format_port_ranges(&cfg.allow_ports),
+            "2000-3000,3001,4000-5000"
+        );
+        assert!(cfg.port_allowed(3001));
+        assert!(!cfg.port_allowed(3999));
+    }
+
+    /// 字符串写法（legacy INI / 官方 `--allow_ports`）也要认，元素里还能带逗号。
+    #[test]
+    fn 字符串写法的_allow_ports_能读进来() {
+        let cfg = parse_server_toml("allowPorts = [\"1000-2000,3000\"]\n").unwrap();
+        assert_eq!(format_port_ranges(&cfg.allow_ports), "1000-2000,3000");
+        assert!(cfg.port_allowed(1500));
+        assert!(!cfg.port_allowed(3001));
+    }
+
+    #[test]
+    fn 区间反了的_allow_ports_要在解析阶段报错() {
+        let err = parse_server_toml("allowPorts = [{ start = 3000, end = 2000 }]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("区间反了"), "{err}");
+        // 表里既没有 start 也没有 single
+        assert!(parse_server_toml("allowPorts = [{ foo = 1 }]\n").is_err());
+    }
+
+    #[test]
+    fn 序列化回官方表写法() {
+        #[derive(Serialize)]
+        struct W {
+            allow_ports: Vec<PortRange>,
+        }
+        let w = W {
+            allow_ports: vec![PortRange::single(8443), PortRange::new(20000, 30000)],
+        };
+        let s = toml::to_string(&w).unwrap();
+        assert!(s.contains("single = 8443"), "{s}");
+        assert!(s.contains("start = 20000"), "{s}");
+        assert!(s.contains("end = 30000"), "{s}");
+        // 写出去的东西必须还能读回来（`--gen-config` 之后手改再加载）
+        let back = parse_server_toml(&s).unwrap();
+        assert_eq!(back.allow_ports, w.allow_ports);
+    }
+
+    // -----------------------------------------------------------------------
+    // 新增字段的默认值与解析
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn 安全相关字段的默认值对齐官方() {
+        let cfg = ServerConfig::default();
+        assert!(cfg.allow_ports.is_empty(), "空 = 不限制（官方语义）");
+        assert_eq!(cfg.max_ports_per_client, 0, "0 = 不限");
+        assert!(
+            cfg.detailed_errors_to_client,
+            "官方 `Complete()` 里 EmptyOr(…, true)"
+        );
+        assert_eq!(cfg.vhost_http_timeout, 60, "官方 EmptyOr(…, 60)");
+        assert_eq!(cfg.max_days, 3, "官方 LogConfig.Complete 里 EmptyOr(…, 3)");
+        assert!(cfg.custom_404_page.is_empty());
+        assert_eq!(cfg.log_to, "");
+        assert!(cfg.vhost_http_timeout().is_some());
+        assert!(ServerConfig {
+            vhost_http_timeout: 0,
+            ..Default::default()
+        }
+        .vhost_http_timeout()
+        .is_none());
+    }
+
+    #[test]
+    fn 服务端的日志与虚拟主机字段能读进来() {
+        let raw = r#"
+bindPort = 7000
+vhostHTTPTimeout = 12
+custom404Page = "/etc/frps/404.html"
+detailedErrorsToClient = false
+maxPortsPerClient = 8
+
+[log]
+to = "/var/log/frps.log"
+level = "debug"
+maxDays = 7
+"#;
+        let cfg = parse_server_toml(raw).unwrap();
+        assert_eq!(cfg.vhost_http_timeout, 12);
+        assert_eq!(cfg.custom_404_page, "/etc/frps/404.html");
+        assert!(!cfg.detailed_errors_to_client);
+        assert_eq!(cfg.max_ports_per_client, 8);
+        assert_eq!(cfg.log_to, "/var/log/frps.log");
+        assert_eq!(cfg.log_level, "debug");
+        assert_eq!(cfg.max_days, 7);
+        assert!(
+            cfg.unsupported_fields.is_empty(),
+            "这几项都已实现，不该再报未实现：{:?}",
+            cfg.unsupported_fields
+        );
+    }
+
+    #[test]
+    fn 客户端的日志字段能读进来() {
+        let raw = r#"
+serverAddr = "1.2.3.4"
+serverPort = 7000
+
+[log]
+to = "frpc.log"
+maxDays = 5
+"#;
+        let cfg = parse_client_toml(raw).unwrap();
+        assert_eq!(cfg.log_to, "frpc.log");
+        assert_eq!(cfg.max_days, 5);
+    }
 
     /// `sk` 是官方 INI 里 `secret_key` 的写法，TOML 下也必须接受。
     ///
@@ -1454,6 +2185,12 @@ bindPort = 2222
         assert!(cfg.hot_reload, "示例里应示范热重载");
         assert_eq!(cfg.max_clients, 100);
         assert_eq!(cfg.max_total_conns, 5000);
+        // 示例里必须示范**安全相关**的那几项，否则用户根本不知道它们存在
+        assert_eq!(cfg.allow_ports.len(), 1, "示例要示范端口白名单");
+        assert!(cfg.port_allowed(25000));
+        assert!(!cfg.port_allowed(22), "22 不该在白名单里");
+        assert_eq!(cfg.max_ports_per_client, 20);
+        assert_eq!(cfg.vhost_http_timeout, 60);
         // 示例里的 token 不能是空的，否则用户照抄会得到一个不设防的服务端
         assert!(!cfg.token.is_empty());
     }
@@ -1496,5 +2233,168 @@ bindPort = 2222
             toml::from_str("server_addr = \"127.0.0.1\"").expect("最小客户端配置");
         assert_eq!(c.server_port, 7000, "与 frp 原生默认值保持一致");
         assert!(c.p2p_enable, "默认允许 P2P，只是没端口可用");
+    }
+
+    /// ★ 回归：`verify` 曾经对未实现的插件类型回「配置校验通过」。
+    ///
+    /// 官方 frp 对未知插件是**解码阶段**就报 `unknown plugin type`
+    /// （`pkg/config/v1/decode.go:115`），所以这里也在解析阶段拒绝。
+    ///
+    /// 官方 0.71 的 9 个插件现已**全部实现**，所以「尚未实现」那条分支目前走不到。
+    /// 这条断言留在这是给以后的自己看的：哪天官方新增插件类型，把
+    /// [`OFFICIAL_PLUGIN_TYPES`] 补上之后它会立刻变红，提醒你那条分支要开始工作了。
+    #[test]
+    fn 官方插件现在全部实现() {
+        let missing = unimplemented_plugin_types();
+        assert!(
+            missing.is_empty(),
+            "以下插件没实现，解析阶段会拒绝它们：{missing:?}"
+        );
+    }
+
+    /// 官方的 9 个插件类型全部能过解析阶段 —— 一个都不能被这条校验误伤。
+    #[test]
+    fn 官方九个插件都能过解析阶段() {
+        for kind in OFFICIAL_PLUGIN_TYPES {
+            let cfg_text = format!(
+                r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+
+[[proxies]]
+name = "p"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 80
+remote_port = 6000
+
+[proxies.plugin]
+type = "{kind}"
+localAddr = "127.0.0.1:9000"
+localPath = "/tmp/x"
+crtPath = "/tmp/x.crt"
+keyPath = "/tmp/x.key"
+"#
+            );
+            assert!(parse_client(&cfg_text).is_ok(), "官方的 {kind} 被误伤了");
+        }
+    }
+
+    /// 拼错的插件名与「官方有但没有」要报不同的错 —— 否则用户没法判断该改拼写还是该换方案。
+    #[test]
+    fn 拼错的插件名要报不认识而不是没实现() {
+        let cfg_text = r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+
+[[proxies]]
+name = "p"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 80
+remote_port = 6000
+
+[proxies.plugin]
+type = "magic_proxy"
+"#;
+        let err = parse_client(cfg_text).expect_err("不认识的插件必须被拒");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("不认识"), "{msg}");
+        assert!(!msg.contains("尚未实现"), "不能把拼错说成没实现：{msg}");
+    }
+
+    // ---- tcpmux ----
+
+    /// 官方 `frpc_full_example.toml` 里 tcpmux 那一段（含 camelCase 字段名）。
+    #[test]
+    fn 官方示例里的_tcpmux_段能整体解析() {
+        let cfg_text = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[[proxies]]
+name = "tcpmuxhttpconnect"
+type = "tcpmux"
+multiplexer = "httpconnect"
+localIP = "127.0.0.1"
+localPort = 10701
+customDomains = ["tunnel1"]
+routeByHTTPUser = "user1"
+"#;
+        let c = parse_client(cfg_text).expect("官方 tcpmux 写法必须能解析");
+        let p = &c.proxies[0];
+        assert_eq!(p.proxy_type, "tcpmux");
+        assert_eq!(p.multiplexer, "httpconnect");
+        assert_eq!(p.route_by_http_user, "user1");
+        assert_eq!(p.local_addr, "127.0.0.1:10701");
+    }
+
+    /// tcpmux 的三条必填约束都要在**解析阶段**拦下 —— 不然 `frpc verify` 回绿灯，
+    /// 用户拿去上线才发现服务端拒绝（这就是之前那批"假绿灯"的同一个坑）。
+    #[test]
+    fn tcpmux_缺字段或缺域名要在解析阶段就报错() {
+        let base = |extra: &str| {
+            format!(
+                r#"
+server_addr = "127.0.0.1"
+server_port = 7000
+
+[[proxies]]
+name = "mux"
+type = "tcpmux"
+localIP = "127.0.0.1"
+localPort = 10701
+{extra}
+"#
+            )
+        };
+
+        // ① 没写 multiplexer
+        let err =
+            parse_client(&base("customDomains = [\"a.b\"]")).expect_err("缺 multiplexer 该报错");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("multiplexer"), "{msg}");
+
+        // ② multiplexer 拼错 / 用了官方没有的值
+        let err = parse_client(&base(
+            "multiplexer = \"httpconnectt\"\ncustomDomains = [\"a.b\"]",
+        ))
+        .expect_err("未知 multiplexer 该报错");
+        assert!(format!("{err:#}").contains("multiplexer"), "{err:#}");
+
+        // ③ 一个域名都没有：tcpmux 不绑端口，没有域名就等于没有入口
+        let err = parse_client(&base("multiplexer = \"httpconnect\"")).expect_err("没有域名该报错");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("customDomains") || msg.contains("subdomain"),
+            "{msg}"
+        );
+
+        // 配齐了就该过
+        assert!(parse_client(&base(
+            "multiplexer = \"httpconnect\"\ncustomDomains = [\"a.b\"]"
+        ))
+        .is_ok());
+    }
+
+    /// 服务端两个新字段：`tcpmuxHTTPConnectPort` / `tcpmuxPassthrough`。
+    #[test]
+    fn 服务端的_tcpmux_配置项能读进来() {
+        // 走 parse_server（含 frp camelCase 归一化）—— 直接 toml::from_str 是
+        // 不认 `tcpmuxHTTPConnectPort` 的，那样测不出"官方配置能不能直接喂进来"
+        let s = parse_server_toml(
+            r#"
+tcpmuxHTTPConnectPort = 1337
+tcpmuxPassthrough = true
+"#,
+        )
+        .expect("官方写法必须能解析");
+        assert_eq!(s.tcpmux_http_connect_port, Some(1337));
+        assert!(s.tcpmux_passthrough);
+
+        // 不配就是"不启用"
+        let d = ServerConfig::default();
+        assert!(d.tcpmux_http_connect_port.is_none());
+        assert!(!d.tcpmux_passthrough);
     }
 }

@@ -1085,7 +1085,7 @@ mod tests {
         let c = client("reap1");
         r.insert(c.clone()).expect("登记");
 
-        use crate::vhost::VhostRoute;
+        use crate::vhost::{VhostKind, VhostRoute};
 
         table
             .register(Arc::new(VhostRoute {
@@ -1099,14 +1099,18 @@ mod tests {
                 rewrite_host: String::new(),
                 req_headers: Default::default(),
                 resp_headers: Default::default(),
-                is_https: false,
+                kind: VhostKind::Http,
             }))
             .expect("注册域名");
-        assert!(table.lookup("a.example.com", "/", None, false).is_some());
+        assert!(table
+            .lookup("a.example.com", "/", None, VhostKind::Http)
+            .is_some());
 
         r.remove("reap1");
         assert!(
-            table.lookup("a.example.com", "/", None, false).is_none(),
+            table
+                .lookup("a.example.com", "/", None, VhostKind::Http)
+                .is_none(),
             "客户端断开后它的域名必须回收，否则别人再也注册不了这个域名"
         );
     }

@@ -34,7 +34,7 @@ use crate::{
     pool::{ClientState, ConnSlot, CtrlCmd, PendingUser, Submit, WorkItem},
     registry::{ClientGuard, PortClaim, Registry, ServerLimits},
     udp_proxy,
-    vhost::{self, VhostRoute, VhostTable},
+    vhost::{self, VhostKind, VhostRoute, VhostTable},
     visitor, vnet,
 };
 
@@ -149,7 +149,10 @@ pub async fn serve_on_with(
     }
 
     info!("nfrp-server 已启动：frp v2 协议，监听 {addr}");
-    info!("支持的代理类型：tcp / udp / http / https / stcp / sudp / xtcp");
+    // ★ 这份清单必须与 `register_proxy` 的 match 分支一一对应。
+    //   tcpmux 加进来时漏过一次：代理类型真能用，但启动日志里没有它，
+    //   用户按日志判断"这个版本支不支持 tcpmux"会得到相反的结论。
+    info!("支持的代理类型：tcp / udp / http / https / tcpmux / stcp / xtcp / sudp");
     let eff = cfg.effective_auth();
     info!(
         "认证方式 = {}，token = {}（{}）",
@@ -167,21 +170,44 @@ pub async fn serve_on_with(
     );
     log_limits(&registry);
 
-    // HTTP / HTTPS 虚拟主机端口（可选）
-    if cfg.vhost_http_port.is_some() || cfg.vhost_https_port.is_some() {
+    // HTTP / HTTPS / tcpmux 虚拟主机端口（各自可选）
+    if cfg.vhost_http_port.is_some()
+        || cfg.vhost_https_port.is_some()
+        || cfg.tcpmux_http_connect_port.is_some()
+    {
         let table = Arc::new(VhostTable::default());
         registry.attach_vhosts(table.clone());
-        for (port, is_https) in [(cfg.vhost_http_port, false), (cfg.vhost_https_port, true)] {
+
+        // 自定义 404 页面**启动时读一次**常驻内存。
+        // 若每个 404 都去读盘，这个配置项就成了"用磁盘 IO 拖垮服务端"的入口；
+        // 而且官方 `getNotFoundPageContent()` 虽然每次读盘、读失败也只是回落到
+        // 内置页，我们读一次失败时同样只警告 + 回落，行为对外一致。
+        let not_found_page = load_not_found_page(&cfg.custom_404_page);
+
+        let ports = [
+            (cfg.vhost_http_port, vhost::VhostKind::Http),
+            (cfg.vhost_https_port, vhost::VhostKind::Https),
+            (cfg.tcpmux_http_connect_port, vhost::VhostKind::TcpMux),
+        ];
+        for (port, kind) in ports {
             let Some(vport) = port else { continue };
             let addr = util::resolve_addr(&format!("{}:{}", cfg.bind_addr, vport))
                 .await
                 .with_context(|| format!("解析 vhost 地址 {}:{} 失败", cfg.bind_addr, vport))?;
             let listener = vhost::bind(addr).await?;
-            tokio::spawn(vhost::run_http(
+            let mut opts = vhost::VhostOpts::new(kind, cfg.tcpmux_passthrough);
+            if kind == vhost::VhostKind::Http {
+                // 官方只给 http vhost 的 ReverseProxy 配了 ResponseHeaderTimeout，
+                // https 是纯透传、tcpmux 是 CONNECT 回合，都没有"读响应头"这一步。
+                opts = opts
+                    .with_timeout(cfg.vhost_http_timeout())
+                    .with_not_found_page(not_found_page.clone());
+            }
+            tokio::spawn(vhost::run_vhost(
                 listener,
                 table.clone(),
                 vport,
-                is_https,
+                opts,
                 registry.clone(),
             ));
         }
@@ -392,6 +418,28 @@ fn log_limits(registry: &Registry) {
             l.max_pending_per_client,
             l.max_proxies_per_client
         );
+    }
+}
+
+/// 读自定义 404 页面（`custom404Page`）。空路径 / 读失败都回 `None`。
+///
+/// 读失败只警告不致命：这个文件只影响"没有代理匹配时给用户看什么"，
+/// 不值得让整个服务端起不来（官方的 `getNotFoundPageContent()` 同样是
+/// 打一条 warn 后回落）。
+fn load_not_found_page(path: &str) -> Option<Arc<Vec<u8>>> {
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    match std::fs::read(path) {
+        Ok(b) => {
+            info!("自定义 404 页面已加载：{path}（{} 字节）", b.len());
+            Some(Arc::new(b))
+        }
+        Err(e) => {
+            warn!("自定义 404 页面 {path} 读取失败（{e}），将使用内置提示页");
+            None
+        }
     }
 }
 
@@ -745,8 +793,14 @@ async fn handle_control(
                             );
                             warn!(proxy = %name, "代理注册被权限模型拒绝：{e:#}");
                             conn.send_msg(&FrpMessage::NewProxyResp(NewProxyResp {
-                                proxy_name: name,
-                                error: e.to_string(),
+                                proxy_name: name.clone(),
+                                // 详细错误里往往带着"别人的代理名 / 端口占用"这类
+                                // 信息，detailedErrorsToClient = false 时必须脱敏。
+                                // 短句与官方 `handleNewProxy` 的 summary 逐字一致。
+                                error: cfg.error_to_client(
+                                    &format!("new proxy [{name}] error"),
+                                    &e.to_string(),
+                                ),
                                 ..Default::default()
                             }))
                             .await?;
@@ -780,7 +834,15 @@ async fn handle_control(
                             Err(e) => {
                                 registry.metrics().proxy_failures.inc();
                                 warn!(proxy = %name, port, "代理注册失败：{e:#}");
-                                NewProxyResp { proxy_name: name, error: e.to_string(), ..Default::default() }
+                                NewProxyResp {
+                                    proxy_name: name.clone(),
+                                    // 同上：`detailedErrorsToClient = false` 时只回短句
+                                    error: cfg.error_to_client(
+                                        &format!("new proxy [{name}] error"),
+                                        &e.to_string(),
+                                    ),
+                                    ..Default::default()
+                                }
                             }
                         };
                         conn.send_msg(&FrpMessage::NewProxyResp(resp)).await?;
@@ -805,6 +867,14 @@ async fn handle_control(
                                     .detail(format!("心跳凭证复核失败：{e:#}")),
                                 );
                                 warn!("心跳凭证复核失败，断开控制连接：{e:#}");
+                                // 先回一条带错误的 Pong 再断，客户端才拿得到原因；
+                                // 短句与官方 `handlePing` 的 summary 逐字一致
+                                // （官方那边同样受 detailedErrorsToClient 控制）。
+                                let _ = conn
+                                    .send_msg(&FrpMessage::Pong(Pong {
+                                        error: cfg.error_to_client("invalid ping", &e.to_string()),
+                                    }))
+                                    .await;
                                 break;
                             }
                         }
@@ -930,18 +1000,49 @@ pub(crate) async fn register_proxy(
             registry.limits().max_proxies_per_client
         )
     })?;
+
+    // ---- 端口管控（allowPorts / maxPortsPerClient）----
+    //
+    // 只对**真的会绑公网端口**的 tcp / udp 生效：http / https / tcpmux / stcp /
+    // xtcp / sudp 都走虚拟主机或 visitor 配对，一个公网端口都不占。
+    // 官方同样如此（`Control.RegisterProxy` 累的是 `pxy.GetUsedPortsNum()`，
+    // 只有 tcp / udp 返回 1）。
+    //
+    // `remote_port == 0` 时不在这里拦：交给 register_tcp / register_udp 报
+    // "必须指定 remote_port"，那条错误信息比"端口 0 不在白名单"有用得多。
+    if matches!(m.proxy_type.as_str(), "tcp" | "udp") && m.remote_port != 0 {
+        if !cfg.port_allowed(m.remote_port) {
+            anyhow::bail!(
+                "远端端口 {} 不在服务端 allowPorts 白名单内（已允许：{}）",
+                m.remote_port,
+                nfrp_common::config::format_port_ranges(&cfg.allow_ports)
+            );
+        }
+        if cfg.max_ports_per_client > 0 {
+            let used = client.ports_used() as i64;
+            if used + 1 > cfg.max_ports_per_client {
+                anyhow::bail!(
+                    "本客户端已占用 {used} 个端口，再加这一个会超过 maxPortsPerClient = {}",
+                    cfg.max_ports_per_client
+                );
+            }
+        }
+    }
     match m.proxy_type.as_str() {
         "tcp" => register_tcp(cfg, registry, client, m, slot).await,
         "udp" => register_udp(cfg, registry, client, m, slot).await,
-        "http" => register_vhost(cfg, registry, client, m, false, slot).await,
-        "https" => register_vhost(cfg, registry, client, m, true, slot).await,
+        "http" => register_vhost(cfg, registry, client, m, VhostKind::Http, slot).await,
+        "https" => register_vhost(cfg, registry, client, m, VhostKind::Https, slot).await,
+        // tcpmux：不绑端口，挂到服务端那个共享的 CONNECT 复用端口上按域名分发
+        "tcpmux" => register_vhost(cfg, registry, client, m, VhostKind::TcpMux, slot).await,
         "stcp" => register_visitor_proxy(registry, client, m, "stcp", slot).await,
         "xtcp" => register_visitor_proxy(registry, client, m, "xtcp", slot).await,
         // SUDP：秘密 UDP。与 stcp 同一套鉴权（secret_key + allow_users），
         // 只是数据面是 UDP。不需要公网端口，visitor 主动连进来时配对。
         "sudp" => register_visitor_proxy(registry, client, m, "sudp", slot).await,
         other => anyhow::bail!(
-            "暂不支持的代理类型：{other}（支持 tcp / udp / http / https / stcp / xtcp / sudp）"
+            "暂不支持的代理类型：{other}\
+             （支持 tcp / udp / http / https / tcpmux / stcp / xtcp / sudp）"
         ),
     }
 }
@@ -1061,27 +1162,45 @@ async fn register_udp(
     Ok(format!("{}:{}/udp", cfg.bind_addr, m.remote_port))
 }
 
-/// HTTP / HTTPS：把域名注册进虚拟主机路由表（不需要额外端口）。
+/// http / https / tcpmux：把域名注册进虚拟主机路由表（都不需要额外端口）。
+///
+/// 三者的域名解析规则完全一样（`customDomains` + `subDomain`.配 `subdomain_host`），
+/// 所以合用一条路径；差别只在路由表里的 `kind`，以及**路径前缀**：
+/// tcpmux 的 CONNECT 请求没有路径，官方 `TCPMuxProxyConfig` 也没有 `locations`，
+/// 所以它注册的前缀是空串（匹配一切），而 http 默认 `/`。
 async fn register_vhost(
     cfg: &Arc<ServerConfig>,
     registry: &Arc<Registry>,
     client: &Arc<ClientState>,
     m: &nfrp_common::frp::msg::NewProxy,
-    is_https: bool,
+    kind: VhostKind,
     slot: Permit,
 ) -> Result<String> {
-    let kind = if is_https { "https" } else { "http" };
-    let vhost_port = if is_https {
-        cfg.vhost_https_port
-    } else {
-        cfg.vhost_http_port
+    let name = kind.label();
+    let vhost_port = match kind {
+        VhostKind::Http => cfg.vhost_http_port,
+        VhostKind::Https => cfg.vhost_https_port,
+        VhostKind::TcpMux => cfg.tcpmux_http_connect_port,
     };
     let Some(vhost_port) = vhost_port else {
         anyhow::bail!(
-            "服务端未配置 vhost_{}_port，无法注册 {kind} 代理",
-            if is_https { "https" } else { "http" }
+            "服务端未配置 {}，无法注册 {name} 代理",
+            match kind {
+                VhostKind::Http => "vhost_http_port",
+                VhostKind::Https => "vhost_https_port",
+                VhostKind::TcpMux =>
+                    "tcpmux_http_connect_port（frps.toml 里叫 tcpmuxHTTPConnectPort）",
+            }
         );
     };
+    if kind == VhostKind::TcpMux && m.multiplexer != "httpconnect" {
+        // 官方 `server/proxy/tcpmux.go` 的 `Run()`：`unknown multiplexer [%s]`
+        anyhow::bail!(
+            "tcpmux 代理 [{}] 的 multiplexer 是 {:?}，只支持 \"httpconnect\"",
+            m.proxy_name,
+            m.multiplexer
+        );
+    }
     let table = registry
         .vhosts()
         .ok_or_else(|| anyhow!("虚拟主机路由表未初始化"))?;
@@ -1103,13 +1222,13 @@ async fn register_vhost(
         ));
     }
     if domains.is_empty() {
-        anyhow::bail!("{kind} 代理必须配置 custom_domains 或 subdomain");
+        anyhow::bail!("{name} 代理必须配置 custom_domains 或 subdomain");
     }
 
-    let mut locations: Vec<String> = if m.locations.is_empty() {
-        vec!["/".to_string()]
-    } else {
-        m.locations.clone()
+    let mut locations: Vec<String> = match kind {
+        VhostKind::TcpMux => vec![String::new()],
+        _ if m.locations.is_empty() => vec!["/".to_string()],
+        _ => m.locations.clone(),
     };
     // 长前缀优先匹配（frp 的路由优先级规则）
     locations.sort_by_key(|a| std::cmp::Reverse(a.len()));
@@ -1125,7 +1244,7 @@ async fn register_vhost(
             rewrite_host: m.host_header_rewrite.clone(),
             req_headers: m.headers.clone(),
             resp_headers: m.response_headers.clone(),
-            is_https,
+            kind,
         }))?;
     }
     client.add_proxy(m.proxy_name.clone(), None, slot);
@@ -1678,6 +1797,155 @@ mod tests {
         let l = limits_from(&cfg);
         assert_eq!(l.max_total_conns, 0, "默认必须保持向后兼容：不限制");
         assert_eq!(l.max_clients, 0);
+    }
+
+    // ---- allowPorts / maxPortsPerClient ----
+
+    fn tcp_proxy(name: &str, port: u16) -> nfrp_common::frp::msg::NewProxy {
+        nfrp_common::frp::msg::NewProxy {
+            proxy_name: name.to_string(),
+            proxy_type: "tcp".to_string(),
+            remote_port: port,
+            ..Default::default()
+        }
+    }
+
+    /// ★ `allowPorts` 是安全项：白名单外的端口必须在**绑定之前**就被拒。
+    #[tokio::test]
+    async fn allow_ports_拦下白名单外的端口() {
+        let registry = Arc::new(Registry::unlimited());
+        let client = client_with(Limit::unlimited(), &registry);
+        let cfg = Arc::new(ServerConfig {
+            bind_addr: "127.0.0.1".into(),
+            allow_ports: nfrp_common::config::parse_port_ranges("20000-30000,8443").unwrap(),
+            ..Default::default()
+        });
+
+        // 22 不在白名单
+        let err = register_proxy(&cfg, &registry, &client, &tcp_proxy("sshd", 22))
+            .await
+            .expect_err("白名单外的端口必须被拒")
+            .to_string();
+        assert!(err.contains("allowPorts"), "错误里要点名配置项：{err}");
+        assert!(err.contains("22"), "错误里要带上是哪个端口：{err}");
+        assert!(err.contains("20000-30000"), "错误里要带上允许范围：{err}");
+
+        // 30001 刚好越过上界
+        assert!(
+            register_proxy(&cfg, &registry, &client, &tcp_proxy("p", 30001))
+                .await
+                .is_err()
+        );
+        // 8443 是 single 项，必须算数
+        assert!(cfg.port_allowed(8443));
+    }
+
+    /// 白名单**内**的端口不能被这道闸拦下 —— 它应该一路走到"真的去 bind"。
+    /// 这里把 `bind_addr` 故意写成一个解析不了的地址，于是错误一定是"解析失败"，
+    /// 从而能确定地证明 allowPorts 这一关放行了（不依赖任何"空闲端口"的运气）。
+    #[tokio::test]
+    async fn allow_ports_放行白名单内的端口() {
+        let registry = Arc::new(Registry::unlimited());
+        let client = client_with(Limit::unlimited(), &registry);
+        let cfg = Arc::new(ServerConfig {
+            bind_addr: "300.300.300.300".into(),
+            allow_ports: nfrp_common::config::parse_port_ranges("20000-30000").unwrap(),
+            ..Default::default()
+        });
+
+        let err = register_proxy(&cfg, &registry, &client, &tcp_proxy("ok", 25000))
+            .await
+            .expect_err("地址解析不了，后面必然失败")
+            .to_string();
+        assert!(
+            !err.contains("allowPorts"),
+            "白名单内的端口不该被 allowPorts 拦下：{err}"
+        );
+        assert!(err.contains("解析"), "应该走到解析地址那一步：{err}");
+    }
+
+    /// ★ `maxPortsPerClient`：按**端口数**（不是代理数）封顶。
+    #[tokio::test]
+    async fn max_ports_per_client_按端口数封顶() {
+        let registry = Arc::new(Registry::unlimited());
+        let client = client_with(Limit::unlimited(), &registry);
+        let cfg = Arc::new(ServerConfig {
+            bind_addr: "300.300.300.300".into(),
+            max_ports_per_client: 2,
+            ..Default::default()
+        });
+
+        // 先手工占掉 2 个端口（注册内存里的条目就够，不必真的 bind）
+        for (i, name) in ["a", "b"].iter().enumerate() {
+            let slot = client.reserve_proxy().expect("名额充足");
+            client.add_proxy(name.to_string(), Some(20000 + i as u16), slot);
+        }
+        assert_eq!(client.ports_used(), 2);
+
+        let err = register_proxy(&cfg, &registry, &client, &tcp_proxy("c", 20099))
+            .await
+            .expect_err("已经占满 2 个端口，第 3 个必须被拒")
+            .to_string();
+        assert!(err.contains("maxPortsPerClient"), "{err}");
+        assert!(err.contains("2 个端口"), "错误里要说明已占用几个：{err}");
+    }
+
+    /// 上限为 0 = 不限制（默认），不能误伤。
+    #[tokio::test]
+    async fn max_ports_per_client_为零时不限制() {
+        let registry = Arc::new(Registry::unlimited());
+        let client = client_with(Limit::unlimited(), &registry);
+        let cfg = Arc::new(ServerConfig {
+            bind_addr: "300.300.300.300".into(),
+            ..Default::default()
+        });
+
+        for i in 0..5 {
+            let slot = client.reserve_proxy().expect("名额充足");
+            client.add_proxy(format!("p{i}"), Some(21000 + i), slot);
+        }
+        let err = register_proxy(&cfg, &registry, &client, &tcp_proxy("more", 21099))
+            .await
+            .expect_err("地址解析不了")
+            .to_string();
+        assert!(!err.contains("maxPortsPerClient"), "0 语义是不限制：{err}");
+    }
+
+    /// `remote_port = 0` 时优先报"必须指定 remote_port"，而不是
+    /// 那句让人摸不着头脑的"端口 0 不在白名单内"。
+    #[tokio::test]
+    async fn 没填端口时报的是必须指定而不是白名单() {
+        let registry = Arc::new(Registry::unlimited());
+        let client = client_with(Limit::unlimited(), &registry);
+        let cfg = Arc::new(ServerConfig {
+            allow_ports: nfrp_common::config::parse_port_ranges("20000-30000").unwrap(),
+            ..Default::default()
+        });
+
+        let err = register_proxy(&cfg, &registry, &client, &tcp_proxy("noport", 0))
+            .await
+            .expect_err("没端口必须被拒")
+            .to_string();
+        assert!(err.contains("remote_port"), "{err}");
+        assert!(!err.contains("allowPorts"), "{err}");
+    }
+
+    /// ★ `detailedErrorsToClient = false` 时回给客户端的必须是短句，
+    /// 不能把"域名已被代理 xxx 占用"这类**别人的代理名**泄露出去。
+    #[test]
+    fn 关闭详细错误后回给客户端的是短句() {
+        let mut cfg = ServerConfig::default();
+        assert!(cfg.detailed_errors_to_client, "官方默认是 true");
+        let summary = "new proxy [alice.web] error";
+        let detail = "域名 web.example.com 的路径已被代理 bob.web 占用";
+        assert_eq!(cfg.error_to_client(summary, detail), detail);
+
+        cfg.detailed_errors_to_client = false;
+        assert_eq!(cfg.error_to_client(summary, detail), summary);
+        assert_eq!(
+            cfg.error_to_client("invalid ping", "签名过期"),
+            "invalid ping"
+        );
     }
 
     #[test]

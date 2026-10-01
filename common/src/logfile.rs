@@ -199,7 +199,11 @@ impl DailyFile {
         opt.create(true).write(true).truncate(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt as _;
+            // ★ 两个 trait 都要在作用域里：`OpenOptionsExt` 提供 `opt.mode()`，
+            // `PermissionsExt` 提供 `permissions().mode()`。少 import 前者编译不过；
+            // 少 import 后者只有 **Linux** 报 E0599 —— Windows 上整块被 cfg 掉，
+            // 本机 fmt/clippy/测试全绿也照样漏（2026-10-01 云端构建抓出来的）。
+            use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
             let mode = fs::metadata(&self.path)
                 .map(|m| m.permissions().mode())
                 .ok();

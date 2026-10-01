@@ -23,6 +23,9 @@ nfrp-common = { workspace = true }
 quinn = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
+# 插件 https2http / https2https / tls2raw 要在 frpc 这一侧终止 TLS，
+# 需要把证书装进异步流（服务端 crate 已有它，客户端是本轮才用上）
+tokio-rustls = { workspace = true }
 
 anyhow = { workspace = true }
 base64 = { workspace = true }

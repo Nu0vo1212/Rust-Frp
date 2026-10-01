@@ -302,6 +302,21 @@ impl ClientState {
         self.proxies.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
+    /// 本客户端已占用的**公网端口数**（对应官方 `Control.portsUsedNum`）。
+    ///
+    /// 与 [`Self::proxy_count`] 的区别：`http` / `https` / `tcpmux` / `stcp` /
+    /// `xtcp` / `sudp` 这些**不绑公网端口**的代理只算代理数、不算端口数
+    /// （它们的 `port` 是 `None`）。官方也是这么分的 ——
+    /// `Control.RegisterProxy` 累加的是 `pxy.GetUsedPortsNum()`，只有 tcp / udp 非零。
+    pub fn ports_used(&self) -> usize {
+        self.proxies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|e| e.port.is_some())
+            .count()
+    }
+
     /// 已登记的代理名（面板展示用）。
     pub fn proxy_names(&self) -> Vec<String> {
         let mut v: Vec<String> = self
@@ -525,6 +540,27 @@ mod tests {
             backlog,
             proxy,
         ))
+    }
+
+    /// `ports_used` 只数**真的占了公网端口**的代理。
+    ///
+    /// 这是 `maxPortsPerClient` 的依据：http / https / tcpmux / stcp 这些走虚拟主机
+    /// 或 visitor 配对的代理一个公网端口都不占，不该把它们的名额算进去 ——
+    /// 否则"允许 2 个端口"会因为两条 http 代理就先被卡住。
+    #[test]
+    fn ports_used_只数占端口的代理() {
+        let c = dummy_client("ports");
+        let s1 = c.reserve_proxy().expect("名额充足");
+        c.add_proxy("tcp-a".into(), Some(6000), s1);
+        let s2 = c.reserve_proxy().expect("名额充足");
+        c.add_proxy("http-b".into(), None, s2);
+        assert_eq!(c.proxy_count(), 2);
+        assert_eq!(c.ports_used(), 1, "http 不占公网端口");
+
+        let s3 = c.reserve_proxy().expect("名额充足");
+        c.add_proxy("tcp-c".into(), Some(6001), s3);
+        assert_eq!(c.ports_used(), 2);
+        assert_eq!(c.proxy_count(), 3);
     }
 
     #[test]

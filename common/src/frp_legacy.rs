@@ -357,6 +357,11 @@ fn common_section_to_table(sec: &IniSection, out: &mut toml::Table) -> Result<()
     put_int(out, sec, "pool_count", "pool_count")?;
     put_bool(out, sec, "tcp_mux", "tcp_mux")?;
     put_str(out, sec, "log_level", "log_level");
+    // 日志落盘：官方 `Convert_ClientCommonConf_To_v1` 里是
+    // `out.Log.To = conf.LogFile`（LogFile 默认 "console"），**完全不看** `log_way`
+    // —— 所以这里也只认 `log_file`，语义与官方逐字一致。
+    put_str(out, sec, "log_file", "log_to");
+    put_int(out, sec, "log_max_days", "max_days")?;
     put_str(out, sec, "tls_server_name", "tls_server_name");
 
     // 传输协议：INI 里叫 `protocol`（tcp / kcp / quic / websocket / wss），
@@ -464,6 +469,10 @@ fn proxy_section_to_table(sec: &IniSection) -> Result<toml::Table> {
     put_str(&mut t, sec, "http_user", "http_user");
     put_str(&mut t, sec, "http_pwd", "http_pwd");
     put_str(&mut t, sec, "host_header_rewrite", "host_header_rewrite");
+    // 官方 INI 里 http 与 tcpmux 都认 `route_by_http_user`，tcpmux 还要 `multiplexer`
+    // （`pkg/config/legacy/proxy.go` 的 `HTTPProxyConf` / `TCPMuxProxyConf`）
+    put_str(&mut t, sec, "route_by_http_user", "route_by_http_user");
+    put_str(&mut t, sec, "multiplexer", "multiplexer");
 
     put_str(&mut t, sec, "group", "group");
     put_str(&mut t, sec, "group_key", "group_key");
@@ -766,6 +775,57 @@ pub fn legacy_server_to_value(text: &str) -> Result<Value> {
     put_int(out, common, "heartbeat_timeout", "heartbeat_timeout")?;
     // frp 的 `tls_only`（强制客户端走 TLS）对应 NFrp 的 `tls_force`
     put_bool(out, common, "tls_only", "tls_force")?;
+
+    // ---- 虚拟主机 ----
+    put_int(out, common, "vhost_http_timeout", "vhost_http_timeout")?;
+    put_str(out, common, "custom_404_page", "custom_404_page");
+    // tcpmux：★ INI 里的键是 `tcpmux_httpconnect_port`（`http` 与 `connect`
+    // 之间**没有**下划线），照 TOML 的 `tcpmux_http_connect_port` 去查会一个都
+    // 匹配不到 —— 于是老 frps.ini 的 tcpmux 端口被静默丢掉，tcpmux 代理全部注册失败。
+    put_int(
+        out,
+        common,
+        "tcpmux_httpconnect_port",
+        "tcpmux_http_connect_port",
+    )?;
+    put_bool(out, common, "tcpmux_passthrough", "tcpmux_passthrough")?;
+
+    // ---- 端口管控（安全相关）----
+    //
+    // ★ 官方这里写的是 `out.AllowPorts, _ = types.NewPortsRangeSliceFromString(...)`
+    //   —— 解析错误被**吞掉**，AllowPorts 变成空集合，语义正好是"所有端口都允许"。
+    //   一份把 `allow_ports = 22,3306` 写错一个字符的 frps.ini，在官方那边会
+    //   **静默放开全部端口**。这里反过来：解析失败直接报错，绝不降级成"不限制"。
+    if let Some(s) = common.non_empty("allow_ports") {
+        let rs = crate::config::parse_port_ranges(s)
+            .map_err(|e| Error::Protocol(format!("[common] allow_ports 解析失败：{e}")))?;
+        let arr: Vec<Value> = rs
+            .iter()
+            .map(|r| {
+                let mut t = toml::Table::new();
+                if r.start == r.end {
+                    t.insert("single".to_string(), Value::Integer(r.start as i64));
+                } else {
+                    t.insert("start".to_string(), Value::Integer(r.start as i64));
+                    t.insert("end".to_string(), Value::Integer(r.end as i64));
+                }
+                Value::Table(t)
+            })
+            .collect();
+        out.insert("allow_ports".to_string(), Value::Array(arr));
+    }
+    put_int(out, common, "max_ports_per_client", "max_ports_per_client")?;
+    put_bool(
+        out,
+        common,
+        "detailed_errors_to_client",
+        "detailed_errors_to_client",
+    )?;
+
+    // ---- 日志 ----
+    // 同客户端：官方 `out.Log.To = conf.LogFile`，不看 `log_way`。
+    put_str(out, common, "log_file", "log_to");
+    put_int(out, common, "log_max_days", "max_days")?;
 
     // 内置面板：frp 叫 dashboard_*，NFrp 也叫 dashboard_*
     put_int(out, common, "dashboard_port", "dashboard_port")?;

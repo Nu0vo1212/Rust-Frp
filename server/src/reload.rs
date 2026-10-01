@@ -94,6 +94,14 @@ pub fn apply_dynamic(
         "vhost_https_port",
         old.vhost_https_port != new.vhost_https_port,
     );
+    changed(
+        "tcpmux_http_connect_port",
+        old.tcpmux_http_connect_port != new.tcpmux_http_connect_port,
+    );
+    changed(
+        "tcpmux_passthrough",
+        old.tcpmux_passthrough != new.tcpmux_passthrough,
+    );
     changed("subdomain_host", old.subdomain_host != new.subdomain_host);
     changed("p2p_port", old.p2p_port != new.p2p_port);
     changed("dashboard_port", old.dashboard_port != new.dashboard_port);
@@ -114,6 +122,32 @@ pub fn apply_dynamic(
         "max_proxies_per_client",
         old.max_proxies_per_client != new.max_proxies_per_client,
     );
+    // 下面这几项都只能在**启动时**固化，中途改一律要重启：
+    // * allow_ports / max_ports_per_client：已经注册上来的代理要不要回头回收？
+    //   变更语义没法自洽，不如明确要求重启；
+    // * vhost_http_timeout / custom_404_page：前者是每个连接的超时参数、
+    //   后者是**启动时读进内存**的一份内容，热改需要重新读盘；
+    // * log_to / max_days：日志订阅者已经按旧目标建好了，换文件等于要重建
+    //   整个 subscriber（tracing 只允许初始化一次）。
+    changed("allow_ports", old.allow_ports != new.allow_ports);
+    changed(
+        "max_ports_per_client",
+        old.max_ports_per_client != new.max_ports_per_client,
+    );
+    changed(
+        "detailed_errors_to_client",
+        old.detailed_errors_to_client != new.detailed_errors_to_client,
+    );
+    changed(
+        "vhost_http_timeout",
+        old.vhost_http_timeout != new.vhost_http_timeout,
+    );
+    changed(
+        "custom_404_page",
+        old.custom_404_page != new.custom_404_page,
+    );
+    changed("log_to", old.log_to != new.log_to);
+    changed("max_days", old.max_days != new.max_days);
 
     out
 }

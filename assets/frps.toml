@@ -1,5 +1,5 @@
 # ============================================================
-# frps 配置（NFrp 实现，兼容原版 frp v0.70+ 的 v2 协议）
+# frps 配置（NFrp 实现，兼容原版 frp 的 v1 / v2 线协议）
 # 用法： frps -c frps.toml
 # 生成： frps --gen-config frps.toml   （打印这份带注释的模板）
 # ============================================================
@@ -36,6 +36,25 @@ vhost_http_port = 8080
 vhost_https_port = 8443
 # 泛域名后缀（对应 frp 的 subdomainHost）：客户端可只写 subdomain = "abc"
 # subdomain_host = "example.com"
+
+# ---- tcpmux（HTTP CONNECT 复用，v0.5.1 新增）----
+# 若干条 tcpmux 代理**共用这一个端口**，靠 CONNECT 请求行里的 authority 分发，
+# 支持 routeByHTTPUser 二级路由与 httpUser 鉴权。不配就不启用 tcpmux 代理。
+# 客户端侧对应 multiplexer = "httpconnect"。
+# tcpmux_http_connect_port = 7004
+# 把 CONNECT 原样转给内网（由内网自己回 200），而不是由 NFrp 先应答：
+# tcpmux_passthrough = false
+
+# ---- 虚拟主机行为（v0.5.1 新增）----
+# 等内网服务**响应头**的秒数（0 = 不限）。超时回 502（与 Go ReverseProxy 一致）。
+vhost_http_timeout = 60
+# 没有代理匹配时返回这个文件的原文（Content-Type: text/html）：
+# custom_404_page = "/etc/nfrp/404.html"
+
+# ---- 回给客户端的错误要不要带细节（v0.5.1 新增）----
+# false 时只回 `new proxy [xxx] error` / `invalid ping`，不会把"这个域名已被
+# 别的代理占用"这类**别人的隧道名**泄露出去。默认 true（与官方一致）。
+# detailed_errors_to_client = true
 
 # ---- xtcp 真 P2P（UDP 打洞 + QUIC 直连）----
 # 牵线用的 UDP 端口。配置后 xtcp 才会尝试打洞，打通了两端数据不再经过本机；
@@ -90,6 +109,18 @@ hot_reload = false
 # max_conns_per_client = 200   # 单个客户端同时转发的连接数
 # max_total_conns = 5000       # 全局同时转发的连接数
 # max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
+
+# ---- 端口管控（安全相关，对外提供服务时强烈建议配；v0.5.1 新增）----
+# ★ 不配 allow_ports 的话，**任何**拿到 token 的客户端都能申请 22 / 3306 这类端口
+#   并直接暴露到公网。写法与官方 frps.toml 一致，也接受字符串形式。
+# 只约束 tcp / udp（真正占公网端口的类型）：
+# allow_ports = [
+#   { start = 20000, end = 30000 },
+#   # { single = 8443 },
+# ]
+# 单个客户端最多占几个公网端口（0 = 不限）。注意它与 max_proxies_per_client
+# 不是一回事：http / https / tcpmux / stcp 这些不占公网端口的只算代理数。
+# max_ports_per_client = 20
 
 # 心跳超时（秒），超时未收到客户端消息则断开
 heartbeat_timeout = 90
@@ -175,3 +206,11 @@ heartbeat_timeout = 90
 
 # 日志级别：error / warn / info / debug / trace
 log_level = "info"
+
+# ---- 日志落盘（v0.5.1 新增）----
+# log_level 也可以写在下面这个 [log] 段里（与官方 frps.toml 一致）。
+# 不配 to 时写标准输出；配了就写文件，按天轮转、按 maxDays 清理老备份。
+# [log]
+# to = "/var/log/nfrps.log"
+# maxDays = 3                 # 备份日志保留天数（<=0 = 不清理）
+# level = "info"

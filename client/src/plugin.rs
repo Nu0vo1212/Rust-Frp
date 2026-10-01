@@ -6,15 +6,32 @@
 //! 用户 -> frps -> [工作连接] -> frpc -> plugin（而不是内网服务）
 //! ```
 //!
-//! 这是官方 frp 的 `plugin = "http_proxy" / "socks5" / "static_file" / "unix_domain_socket"`。
-//! 支持的前三个都是纯 Rust 实现，最后一个走 Unix 域套接字（仅 Unix）。
+//! 这是官方 frp 的 `plugin = "..."`。目前已实现官方 0.71 的**全部 9 个**：
+//!
+//! * 正向代理类：`http_proxy`、`socks5`
+//! * 静态资源类：`static_file`、`unix_domain_socket`（仅 Unix）
+//! * HTTP 桥接类：`http2http`、`http2https`、`https2http`、`https2https`、`tls2raw`
+//!   （见 [`crate::plugin_bridge`]）
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use nfrp_common::{config::ProxyConfig, frp::stream::BoxStream, util};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, warn};
+
+/// 一次插件调用的上下文。
+pub struct Ctx<'a> {
+    /// 服务端下发的代理**线上全名**（带 `{user}.` 前缀）。
+    pub proxy_name: &'a str,
+    /// 真实客户端的地址，来自服务端下发的 `StartWorkConn.src_addr` / `src_port`。
+    ///
+    /// ★ 只有它才配写进 `X-Forwarded-For`。工作连接的对端是 **frps 自己**，
+    /// 拿它当客户端 IP 会让后端看到一屋子 `127.0.0.1`，按 IP 做的限流 / 风控全失效。
+    /// 服务端没下发（比如老版本）时为 `None`。
+    pub src: Option<SocketAddr>,
+}
 
 /// 一个客户端插件。
 pub enum Plugin {
@@ -24,6 +41,8 @@ pub enum Plugin {
     Socks5 { user: String, passwd: String },
     /// 静态文件服务器。
     StaticFile { root: PathBuf, strip_prefix: String },
+    /// HTTP 桥接：`http2http` / `http2https` / `https2http` / `https2https` / `tls2raw`。
+    Bridge(crate::plugin_bridge::Bridge),
     /// Unix 域套接字（仅 Unix 平台）。
     #[cfg(unix)]
     UnixSocket(PathBuf),
@@ -76,14 +95,18 @@ impl Plugin {
                     ))
                 }
             }
+            "http2http" | "http2https" | "https2http" | "https2https" | "tls2raw" => {
+                crate::plugin_bridge::build(kind.as_str(), p).map(Plugin::Bridge)
+            }
             other => Err(anyhow!(
-                "未知插件 [{other}]，支持：http_proxy / socks5 / static_file / unix_domain_socket"
+                "未知插件 [{other}]，支持：http_proxy / socks5 / static_file / unix_domain_socket \
+                 / http2http / http2https / https2http / https2https / tls2raw"
             )),
         })
     }
 
     /// 在这条工作连接上跑插件。
-    pub async fn serve(self, stream: BoxStream, leftover: Vec<u8>, proxy_name: &str) -> Result<()> {
+    pub async fn serve(self, stream: BoxStream, leftover: Vec<u8>, ctx: &Ctx<'_>) -> Result<()> {
         match self {
             Plugin::HttpProxy { user, passwd } => {
                 http_proxy::serve(stream, leftover, &user, &passwd).await
@@ -92,8 +115,15 @@ impl Plugin {
                 socks5::serve(stream, leftover, &user, &passwd).await
             }
             Plugin::StaticFile { root, strip_prefix } => {
-                static_file::serve(stream, leftover, &root, &strip_prefix, proxy_name).await
+                static_file::serve(stream, leftover, &root, &strip_prefix, ctx.proxy_name).await
             }
+            // 桥接类插件（http2*/https2*/tls2raw）失败多半是**用户配错了**：
+            // 拿明文 HTTP 去连 https2http、或上游没起。工作连接收尾只按 debug
+            // 记一笔，默认看不见，所以这里额外补一条 warn。
+            Plugin::Bridge(b) => b.serve(stream, leftover, ctx).await.map_err(|e| {
+                crate::plugin_bridge::log_failure(ctx.proxy_name, &e);
+                e
+            }),
             #[cfg(unix)]
             Plugin::UnixSocket(path) => {
                 let mut sock = tokio::net::UnixStream::connect(&path)
@@ -575,6 +605,55 @@ mod tests {
     fn unknown_plugin_is_an_error_not_a_silent_fallback() {
         let r = Plugin::from_proxy(&proxy("magic")).expect("配了插件就要有结果");
         assert!(r.is_err(), "拼错的插件名必须报错");
+    }
+
+    /// ★ 两张表必须锁在一起：`nfrp_common::config::SUPPORTED_PLUGIN_TYPES` 是
+    /// 解析阶段放行用的清单，这里的 `match` 才是真正能跑的实现。
+    ///
+    /// 只加一边 = 要么 `verify` 继续放行跑不起来的插件（假绿灯），
+    /// 要么实现了的插件在解析阶段就被拦掉。这个测试让两者不可能各自漂移。
+    #[test]
+    fn 公共层的支持清单与这里的实现必须一一对应() {
+        for kind in nfrp_common::config::SUPPORTED_PLUGIN_TYPES {
+            let mut p = proxy(kind);
+            p.plugin_local_path = "/tmp/x".into();
+            let r = Plugin::from_proxy(&p);
+            let Some(built) = r else {
+                panic!("公共层说 {kind} 支持，这里却完全不认它");
+            };
+            // `Plugin` 没有 Debug，不能用 `expect_err`，这里用 match 取错误文本。
+            if let Err(e) = built {
+                let msg = format!("{e:#}");
+                assert!(
+                    !msg.contains("未知插件"),
+                    "公共层说 {kind} 支持，这里却报未知插件：{msg}"
+                );
+            }
+        }
+    }
+
+    /// 反向：对官方全集逐个比对「公共层登记」与「这里认得」是否一致。
+    ///
+    /// 判据用的是**「未知插件」这个具体错误**，不是 `is_ok()` ——
+    /// `static_file` 少给 `localPath` 也会 Err，那属于"认得但配置不全"，
+    /// 不能和"根本不认得"混为一谈。
+    #[test]
+    fn 公共层登记与这里的识别范围必须一致() {
+        for kind in nfrp_common::config::OFFICIAL_PLUGIN_TYPES {
+            let mut p = proxy(kind);
+            p.plugin_local_path = "/tmp/x".into();
+            let recognized = match Plugin::from_proxy(&p) {
+                None => false,
+                Some(Ok(_)) => true,
+                Some(Err(e)) => !format!("{e:#}").contains("未知插件"),
+            };
+            assert_eq!(
+                nfrp_common::config::plugin_type_supported(kind),
+                recognized,
+                "{kind}：公共层 supported={} 但本 crate recognized={recognized}，两边对不上",
+                nfrp_common::config::plugin_type_supported(kind)
+            );
+        }
     }
 
     #[test]

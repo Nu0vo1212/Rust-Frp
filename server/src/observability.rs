@@ -84,6 +84,8 @@ pub struct Metrics {
 
     pub http_requests: Counter,
     pub https_conns: Counter,
+    /// tcpmux：接入的 CONNECT 隧道数（一个共享端口上的多次分发各算一次）。
+    pub tcpmux_conns: Counter,
 
     pub visitor_conns: Counter,
     pub visitor_rejected: Counter,
@@ -117,6 +119,7 @@ pub struct Snapshot {
     pub bytes_down: u64,
     pub http_requests: u64,
     pub https_conns: u64,
+    pub tcpmux_conns: u64,
     pub visitor_conns: u64,
     pub visitor_rejected: u64,
     pub p2p_success: u64,
@@ -168,6 +171,7 @@ impl Registry {
             bytes_down: m.bytes_down.get(),
             http_requests: m.http_requests.get(),
             https_conns: m.https_conns.get(),
+            tcpmux_conns: m.tcpmux_conns.get(),
             visitor_conns: m.visitor_conns.get(),
             visitor_rejected: m.visitor_rejected.get(),
             p2p_success: m.p2p_success.get(),
@@ -262,6 +266,11 @@ pub fn encode_prometheus(snap: &Snapshot, namespace: &str) -> String {
             snap.https_conns as i64,
         ),
         (
+            "tcpmux_conns_total",
+            "处理的 tcpmux CONNECT 隧道数",
+            snap.tcpmux_conns as i64,
+        ),
+        (
             "visitor_conns_total",
             "visitor 接入次数",
             snap.visitor_conns as i64,
@@ -311,7 +320,7 @@ pub fn encode_json(snap: &Snapshot) -> String {
         };
     }
     format!(
-        "{{{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}}}",
+        "{{{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}}}",
         kv!("uptime_secs", snap.uptime_secs),
         kv!("clients_total", snap.clients_total),
         kv!("clients_active", snap.clients_active),
@@ -326,6 +335,7 @@ pub fn encode_json(snap: &Snapshot) -> String {
         kv!("bytes_down", snap.bytes_down),
         kv!("http_requests", snap.http_requests),
         kv!("https_conns", snap.https_conns),
+        kv!("tcpmux_conns", snap.tcpmux_conns),
         kv!("visitor_conns", snap.visitor_conns),
         kv!("visitor_rejected", snap.visitor_rejected),
         kv!("p2p_success", snap.p2p_success),
@@ -395,8 +405,8 @@ mod tests {
         assert!(j.starts_with('{') && j.ends_with('}'));
         assert!(j.contains("\"uptime_secs\":3"));
         assert!(j.contains("\"clients_active\":3"));
-        // 简单的合法 JSON 检查：逗号数量 = 字段数 - 1
-        assert_eq!(j.matches(',').count(), 17, "{j}");
+        // 简单的合法 JSON 检查：逗号数量 = 字段数 - 1（19 个字段）
+        assert_eq!(j.matches(',').count(), 18, "{j}");
         assert!(!j.contains(",,"), "{j}");
     }
 

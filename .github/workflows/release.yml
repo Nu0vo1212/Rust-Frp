@@ -5,7 +5,7 @@ name: Release
 #   - 构建 Windows / Linux amd64 / Linux arm64 三个产物
 #   - 生成 SHA256SUMS + 用 cosign/sigstore 做无密钥签名（默认可用）
 #   - 上传 GitHub Release 并推 ghcr.io 镜像
-# 触发：git tag v0.5.0 && git push --tags
+# 触发：git tag v0.5.1 && git push --tags
 
 on:
   push:
@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "要发布的标签（例如 v0.5.0）"
+        description: "要发布的标签（例如 v0.5.1）"
         required: true
 
 permissions:

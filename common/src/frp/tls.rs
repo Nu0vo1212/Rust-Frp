@@ -76,6 +76,83 @@ pub fn client_config() -> Result<Arc<rustls::ClientConfig>> {
     Ok(Arc::new(cfg))
 }
 
+/// 读 PEM 文件，返回 `(块标签, DER 字节)` 的列表，顺序保留。
+///
+/// 标签是 `CERTIFICATE` / `PRIVATE KEY` / `RSA PRIVATE KEY` / `EC PRIVATE KEY` 这类
+/// BEGIN 行里的那个词。**按标签区分私钥格式是必须的** —— 三种格式的 DER 结构不同，
+/// 猜错会在握手时才报一个和文件内容完全无关的错。
+///
+/// 这里是**唯一**一处解析 PEM 的地方：客户端插件的 `crtPath` / `keyPath`
+/// 和 OIDC 的 `trustedCaFile` 都走它，省得两处对"什么算合法 PEM"理解不一致。
+pub fn read_pem_blocks(path: &str) -> Result<Vec<(String, Vec<u8>)>> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("读取 PEM 文件 {path} 失败"))?;
+    let mut out = Vec::new();
+    let mut label: Option<String> = None;
+    let mut b64 = String::new();
+    for line in text.lines() {
+        let l = line.trim();
+        if let Some(rest) = l.strip_prefix("-----BEGIN ") {
+            let name = rest.trim_end_matches('-').trim().to_string();
+            label = Some(name);
+            b64.clear();
+            continue;
+        }
+        if l.starts_with("-----END ") {
+            if let Some(name) = label.take() {
+                let der = STANDARD
+                    .decode(b64.as_bytes())
+                    .map_err(|e| anyhow!("PEM 文件 {path} 的 {name} 块不是合法 base64：{e}"))?;
+                out.push((name, der));
+            }
+            continue;
+        }
+        if label.is_some() {
+            b64.push_str(l);
+        }
+    }
+    if out.is_empty() {
+        bail!("PEM 文件 {path} 里没有找到任何 -----BEGIN ...----- 块");
+    }
+    Ok(out)
+}
+
+/// 从 PEM 文件构造服务端 TLS 配置（对应官方 frp 的 `transport.NewServerTLSConfig`）。
+///
+/// 用于客户端的 `https2http` / `https2https` / `tls2raw` 三个插件 —— 它们在
+/// frpc 这一侧**终止** TLS，所以要拿用户给的证书自己当 TLS 服务端
+/// （frp 的 https 代理与之相反：服务端只嗅探 SNI，不终止 TLS）。
+pub fn server_config_from_pem(crt_path: &str, key_path: &str) -> Result<Arc<rustls::ServerConfig>> {
+    let certs: Vec<CertificateDer<'static>> = read_pem_blocks(crt_path)?
+        .into_iter()
+        .filter(|(label, _)| label.eq_ignore_ascii_case("CERTIFICATE"))
+        .map(|(_, der)| CertificateDer::from(der))
+        .collect();
+    if certs.is_empty() {
+        bail!("证书文件 {crt_path} 里没有 CERTIFICATE 块");
+    }
+
+    let (label, der) = read_pem_blocks(key_path)?
+        .into_iter()
+        .find(|(label, _)| label.to_ascii_uppercase().contains("PRIVATE KEY"))
+        .ok_or_else(|| anyhow!("私钥文件 {key_path} 里没有 PRIVATE KEY 块"))?;
+    let key = match label.to_ascii_uppercase().as_str() {
+        "PRIVATE KEY" => PrivateKeyDer::Pkcs8(der.into()),
+        "RSA PRIVATE KEY" => PrivateKeyDer::Pkcs1(der.into()),
+        "EC PRIVATE KEY" => PrivateKeyDer::Sec1(der.into()),
+        other => bail!("私钥文件 {key_path} 的块类型 {other} 不认识"),
+    };
+
+    let cfg = rustls::ServerConfig::builder_with_provider(crypto_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .map_err(|e| anyhow!("TLS 协议版本配置失败：{e}"))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .with_context(|| format!("装载证书 {crt_path} + 私钥 {key_path} 失败"))?;
+    Ok(Arc::new(cfg))
+}
+
 /// 把主机名转成 rustls 的 ServerName（IP 和域名是两种不同的变体）。
 fn to_server_name(host: &str) -> Result<ServerName<'static>> {
     if let Ok(ip) = host.parse::<IpAddr>() {

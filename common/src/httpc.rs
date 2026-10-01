@@ -480,34 +480,15 @@ fn client_tls_config(opts: &Options) -> Result<Arc<rustls::ClientConfig>> {
 }
 
 /// 从 PEM 文件里读出所有 CERTIFICATE 块。
+///
+/// 实际的 PEM 解析在 [`crate::frp::tls::read_pem_blocks`] —— 客户端插件的
+/// `crtPath` / `keyPath` 也走那里，两边不该各有一套"什么算合法 PEM"。
 fn read_pem_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("读取 CA 文件 {path} 失败"))?;
-    let mut out = Vec::new();
-    let mut in_block = false;
-    let mut b64 = String::new();
-    for line in text.lines() {
-        let l = line.trim();
-        if l.contains("BEGIN CERTIFICATE") {
-            in_block = true;
-            b64.clear();
-            continue;
-        }
-        if l.contains("END CERTIFICATE") {
-            if in_block {
-                let der = STANDARD
-                    .decode(b64.as_bytes())
-                    .map_err(|e| anyhow!("CA 文件里的证书不是合法 base64：{e}"))?;
-                out.push(CertificateDer::from(der));
-            }
-            in_block = false;
-            continue;
-        }
-        if in_block {
-            b64.push_str(l);
-        }
-    }
+    let out: Vec<CertificateDer<'static>> = crate::frp::tls::read_pem_blocks(path)?
+        .into_iter()
+        .filter(|(label, _)| label.eq_ignore_ascii_case("CERTIFICATE"))
+        .map(|(_, der)| CertificateDer::from(der))
+        .collect();
     if out.is_empty() {
         bail!("CA 文件 {path} 里没有找到任何 CERTIFICATE 块");
     }

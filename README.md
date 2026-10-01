@@ -12,10 +12,11 @@
 
 - ✅ **frp v1 / v2 双线协议** — **默认 v1**（与官方默认值相同），官方 frpc / frps **零配置直连**；需要时可用 `transport.wireProtocol = "v2"` 显式启用 v2
 - ✅ **原版配置直接可用** — 原版 frpc / 第三方 frp 平台下发的配置（camelCase、`[[proxies]]`、`localIP`+`localPort`、`[metadatas]`）无需改写即可运行
-- ✅ **七种代理类型** — `tcp` / `udp` / `http` / `https` / `stcp` / `sudp` / `xtcp`，多代理同时工作
+- ✅ **八种代理类型** — `tcp` / `udp` / `http` / `https` / `tcpmux` / `stcp` / `sudp` / `xtcp`，与官方 frp 的类型清单**完全一致**，多代理同时工作
 - ✅ **UDP 转发** — 每个 UDP 代理只占一条工作连接，靠访客地址区分会话
 - ✅ **HTTP 反向代理** — 按域名路由，支持 `locations` 前缀、Basic Auth、Host 改写、自定义请求/响应头
 - ✅ **HTTPS SNI 透传** — 只嗅探 ClientHello 里的 SNI 做路由，不终止 TLS，证书仍由内网服务提供
+- ✅ **tcpmux（HTTP CONNECT 复用）** — 多条代理共用一个服务端端口，按 `CONNECT` 的 authority 分发，支持 `routeByHTTPUser` 二级路由与 `httpUser` 鉴权，可选 `tcpmuxPassthrough` 原样透传
 - ✅ **stcp 私密隧道** — 服务端不开放公网端口，需 `secret_key` 校验 + 提供者端 `allow_users` 白名单，与官方 frp 互通
 - ✅ **sudp 秘密 UDP** — 与 stcp 同一套鉴权，但数据面是 UDP：访问方本地开 UDP socket，一条持久工作连接上跑 `UdpPacket` 帧，按访客地址回包；同样不占公网端口
 - ✅ **xtcp 真 P2P** — UDP 打洞 + QUIC / KCP 直连，数据不经服务端；打不通自动回退中继，不会比 stcp 更差
@@ -51,9 +52,11 @@
 
 - ✅ **group 负载均衡** — 同 `group` 的多个代理共享一个 `remote_port`，服务端按**最小连接数**分摊
 - ✅ **健康检查** — `tcp` / `http` 探测，连续失败自动摘除后端，恢复后自动回归
-- ✅ **客户端插件** — `http_proxy` / `socks5` / `static_file` / `unix_domain_socket`，frpc 本身即正向代理或静态站点
+- ✅ **客户端插件** — 官方 9 种全实现：`http_proxy` / `socks5` / `static_file` / `unix_domain_socket` / `http2http` / `http2https` / `https2http` / `https2https` / `tls2raw`，frpc 本身即正向代理、静态站点或 TLS 终结器
 - ✅ **带宽限流** — 每个代理可配 `bandwidth_limit`（如 `1MB`），令牌桶精确限速
 - ✅ **资源上限** — 客户端数 / 代理数 / 转发连接数 / 待处理队列，五个维度全部可限并计入指标
+- ✅ **端口白名单** — `allowPorts` + `maxPortsPerClient`（官方同名配置），限定客户端能申请哪些公网端口、最多占几个
+- ✅ **日志落盘与轮转** — `log.to` + `log.maxDays`，按天切分、按天数清理老备份，不引入时区依赖
 - ✅ **可观测性** — 内置 Web 面板 + Prometheus `/metrics` + 健康检查端点，支持 Basic Auth
 - ✅ **面板可写** — 在面板上直接增删代理、踢掉客户端，无需改配置重启（`/api/proxies/add` 等）
 - ✅ **配置热重载** — 改 `log_level` / 面板密码无需重启，静态项变更会明确提示需重启
@@ -70,7 +73,7 @@
 
 ### 工程质量
 
-- ✅ **459 个自动化测试** — 含真实 QUIC 栈握手、口令正反用例、端到端集成测试、**SUDP 端到端与 KCP 传输链路**、**与官方 frpc/frps 真实抓包密文的解密回归**
+- ✅ **542 个自动化测试** — 含真实 QUIC 栈握手、口令正反用例、端到端集成测试、**SUDP 端到端与 KCP 传输链路**、**与官方 frpc/frps 真实抓包密文的解密回归**
 - ✅ **CI 流水线** — `fmt` / `clippy` / 测试 / 四目标构建 / 冒烟，PR 必过
 - ✅ **发布可验真** — `SHA256SUMS` + 可选 Ed25519 分离签名与本地验签脚本
 - ✅ **容器就绪** — 多阶段 `Dockerfile`（musl 静态）+ `docker-compose.yml`
@@ -297,6 +300,7 @@ NFrp 服务端**不需要预先知道对端用哪个版本**：它读满 8 字�
 | `udp` | `remote_port` | 每个代理一条专用工作连接，报文带访客地址；会话 30s 空闲回收 |
 | `http` | 服务端 `vhost_http_port` | 按 `Host` 路由，支持 `custom_domains` / `subdomain` / `locations` / `http_user` / `host_header_rewrite` |
 | `https` | 服务端 `vhost_https_port` | 按 TLS SNI 路由后原样透传（不终止 TLS） |
+| `tcpmux` | 服务端 `tcpmuxHTTPConnectPort` | **一个共享端口**上的 HTTP `CONNECT` 复用器：按 CONNECT 请求行里的 authority 分发，可再按 `routeByHTTPUser` 二级路由、用 `httpUser` / `httpPassword` 做 Basic 鉴权 |
 | `stcp` | 无（不占公网端口） | 私密隧道：由访客端在本地起监听，凭 `secret_key` + `allow_users` 鉴权后经服务端配对 |
 | `xtcp` | 无（不占公网端口） | 先试 **UDP 打洞 + QUIC 直连**；打不通自动回退服务端中继 |
 
@@ -406,6 +410,59 @@ bind_port = 9002
 > 服务端如果没配 `p2p_port`，会明确拒绝 `NatHoleVisitor` 并回 `nat hole not enabled`，
 > 而不是让访客干等超时 —— 官方 frpc 的 xtcp 访客也会因此**快速失败**而不是挂起。
 
+### tcpmux（HTTP CONNECT 复用）
+
+上面几种代理要么各占一个公网端口 要么完全不占端口 `tcpmux` 是第三种：
+**所有 tcpmux 代理共用服务端同一个端口** 客户端用 HTTP `CONNECT` 指定要连哪个域名。
+
+场景：服务端只有一个端口可暴露（比如只放行了 443）但你有多条隧道要开。
+
+```toml
+# frps.toml
+tcpmuxHTTPConnectPort = 8443
+# tcpmuxPassthrough = true   # 内网本身就是 HTTP 代理时才开
+
+# frpc.toml —— 三条代理共用 8443
+[[proxies]]
+name = "web"
+type = "tcpmux"
+multiplexer = "httpconnect"     # 官方目前只有这一个取值
+local_addr = "127.0.0.1:8080"
+custom_domains = ["a.example.com"]
+
+[[proxies]]
+name = "web-b"
+type = "tcpmux"
+multiplexer = "httpconnect"
+local_addr = "127.0.0.1:8081"
+custom_domains = ["a.example.com"]   # 同一域名也能共存
+http_user = "alice"                  # 靠 Basic 鉴权区分
+http_pwd = "s3cret"
+```
+
+用法：
+
+```bash
+# 明文 HTTP 走 CONNECT（curl 的 --proxytunnel 就是干这个的）
+curl --proxytunnel -x http://alice:s3cret@server:8443 http://a.example.com/
+
+# HTTPS 也一样（CONNECT 里带 443 端口，服务端会去掉端口再匹配域名）
+curl -x http://server:8443 https://a.example.com/
+```
+
+行为要点：
+
+* 路由取的是 **`CONNECT` 请求行里的 authority**（去端口、转小写）而不是 `Host` 头；
+  支持 `custom_domains` 与 `subdomain`（配了 `subdomain_host` 之后）。
+* 与 http / https 代理**共用同一套**域名匹配、最长路径前缀、`routeByHTTPUser` 两级路由。
+  `routeByHTTPUser` 的用法是"同一域名 + 同一路径下 按访问用户名分给不同代理"。
+* 只有 `multiplexer = "httpconnect"` 被接受（与官方一致）服务端没配
+  `tcpmuxHTTPConnectPort` 时注册会**明确失败**而不是静默不生效。
+* 密码不对时回 `407 Proxy Authentication Required` 并带 `Proxy-Authenticate` 头。
+  ★ 这里与官方有一处**有意偏离**：官方先回 `200 OK` 再校验 于是密码错时客户端
+  **先收到 200**、再收到一个 407 隧道已经"建立成功" 那个 407 会被当成隧道里的数据；
+  NFrp 改成先校验再回 200 只发一个 407。
+
 ## 传输层
 
 ### QUIC
@@ -499,7 +556,8 @@ health_check_max_failed = 3       # 连续失败几次判定不健康
 ## 客户端插件
 
 `plugin` 字段让工作连接不再连 `local_addr`，而是接到插件上——
-于是 frpc 本身就能当正向代理或静态站点服务器用：
+于是 frpc 本身就能当正向代理或静态站点服务器用。
+**官方 0.71 的 9 个插件类型全部实现**：
 
 | `plugin` | 说明 | 需要的字段 |
 |---|---|---|
@@ -507,6 +565,15 @@ health_check_max_failed = 3       # 连续失败几次判定不健康
 | `socks5` | SOCKS5 代理（无认证 / 用户名密码） | 可选 `plugin_user` / `plugin_passwd` |
 | `static_file` | 直接把一个目录当静态站点服务 | 必填 `plugin_local_path`，可选 `plugin_strip_prefix` |
 | `unix_domain_socket` | 转发到本地 Unix 套接字 | 必填 `plugin_local_path`（仅 Unix） |
+| `http2http` | 收明文 HTTP、按 HTTP 转发到后端（可改写 Host、删/加请求头） | `plugin_local_addr`，可选 `plugin_host_header_rewrite` / `plugin_request_headers` |
+| `http2https` | 收明文 HTTP、以 **TLS 客户端**连后端 | 同上 |
+| `https2http` | **终止 TLS**（用 `plugin_crt_path` / `plugin_key_path` 的证书），再按明文 HTTP 转发 | 必填证书字段 |
+| `https2https` | 两端都走 TLS：对外终止、对内再起 TLS | 必填证书字段 |
+| `tls2raw` | 对外终止 TLS，把明文原样喂给后端（Redis / SMTP 这类裸协议） | 必填证书字段 |
+
+> `https2*` / `tls2raw` 收尾时会显式发 TLS `close_notify` 再关连接 ——
+> 直接 drop rustls 流只发 FIN，严格一点的客户端（Go 1.21+、OpenSSL 3）
+> 会报 `peer closed connection without sending TLS close_notify`。
 
 ```toml
 [[proxies]]
@@ -863,6 +930,31 @@ max_total_conns = 5000       # 全局同时转发的连接数
 max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
 ```
 
+### 端口白名单（安全相关，对外提供服务时务必配）
+
+上面那组管的是"多少" 这一项管的是"**哪些**"：
+
+```toml
+# frps.toml —— 与官方 frps.toml 完全一致
+allowPorts = [
+  { start = 20000, end = 30000 },
+  { single = 8443 },
+]
+maxPortsPerClient = 20       # 单个客户端最多占用几个公网端口
+```
+
+* **不配 `allow_ports` = 不限制**（与官方一致）拿到 token 的客户端可以把 `22` / `3306`
+  直接映射到公网。多方共用一个服务端时这是最该配的一项。
+* 也接受字符串写法：`allowPorts = ["20000-30000", "8443"]`（legacy INI 的
+  `allow_ports = 20000-30000,8443` 同样会被搬进来）。
+* `allowPorts` 判在**绑定端口之前** —— 白名单外的端口连监听都不会建。
+* `maxPortsPerClient` 数的是**端口**不是代理：`http` / `https` / `tcpmux` / `stcp` /
+  `xtcp` / `sudp` 都不占公网端口 所以只受 `max_proxies_per_client` 约束
+  （与官方 `pxy.GetUsedPortsNum()` 的算法一致）。
+* 两项都能在启动日志里看到生效值：`allowPorts 已生效：客户端只能申请这些远端端口 …`。
+* 违规时服务端日志给完整原因 回给客户端的则受 `detailedErrorsToClient` 控制
+  （默认带上详情 想脱敏就设 `false`）。
+
 实现细节：用 `tokio::sync::Semaphore` 的 owned permit 做 RAII 配额，
 **配额令牌随连接/代理的生命周期存活**（而不是"检查一下就算过"），
 所以不会出现"上限配了但没生效"或"名额泄漏后越用越少"这两类问题。
@@ -882,11 +974,18 @@ max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
 | `kcp_bind_port` | KCP 传输的 UDP 监听端口（不配 = 不开）；TCP 端口照旧保留 | 空 |
 | `vhost_http_port` | HTTP 代理入口端口（不配则拒绝 http 代理） | 空 |
 | `vhost_https_port` | HTTPS 代理入口端口 | 空 |
+| `tcpmuxHTTPConnectPort` | tcpmux 代理的 **HTTP CONNECT 共享端口**（不配则拒绝 tcpmux 代理） | 空 |
+| `tcpmuxPassthrough` | CONNECT 请求原样透传给内网（让内网自己回 200，适合内网本身就是 HTTP 代理） | `false` |
+| `vhostHTTPTimeout` | vhost HTTP 等内网服务**响应头**的秒数（0 = 不限） | `60` |
+| `custom404Page` | 没有代理匹配时返回的文件路径（不改状态码，仍 404） | 空（内置提示） |
 | `subdomain_host` | 泛域名后缀，配合客户端 `subdomain` | 空 |
 | `p2p_port` | xtcp 打洞牵线的 UDP 端口（不配则 xtcp 只走中继） | 空 |
 | `dashboard_port` | 内置面板 / 指标端口 | 空 |
 | `dashboard_user` / `dashboard_pwd` | 面板 Basic Auth（用户名留空 = 不鉴权） | 空 |
 | `hot_reload` | 监视配置文件 mtime 并热应用动态项 | `false` |
+| **`allowPorts`** | ★ **端口白名单**：客户端能申请的远端端口。空 = 不限制（任何客户端都能申请 22 / 3306） | 空 |
+| **`maxPortsPerClient`** | ★ 单客户端可占用的**端口数**上限（http / https / tcpmux / stcp 不占端口，不计入） | `0` |
+| **`detailedErrorsToClient`** | ★ 是否把详细失败原因回给客户端。关掉后只回 `new proxy [x] error` / `invalid ping`，不泄露别人的隧道名 | `true` |
 | `max_clients` | 同时在线的客户端数上限 | `0`（不限） |
 | `max_proxies_per_client` | 单客户端代理数上限 | `0` |
 | `max_conns_per_client` | 单客户端转发连接数上限 | `0` |
@@ -912,6 +1011,8 @@ max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
 | `audit.path` | 审计 JSONL 落盘路径（留空 = 仅内存） | 空 |
 | `audit.maxEntries` | 内存环形缓冲条数 | `1000` |
 | `log_level` | `error`/`warn`/`info`/`debug`/`trace` | `info` |
+| `log.to` | 日志落盘路径（空 / `console` = 标准输出）。写文件时**按天轮转**，备份名 `<名>.<YYYYMMDD-HHMMSS><扩展名>` | `console` |
+| `log.maxDays` | 备份日志保留天数（`<= 0` = 不清理） | `3` |
 
 ### 客户端（nfrp-client）
 
@@ -947,16 +1048,21 @@ max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
 | `virtualNet.address` | 本机虚拟地址；留空且 `autoAssign` 时由服务端分配 | 空 |
 | `virtualNet.autoAssign` | 由服务端自动分配地址 | `false` |
 | `virtualNet.mtu` | 虚拟网卡 MTU | `1400` |
+| `log.to` | 日志落盘路径（空 / `console` = 标准输出）；写文件时按天轮转 | `console` |
+| `log.maxDays` | 备份日志保留天数（`<= 0` = 不清理） | `3` |
+
+> 配了 `log.to` 之后 **stdout 上就没有日志了**（与官方 frpc 一样是"控制台**或**文件"）。
+> NetTool 这类按行读 stdout 的第三方启动器面板上会看不到日志，排查时别以为是进程没起来。
 
 `[[proxies]]` 字段：
 
 | 字段 | 说明 |
 |---|---|
 | `name` | 代理名，全局唯一 |
-| `type` | `tcp` / `udp` / `http` / `https` / `stcp` / `xtcp` |
+| `type` | `tcp` / `udp` / `http` / `https` / `tcpmux` / `stcp` / `xtcp` / `sudp` |
 | `local_addr` | 内网服务地址，如 `127.0.0.1:53` |
 | `remote_port` | tcp / udp 的公网端口（同 `group` 可与他人共享） |
-| `custom_domains` | http / https 的域名列表（支持 `*.example.com`） |
+| `custom_domains` | http / https / tcpmux 的域名列表（支持 `*.example.com`） |
 | `subdomain` | 配合服务端 `subdomain_host` |
 | `locations` | http 路径前缀，留空等价 `/` |
 | `http_user` / `http_pwd` | http 基本认证 |
@@ -968,11 +1074,17 @@ max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
 | `health_check_interval_s` | 探测间隔（秒），默认 `10` |
 | `health_check_timeout_s` | 单次超时（秒），默认 `3` |
 | `health_check_max_failed` | 连续失败几次判定不健康，默认 `3` |
-| `plugin` | `http_proxy` / `socks5` / `static_file` / `unix_domain_socket` |
+| `plugin` | 官方 9 种全支持：`http_proxy` / `socks5` / `static_file` / `unix_domain_socket` / `http2http` / `http2https` / `https2http` / `https2https` / `tls2raw` |
 | `plugin_local_path` | `static_file` 的目录 / `unix_domain_socket` 的套接字路径 |
 | `plugin_strip_prefix` | `static_file` 回源时剥掉的路径前缀 |
+| `plugin_local_addr` | `http2*` / `https2*` / `tls2raw` 的后端地址（留空则回退到 `local_addr`） |
+| `plugin_host_header_rewrite` | 转发到后端时改写的 Host |
+| `plugin_crt_path` / `plugin_key_path` | `https2*` / `tls2raw` 的证书与私钥 PEM 路径 |
+| `plugin_request_headers` | 增删请求头：`{ set = { K = "V" } }`，值为空串表示删除 |
 | `plugin_user` / `plugin_passwd` | `http_proxy` / `socks5` 的认证 |
-| `secret_key` | stcp / xtcp 的共享密钥（别名 `secretKey`） |
+| `routeByHTTPUser` | http / tcpmux 的**第二级路由**：同一域名 + 路径下按访问者用户名分给不同代理 |
+| `multiplexer` | tcpmux 专用，官方只有 `httpconnect` 一个取值 |
+| `secret_key` | stcp / xtcp / sudp 的共享密钥（别名 `secretKey`，legacy INI 里写 `sk`） |
 | `allow_users` | stcp / xtcp 允许的**访客客户端 `user`** 白名单（别名 `allowUsers`）；**留空 = 只允许与 provider 同一 user**，`["*"]` = 全部放行 |
 | `proxyProtocolVersion` | `v1` / `v2`，连内网服务前注入 PROXY 头透传真实客户端 IP；留空 = 不发 |
 
@@ -1139,24 +1251,93 @@ max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
 > （★ 记一笔坑：`cargo check --target *-musl` 在 Windows 上做不了 —— `ring` 的
 > 构建脚本要 `aarch64-linux-musl-gcc`。用一个**只依赖 `libc`** 的最小工程可以
 > 精确复现/验证这个类型差异，不需要交叉 C 工具链。）
+>
+> **v0.5.1 是补齐与官方 0.71 差距的一版**
+> 起因是把"NFrp 到底比官方 0.71 少什么"逐项对了一遍 结论是代理类型少 1 种
+> 客户端插件少 5 个 配置字段静默忽略 46 项（客户端 20 服务端 26）
+> 加上两处已经查实的 bug 于是把能一次收口的全部收口 结果如下
+>
+> ① **补上第 8 种代理类型 `tcpmux`** —— 它是官方那套"一个共享端口上的 HTTP CONNECT
+> 复用器" 所有 tcpmux 代理都挂在服务端同一个 `tcpmuxHTTPConnectPort` 上 靠 CONNECT
+> 请求行里的 authority 分发。实现时把 官方 `server/proxy/tcpmux.go` +
+> `pkg/util/tcpmux/httpconnect.go` + `pkg/util/vhost` 三条路径合成了服务端的一个
+> `VhostKind` 枚举 于是域名匹配 / 最长路径前缀 / `routeByHTTPUser` 两级路由 /
+> `httpUser` 鉴权全部与 http / https 共用同一段代码 只有"域名从哪来"和"怎么交给内网"
+> 两处不同。`tcpmuxPassthrough` 也实现了（把 CONNECT 原样转给内网 由内网自己回 200）。
+> ★ 一处**有意偏离**：官方先回 `200 OK` 再校验密码 于是密码不对时客户端**先收到 200**、
+> 再收到一个 407 curl 这类客户端已经把隧道当建好了 那个 407 会被当成隧道里的数据。
+> 这里改成**先校验再回 200** 协议上才是对的。
+>
+> ② **补上 5 个客户端插件 官方 9 种现在全实现**：`http2http` / `http2https` /
+> `https2http` / `https2https` / `tls2raw`。这一族是"插件自己扮演前端" 收明文或 TLS、
+> 按 HTTP 或裸字节送到后端 支持 `pluginHostHeaderRewrite` / `pluginRequestHeaders`。
+> 踩到的坑：**rustls 的流被 drop 时只发 FIN、不发 TLS `close_notify`** Go 1.21+ 与
+> OpenSSL 3 的客户端会报 `peer closed connection without sending TLS close_notify`
+> 于是 `https2*` / `tls2raw` 收尾必须显式 `shutdown()`。
+>
+> ③ **7 个"便宜 + 安全相关"的配置字段落地**（其余 39 项仍按默认值忽略 启动日志会逐条列出）：
+> `allowPorts` 与 `maxPortsPerClient` 是**安全项** 一个管"哪些公网端口能被申请"
+> 一个管"单个客户端最多占几个端口" 两项都在**绑定端口之前**判定
+> （`http` / `https` / `tcpmux` / `stcp` 不占公网端口 所以只算代理数 不算端口数
+> 与官方 `pxy.GetUsedPortsNum()` 的算法一致）
+> `detailedErrorsToClient` 关掉后只回官方那两句短句
+> （`new proxy [x] error` / `invalid ping`）不会再把"这个域名已被代理 bob.web 占用"
+> 这种**别人的隧道名**泄露给客户端
+> `vhostHTTPTimeout` 卡的是"内网连上了却不回响应头" 超时回 502（与 Go ReverseProxy
+> 默认错误处理器一致 不是 504）
+> `custom404Page` 没代理匹配时返回指定文件的原文 `Content-Type: text/html`
+> 另外 `log.to` + `log.maxDays` 实现了日志落盘与按天轮转。
+> ★ 轮转按官方 `golib/log/output_rotatefile.go` 的规则重写：同名文件 append
+> 跨天改名成 `<名>.<YYYYMMDD-HHMMSS><扩展名>` 再建新的 按 `maxDays` 裁剪老备份
+> 没有引入 `chrono` / `time` 之类的时区依赖（一处小差异：官方按**本地**零点轮转
+> 这里按 **UTC** 零点 因为 NFrp 日志时间戳本身就是 UTC 按本地切反而会让文件名与
+> 行内日期错开 8 小时）。
+>
+> ④ **两处已查实的 bug**：`visitors.bindPort = -1` 直接解析失败（官方文档明写
+> "-1 表示不监听" 而 NFrp 用 `u16` 接）以及 `verify` 对**未实现的插件 / 代理类型**
+> 假绿灯（它只检查"必填字段全不全" 于是 `plugin = "http2http"` 这种当时根本没实现的
+> 配置会报"校验通过" —— 对宿主软件来说这比报错危险 因为它会显示"已就绪"）
+> 现在 `verify` 跟着 `SUPPORTED_PLUGIN_TYPES` 走 且插件代理不再显示误导性的
+> `127.0.0.1:0` 而是显示真实上游。
+>
+> ⑤ **顺手抓出的三处"不报错但不对"**：
+> 启动日志里"支持的代理类型"清单漏了 `tcpmux`（功能能用 但用户按日志判断会得到相反结论
+> 现在这份清单与 `register_proxy` 的 match 分支一一对应）
+> legacy INI 的键是 **`tcpmux_httpconnect_port`**（`http` 与 `connect` 之间没有下划线）
+> 照着 TOML 的 `tcpmux_http_connect_port` 去查一个都匹配不到 老 frps.ini 的 tcpmux 端口
+> 会被静默丢掉
+> 以及官方 `Convert_ServerCommonConf_To_v1` 里 `out.AllowPorts, _ = …` 把解析错误
+> **吞掉** 于是一份把 `allow_ports` 写错一个字符的 frps.ini 会**静默放开全部端口**
+> —— NFrp 在这里反过来 解析失败直接报错 绝不降级成"不限制"。
+>
+> 质量门：`cargo fmt --check` 干净 `cargo clippy --workspace --all-targets -- -D warnings`
+> 0 告警 **542 个测试全绿**（common 275 / server lib 163 / client 81 / server bin 5 /
+> e2e 18）。另外用**发布版二进制**（不是 debug）跑了三轮真机冒烟：
+> 标准冒烟 **26/26**（RBAC / 审计 JSONL / WebSocket / API v2 / 客户端本地界面 / PROXY
+> v1+v2 / SUDP / KCP 传输）、tcpmux 冒烟 **4/4**（CONNECT 复用 +
+> `routeByHTTPUser` 二级路由 + 未知域名 404）、配置字段冒烟 **15/15**：白名单内的
+> `17200` / `17201` 真实监听、白名单外的 `22` 与超出上限的 `17202` 被拒（客户端拿到的是
+> 脱敏短句 `new proxy [x] error` 服务端日志里保留了完整原因）自定义 404 页逐字节返回
+> 慢后端 2 秒的响应被 1 秒超时切成 `502` 且耗时实测 **1.00 秒** `log.to` 指定的文件里
+> 出现了启动日志而 stdout 是空的。
 
 ## 质量保障
 
 ```bash
 cargo fmt --all -- --check          # 格式
 cargo clippy --workspace --all-targets   # 静态检查（当前 0 告警）
-cargo test --workspace              # 459 个测试
+cargo test --workspace              # 542 个测试
 ```
 
 测试分布：
 
 | 目标 | 数量 | 覆盖重点 |
 |---|---|---|
-| `common` 单元测试 | 230 | **v1 线协议**（消息类型字节、帧编解码、AES-128-CFB 密钥派生与流式状态机、**官方抓包密文解密回归**）、v2 线协议编解码、加密、配置解析、**原版 frp 配置兼容层**、打洞报文/口令/端口预测、**KCP（含 30% 丢包下的可靠传输）**、令牌桶、示例配置可加载、**OIDC 令牌源与 JWKS 验签**、**CIDR/ACL/RBAC 判定边界**、**WebSocket 帧编解码与 Ping/Pong**、**PROXY v1/v2 编解码与防注入 sniff**、**VirtualNet 帧/路由/地址池**、**HTTP/1.1 请求解析** |
-| `server` 单元测试（lib） | 144 | 虚拟主机路由表与优先级、chunked 解析、Basic Auth、连接池配对与回收、**端口组最小连接数调度**、资源配额、指标编码、面板鉴权与**写接口**、热重载字段判定、打洞会话、**审计日志（JSONL + 环形缓冲 + 过滤）**、**安全上下文（ACL→认证→RBAC→审计）**、**API v2（错误信封 / 分页 / 百分号解码）**、**VirtualNet 服务端路由与代答 ICMP** |
+| `common` 单元测试 | 275 | **v1 线协议**（消息类型字节、帧编解码、AES-128-CFB 密钥派生与流式状态机、**官方抓包密文解密回归**）、v2 线协议编解码、加密、配置解析、**原版 frp 配置兼容层**、打洞报文/口令/端口预测、**KCP（含 30% 丢包下的可靠传输）**、令牌桶、示例配置可加载、**OIDC 令牌源与 JWKS 验签**、**CIDR/ACL/RBAC 判定边界**、**WebSocket 帧编解码与 Ping/Pong**、**PROXY v1/v2 编解码与防注入 sniff**、**VirtualNet 帧/路由/地址池**、**HTTP/1.1 请求解析** |
+| `server` 单元测试（lib） | 163 | 虚拟主机路由表与优先级、chunked 解析、Basic Auth、连接池配对与回收、**端口组最小连接数调度**、资源配额、指标编码、面板鉴权与**写接口**、热重载字段判定、打洞会话、**审计日志（JSONL + 环形缓冲 + 过滤）**、**安全上下文（ACL→认证→RBAC→审计）**、**API v2（错误信封 / 分页 / 百分号解码）**、**VirtualNet 服务端路由与代答 ICMP** |
 | `server` 单元测试（bin） | 5 | 命令行与配置装载 |
-| `client` 单元测试 | 64 | QUIC 建连与口令握手、插件（http_proxy / socks5 / static_file）、健康检查状态机、打洞编排、`NewProxy` 字段映射（含与官方 frpc 抓包逐字节对拍）、服务端下发名 → 本地代理的翻译（`resolve_uploaded_proxy`）、**动态代理表**、**store 落盘与损坏文件容错**、**本地管理界面的路由与本地校验**、**PROXY 头注入** |
-| `server` 端到端集成测试 | 14 | 真握手 + 真转发的 TCP / HTTP / stcp / QUIC 链路、**v1 与 v2 双协议握手**、group 负载均衡、面板鉴权边界、**SUDP 端到端（visitor→provider 的 UdpPacket 往返）**、**KCP 传输上的完整控制连接 + 多会话共端口** |
+| `client` 单元测试 | 81 | QUIC 建连与口令握手、插件（http_proxy / socks5 / static_file）、健康检查状态机、打洞编排、`NewProxy` 字段映射（含与官方 frpc 抓包逐字节对拍）、服务端下发名 → 本地代理的翻译（`resolve_uploaded_proxy`）、**动态代理表**、**store 落盘与损坏文件容错**、**本地管理界面的路由与本地校验**、**PROXY 头注入** |
+| `server` 端到端集成测试 | 18 | 真握手 + 真转发的 TCP / HTTP / stcp / QUIC 链路、**v1 与 v2 双协议握手**、group 负载均衡、面板鉴权边界、**SUDP 端到端（visitor→provider 的 UdpPacket 往返）**、**KCP 传输上的完整控制连接 + 多会话共端口** |
 
 CI（`.github/workflows/ci.yml`）在每次 push / PR 上跑：`cargo fmt --check` +
 `cargo clippy -- -D warnings` → **Linux / Windows / macOS** 三个系统的全量测试 →
@@ -1245,6 +1426,13 @@ cargo build --release --target aarch64-unknown-linux-gnu
   不认识这些扩展 —— 官方 frpc 连上来时按普通 token 客户端处理，不会因为对方不支持而失败。
 - 客户端 `[store]` 的落盘格式是 NFrp 自己的 JSON，**与官方 frp 的 store 不通用**
   （官方是 Go `configmgmt` 的序列化结构），从官方 frpc 迁移过来需要重新加一遍动态代理。
+- **仍有若干官方配置字段未实现**（客户端侧 17 项、服务端侧 18 项，例如
+  `useEncryption` / `useCompression` / `userConnTimeout` / `udpPacketSize` /
+  `quicBindPort` / `assetsDir` / `disablePrintColor` / `httpPlugins` 等）。
+  这些字段**不会让解析报错，但也不会生效** —— 启动日志会以 WARN 逐条列出
+  "官方支持、nfrp 未实现"的字段名，看到告警就去查这一项是不是你想要的效果。
+  （v0.5.1 已把其中 7 项落地：`allowPorts` / `maxPortsPerClient` /
+  `detailedErrorsToClient` / `vhostHTTPTimeout` / `custom404Page` / `log.to` / `log.maxDays`。）
 
 ## License
 

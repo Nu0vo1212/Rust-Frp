@@ -916,6 +916,355 @@ async fn http_vhost_routes_by_host_header() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// tcpmux（HTTP CONNECT 复用）
+// ---------------------------------------------------------------------------
+
+/// 一个"回自己标签"的极简 HTTP 服务：读完一条请求，回 `tag:<请求行>`。
+async fn tagged_http_backend(tag: &'static str) -> SocketAddr {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let first = req.lines().next().unwrap_or("").to_string();
+                let body = format!("{tag}:{first}");
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    addr
+}
+
+/// 模拟 frpc 的 provider：按 `StartWorkConn.proxy_name` 选内网地址。
+///
+/// ★ 与真实 frpc 一样要**按线上全名反查本地表**：服务端下发的是
+/// `{user}.{name}`，本地表是按原始名建的（这一条踩过三次）。
+fn spawn_provider_multi(
+    mut conn: FrpConn,
+    port: u16,
+    run_id: String,
+    backends: std::collections::HashMap<String, SocketAddr>,
+) {
+    tokio::spawn(async move {
+        while let Ok(Some(msg)) = conn.recv_msg().await {
+            if matches!(msg, FrpMessage::ReqWorkConn) {
+                let run = run_id.clone();
+                let backends = backends.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = serve_work_conn_named(port, &run, &backends).await {
+                        eprintln!("工作连接出错：{e:#}");
+                    }
+                });
+            }
+        }
+    });
+}
+
+async fn serve_work_conn_named(
+    port: u16,
+    run_id: &str,
+    backends: &std::collections::HashMap<String, SocketAddr>,
+) -> anyhow::Result<()> {
+    let stream = TcpStream::connect(("127.0.0.1", port)).await?;
+    let ts = util::now_unix_secs() as i64;
+    let (mut work, leftover, start) =
+        conn::client_work_conn(Box::pin(stream), WireVersion::V2, run_id, TOKEN, ts).await?;
+    let short = start
+        .proxy_name
+        .rsplit_once('.')
+        .map(|(_, n)| n)
+        .unwrap_or(&start.proxy_name);
+    let local = backends
+        .get(short)
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("没有名为 {short} 的后端"))?;
+    let mut dst = TcpStream::connect(local).await?;
+    if !leftover.is_empty() {
+        dst.write_all(&leftover).await?;
+    }
+    util::relay_between(&mut work, &mut dst).await?;
+    Ok(())
+}
+
+/// 读一个 `\r\n\r\n` 结尾的 HTTP 头块。
+async fn read_http_head(s: &mut TcpStream) -> String {
+    let mut got = Vec::new();
+    let mut b = [0u8; 1024];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut b))
+            .await
+            .expect("读响应超时")
+            .expect("读响应出错");
+        assert!(
+            n > 0,
+            "还没读到完整头块连接就断了：{:?}",
+            String::from_utf8_lossy(&got)
+        );
+        got.extend_from_slice(&b[..n]);
+        if got.windows(4).any(|w| w == b"\r\n\r\n") {
+            return String::from_utf8_lossy(&got).to_string();
+        }
+    }
+}
+
+/// 走一次完整的 CONNECT 隧道：发 CONNECT → 读 200 → 发请求 → 读回响应体。
+/// 返回 `(CONNECT 的响应头, 隧道里拿到的响应)`。
+async fn tcpmux_roundtrip(port: u16, host: &str, auth: Option<(&str, &str)>) -> (String, String) {
+    let mut s = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("连接 tcpmux 端口");
+    let auth_line = match auth {
+        Some((u, p)) => {
+            use base64::{engine::general_purpose::STANDARD, Engine as _};
+            format!(
+                "Proxy-Authorization: Basic {}\r\n",
+                STANDARD.encode(format!("{u}:{p}"))
+            )
+        }
+        None => String::new(),
+    };
+    s.write_all(format!("CONNECT {host}:80 HTTP/1.1\r\n{auth_line}\r\n").as_bytes())
+        .await
+        .unwrap();
+    let connect_resp = read_http_head(&mut s).await;
+    if !connect_resp.starts_with("HTTP/1.1 200") {
+        return (connect_resp, String::new());
+    }
+    s.write_all(format!("GET /x HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).await.unwrap();
+    (connect_resp, String::from_utf8_lossy(&raw).to_string())
+}
+
+/// ★ tcpmux 的核心：同一个共享端口上，靠 CONNECT 的 **authority** 选域名、
+/// 靠 `Proxy-Authorization` 的用户名选**同域名下的哪一条代理**。
+///
+/// 拓扑照抄官方 e2e（`test/e2e/v1/basic/tcpmux.go` 的 "Route by HTTP user"）：
+/// `normal.example.com` 上挂 user1 / user2 两条精确路由 + 一条不限用户的兜底。
+#[tokio::test]
+async fn tcpmux_routes_by_authority_and_http_user() {
+    let foo = tagged_http_backend("foo").await;
+    let bar = tagged_http_backend("bar").await;
+    let other = tagged_http_backend("other").await;
+
+    let mut cfg = base_cfg();
+    cfg.tcpmux_http_connect_port = Some(free_port());
+    let mux_port = cfg.tcpmux_http_connect_port.unwrap();
+    let port = start_server(cfg).await;
+
+    let (mut conn, run_id) = login(port, TOKEN, "web").await;
+    for (name, user) in [("foo", "user1"), ("bar", "user2"), ("catchAll", "")] {
+        let resp = register_proxy(
+            &mut conn,
+            NewProxy {
+                proxy_name: name.into(),
+                proxy_type: "tcpmux".into(),
+                custom_domains: vec!["normal.example.com".into()],
+                multiplexer: "httpconnect".into(),
+                route_by_http_user: user.into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(
+            resp.error.is_empty(),
+            "tcpmux {name} 注册失败：{}",
+            resp.error
+        );
+        assert!(
+            resp.remote_addr.contains("normal.example.com"),
+            "remote_addr 该告诉用户域名 + 端口：{}",
+            resp.remote_addr
+        );
+    }
+    let mut backends = std::collections::HashMap::new();
+    backends.insert("foo".to_string(), foo);
+    backends.insert("bar".to_string(), bar);
+    backends.insert("catchAll".to_string(), other);
+    spawn_provider_multi(conn, port, run_id, backends);
+
+    // user1 / user2 各自命中自己的代理
+    let (head, resp) = tcpmux_roundtrip(mux_port, "normal.example.com", Some(("user1", ""))).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "隧道没建起来：{head}");
+    assert!(resp.contains("foo:GET /x"), "user1 该到 foo：{resp}");
+
+    let (_, resp) = tcpmux_roundtrip(mux_port, "normal.example.com", Some(("user2", ""))).await;
+    assert!(resp.contains("bar:GET /x"), "user2 该到 bar：{resp}");
+
+    // 没登记过的用户名 / 不带凭证 -> 落到不限用户的兜底那条
+    let (_, resp) = tcpmux_roundtrip(mux_port, "normal.example.com", Some(("user3", ""))).await;
+    assert!(resp.contains("other:GET /x"), "user3 该落到兜底：{resp}");
+    let (_, resp) = tcpmux_roundtrip(mux_port, "normal.example.com", None).await;
+    assert!(resp.contains("other:GET /x"), "不带凭证该落到兜底：{resp}");
+
+    // 没注册的域名 -> 404（而且要在隧道建成**之前**就拒掉）
+    let (head, _) = tcpmux_roundtrip(mux_port, "nope.example.com", None).await;
+    assert!(
+        head.starts_with("HTTP/1.1 404"),
+        "未注册域名该回 404：{head}"
+    );
+}
+
+/// `httpUser` / `httpPassword`：认证不通过就**只回一个 407**，不能先给 200。
+///
+/// ★ 这里是对官方的**有意偏离**：官方 `Muxer.handle` 先 `successHook`（回 200）
+/// 再 `checkAuth`，密码错时会先收到 200、再收到一个 407 —— 对 curl 这类客户端
+/// 来说隧道已经"建立成功"，那个 407 会被当成隧道里的数据。协议上应该先拒。
+#[tokio::test]
+async fn tcpmux_proxy_auth_returns_407_before_ok() {
+    let foo = tagged_http_backend("foo").await;
+    let mut cfg = base_cfg();
+    cfg.tcpmux_http_connect_port = Some(free_port());
+    let mux_port = cfg.tcpmux_http_connect_port.unwrap();
+    let port = start_server(cfg).await;
+
+    let (mut conn, run_id) = login(port, TOKEN, "web").await;
+    let resp = register_proxy(
+        &mut conn,
+        NewProxy {
+            proxy_name: "secure".into(),
+            proxy_type: "tcpmux".into(),
+            custom_domains: vec!["normal.example.com".into()],
+            multiplexer: "httpconnect".into(),
+            http_user: "test".into(),
+            http_pwd: "test".into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(resp.error.is_empty(), "注册失败：{}", resp.error);
+    let mut backends = std::collections::HashMap::new();
+    backends.insert("secure".to_string(), foo);
+    spawn_provider_multi(conn, port, run_id, backends);
+
+    // 不带凭证
+    let (head, _) = tcpmux_roundtrip(mux_port, "normal.example.com", None).await;
+    assert!(head.starts_with("HTTP/1.1 407"), "没凭证该回 407：{head}");
+    assert!(
+        head.contains("Proxy-Authenticate"),
+        "407 必须带 Proxy-Authenticate：{head}"
+    );
+
+    // 密码错
+    let (head, _) = tcpmux_roundtrip(mux_port, "normal.example.com", Some(("test", "bad"))).await;
+    assert!(head.starts_with("HTTP/1.1 407"), "密码错该回 407：{head}");
+
+    // 对了才放行
+    let (head, resp) =
+        tcpmux_roundtrip(mux_port, "normal.example.com", Some(("test", "test"))).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "凭证对却没过：{head}");
+    assert!(resp.contains("foo:GET /x"), "{resp}");
+}
+
+/// `tcpmuxPassthrough = true`：连 CONNECT 请求本身都转发给内网服务，
+/// 由内网服务自己回 200 —— 适合内网本身就是 HTTP 代理的场景。
+#[tokio::test]
+async fn tcpmux_passthrough_hands_the_connect_request_to_the_backend() {
+    // 后端自己读 CONNECT、自己回 200，然后把后面的字节原样回吐
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend = l.local_addr().unwrap();
+    let seen = Arc::new(tokio::sync::Mutex::new(String::new()));
+    let seen_bg = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            let seen = seen_bg.clone();
+            tokio::spawn(async move {
+                let head = read_http_head(&mut s).await;
+                *seen.lock().await = head;
+                let _ = s
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+                let mut buf = [0u8; 64];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let _ = s.write_all(&buf[..n]).await;
+            });
+        }
+    });
+
+    let mut cfg = base_cfg();
+    cfg.tcpmux_http_connect_port = Some(free_port());
+    cfg.tcpmux_passthrough = true;
+    let mux_port = cfg.tcpmux_http_connect_port.unwrap();
+    let port = start_server(cfg).await;
+
+    let (mut conn, run_id) = login(port, TOKEN, "web").await;
+    let resp = register_proxy(
+        &mut conn,
+        NewProxy {
+            proxy_name: "raw".into(),
+            proxy_type: "tcpmux".into(),
+            custom_domains: vec!["normal.example.com".into()],
+            multiplexer: "httpconnect".into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(resp.error.is_empty(), "注册失败：{}", resp.error);
+    let mut backends = std::collections::HashMap::new();
+    backends.insert("raw".to_string(), backend);
+    spawn_provider_multi(conn, port, run_id, backends);
+
+    let mut s = TcpStream::connect(("127.0.0.1", mux_port)).await.unwrap();
+    s.write_all(b"CONNECT normal.example.com:80 HTTP/1.1\r\n\r\n")
+        .await
+        .unwrap();
+    let head = read_http_head(&mut s).await;
+    assert!(
+        head.starts_with("HTTP/1.1 200"),
+        "后端回的 200 没透回来：{head}"
+    );
+    s.write_all(b"frp").await.unwrap();
+    let mut buf = [0u8; 3];
+    tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut buf))
+        .await
+        .expect("等回显超时")
+        .expect("读回显失败");
+    assert_eq!(&buf, b"frp");
+
+    let got = seen.lock().await.clone();
+    assert!(
+        got.starts_with("CONNECT normal.example.com:80 HTTP/1.1"),
+        "透传模式下内网服务该收到原始的 CONNECT 请求：{got:?}"
+    );
+}
+
+/// 服务端没配 `tcpmuxHTTPConnectPort` 时，注册 tcpmux 代理必须**明确报错**，
+/// 而不是"注册成功但永远连不通"。
+#[tokio::test]
+async fn tcpmux_registration_fails_without_the_server_port() {
+    let cfg = base_cfg();
+    assert!(cfg.tcpmux_http_connect_port.is_none());
+    let port = start_server(cfg).await;
+    let (mut conn, _run_id) = login(port, TOKEN, "web").await;
+    let resp = register_proxy(
+        &mut conn,
+        NewProxy {
+            proxy_name: "mux".into(),
+            proxy_type: "tcpmux".into(),
+            custom_domains: vec!["a.example.com".into()],
+            multiplexer: "httpconnect".into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        resp.error.contains("tcpmux_http_connect_port"),
+        "报错要说清楚差哪个配置：{}",
+        resp.error
+    );
+}
+
 /// QUIC 传输：同样的 frp 协议，跑在 QUIC 上而不是 TCP 上。
 ///
 /// 这条用例证明 QUIC 真的能承载完整链路（控制连接 + 工作连接 + 数据往返），

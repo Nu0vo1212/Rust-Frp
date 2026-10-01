@@ -48,6 +48,11 @@ pub async fn resolve_host_port(host: &str, port: u16) -> Result<SocketAddr> {
 /// 初始化 `tracing` 订阅者。
 ///
 /// 优先级：环境变量 `RUST_LOG` > 配置里的 `log_level` > `info`。
+///
+/// `log_to` / `max_days` 对应官方 frp 的 `[log] to` / `[log] maxDays`：
+/// `to` 为空或 `console`（默认）时写控制台，否则写文件并按天轮转。
+/// 详见 [`crate::logfile`]。
+///
 /// 日志要不要带 ANSI 颜色转义码。
 ///
 /// 只在**输出是终端**时才上色。这一点对第三方启动器很关键：NetTool 之类
@@ -60,15 +65,27 @@ fn ansi_enabled() -> bool {
     std::io::stdout().is_terminal()
 }
 
-pub fn init_tracing(default_level: &str) {
+/// 按配置装配一个订阅者，落到控制台或日志文件。
+///
+/// 上色只在**输出是终端**时才开：写文件时开关颜色没有意义，只会往文件里
+/// 塞 `\x1b[` 转义码（官方 `disableLogColor` 的默认行为也是写文件不上色）。
+pub fn init_tracing(default_level: &str, log_to: &str, max_days: i64) {
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(default_level))
         .unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_ansi(ansi_enabled())
-        .init();
+    match crate::logfile::sink_from_config(log_to, max_days) {
+        Some(sink) => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_ansi(false)
+            .with_writer(sink)
+            .init(),
+        None => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_ansi(ansi_enabled())
+            .init(),
+    }
 }
 
 /// 可以在运行时替换日志级别的热重载句柄。
@@ -79,7 +96,11 @@ pub type LogFilterHandle =
     tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>;
 
 /// 与 [`init_tracing`] 相同，但额外返回一个热重载句柄。
-pub fn init_tracing_reloadable(default_level: &str) -> Option<LogFilterHandle> {
+pub fn init_tracing_reloadable(
+    default_level: &str,
+    log_to: &str,
+    max_days: i64,
+) -> Option<LogFilterHandle> {
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(default_level))
         .unwrap_or_else(|_| EnvFilter::new("info"));
@@ -87,14 +108,25 @@ pub fn init_tracing_reloadable(default_level: &str) -> Option<LogFilterHandle> {
     use tracing_subscriber::util::SubscriberInitExt as _;
 
     let (layer, handle) = tracing_subscriber::reload::Layer::new(filter);
-    tracing_subscriber::registry()
-        .with(layer)
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_target(false)
-                .with_ansi(ansi_enabled()),
-        )
-        .init();
+    match crate::logfile::sink_from_config(log_to, max_days) {
+        Some(sink) => tracing_subscriber::registry()
+            .with(layer)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_target(false)
+                    .with_ansi(false)
+                    .with_writer(sink),
+            )
+            .init(),
+        None => tracing_subscriber::registry()
+            .with(layer)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_target(false)
+                    .with_ansi(ansi_enabled()),
+            )
+            .init(),
+    }
     Some(handle)
 }
 

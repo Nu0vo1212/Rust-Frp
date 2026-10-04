@@ -49,7 +49,7 @@ impl Monitor {
             // 键用**配置里的原始 `name`**（不带 `{user}.` 前缀）。
             // 服务端回包里的名字前缀策略各实现不一致，统一在这里剥掉再查。
             let wire = p.name.clone();
-            m.states.lock().unwrap().insert(wire.clone(), State::new());
+            m.lock().insert(wire.clone(), State::new());
 
             let mon = m.clone();
             let p = p.clone();
@@ -72,17 +72,12 @@ impl Monitor {
 
     /// 该代理现在能提供服务吗？没配健康检查的永远返回 true。
     pub fn is_healthy(&self, proxy: &str) -> bool {
-        self.states
-            .lock()
-            .unwrap()
-            .get(proxy)
-            .map(|s| s.healthy)
-            .unwrap_or(true)
+        self.lock().get(proxy).map(|s| s.healthy).unwrap_or(true)
     }
 
     /// 记录一次探测结果；**只在状态翻转时打日志**，否则日志会被探测刷屏。
     fn record(&self, wire: &str, name: &str, ok: bool, max_failed: u32) {
-        let mut g = self.states.lock().unwrap();
+        let mut g = self.lock();
         let st = g.entry(wire.to_string()).or_default();
         let was = st.healthy;
         if ok {
@@ -103,6 +98,19 @@ impl Monitor {
         } else if !was && st.healthy {
             info!(proxy = %name, "健康检查恢复，重新提供服务");
         }
+    }
+
+    /// 取状态表的锁；**锁被 poison 时照用不误**。
+    ///
+    /// 这里原先直接 `.unwrap()`。危害不在于"当场 panic"，而在于 panic 之后：
+    /// 一旦某个持锁者 panic 把锁写脏，**后续每一次**探测/查询都会 panic。
+    /// 探测任务跑在 `tokio::spawn` 里，panic 表现为任务静默消失 ——
+    /// 而 `is_healthy` 那侧因为 `.unwrap_or(true)` 会退化成"永远健康"，
+    /// 于是故障被彻底掩盖：隧道明明已经不通，界面和日志都说没事。
+    ///
+    /// 与 `store.rs` / `registry.rs` 的处理方式保持一致。
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, State>> {
+        self.states.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 

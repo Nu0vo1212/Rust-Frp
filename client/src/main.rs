@@ -319,6 +319,14 @@ async fn main() -> Result<()> {
     // `port` 为 0（默认）时整段都不执行：不绑端口、不起任务，
     // 与没有这个功能的版本**完全一致**。
     let hub = if cfg.web_server.is_enabled() {
+        // ★ 安全检查必须在 **bind 之前**。
+        //
+        // 非回环 + 无凭据 = 任何能访问这个端口的人都能增删隧道、直接停止
+        // 客户端。原先只打一条 warn 就放行。
+        //
+        // 这里必须 `bail!` 而不是"起了任务再在里面 return" —— 那样端口已经
+        // 绑上了、监听已经在跑，日志写着"已拒绝启动"而实际开着，比不检查更糟。
+        check_web_server_is_safe(&cfg)?;
         let addr = format!("{}:{}", cfg.web_server.addr, cfg.web_server.port);
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
@@ -493,6 +501,33 @@ fn cmd_verify(a: &VerifyArgs) -> Result<()> {
             std::process::exit(1);
         }
     }
+}
+
+/// 启动前检查 `[webServer]` 的鉴权配置是否安全。
+///
+/// **必须在 bind 之前调用** —— 这是"拒绝启动"与"起了一半"的分界：
+/// 端口一旦绑上，管理界面就已经在服务了，此时再 `return` 只会留下
+/// "日志说拒绝了、端口却开着"的误导状态。
+///
+/// 规则：监听非回环地址时**必须**配 `user`/`password`，除非显式写
+/// `allowInsecureRemote = true` 表明知情。回环地址上留空是允许的
+/// （默认值就是 127.0.0.1，只有本机能连）。
+fn check_web_server_is_safe(cfg: &ClientConfig) -> Result<()> {
+    if cfg.web_server.user.trim().is_empty()
+        && !nfrp_common::util::is_loopback_addr(&cfg.web_server.addr)
+        && !cfg.web_server.allow_insecure_remote
+    {
+        bail!(
+            "管理界面配置为监听 {}:{} 却没有配置 user/password —— \
+             任何能访问这个端口的人都能增删你的隧道、并可直接停止客户端。\n\
+             请二选一：① 配置 [webServer] user + password；\
+             ② 把 addr 改回 127.0.0.1；\
+             ③ 确实要裸奔就显式写 allowInsecureRemote = true（自担风险）。",
+            cfg.web_server.addr,
+            cfg.web_server.port
+        );
+    }
+    Ok(())
 }
 
 /// 从配置的 `[webServer]` 取本地管理界面地址。
@@ -1156,6 +1191,17 @@ fn add_proxy_cmd(
     if p.proxy_type.is_empty() {
         anyhow::bail!("代理配置缺少 type");
     }
+    // ★ 服务端下发的配置**不能**只查 name/type 就照单全收。
+    //
+    // 走配置文件的代理要过类型 / 插件 / tcpmux 三道校验，而这条路径原先
+    // 一道都不过。更要命的是 `ProxyConfig` 里混着「本机资源字段」——
+    // `plugin_local_path`（读哪个文件）、`plugin_local_addr`（连哪个内网地址）、
+    // `plugin_crt_path` / `plugin_key_path`（读哪对证书）。服务端能下发这些，
+    // 就等于让它决定客户端去读本机哪个文件、连内网哪个地址。
+    //
+    // `is_remote = true` ⇒ 上述本机资源字段一律拒绝；类型/插件/tcpmux 照常校验。
+    nfrp_common::config::validate_remote_proxy(&p, true)
+        .map_err(|e| anyhow::anyhow!("服务端下发的代理配置未通过校验：{e}"))?;
     let name = p.name.clone();
     let existed = proxies.insert(p.clone()).is_some();
     if existed {
@@ -1340,6 +1386,42 @@ mod tests {
 
     /// 测试里统一用的 `user`（真实场景就是 Lolia 那份配置里的 `user = '2569'`）。
     const USER: &str = "alice";
+
+    /// ★ 回归测试：管理界面监听非回环却不配凭据，必须**拒绝启动**。
+    ///
+    /// 原先只打一条 warn 就放行 ⇒ 任何能访问该端口的人都能增删隧道、
+    /// 直接停止客户端。而且这个检查必须在 bind **之前** —— 否则端口已经
+    /// 在服务了，日志说拒绝了也没用。
+    #[test]
+    fn 管理界面对外监听却不配凭据必须拒绝启动() {
+        let mut cfg = ClientConfig::default();
+        cfg.web_server.port = 7400;
+        cfg.web_server.addr = "0.0.0.0".into();
+        let e = check_web_server_is_safe(&cfg)
+            .expect_err("必须拒绝启动")
+            .to_string();
+        assert!(e.contains("user"), "错误里要点名该怎么修：{e}");
+
+        // 配了用户名就能起
+        cfg.web_server.user = "admin".into();
+        cfg.web_server.password = "pw".into();
+        assert!(check_web_server_is_safe(&cfg).is_ok());
+
+        // 或者显式声明知情
+        cfg.web_server.user.clear();
+        cfg.web_server.allow_insecure_remote = true;
+        assert!(check_web_server_is_safe(&cfg).is_ok());
+    }
+
+    /// 绑回环时不配凭据是合法的（默认配置就是这样），不能误伤。
+    #[test]
+    fn 管理界面只监听回环时不配凭据可以启动() {
+        let mut cfg = ClientConfig::default();
+        cfg.web_server.port = 7400;
+        // 默认 addr 就是 127.0.0.1
+        assert_eq!(cfg.web_server.addr, "127.0.0.1");
+        assert!(check_web_server_is_safe(&cfg).is_ok());
+    }
 
     /// 一个所有字段都填满独特值的 tcp 代理配置。
     fn full_tcp_config() -> ProxyConfig {
@@ -1788,6 +1870,102 @@ bandwidthLimitMode = 'server'
     /// 测试用的"不落盘"的 store（`[store] path` 没配就是它）。
     fn no_store() -> store::Store {
         store::Store::from_config(&ClientConfig::default()).expect("默认配置永远不该失败")
+    }
+
+    /// 造一条带某个插件字段的服务端管理命令。
+    fn add_cmd_with(name: &str, f: impl FnOnce(&mut ProxyConfig)) -> msg::ServerCmd {
+        let mut p = ProxyConfig {
+            name: name.to_string(),
+            proxy_type: "tcp".to_string(),
+            remote_port: 7000,
+            ..Default::default()
+        };
+        f(&mut p);
+        msg::ServerCmd {
+            id: "cmd-1".to_string(),
+            op: msg::CMD_ADD_PROXY.to_string(),
+            proxy_name: name.to_string(),
+            proxy: Some(serde_json::to_value(&p).expect("序列化")),
+            reason: "dashboard".to_string(),
+        }
+    }
+
+    /// ★ 回归测试：服务端**不能**用管理命令让客户端去读任意本机文件。
+    ///
+    /// `pluginLocalPath` 这类本机资源字段只该由本机配置文件指定。放行它的
+    /// 后果是：服务端配一条 `plugin = "static_file"` + `localPath = "/etc"`
+    /// 的代理，就能借公网端口把客户端本机的文件服务出去。
+    /// 这几条字段曾经**完全没有校验**（只查 name/type 非空）。
+    #[tokio::test]
+    async fn 远程下发的_plugin_local_path_必须被拒绝() {
+        for (field, set) in [
+            (
+                "pluginLocalPath",
+                Box::new(|p: &mut ProxyConfig| p.plugin_local_path = "/etc".to_string())
+                    as Box<dyn FnOnce(&mut ProxyConfig)>,
+            ),
+            (
+                "pluginLocalAddr",
+                Box::new(|p: &mut ProxyConfig| {
+                    p.plugin_local_addr = "169.254.169.254:80".to_string()
+                }),
+            ),
+            (
+                "pluginCrtPath",
+                Box::new(|p: &mut ProxyConfig| p.plugin_crt_path = "/etc/shadow".to_string()),
+            ),
+            (
+                "pluginKeyPath",
+                Box::new(|p: &mut ProxyConfig| p.plugin_key_path = "/etc/shadow".to_string()),
+            ),
+        ] {
+            let (mut me, _peer) = cmd_pair();
+            let table = registry::ProxyTable::default();
+            let cmd = add_cmd_with("evil", set);
+            let err = apply_server_cmd(&table, &no_store(), &cmd, &mut me)
+                .await
+                .expect_err(&format!("{field} 必须被拒绝"));
+            let msg = err.to_string();
+            assert!(msg.contains(field), "错误里要点名 {field}：{msg}");
+            assert_eq!(table.len(), 0, "{field} 被拒时不该留下代理");
+        }
+    }
+
+    /// ★ 回归测试：服务端下发**不认识的插件类型**要在解析阶段就被拒。
+    ///
+    /// 原先这条路径一道校验都不过，拼错的插件名能一路溜到运行期，
+    /// 变成"每条工作连接逐个失败"。
+    ///
+    /// 注：v0.5.1 已实现全部 9 个**官方**插件，所以这里用一个官方也没有的名字。
+    #[tokio::test]
+    async fn 远程下发的不认识插件类型必须被拒绝() {
+        let (mut me, _peer) = cmd_pair();
+        let table = registry::ProxyTable::default();
+        let cmd = add_cmd_with("bad-plugin", |p| p.plugin = "totally_made_up".to_string());
+        let err = apply_server_cmd(&table, &no_store(), &cmd, &mut me)
+            .await
+            .expect_err("不认识的插件类型必须被拒绝");
+        assert!(
+            err.to_string().contains("totally_made_up"),
+            "错误里要点名插件：{err}"
+        );
+        assert_eq!(table.len(), 0);
+    }
+
+    /// ★ 回归测试：服务端下发**不受支持的代理类型**要被拒。
+    #[tokio::test]
+    async fn 远程下发的不支持代理类型必须被拒绝() {
+        let (mut me, _peer) = cmd_pair();
+        let table = registry::ProxyTable::default();
+        let cmd = add_cmd_with("bad-type", |p| p.proxy_type = "not-a-thing".to_string());
+        let err = apply_server_cmd(&table, &no_store(), &cmd, &mut me)
+            .await
+            .expect_err("不支持的代理类型必须被拒绝");
+        assert!(
+            err.to_string().contains("not-a-thing"),
+            "错误里要点名类型：{err}"
+        );
+        assert_eq!(table.len(), 0);
     }
 
     /// 新增代理：本地表里要真的多出一条，且必须回一条成功回执。

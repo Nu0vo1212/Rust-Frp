@@ -208,6 +208,16 @@ pub struct ClientState {
     backlog_limit: Limit,
     /// 本客户端可注册的代理数上限。
     proxy_limit: Limit,
+    /// 这个客户端的角色是否允许**面板管理**它（RBAC 的 `allowManage`）。
+    ///
+    /// ★ 曾经是死字段：`Role::allow_manage` 从配置读进来、编译进角色，
+    /// 但没有任何生产代码读它 —— 管理员写 `allowManage = false` 以为禁掉了
+    /// 面板增删这个客户端代理的能力，实际照做不误。角色在握手期解析一次，
+    /// 之后就丢了，所以这里随会话存一份。
+    ///
+    /// 用 `AtomicBool` 而不是普通 `bool`：客户端建好之后要由控制连接那边
+    /// 补写（角色是在握手函数内部解析出来的，`ClientState::new` 时还拿不到）。
+    allow_manage: AtomicBool,
 }
 
 impl ClientState {
@@ -241,7 +251,20 @@ impl ClientState {
             conn_limit,
             backlog_limit,
             proxy_limit,
+            // 默认**允许**：未启用 RBAC 时行为必须与老版本完全一致。
+            // 启用 RBAC 后由控制连接按角色覆盖。
+            allow_manage: AtomicBool::new(true),
         }
+    }
+
+    /// 按角色写入"面板能不能管理这个客户端"。握手期解析出角色后立刻调用。
+    pub fn set_allow_manage(&self, allow: bool) {
+        self.allow_manage.store(allow, Ordering::Relaxed);
+    }
+
+    /// 面板能不能管理这个客户端（RBAC 关闭时恒为 true）。
+    pub fn allow_manage(&self) -> bool {
+        self.allow_manage.load(Ordering::Relaxed)
     }
 
     pub fn udp_codec_is_binary(&self) -> bool {

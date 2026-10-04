@@ -238,19 +238,24 @@ impl PunchBus {
         m: NatHoleVisitor,
     ) -> Result<tokio::sync::oneshot::Receiver<NatHoleResp>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.waiters
-            .lock()
-            .unwrap()
-            .insert(m.transaction_id.clone(), tx);
-        self.req_tx
-            .send(m)
-            .map_err(|_| anyhow!("控制连接已关闭，无法发起打洞"))?;
+        let txn = m.transaction_id.clone();
+        self.lock().insert(txn.clone(), tx);
+        if let Err(e) = self.req_tx.send(m) {
+            // ★ 发送失败必须把刚登记的等待者摘掉。
+            //
+            // 原先这里是 `.map_err(...)?` 直接返回，waiters 里那条永远留着了：
+            // 没人会来 deliver 它（请求根本没发出去），也不会有人 remove。
+            // 反复重连/断线会一直累积。`clear()` 只在控制连接断开时兜底，
+            // 而这条路正是"控制连接已经坏了"的场景 —— 兜底赶不上。
+            self.lock().remove(&txn);
+            return Err(anyhow!("控制连接已关闭，无法发起打洞：{e}"));
+        }
         Ok(rx)
     }
 
     /// 主循环收到 `NatHoleResp` 时调用：按 transaction_id 交给等待者。
     pub fn deliver(&self, resp: NatHoleResp) {
-        let waiter = self.waiters.lock().unwrap().remove(&resp.transaction_id);
+        let waiter = self.lock().remove(&resp.transaction_id);
         if let Some(tx) = waiter {
             let _ = tx.send(resp);
         } else {
@@ -260,7 +265,18 @@ impl PunchBus {
 
     /// 控制连接断开时清空等待者，否则对端会一直挂到超时。
     pub fn clear(&self) {
-        self.waiters.lock().unwrap().clear();
+        self.lock().clear();
+    }
+
+    /// 取等待者表的锁；**锁被 poison 时照用不误**（同 `health.rs` / `store.rs`）。
+    ///
+    /// 裸 `unwrap()` 在这里的后果：一旦某个持锁者 panic 把锁写脏，之后每次
+    /// 打洞（`request` / `deliver` / `clear`）都会 panic —— 而它们分别跑在
+    /// 控制连接主循环与工作连接任务里，表现为 P2P 静默失效。
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, tokio::sync::oneshot::Sender<NatHoleResp>>> {
+        self.waiters.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 

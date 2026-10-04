@@ -20,8 +20,11 @@ services:
       - ./assets/frps.toml:/etc/nfrp/frps.toml:ro
     restart: unless-stopped
 
-  # 演示：把本机 22 端口通过 frps 暴露到 6000
-  # 不需要时整段删掉
+  # 演示客户端。★ 注意 `assets/frpc.toml` 里默认有一条**启用**的代理：
+  #   把本机 22 端口（SSH）通过 frps 暴露到 <server>:6000。
+  # 跟着这份 compose 跑起来 = 你的 SSH 就在公网上了。
+  # 不需要的话请把 `assets/frpc.toml` 里第 1 条 `[[proxies]]`（name = "ssh"）
+  # 注释掉，或者整段删掉下面这个 service。
   frpc:
     build: .
     image: nfrp:latest

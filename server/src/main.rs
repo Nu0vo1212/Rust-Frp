@@ -104,7 +104,25 @@ async fn main() -> Result<()> {
         cfg.token = token.clone();
     }
     if cfg.token.is_empty() {
-        tracing::warn!("未配置 token：任何人都能连接本服务端，强烈建议设置");
+        // 空 token = 不做认证，这是官方 frp 的行为（靠网络隔离兜底），
+        // 不能改成拒绝启动 —— 那会破坏一大票内网部署。但要把话说全：
+        // 只写"建议设置"的话，用户看不出"绑在 0.0.0.0 上"意味着什么。
+        if nfrp_common::util::is_loopback_addr(&cfg.bind_addr) {
+            tracing::warn!(
+                "未配置 token：任何人只要能连上 {}:{} 就能使用本服务端（当前只监听回环，仅本机可达）",
+                cfg.bind_addr,
+                cfg.frp_bind_port()
+            );
+        } else {
+            tracing::warn!(
+                "未配置 token 且监听在对外地址 {}：**任何人**都能连上 {}:{} 并注册代理、\
+                 申请公网端口 —— 等于把你的服务器开放成一个公共内网穿透节点。\
+                 请设置 token，或用 [acl] 限制来源 IP。",
+                cfg.bind_addr,
+                cfg.bind_addr,
+                cfg.frp_bind_port()
+            );
+        }
     }
 
     let level = cli
@@ -136,6 +154,25 @@ async fn main() -> Result<()> {
         tracing::info!(
             "allowPorts 已生效：客户端只能申请这些远端端口 {}",
             nfrp_common::config::format_port_ranges(&cfg.allow_ports)
+        );
+    }
+
+    // ★ RBAC 的经典陷阱：配了 [[roles]] 却忘了 denyUnknown。
+    //
+    // 此时**没匹配到任何角色**的用户会拿到 `unrestricted`（全权）——
+    // 因为 `role_for` 里那条分支是为了"老配置不启用 RBAC 时行为不变"而留的。
+    // 但一旦你写了角色表，本意显然是"只有名单里的人能用"，于是拼错用户名、
+    // 或者某个新同事还没加进名单，都能拿到**比任何角色都大的权限**。
+    //
+    // 这个默认值不能直接改（会破坏"配了角色表但想放行其余人"的合法用法），
+    // 但可以明确告警，把"你以为的限制"和"实际的行为"对齐。
+    if !cfg.roles.is_empty() && !cfg.deny_unknown && cfg.default_role.is_empty() {
+        tracing::warn!(
+            "配置了 {} 个 [[roles]] 角色，但既没写 denyUnknown 也没写 defaultRole —— \
+             **没匹配到任何角色**的用户会拿到不受限的全权角色（可以注册任意类型代理、\
+             占任意端口）。如果本意是「只有名单里的人能用」，请加 denyUnknown = true；\
+             如果想给其他人一个受限角色，请加 defaultRole = \"<角色名>\"。",
+            cfg.roles.len()
         );
     }
     if cfg.max_ports_per_client > 0 {
@@ -204,6 +241,39 @@ fn validate(cfg: &ServerConfig) -> Result<()> {
             cfg.max_total_conns
         );
     }
+
+    // ---- 面板鉴权：对外监听时**必须**配 dashboard_user ----
+    //
+    // 原先只要 `dashboard_user` 为空，`dashboard.rs` 就整块跳过鉴权。而面板
+    // 跟随 `bind_addr` —— 默认 `0.0.0.0` ⇒ 面板端口一旦配了就是**公网可写**：
+    // 匿名者能读 `/api/status`（全部客户端、代理名、端口、流量），能
+    // `POST /api/clients/kick` 踢掉任意客户端（这条连能力协商都不需要，
+    // 无条件生效），若目标客户端是 nfrp 自研的还能 `POST /api/proxies/add`
+    // 直接开公网端口。已实测复现过。
+    //
+    // 所以：绑非回环 + 没配用户名 ⇒ **拒绝启动**，而不是只打一条 warn 让人
+    // 从日志里自己发现。真要裸奔（比如面板只在跳板机能到的内网里），
+    // 显式写 `allow_insecure_dashboard = true` 表明是知情选择。
+    if cfg.dashboard_port.is_some() && cfg.dashboard_user.trim().is_empty() {
+        let loopback = nfrp_common::util::is_loopback_addr(&cfg.bind_addr);
+        if loopback {
+            tracing::warn!(
+                "面板未配置 dashboard_user —— 当前只监听回环地址 {}，仅本机可访问。",
+                cfg.bind_addr
+            );
+        } else {
+            anyhow::ensure!(
+                cfg.allow_insecure_dashboard,
+                "面板端口 {} 配在了非回环地址 {}，但没有配置 dashboard_user —— \
+                 这会让匿名者可以读面板、踢掉任意客户端、并（对 nfrp 客户端）直接开公网端口。\n\
+                 请二选一：① 配置 dashboard_user + dashboard_pwd；\
+                 ② 把 bind_addr 设成 127.0.0.1 只让本机访问；\
+                 ③ 确实要裸奔就显式写 allow_insecure_dashboard = true（自担风险）。",
+                cfg.dashboard_port.unwrap_or_default(),
+                cfg.bind_addr
+            );
+        }
+    }
     Ok(())
 }
 
@@ -251,5 +321,47 @@ mod tests {
         c.max_total_conns = 10;
         c.max_conns_per_client = 999;
         assert!(validate(&c).is_ok(), "这只是浪费配额，不是错误");
+    }
+
+    /// ★ 回归测试：面板配在非回环地址上却不配用户名，必须**拒绝启动**。
+    ///
+    /// 这是实测复现过的漏洞：`dashboard_user` 为空 ⇒ `dashboard.rs` 整块
+    /// 跳过鉴权 ⇒ 匿名者能读 `/api/status`、踢掉任意客户端、并对 nfrp
+    /// 客户端直接开公网端口。
+    #[test]
+    fn 面板对外监听却不配用户名必须拒绝启动() {
+        let mut c = cfg();
+        c.dashboard_port = Some(17500);
+        c.bind_addr = "0.0.0.0".into();
+        // 用户名留空
+        let e = validate(&c).expect_err("必须拒绝启动").to_string();
+        assert!(e.contains("dashboard_user"), "错误里要点名配置项：{e}");
+
+        // 补上用户名就能起
+        c.dashboard_user = "admin".into();
+        c.dashboard_pwd = "s3cret".into();
+        assert!(validate(&c).is_ok());
+
+        // 或者显式声明"我知道风险"
+        c.dashboard_user.clear();
+        c.allow_insecure_dashboard = true;
+        assert!(validate(&c).is_ok());
+    }
+
+    /// 绑回环时留空用户名是允许的（只有本机能连），不该拦。
+    #[test]
+    fn 面板只监听回环时留空用户名可以启动() {
+        let mut c = cfg();
+        c.dashboard_port = Some(17500);
+        c.bind_addr = "127.0.0.1".into();
+        assert!(validate(&c).is_ok());
+    }
+
+    /// 压根没配面板端口时，上面那条规则不该生效。
+    #[test]
+    fn 没配面板端口时用户名留空不影响启动() {
+        let c = cfg();
+        assert!(c.dashboard_port.is_none());
+        assert!(validate(&c).is_ok());
     }
 }

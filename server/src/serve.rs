@@ -168,7 +168,7 @@ pub async fn serve_on_with(
             "已启用"
         }
     );
-    log_limits(&registry);
+    log_limits(&registry, &cfg);
 
     // HTTP / HTTPS / tcpmux 虚拟主机端口（各自可选）
     if cfg.vhost_http_port.is_some()
@@ -236,6 +236,21 @@ pub async fn serve_on_with(
             Some((cfg.dashboard_user.clone(), cfg.dashboard_pwd.clone()))
         }));
     if let Some(dport) = cfg.dashboard_port {
+        // 防御性兜底：`validate()` 已经在启动路径上拦过一次，但这里再挡一次 ——
+        // `serve_with` 是所有启动方式的必经之地（包括将来新加的加载路径、
+        // 以及嵌进别的宿主程序时直接调它的场景）。面板无鉴权 + 非回环 =
+        // 匿名者可写，这条不能只靠上游校验。
+        if cfg.dashboard_user.trim().is_empty()
+            && !nfrp_common::util::is_loopback_addr(&cfg.bind_addr)
+            && !cfg.allow_insecure_dashboard
+        {
+            anyhow::bail!(
+                "拒绝启动面板：bind_addr = {:?} 是对外地址，但没有配置 dashboard_user。\
+                 要么配用户名密码，要么把 bind_addr 改成 127.0.0.1，\
+                 要么显式写 allow_insecure_dashboard = true。",
+                cfg.bind_addr
+            );
+        }
         let addr = util::resolve_addr(&format!("{}:{}", cfg.bind_addr, dport))
             .await
             .with_context(|| format!("解析面板地址 {}:{} 失败", cfg.bind_addr, dport))?;
@@ -401,14 +416,25 @@ pub async fn serve_on_with(
     Ok(())
 }
 
-fn log_limits(registry: &Registry) {
+fn log_limits(registry: &Registry, cfg: &ServerConfig) {
     let l = registry.limits();
     if !l.max_total_conns.gt(&0)
         && !l.max_clients.gt(&0)
         && !l.max_conns_per_client.gt(&0)
         && !l.max_proxies_per_client.gt(&0)
     {
-        warn!("未配置任何资源上限：单个客户端即可耗尽服务端连接/代理配额");
+        // 对外监听时把后果说具体：这条 warn 原来只说"能耗尽配额"，
+        // 用户看不出它跟"我把端口开在公网上"有什么关系。
+        if nfrp_common::util::is_loopback_addr(&cfg.bind_addr) {
+            warn!("未配置任何资源上限：单个客户端即可耗尽服务端连接/代理配额");
+        } else {
+            warn!(
+                "未配置任何资源上限，且监听在对外地址 {}：**任何**能连上本端口的人\
+                 （未配 token 时就是字面意义上的任何人）都可以不断建连接 / 占代理名额，\
+                 把服务端拖垮。对外提供服务时建议至少配 max_clients 与 max_total_conns。",
+                cfg.bind_addr
+            );
+        }
     } else if l.max_total_conns > 0 || l.max_conns_per_client > 0 {
         info!(
             "资源上限：全局连接 {} / 客户端数 {} / 单客户端连接 {} / 排队 {} / 代理数 {}（0 = 不限）",
@@ -711,6 +737,11 @@ async fn handle_control(
         backlog_limit,
         proxy_limit,
     ));
+    // 角色的 `allowManage` 在这里落地：面板能不能增删这个客户端的代理。
+    // 角色是在握手函数内部解析出来的，`ClientState::new` 时还拿不到，
+    // 所以补写一次。未启用 RBAC 时 role 是 unrestricted（allow_manage = true），
+    // 行为与老版本完全一致。
+    client.set_allow_manage(role.allow_manage);
 
     // 客户端数上限：超出时明确拒绝并带上 reason，方便排查
     let _client_slot = match registry.insert(client.clone()) {
@@ -778,7 +809,9 @@ async fn handle_control(
                         //
                         // 放在 register_proxy **之前**：注册会真的去占端口、
                         // 建 vhost 路由，先拦下来才不会有"拒绝了一半"的状态。
-                        if let Err(e) = sec.check_proxy(&role, &name, &m.proxy_type, port) {
+                        if let Err(e) =
+                            sec.check_proxy(&role, &name, &m.proxy_type, port, client.proxy_count())
+                        {
                             registry.metrics().proxy_failures.inc();
                             registry.audit().record(
                                 crate::audit::AuditEvent::new(

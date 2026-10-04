@@ -187,6 +187,14 @@ impl Hub {
         if p.proxy_type.trim().is_empty() {
             return Err("缺少 type".to_string());
         }
+        // 类型 / 插件 / tcpmux 三道校验：配置文件路径本来就有，这条 API 路径
+        // 原先一道都不过（`tls2raw` 之类未实现的插件能从这里溜进去，
+        // 一路要到运行期才逐条连接失败）。
+        //
+        // `is_remote = false`：调用方是**本机用户**（面板就长在本机上），
+        // 他本来就有权指定 `pluginLocalPath` 这些本机资源字段。
+        nfrp_common::config::validate_remote_proxy(&p, false)
+            .map_err(|e| format!("代理配置未通过校验：{e}"))?;
         if self.proxies.get(&p.name).is_some() {
             return Err(format!("已存在同名代理 [{}]", p.name));
         }
@@ -244,11 +252,16 @@ pub async fn run(listener: TcpListener, hub: Arc<Hub>) {
     );
     let user = hub.cfg.web_server.user.trim();
     if user.is_empty() {
-        // 默认只监听回环地址；这句话是给"手滑改成 0.0.0.0 又没配密码"的人看的
-        if !is_loopback_addr(&hub.cfg.web_server.addr) {
+        // 真正的拒绝发生在 `main.rs` 里 **bind 之前** —— 只有那里 bail 才是
+        // "拒绝启动"。这里只记一条日志，否则会出现"日志说拒绝了、端口却开着"
+        // 这种比不检查更误导的状态。
+        if nfrp_common::util::is_loopback_addr(&hub.cfg.web_server.addr) {
+            debug!("管理界面只监听回环地址，未配置凭据（本机可用）");
+        } else {
             warn!(
                 addr = %hub.cfg.web_server.addr,
-                "管理界面监听在非回环地址上却没有配置 user/password —— 任何能访问这个端口的人都能增删你的隧道。强烈建议配上凭证"
+                "管理界面监听在非回环地址上却没有配置 user/password —— \
+                 任何能访问这个端口的人都能增删你的隧道。"
             );
         }
     } else {
@@ -273,10 +286,10 @@ pub async fn run(listener: TcpListener, hub: Arc<Hub>) {
     }
 }
 
-fn is_loopback_addr(addr: &str) -> bool {
-    let a = addr.trim();
-    a == "127.0.0.1" || a == "localhost" || a == "::1"
-}
+/// 回环判定统一走 `common::util` —— 原先这里有第二份实现，口径还不一样
+/// （本地版认 `localhost`，common 版不认）。两份实现迟早漂移，删掉这份。
+#[cfg(test)]
+use nfrp_common::util::is_loopback_addr;
 
 async fn handle(mut stream: TcpStream, peer: SocketAddr, hub: Arc<Hub>) -> anyhow::Result<()> {
     let req = http1::read_request(&mut stream).await?;
@@ -311,10 +324,86 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, hub: Arc<Hub>) -> anyho
         return Ok(());
     }
 
+    // ---- CSRF / DNS rebinding 防线 ----
+    //
+    // 这个界面原先**只看 Basic Auth**，而 `user` 留空时连鉴权都跳过。
+    // 于是恶意网页可以：① 盲打 `POST /api/proxies/add` 增删隧道；
+    // ② 盲打 `POST /api/stop` 直接把客户端关掉；③ 用 DNS rebinding
+    // 把自己伪装成 `http://evil.com` 再访问 127.0.0.1 上的这个端口。
+    //
+    // 两道检查，都只对**写操作**生效（读接口不产生副作用）：
+    //
+    // 1. **来源校验**：带了 `Origin` 就必须是本机回环来源。浏览器发的
+    //    跨站请求一定会带 `Origin`（fetch/XHR/表单都带），而 curl / 脚本
+    //    这类合法调用方默认不带 —— 所以"没有 Origin 就放行"是安全的，
+    //    且不会误伤命令行用法。
+    // 2. **自定义头**：要求写操作带 `X-Nfrp-Client: 1`。自定义头会触发
+    //    浏览器的 CORS 预检，而本界面**不回应任何预检**，于是跨站
+    //    写请求根本发不出来。命令行调用方带一下这个头即可。
+    if is_write_method(method) {
+        if let Some(origin) = req.header("origin") {
+            if !origin_is_local(&origin) {
+                debug!(%peer, origin, "拒绝跨站写请求");
+                http1::send_json(
+                    &mut stream,
+                    403,
+                    &err_body("forbidden", "写操作不允许跨站来源（Origin 不是本机）"),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+        if req.header(CSRF_HEADER).is_none() {
+            debug!(%peer, %method, %path, "拒绝缺少防伪头的写请求");
+            http1::send_json(
+                &mut stream,
+                403,
+                &err_body(
+                    "forbidden",
+                    &format!("写操作必须带 {CSRF_HEADER} 头（防止网页盲打本地接口）"),
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
     let (code, ctype, body) = route(&hub, method, path, &req).await;
     http1::send(&mut stream, code, ctype, body.as_bytes(), &[]).await?;
     debug!(%peer, %method, %path, code, "客户端管理界面请求已处理");
     Ok(())
+}
+
+/// 防 CSRF 用的自定义头名。
+///
+/// 名字里带 `X-` 且非标准 ⇒ 浏览器把它当**非简单请求**，跨站时会先发
+/// OPTIONS 预检；本界面不回应预检，所以跨站写请求到不了这里。
+pub const CSRF_HEADER: &str = "x-nfrp-client";
+
+/// 会产生副作用的 HTTP 方法。
+fn is_write_method(method: &str) -> bool {
+    matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
+}
+
+/// `Origin` 是不是本机来源。
+///
+/// 只认 `http://127.x.x.x[:port]` / `http://localhost[:port]` / `http://[::1][:port]`。
+/// 判定从严：解析不出主机名就当作非本机。
+fn origin_is_local(origin: &str) -> bool {
+    let rest = match origin.split_once("://") {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("http") => rest,
+        // https 来源不可能是这个明文界面，直接拒
+        _ => return false,
+    };
+    // 去掉路径（Origin 规范上不含路径，但防御性地处理一下）
+    let host_port = rest.split('/').next().unwrap_or(rest);
+    let host = if let Some(h) = host_port.strip_prefix('[') {
+        // IPv6：`[::1]:8080`
+        h.split(']').next().unwrap_or(h)
+    } else {
+        host_port.split(':').next().unwrap_or(host_port)
+    };
+    host.eq_ignore_ascii_case("localhost") || nfrp_common::util::is_loopback_addr(host)
 }
 
 /// `Some(响应体)` 表示鉴权没过。
@@ -738,6 +827,30 @@ mod tests {
         }
     }
 
+    /// 真实起一个监听 socket，完整跑 `handle`，并读回响应。
+    ///
+    /// 用真 socket 而不是 duplex：`handle` 的响应是往它自己那条连接写的，
+    /// 只有真实连接才能把两个方向都拿到。
+    async fn handle_over_socket(hub: Arc<Hub>, raw: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let h = hub.clone();
+        let srv = tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            let _ = handle(stream, peer, h).await;
+        });
+
+        let mut cli = tokio::net::TcpStream::connect(addr).await.unwrap();
+        cli.write_all(raw.as_bytes()).await.unwrap();
+        cli.flush().await.unwrap();
+        let _ = cli.shutdown().await;
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(3), cli.read_to_end(&mut out)).await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), srv).await;
+        String::from_utf8_lossy(&out).to_string()
+    }
+
     #[test]
     fn 代理名两种写法都收() {
         assert_eq!(proxy_name_of("  web  ").unwrap(), "web");
@@ -748,14 +861,119 @@ mod tests {
         assert!(proxy_name_of("{不是 JSON").is_err());
     }
 
-    /// `0.0.0.0` **不是**回环 —— 它恰恰是需要告警的那一种。
+    /// `0.0.0.0` **不是**回环 —— 它恰恰是需要拦下的那一种。
+    ///
+    /// 注意 `localhost` 在新口径下也**不算回环**：它解析到哪个地址取决于
+    /// 本机 hosts 与 DNS，解析到非回环地址时就是一个对外端口，不能靠名字赌。
+    /// 所以配 `addr = "localhost"` 且不配密码同样会被拒绝启动。
     #[test]
     fn 回环地址识别() {
         assert!(is_loopback_addr("127.0.0.1"));
-        assert!(is_loopback_addr(" localhost "));
+        assert!(is_loopback_addr("127.0.0.2"), "整个 127/8 都是回环");
         assert!(is_loopback_addr("::1"));
         assert!(!is_loopback_addr("0.0.0.0"));
         assert!(!is_loopback_addr("192.168.1.5"));
+        assert!(!is_loopback_addr("localhost"), "名字解析结果不可控");
+        assert!(!is_loopback_addr(""));
+    }
+
+    /// ★ Origin 校验：只认本机明文来源。
+    #[test]
+    fn origin_只认本机来源() {
+        assert!(origin_is_local("http://127.0.0.1:7400"));
+        assert!(origin_is_local("http://127.0.0.1"));
+        assert!(origin_is_local("http://localhost:7400"));
+        assert!(origin_is_local("http://[::1]:7400"));
+
+        // 跨站来源一律拒
+        assert!(!origin_is_local("http://evil.com"));
+        assert!(!origin_is_local("https://evil.com"));
+        assert!(!origin_is_local("http://evil.com/127.0.0.1"));
+        assert!(!origin_is_local("null"), "沙箱 iframe 会发 Origin: null");
+        assert!(!origin_is_local(""));
+        // https 来源不可能是这个明文界面
+        assert!(!origin_is_local("https://127.0.0.1"));
+    }
+
+    /// ★ 写操作判定：GET/HEAD 不算写，不该被防伪头挡住。
+    #[test]
+    fn 写方法判定() {
+        assert!(is_write_method("POST"));
+        assert!(is_write_method("DELETE"));
+        assert!(!is_write_method("GET"));
+        assert!(!is_write_method("HEAD"));
+    }
+
+    /// ★ 回归测试：跨站来源的写请求必须被拒。
+    ///
+    /// 原先只看 Basic Auth（`user` 留空时连那层都没有）⇒ 恶意网页可以
+    /// 盲打 `POST /api/stop` 把客户端关掉，或用 DNS rebinding 伪装成
+    /// `http://evil.com` 增删隧道。
+    #[tokio::test]
+    async fn 跨站来源的写请求被拒绝() {
+        let hub = hub_with(ProxyTable::default());
+        let resp = handle_over_socket(
+            hub,
+            "POST /api/proxies/add HTTP/1.1\r\nHost: localhost\r\n\
+             Origin: http://evil.com\r\nX-Nfrp-Client: 1\r\n\
+             Content-Length: 2\r\n\r\n{}",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 403"),
+            "跨站 Origin 必须 403，实际：{resp}"
+        );
+    }
+
+    /// ★ 回归测试：写请求缺防伪头必须被拒。
+    ///
+    /// 自定义头会触发 CORS 预检，而本界面不回应预检 ⇒ 网页根本发不出
+    /// 带这个头的跨站请求。
+    #[tokio::test]
+    async fn 写请求缺防伪头被拒绝() {
+        let hub = hub_with(ProxyTable::default());
+        let resp = handle_over_socket(
+            hub,
+            "POST /api/proxies/add HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Length: 2\r\n\r\n{}",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 403"),
+            "缺防伪头必须 403，实际：{resp}"
+        );
+        assert!(resp.contains("x-nfrp-client"), "错误里要点名该头：{resp}");
+    }
+
+    /// 带了防伪头 + 无 Origin（命令行场景）应当放行到业务逻辑。
+    #[tokio::test]
+    async fn 带防伪头的写请求能通过_csrf_检查() {
+        let hub = hub_with(ProxyTable::default());
+        let resp = handle_over_socket(
+            hub,
+            "POST /api/proxies/add HTTP/1.1\r\nHost: localhost\r\n\
+             X-Nfrp-Client: 1\r\nContent-Length: 2\r\n\r\n{}",
+        )
+        .await;
+        assert!(
+            !resp.starts_with("HTTP/1.1 403"),
+            "带了防伪头就不该被 CSRF 挡住，实际：{resp}"
+        );
+        // 空 JSON 会被业务层拒（缺 name），那是 400 不是 403
+        assert!(resp.starts_with("HTTP/1.1 400"), "实际：{resp}");
+    }
+
+    /// 读操作不受 CSRF 检查影响（没有副作用）。
+    #[tokio::test]
+    async fn 读请求不需要防伪头() {
+        let hub = hub_with(ProxyTable::from_iter([proxy("web")]));
+        let resp =
+            handle_over_socket(hub, "GET /api/status HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "读接口不该被挡，实际：{resp}"
+        );
+        assert!(resp.contains("\"connected\""), "{resp}");
     }
 
     #[tokio::test]

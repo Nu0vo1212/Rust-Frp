@@ -37,6 +37,15 @@ const METRIC_PREFIX: &str = "nfrp";
 /// 单条请求行的最大长度。
 const MAX_LINE: usize = 8 * 1024;
 
+/// 面板能同时处理的连接数上限。
+///
+/// 面板是个"低频管理界面"，不是业务数据面 —— 正常使用下并发个位数就够。
+/// 没有上限时，谁都能开一堆连接把任务/Arena 占满，进而拖垮整个服务端进程
+/// （面板和业务跑在同一个进程里）。
+///
+/// 取 128 是个很松的值：正常永远碰不到，但足以挡住洪水式连接。
+const MAX_DASHBOARD_CONNS: usize = 128;
+
 /// 启动面板服务。
 pub async fn run(
     listener: TcpListener,
@@ -49,13 +58,23 @@ pub async fn run(
         "面板已启动：{}  （/ 面板、/metrics 指标、/api/status 状态）",
         addr.map(|a| a.to_string()).unwrap_or_default()
     );
+    // 并发闸门：拿不到许可就直接关掉这条连接（不回 503 —— 那还要多写一次，
+    // 而洪水场景下我们连写都不想写）。
+    let gate = Arc::new(tokio::sync::Semaphore::new(MAX_DASHBOARD_CONNS));
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
+                let Ok(permit) = gate.clone().try_acquire_owned() else {
+                    debug!(%peer, limit = MAX_DASHBOARD_CONNS, "面板并发连接已达上限，直接关闭");
+                    drop(stream);
+                    continue;
+                };
                 let registry = registry.clone();
                 let auth = auth.clone();
                 let cfg = cfg.clone();
                 tokio::spawn(async move {
+                    // permit 随任务存活，任务结束即归还
+                    let _permit = permit;
                     if let Err(e) = handle(stream, peer, registry, auth, cfg).await {
                         debug!(%peer, "面板连接结束：{e:#}");
                     }
@@ -146,6 +165,17 @@ async fn handle(
         match &given {
             Some(g) if constant_time_eq(g, &expect_cred) => {}
             _ => {
+                // 认证失败加一个小延迟，压低暴力破解速率。
+                //
+                // 定长比较挡住了"按耗时逐字节猜"，但挡不住"猜得快"——
+                // 面板走 TCP，本地/内网链路上每秒能试几千次。加 200ms
+                // 之后单连接降到 ~5 次/秒，配合上面的并发上限（128），
+                // 整体速率被压到可控范围。
+                //
+                // 用 `sleep` 而不是"按 IP 计数熔断"：后者要引入一张会
+                // 无限增长的表（还得处理过期清理），对面板这个低频接口
+                // 不划算。
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 send(
                     &mut stream,
                     401,

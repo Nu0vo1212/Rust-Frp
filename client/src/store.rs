@@ -183,8 +183,38 @@ impl Store {
         let body = serde_json::to_vec_pretty(&file).context("序列化 store 失败")?;
 
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &body)
-            .with_context(|| format!("写临时文件 {} 失败", tmp.display()))?;
+        // ★ 这份文件里装着**完整的代理配置**：`secret_key`、插件密码、
+        // `http_pwd` 都在里面。`logfile.rs` 早就按 0600 落盘（注释里也写了
+        // "日志里可能有 token"），这里一直漏了 —— 同机其他用户可直接读走密钥。
+        //
+        // 先删掉同名临时文件：若有人预先把 `xxx.tmp` 做成软链，直接 open
+        // 会写到链接指向的地方（TOCTOU）。删一次把"跟着软链走"掐掉。
+        let _ = std::fs::remove_file(&tmp);
+
+        // Unix 上显式 0600；Windows 没有这个模式位（靠父目录 ACL），
+        // 所以用 cfg 分开建 OpenOptions。
+        #[cfg(unix)]
+        let opt = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut o = std::fs::OpenOptions::new();
+            o.write(true).create_new(true).mode(0o600);
+            o
+        };
+        #[cfg(not(unix))]
+        let opt = {
+            let mut o = std::fs::OpenOptions::new();
+            o.write(true).create_new(true);
+            o
+        };
+        {
+            use std::io::Write as _;
+            let mut f = opt
+                .open(&tmp)
+                .with_context(|| format!("写临时文件 {} 失败", tmp.display()))?;
+            f.write_all(&body)
+                .with_context(|| format!("写临时文件 {} 失败", tmp.display()))?;
+            f.sync_all().ok();
+        }
         std::fs::rename(&tmp, path)
             .with_context(|| format!("把 {} 改名为 {} 失败", tmp.display(), path.display()))?;
         debug!(path = %path.display(), count = file.proxies.len(), "store 已落盘");

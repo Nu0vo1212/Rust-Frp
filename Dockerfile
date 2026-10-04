@@ -44,6 +44,26 @@ COPY assets/frpc.toml /etc/nfrp/frpc.toml
 # 17000 控制+数据，17002/udp xtcp 打洞牵线，17500 面板
 EXPOSE 17000 17002/udp 17500
 
+# ---- 健康检查 ----
+#
+# ★ 这里**故意不写 HEALTHCHECK**。
+#
+# 唯一适合做探针的是免鉴权的 `/api/healthz`，但它挂在**面板端口**上，
+# 而随包发出的 `assets/frps.toml` 里 `dashboard_port` 默认是**注释掉的**
+# （面板不启用）。写死一个探针 ⇒ 用户一 `docker compose up` 就看到
+# `unhealthy`，而且不知道该改哪儿；做成环境变量又没用 —— HEALTHCHECK
+# 在构建期就固化了，运行期改配置影响不到它。
+#
+# 「容器看起来一直是 unhealthy」比「没有健康检查」更难排查，所以宁可不加。
+# 需要探针时请自己启用面板并补一行：
+#
+#   HEALTHCHECK CMD wget -qO- http://127.0.0.1:7500/api/healthz >/dev/null || exit 1
+#
+# （alpine 的 busybox 自带 wget，直接就能用。）
+#
+# 控制端口 17000 不适合做探针：它是 frp 协议端口，不是 HTTP，
+# 探针连上去只会被当成一个握手失败并被断开。
+
 USER nfrp
 ENTRYPOINT ["/usr/local/bin/frps"]
 CMD ["-c", "/etc/nfrp/frps.toml"]

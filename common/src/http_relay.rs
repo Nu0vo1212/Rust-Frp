@@ -256,14 +256,28 @@ impl HeadParts {
             .map(|(_, v)| v.as_str())
     }
 
+    /// 写一个头（同名则替换）。
+    ///
+    /// ★ 名字和值里的 **CR / LF 会被就地剥掉**。
+    ///
+    /// 这不是洁癖：`plugin_request_headers`（插件自定义请求头）能由**服务端
+    /// 经 `ServerCmd` 下发**，`set()` 又直接 `push_str` 到报文里 —— 值里塞一个
+    /// `"\r\nX-Admin: 1"` 就能往用户**内网服务**的请求里插任意头，甚至借
+    /// `Content-Length` 做请求走私。配置文件的路径上这是用户自己的输入，
+    /// 但远程下发之后就变成不可信数据了。
+    ///
+    /// 剥掉而不是报错：调用方遍布转发热路径，逐处处理 `Result` 不值得；
+    /// 而且 HTTP 头的名字/值本来就不允许含 CRLF，剥掉等于"按规范收敛"。
     pub fn set(&mut self, name: &str, value: &str) {
+        let name = strip_crlf(name);
+        let value = strip_crlf(value);
         for (k, v) in self.headers.iter_mut() {
-            if k.eq_ignore_ascii_case(name) {
-                *v = value.to_string();
+            if k.eq_ignore_ascii_case(&name) {
+                *v = value;
                 return;
             }
         }
-        self.headers.push((name.to_string(), value.to_string()));
+        self.headers.push((name, value));
     }
 
     pub fn remove(&mut self, name: &str) {
@@ -276,19 +290,36 @@ impl HeadParts {
     }
 
     /// 序列化回字节（保留原有头顺序）。
+    ///
+    /// 这里是**最后一道防线**：即便某个头绕过了 [`Self::set`] 直接塞进
+    /// `headers`（比如 `HeadParts::parse` 从线路上读进来的畸形行），
+    /// 序列化时也会把 CRLF 剥掉，绝不让报文结构被撑开。
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut s = String::with_capacity(256);
-        s.push_str(&self.start_line);
+        s.push_str(&strip_crlf(&self.start_line));
         s.push_str("\r\n");
         for (k, v) in &self.headers {
-            s.push_str(k);
+            s.push_str(&strip_crlf(k));
             s.push_str(": ");
-            s.push_str(v);
+            s.push_str(&strip_crlf(v));
             s.push_str("\r\n");
         }
         s.push_str("\r\n");
         s.into_bytes()
     }
+}
+
+/// 去掉 CR / LF / NUL。
+///
+/// HTTP 头的名字与值都不允许出现这些字符；放进去就等于能伪造报文边界
+/// （头注入 / 请求走私）。见 [`HeadParts::set`] 的说明。
+fn strip_crlf(s: &str) -> String {
+    if !s.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+        return s.to_string();
+    }
+    s.chars()
+        .filter(|c| *c != '\r' && *c != '\n' && *c != '\0')
+        .collect()
 }
 
 /// 这条请求/响应还打算复用连接吗（HTTP/1.1 默认复用，1.0 要显式 `keep-alive`）。
@@ -493,6 +524,54 @@ mod tests {
         h.remove("x-a");
         let text = String::from_utf8(h.to_bytes()).unwrap();
         assert_eq!(text, "GET /a HTTP/1.1\r\nHost: new\r\nX-B: 2\r\n\r\n");
+    }
+
+    /// ★ 回归测试：头的名字/值里塞 CRLF 必须被剥掉，不能让报文被撑开。
+    ///
+    /// `plugin_request_headers` 能被**服务端经 `ServerCmd` 下发**，而 `set()`
+    /// 直接拼进报文 —— 值里一个 `"\r\nX-Admin: 1"` 就能往用户内网服务的请求里
+    /// 插任意头，甚至借 `Content-Length` 做请求走私。
+    #[test]
+    fn 头注入的_crlf_必须被剥掉() {
+        let mut h = HeadParts::parse(&lines(&["GET / HTTP/1.1", "Host: a"])).unwrap();
+
+        // 值里注入一个头（经典手法）
+        h.set("X-Evil", "1\r\nX-Admin: 1");
+        let text = String::from_utf8(h.to_bytes()).unwrap();
+
+        // 判据不是"不含 X-Admin 字面量"—— CRLF 被剥掉后那几个字符会留在**同一个
+        // 值**里，作为普通文本完全无害。真正的判据是**报文结构**：
+        // 注入失败时 `X-Admin: 1` 会自成一行；这里它必须还粘在 X-Evil 的值里。
+        assert!(
+            text.contains("X-Evil: 1X-Admin: 1"),
+            "CRLF 该被剥掉、内容并入同一个值：{text:?}"
+        );
+        assert!(
+            !text.contains("\r\nX-Admin"),
+            "不该多出一行 X-Admin 头：{text:?}"
+        );
+        // 起始行 1 个 + 两个头各 1 个 + 结尾空行 1 个 = 4
+        assert_eq!(text.matches("\r\n").count(), 4, "头数量不能变多：{text:?}");
+
+        // 名字里注入
+        let mut h2 = HeadParts::parse(&lines(&["GET / HTTP/1.1"])).unwrap();
+        h2.set("X-A\r\nX-B", "v");
+        let text2 = String::from_utf8(h2.to_bytes()).unwrap();
+        assert!(
+            !text2.contains("\r\nX-B: v"),
+            "名字里的注入也要挡住：{text2:?}"
+        );
+
+        // 裸 LF 同样挡（有些服务端只按 LF 断行）
+        let mut h3 = HeadParts::parse(&lines(&["GET / HTTP/1.1"])).unwrap();
+        h3.set("X-C", "a\nX-D: b");
+        let text3 = String::from_utf8(h3.to_bytes()).unwrap();
+        assert!(!text3.contains("\nX-D"), "裸 LF 注入也要挡住：{text3:?}");
+
+        // 正常值不受影响
+        let mut h4 = HeadParts::parse(&lines(&["GET / HTTP/1.1"])).unwrap();
+        h4.set("X-Ok", "normal-value");
+        assert_eq!(h4.get("x-ok"), Some("normal-value"));
     }
 
     #[test]

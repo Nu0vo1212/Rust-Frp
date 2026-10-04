@@ -714,7 +714,18 @@ impl CompiledRbac {
     }
 
     /// 注册代理前的完整检查。
-    pub fn check_proxy(&self, role: &Role, name: &str, ty: &str, port: u16) -> anyhow::Result<()> {
+    ///
+    /// `used_proxies` 是该客户端**当前已注册**的代理数（不含正要注册的这条）。
+    /// 角色的 `maxProxies` 靠它落地 —— 服务端全局的 `maxProxiesPerClient`
+    /// 是另一层配额，两层都要过。
+    pub fn check_proxy(
+        &self,
+        role: &Role,
+        name: &str,
+        ty: &str,
+        port: u16,
+        used_proxies: usize,
+    ) -> anyhow::Result<()> {
         let ty_l = ty.to_ascii_lowercase();
         if !role.allow_proxy_type(&ty_l) {
             anyhow::bail!(
@@ -739,6 +750,19 @@ impl CompiledRbac {
         }
         if !role.allow_visitors && matches!(ty_l.as_str(), "stcp" | "xtcp") {
             anyhow::bail!("角色 {:?} 不允许注册 {name}（访客类代理被禁用）", role.name);
+        }
+        // 角色级代理数配额（0 = 不限，退给服务端全局的 maxProxiesPerClient 兜底）。
+        //
+        // ★ 这个字段曾经是**死字段**：从配置读进来、编译进 Role，但没有任何
+        // 生产代码读它 —— 管理员写了 `maxProxies = 5` 以为限住了，实际没限。
+        // 判据用 `>=`：`used_proxies` 不含当前这条，所以"已用 5 条、再注册第 6 条"
+        // 时 `5 >= 5` 命中，允许的总数正好是 max_proxies 条。
+        if role.max_proxies > 0 && used_proxies >= role.max_proxies {
+            anyhow::bail!(
+                "角色 {:?} 的代理数已达上限 {}（已注册 {used_proxies} 条）",
+                role.name,
+                role.max_proxies
+            );
         }
         Ok(())
     }
@@ -942,16 +966,16 @@ mod tests {
         .unwrap();
         let r = rbac.role_for("x").unwrap();
 
-        assert!(rbac.check_proxy(&r, "a", "tcp", 25000).is_ok());
+        assert!(rbac.check_proxy(&r, "a", "tcp", 25000, 0).is_ok());
         // 端口越界
         let e = rbac
-            .check_proxy(&r, "b", "tcp", 80)
+            .check_proxy(&r, "b", "tcp", 80, 0)
             .unwrap_err()
             .to_string();
         assert!(e.contains("80"), "{e}");
         // 类型不允许
         let e = rbac
-            .check_proxy(&r, "c", "http", 0)
+            .check_proxy(&r, "c", "http", 0, 0)
             .unwrap_err()
             .to_string();
         assert!(e.contains("http"), "{e}");
@@ -959,9 +983,62 @@ mod tests {
         // 这里单独验一次"类型允许时端口范围不参与"）
         let r2 = rbac.role_for("x").unwrap();
         assert!(
-            rbac.check_proxy(&r2, "d", "tcp", 0).is_ok(),
+            rbac.check_proxy(&r2, "d", "tcp", 0, 0).is_ok(),
             "port=0 表示不指定端口"
         );
+    }
+
+    /// ★ 回归测试：角色的 `maxProxies` 必须真的生效。
+    ///
+    /// 这个字段曾经是**死字段** —— 配置读得进来、`compile()` 也赋了值，
+    /// 但没有任何生产代码读它。管理员写 `maxProxies = 2` 以为限住了，
+    /// 实际想注册多少条都行。这条测试就是防止它再退化回去。
+    #[test]
+    fn 角色的_max_proxies_必须真的拦得住() {
+        let rbac = RbacConfig {
+            roles: vec![RoleConfig {
+                name: "small".into(),
+                users: vec!["alice".into()],
+                max_proxies: 2,
+                ..Default::default()
+            }],
+            deny_unknown: true,
+            ..Default::default()
+        }
+        .compile()
+        .unwrap();
+        let r = rbac.role_for("alice").unwrap();
+        assert_eq!(r.max_proxies, 2, "配额要能穿过 compile()");
+
+        // 已用 0、1 条时还能注册（总数最终是 2 条）
+        assert!(rbac.check_proxy(&r, "a", "tcp", 0, 0).is_ok());
+        assert!(rbac.check_proxy(&r, "b", "tcp", 0, 1).is_ok());
+        // 已用 2 条时第 3 条必须被拒，且错误里要点名上限
+        let e = rbac
+            .check_proxy(&r, "c", "tcp", 0, 2)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains('2'), "错误里要带上限：{e}");
+        assert!(e.contains("small"), "错误里要点角色名：{e}");
+    }
+
+    /// `maxProxies = 0` 是"不限"（默认值），不能误伤。
+    #[test]
+    fn max_proxies_为零表示不限() {
+        let rbac = RbacConfig {
+            roles: vec![RoleConfig {
+                name: "big".into(),
+                users: vec!["alice".into()],
+                max_proxies: 0,
+                ..Default::default()
+            }],
+            deny_unknown: true,
+            ..Default::default()
+        }
+        .compile()
+        .unwrap();
+        let r = rbac.role_for("alice").unwrap();
+        assert!(rbac.check_proxy(&r, "a", "tcp", 0, 9999).is_ok());
     }
 
     #[test]

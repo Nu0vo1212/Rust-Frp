@@ -25,11 +25,14 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use nfrp_common::frp::{
     conn::FrpConn,
-    msg::{FrpMessage, StartWorkConn},
+    msg::{constant_time_eq, FrpMessage, StartWorkConn},
 };
 // HTTP 报文的读写原语住在 common 里 —— 客户端的 http2http / https2http 那组插件
 // 需要**一模一样**的能力（读头、按框架读体、原样转发），复制一份就得修两遍 bug。
-use nfrp_common::http_relay::{relay_fixed, relay_until_eof, wants_keep_alive, HeadParts, HttpIo};
+use nfrp_common::http_relay::{
+    connection_tokens, relay_fixed, relay_until_eof, wants_keep_alive, HeadParts, HttpIo,
+    HOP_BY_HOP,
+};
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
@@ -752,6 +755,29 @@ where
         };
         let mut req = HeadParts::parse(&lines)?;
 
+        // ---- `Expect: 100-continue` ----
+        //
+        // 客户端发了这个头就会**先等一个 100 才肯发请求体**。原先这里完全没处理：
+        // 不回应就直接去取工作连接、转发头，然后 `read_n` 等请求体 —— 而客户端
+        // 还在等 100。双方互等，一直挂到 `vhostHTTPTimeout`（默认 60 秒）。
+        //
+        // 单条请求就能占住一条工作连接 60 秒，是个很划算的放大 DoS。
+        //
+        // 处理方式与客户端 `plugin_bridge.rs` 一致：**自己回一个 100**，
+        // 不把中间态转发给上游（那要处理"响应先于请求体"的重排序，不值得）。
+        // 回完把这个头删掉，免得上游又多等一次。
+        if req
+            .get("expect")
+            .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"))
+        {
+            io.stream
+                .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                .await
+                .context("回 100-continue 失败")?;
+            io.stream.flush().await?;
+            req.remove("expect");
+        }
+
         let method = req
             .start_line
             .split_whitespace()
@@ -764,10 +790,12 @@ where
             .nth(1)
             .unwrap_or("/")
             .to_string();
-        let host_header = req
-            .get("host")
-            .map(|h| h.split(':').next().unwrap_or("").to_string())
-            .unwrap_or_default();
+        // `Host` 头里可能带端口，也可能写成 IPv6 的 `[::1]:8080`。
+        // 原先直接 `split(':').next()` —— 对 IPv6 会切出一个孤零零的 `[`，
+        // 对 `a.example.com:8080` 倒是对，但口径与 tcpmux/CONNECT 那条路径
+        // 用的 `canonical_host` 不一致。统一走同一个函数，顺带把
+        // 尾点和大小写也规范化了（与官方 `util.CanonicalHost` 对齐）。
+        let host_header = req.get("host").map(canonical_host).unwrap_or_default();
         let auth_user = basic_auth_user(&req);
         let visitor_keep_alive = wants_keep_alive(&req);
 
@@ -790,9 +818,14 @@ where
         };
 
         // ---- Basic Auth ----
+        //
+        // 用常量时间比较，与面板 / visitor 密钥那几处保持一致。
+        // 这里是**用户自配的** HTTP 代理访问密码（不是服务端凭证），
+        // 风险等级低，但没有理由留一处 `==` 比密钥的路径 ——
+        // 逐字节比较会通过响应耗时泄露前缀，攻击者可据此逐位猜。
         if !route.http_user.is_empty() {
             let ok = match (&auth_user, route.http_pwd.is_empty()) {
-                (Some(u), true) => u == &route.http_user,
+                (Some(u), true) => constant_time_eq(u, &route.http_user),
                 (Some(u), false) => {
                     // 用户名 + 密码都校验
                     let raw = req.get("authorization").unwrap_or("");
@@ -803,7 +836,7 @@ where
                         .and_then(|(_, v)| STANDARD.decode(v.trim().as_bytes()).ok())
                         .and_then(|b| String::from_utf8(b).ok())
                         .unwrap_or_default();
-                    u == &route.http_user && given == expect
+                    constant_time_eq(u, &route.http_user) && constant_time_eq(&given, &expect)
                 }
                 (None, _) => false,
             };
@@ -822,6 +855,30 @@ where
         }
 
         // ---- 读请求体（原样保留编码）----
+        //
+        // ★ `Transfer-Encoding` 与 `Content-Length` **同时出现时必须拒绝**
+        // （RFC 7230 §3.3.3：这种情况要么按 TE 处理并移除 CL，要么直接 400）。
+        //
+        // 原先的写法是"有 TE 就按 chunked 读，否则看 CL"—— 读的方向没错，
+        // 但**两个头都原样转发**给了上游。于是：NFrp 按 chunked 解读完请求，
+        // 上游若按 `Content-Length` 去解读同一串字节，双方对"第一个请求到哪
+        // 结束"的认知就不一样了 —— 这就是经典的 CL.TE 请求走私，攻击者能借此
+        // 让本请求的尾巴被上游当成**下一个请求**（可以是别人的请求）来处理。
+        //
+        // 直接 400 最省事也最安全：合法客户端不会同时发这两个头。
+        let has_te = req.get("transfer-encoding").is_some();
+        let has_cl = req.get("content-length").is_some();
+        if has_te && has_cl {
+            debug!(%peer, "同时带 Transfer-Encoding 与 Content-Length，按走私风险直接拒绝");
+            io.stream
+                .write_all(&simple_response(
+                    "400 Bad Request",
+                    "Transfer-Encoding 与 Content-Length 不能同时出现\n",
+                ))
+                .await?;
+            return Ok(());
+        }
+
         let body = if let Some(te) = req.get("transfer-encoding") {
             if te.to_ascii_lowercase().contains("chunked") {
                 io.read_chunked().await?
@@ -840,6 +897,24 @@ where
         };
 
         // ---- 改写请求头 ----
+        //
+        // 先摘掉逐跳头（`Connection` / `Keep-Alive` / `Upgrade` / `TE` /
+        // `Trailer` / `Proxy-*`，以及 `Connection: xxx` 里点名的那几个）。
+        //
+        // 这些头**只对当前这一段连接有意义**，原样转给内网服务是有害的：
+        // 比如 `Connection: keep-alive, X-Secret` 会让上游把 `X-Secret`
+        // 也当逐跳头处理；`Upgrade: h2c` + `Connection: Upgrade` 则可能让
+        // 上游切到 h2c，绕开我们假定的 HTTP/1.1 语义。
+        //
+        // 工具在 `common::http_relay` 里本来就有（`HOP_BY_HOP` /
+        // `connection_tokens`），客户端 `plugin_bridge` 一直在用，只有这条
+        // 服务端路径漏了。服务端不支持 WebSocket 升级，所以可以整批摘掉。
+        let mut hop: Vec<String> = HOP_BY_HOP.iter().map(|s| (*s).to_string()).collect();
+        hop.extend(connection_tokens(&req));
+        for k in hop {
+            req.remove(&k);
+        }
+
         if !route.rewrite_host.is_empty() {
             req.set("host", &route.rewrite_host);
         }
@@ -1446,6 +1521,233 @@ mod tests {
             head.contains(&format!("Content-Length: {}", body.len())),
             "{head}"
         );
+    }
+
+    /// ★ 回归测试：`Transfer-Encoding` 与 `Content-Length` 同时出现必须 400。
+    ///
+    /// 放行的后果是 CL.TE 请求走私：NFrp 按 chunked 解读请求，上游按
+    /// `Content-Length` 解读同一串字节，双方对"请求到哪结束"的认知不一致，
+    /// 攻击者能让本请求的尾巴被上游当成**下一个请求**处理。
+    #[tokio::test]
+    async fn 同时带_cl_与_te_直接拒绝而不是转发() {
+        let registry = Arc::new(Registry::unlimited());
+        let client = dummy_client("run-smuggle");
+        let (up_srv, _up_cli) = duplex(64 * 1024);
+        client.submit_work(crate::pool::WorkItem {
+            conn: FrpConn::new(Box::pin(up_srv), nfrp_common::frp::WireVersion::V1),
+            at: std::time::Instant::now(),
+        });
+
+        let table = Arc::new(table_with(vec![Arc::new(VhostRoute {
+            proxy_name: "web".into(),
+            client: client.clone(),
+            domain: "a.example.com".into(),
+            locations: vec!["/".into()],
+            http_user: String::new(),
+            http_pwd: String::new(),
+            route_by_http_user: String::new(),
+            rewrite_host: String::new(),
+            req_headers: HashMap::new(),
+            resp_headers: HashMap::new(),
+            kind: VhostKind::Http,
+        })]));
+
+        let (mut visitor, srv) = duplex(64 * 1024);
+        let opts =
+            VhostOpts::new(VhostKind::Http, false).with_timeout(Some(Duration::from_secs(5)));
+        let task = tokio::spawn(async move {
+            handle_http(
+                srv,
+                SocketAddr::from(([127, 0, 0, 1], 5000)),
+                table,
+                0,
+                opts,
+                registry,
+            )
+            .await
+        });
+
+        // 经典 CL.TE 形态：两个头都在，chunked 体里藏第二个请求
+        visitor
+            .write_all(
+                b"POST / HTTP/1.1\r\nHost: a.example.com\r\n\
+                  Content-Length: 6\r\nTransfer-Encoding: chunked\r\n\r\n\
+                  0\r\n\r\nGET /admin HTTP/1.1\r\nHost: a.example.com\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(5), visitor.read(&mut buf))
+            .await
+            .expect("必须立刻回一个应答，不能挂住")
+            .unwrap();
+        let text = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(
+            text.starts_with("HTTP/1.1 400 Bad Request"),
+            "CL+TE 必须 400，实际：{text}"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    }
+
+    /// ★ 回归测试：`Expect: 100-continue` 必须被回应，不能让双方互等。
+    ///
+    /// 原先不处理这个头 ⇒ 客户端等 100、服务端等请求体 ⇒ 死锁到
+    /// `vhostHTTPTimeout`（默认 60 秒）。单请求就能占住一条工作连接。
+    #[tokio::test]
+    async fn expect_100_continue_要立刻回_100() {
+        let registry = Arc::new(Registry::unlimited());
+        let client = dummy_client("run-expect");
+        let (up_srv, mut up_cli) = duplex(64 * 1024);
+        client.submit_work(crate::pool::WorkItem {
+            conn: FrpConn::new(Box::pin(up_srv), nfrp_common::frp::WireVersion::V1),
+            at: std::time::Instant::now(),
+        });
+
+        let table = Arc::new(table_with(vec![Arc::new(VhostRoute {
+            proxy_name: "web".into(),
+            client: client.clone(),
+            domain: "a.example.com".into(),
+            locations: vec!["/".into()],
+            http_user: String::new(),
+            http_pwd: String::new(),
+            route_by_http_user: String::new(),
+            rewrite_host: String::new(),
+            req_headers: HashMap::new(),
+            resp_headers: HashMap::new(),
+            kind: VhostKind::Http,
+        })]));
+
+        let (mut visitor, srv) = duplex(64 * 1024);
+        let opts =
+            VhostOpts::new(VhostKind::Http, false).with_timeout(Some(Duration::from_secs(5)));
+        let task = tokio::spawn(async move {
+            handle_http(
+                srv,
+                SocketAddr::from(([127, 0, 0, 1], 5000)),
+                table,
+                0,
+                opts,
+                registry,
+            )
+            .await
+        });
+
+        // 只发头 —— 真客户端此时在等 100，不会发体
+        visitor
+            .write_all(
+                b"POST / HTTP/1.1\r\nHost: a.example.com\r\n\
+                  Content-Length: 5\r\nExpect: 100-continue\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(3), visitor.read(&mut buf))
+            .await
+            .expect("服务端必须立刻回 100 Continue，不能等满超时")
+            .unwrap();
+        let text = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(
+            text.starts_with("HTTP/1.1 100 Continue"),
+            "必须先回 100 Continue，实际：{text}"
+        );
+
+        // 上游收到的头里不该再有 expect（否则它还得多等一次）
+        let mut up_buf = vec![0u8; 4096];
+        if let Ok(Ok(n)) =
+            tokio::time::timeout(Duration::from_secs(2), up_cli.read(&mut up_buf)).await
+        {
+            let up_text = String::from_utf8_lossy(&up_buf[..n]).to_ascii_lowercase();
+            assert!(
+                !up_text.contains("expect:"),
+                "转发给上游前必须摘掉 expect：{up_text}"
+            );
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    }
+
+    /// ★ 回归测试：逐跳头不能原样传给上游。
+    #[tokio::test]
+    async fn 逐跳头不会转发给上游() {
+        let registry = Arc::new(Registry::unlimited());
+        let client = dummy_client("run-hop");
+        let (up_srv, mut up_cli) = duplex(64 * 1024);
+        client.submit_work(crate::pool::WorkItem {
+            conn: FrpConn::new(Box::pin(up_srv), nfrp_common::frp::WireVersion::V1),
+            at: std::time::Instant::now(),
+        });
+
+        let table = Arc::new(table_with(vec![Arc::new(VhostRoute {
+            proxy_name: "web".into(),
+            client: client.clone(),
+            domain: "a.example.com".into(),
+            locations: vec!["/".into()],
+            http_user: String::new(),
+            http_pwd: String::new(),
+            route_by_http_user: String::new(),
+            rewrite_host: String::new(),
+            req_headers: HashMap::new(),
+            resp_headers: HashMap::new(),
+            kind: VhostKind::Http,
+        })]));
+
+        let (mut visitor, srv) = duplex(64 * 1024);
+        let opts =
+            VhostOpts::new(VhostKind::Http, false).with_timeout(Some(Duration::from_secs(5)));
+        let task = tokio::spawn(async move {
+            handle_http(
+                srv,
+                SocketAddr::from(([127, 0, 0, 1], 5000)),
+                table,
+                0,
+                opts,
+                registry,
+            )
+            .await
+        });
+
+        // `Connection: keep-alive, X-Secret` 点名的 X-Secret 也是逐跳头
+        visitor
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: a.example.com\r\n\
+                  Connection: keep-alive, X-Secret\r\n\
+                  X-Secret: leak-me\r\n\
+                  Keep-Alive: timeout=5\r\n\
+                  Upgrade: h2c\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let mut up_buf = vec![0u8; 8192];
+        let n = tokio::time::timeout(Duration::from_secs(3), up_cli.read(&mut up_buf))
+            .await
+            .expect("上游应当收到请求")
+            .unwrap();
+        let up_text = String::from_utf8_lossy(&up_buf[..n]).to_ascii_lowercase();
+        for banned in ["connection:", "keep-alive:", "upgrade:", "x-secret:"] {
+            assert!(
+                !up_text.contains(banned),
+                "逐跳头 {banned} 不该转发给上游：{up_text}"
+            );
+        }
+        // 但正常头要留着
+        assert!(up_text.contains("host: a.example.com"), "{up_text}");
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    }
+
+    /// ★ 回归测试：`Host` 头里的 IPv6 要能正确取到域名。
+    ///
+    /// 原先按 `:` 硬切，`[::1]:8080` 会切出一个孤零零的 `[`。
+    #[test]
+    fn canonical_host_处理_ipv6_与端口() {
+        assert_eq!(canonical_host("[::1]:8080"), "::1");
+        assert_eq!(canonical_host("[::1]"), "::1");
+        assert_eq!(canonical_host("a.example.com:8080"), "a.example.com");
+        assert_eq!(canonical_host("A.Example.COM."), "a.example.com");
+        assert_eq!(canonical_host("a.example.com"), "a.example.com");
+        // 绝对形式（部分库会这么发 CONNECT）
+        assert_eq!(canonical_host("http://a.b/x"), "a.b");
     }
 
     /// ★ `vhostHTTPTimeout` 的端到端验证：内网服务**连上了却不回响应头**

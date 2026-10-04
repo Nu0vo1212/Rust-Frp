@@ -36,6 +36,11 @@
   + `[acl]` 客户端 IP 白/黑名单（CIDR，`deny` 优先，IPv4 / IPv6 分族比较）
 - ✅ **审计日志** — `[audit] enable = true`，JSONL 追加写（不阻塞业务线程）+ 内存环形缓冲便于查询；
   登录、建代理、断代理、踢人、拒绝访问全部落盘；**关掉时零开销、零事件构造**
+- ✅ **默认安全（v0.5.2 起）** — 面板 / 客户端本地界面**绑非回环地址却没有凭据时直接拒绝启动**
+  （逃生开关 `allow_insecure_dashboard` / `allowInsecureRemote`）；凭据比较全走常量时间；
+  面板认证失败 200ms 退避 + 128 连接闸门；HTTP 转发做逐跳头剥离、`Host` 规范化、
+  CL+TE 走私拒绝、`Expect: 100-continue` 自行应答；本地界面写接口要求 `X-Nfrp-Client` 防伪头防 CSRF。
+  完整清单见仓库内 `SECURITY-FIXES.md`
 
 ### 网络与传输扩展
 
@@ -73,7 +78,7 @@
 
 ### 工程质量
 
-- ✅ **542 个自动化测试** — 含真实 QUIC 栈握手、口令正反用例、端到端集成测试、**SUDP 端到端与 KCP 传输链路**、**与官方 frpc/frps 真实抓包密文的解密回归**
+- ✅ **564 个自动化测试** — 含真实 QUIC 栈握手、口令正反用例、端到端集成测试、**SUDP 端到端与 KCP 传输链路**、**与官方 frpc/frps 真实抓包密文的解密回归**
 - ✅ **CI 流水线** — `fmt` / `clippy` / 测试 / 四目标构建 / 冒烟，PR 必过
 - ✅ **发布可验真** — `SHA256SUMS` + 可选 Ed25519 分离签名与本地验签脚本
 - ✅ **容器就绪** — 多阶段 `Dockerfile`（musl 静态）+ `docker-compose.yml`
@@ -1252,6 +1257,70 @@ maxPortsPerClient = 20       # 单个客户端最多占用几个公网端口
 > 构建脚本要 `aarch64-linux-musl-gcc`。用一个**只依赖 `libc`** 的最小工程可以
 > 精确复现/验证这个类型差异，不需要交叉 C 工具链。）
 >
+> **v0.5.2 是安全修复版**（2026-10-04 全仓安全审计，17 项问题全部修复并带回归测试）
+> 完整报告见仓库内 `SECURITY-FIXES.md`（随仓库走，不进发布包）。
+> ★★ **本版有四处行为变更，升级前务必看**：
+>
+> ① **配了 `dashboard_port`、绑的是非回环地址、又没配 `dashboard_user` 的部署将拒绝启动。**
+> 这是有意为之 —— 那正是漏洞本身：面板**跟随 `bind_addr`**（默认 `0.0.0.0`），
+> `dashboard_user` 留空时鉴权整块被跳过，匿名者因此可以读 `/api/status`（全部客户端与代理名）、
+> `POST /api/clients/kick` **踢掉任意客户端**（这条无条件生效，连能力协商都不需要）、
+> 对 nfrp 客户端还能 `POST /api/proxies/add` **直接开公网端口**
+> （已用独立工程实测复现：留空 `dashboard_user` 时匿名 POST 返回 200 且端口真的打开）。
+> 三条出路任选：配上 `dashboard_user` / `dashboard_password`、
+> 改 `bind_addr = "127.0.0.1"`（回环无凭据仍合法，只有本机能连）、
+> 或显式写 `allow_insecure_dashboard = true` 承认风险。
+> ② 客户端 `[webServer]` **监听非回环地址且无凭据时同样拒绝启动**
+> （原先只打一条 warn 就放行），逃生开关 `allowInsecureRemote = true`。
+> ③ **调本地管理界面写接口的脚本要加 `X-Nfrp-Client: 1` 头**，且带 `Origin` 时必须是本机来源
+> —— 这是防 CSRF / DNS rebinding 的（自定义头会触发 CORS 预检，而本界面不回应预检，
+> 跨站写请求因此根本发不出去；命令行脚本默认不带 `Origin`，不受影响）。
+> ④ 面板**认证失败加了 200ms 延迟**（单连接降到约 5 次/秒，防爆破），
+> 且面板连接数上了 `MAX_DASHBOARD_CONNS = 128` 的闸门 ——
+> 面板与业务在同进程里，原先洪水式连接能把整个服务端拖垮。
+>
+> 其余修复：**`ServerCmd` 可下发任意插件配置**（服务端下发的 `ProxyConfig` 原先只校验
+> `name`/`type` 非空，于是能指定客户端**读哪个文件、连哪个内网地址** ——
+> 新增 `validate_remote_proxy` 禁止远程来源携带 `pluginLocalPath` / `pluginLocalAddr` /
+> `pluginCrtPath` / `pluginKeyPath`）、**RBAC 两个死字段**
+> （`allowManage` / `maxProxies` 能从配置赋值却全仓零生产读取点，管理员以为限住了其实毫无作用
+> —— 改成真正生效；★ `allowVisitors` **一直是生效的**，不在此列）、
+> **CL+TE 请求走私**（两头并存直接 400）、**`Expect: 100-continue` 死锁**
+> （原先双方互等到 `vhostHTTPTimeout` 60 秒，**单条请求就能占住一条工作连接**，
+> 改成自己回 100 并摘掉该头）、**逐跳头未剥离**（`HOP_BY_HOP` 工具早就写好，
+> 只有 vhost 这条路径漏了调用）、**HTTP 头注入**（`http_relay` 的 `set()` 不剥 CRLF，
+> 而 `plugin_request_headers` 可由服务端下发 ⇒ 值里塞 `\r\nX-Admin: 1` 能往用户内网插入任意头；
+> 改成写入与序列化**双重剥离**）、**rustls 依赖漏洞** RUSTSEC-2026-0285
+> （0.23.44 → 0.23.45，CI 同时加上 `rustsec/audit-check` 门禁 ——
+> v0.5.1 就是带着这个漏洞发出去的，而当时没有任何环节会去查）、
+> **`Host` 头按 `:` 硬切**（`[::1]:8080` 会切出孤零零的 `[`，统一走 `canonical_host`）、
+> **`store.rs` 落盘权限**（这份文件含完整代理配置与 `secret_key`，却走默认 umask 0644，
+> 同机其他用户可直接读走密钥 ⇒ 改 0600 + `create_new` 防软链 TOCTOU）、
+> **HTTP 代理 Basic Auth 用普通 `==`**（改 `constant_time_eq`，与全项目另外四处凭据比较口径一致）、
+> **裸 `lock().unwrap()`**（`health.rs` / `p2p.rs` 改 `unwrap_or_else(|e| e.into_inner())`，
+> 否则锁一旦被写脏后续**每次**调用都 panic，而 `is_healthy` 会退化成"永远健康"把故障掩盖；
+> 顺带修 `p2p.rs request()` 失败时漏删 waiter 的泄漏）、
+> **示例配置默认把 SSH 暴露到公网**（`assets/frpc.toml` 那条 `[[proxies]]` 是未注释的启用状态，
+> 而 `docker-compose.yml` 又原样挂载它 ⇒ 跟着示例跑一遍 SSH 就裸奔在公网 6000 端口；
+> ★ **有意保留默认启用、只加醒目警告** —— 改成默认注释掉会让 `docker compose up`
+> 跑起来一个代理都没有，用户以为在演示、实际什么都没转发，同样是破坏）。
+> 审计中另有两处「疑似高危」**实测后判定为误报**（`sni.rs::parse_sni` 越界 panic：
+> 30 万次 fuzz + 定向构造零 panic；审计日志 CRLF/ANSI 注入：实测 `serde_json`
+> 把 `\r\n` 输出为转义序列而非真实换行），**别再重复排查**。
+> ★ `Dockerfile` 有意**不加 `HEALTHCHECK`**：唯一适合做探针的免鉴权 `/api/healthz`
+> 挂在面板端口上，而示例配置里 `dashboard_port` 默认注释掉 ⇒ 写死探针会让用户
+> 一 `docker compose up` 就看到 `unhealthy` 且不知道改哪儿
+> —— 「容器看起来一直 unhealthy」比「没有健康检查」更难排查。理由已写进 Dockerfile。
+>
+> 质量门：`cargo fmt --check` 干净、`cargo clippy --workspace --all-targets -- -D warnings`
+> **0 告警**、**564 个测试全绿**（542 → 564，新增 22 条安全回归测试）、
+> `cargo audit` **exit 0 零漏洞**（修复前 1 条）。
+> 发布版二进制真机冒烟 **18/18**（含面板鉴权 401 / 写接口鉴权 / 面板增删代理 / QUIC /
+> xtcp 真 P2P / group 均衡 / 限流），与 v0.5.1 基线**逐项一致**（基线同样 18/18）。
+> 线协议未改动（魔术字 / 版本串 / 消息结构都没变），与官方 frp 的互通性不受影响；
+> 配置层新增两个**可选**字段（`allow_insecure_dashboard` / `allow_insecure_remote`），
+> 老配置在**回环或已配凭据**的前提下照常工作。
+>
 > **v0.5.1 是补齐与官方 0.71 差距的一版**
 > 起因是把"NFrp 到底比官方 0.71 少什么"逐项对了一遍 结论是代理类型少 1 种
 > 客户端插件少 5 个 配置字段静默忽略 46 项（客户端 20 服务端 26）
@@ -1311,7 +1380,7 @@ maxPortsPerClient = 20       # 单个客户端最多占用几个公网端口
 > —— NFrp 在这里反过来 解析失败直接报错 绝不降级成"不限制"。
 >
 > 质量门：`cargo fmt --check` 干净 `cargo clippy --workspace --all-targets -- -D warnings`
-> 0 告警 **542 个测试全绿**（common 275 / server lib 163 / client 81 / server bin 5 /
+> 0 告警 **564 个测试全绿**（common 279 / server lib 167 / client 92 / server bin 8 /
 > e2e 18）。另外用**发布版二进制**（不是 debug）跑了三轮真机冒烟：
 > 标准冒烟 **26/26**（RBAC / 审计 JSONL / WebSocket / API v2 / 客户端本地界面 / PROXY
 > v1+v2 / SUDP / KCP 传输）、tcpmux 冒烟 **4/4**（CONNECT 复用 +
@@ -1326,17 +1395,17 @@ maxPortsPerClient = 20       # 单个客户端最多占用几个公网端口
 ```bash
 cargo fmt --all -- --check          # 格式
 cargo clippy --workspace --all-targets   # 静态检查（当前 0 告警）
-cargo test --workspace              # 542 个测试
+cargo test --workspace              # 564 个测试
 ```
 
 测试分布：
 
 | 目标 | 数量 | 覆盖重点 |
 |---|---|---|
-| `common` 单元测试 | 275 | **v1 线协议**（消息类型字节、帧编解码、AES-128-CFB 密钥派生与流式状态机、**官方抓包密文解密回归**）、v2 线协议编解码、加密、配置解析、**原版 frp 配置兼容层**、打洞报文/口令/端口预测、**KCP（含 30% 丢包下的可靠传输）**、令牌桶、示例配置可加载、**OIDC 令牌源与 JWKS 验签**、**CIDR/ACL/RBAC 判定边界**、**WebSocket 帧编解码与 Ping/Pong**、**PROXY v1/v2 编解码与防注入 sniff**、**VirtualNet 帧/路由/地址池**、**HTTP/1.1 请求解析** |
-| `server` 单元测试（lib） | 163 | 虚拟主机路由表与优先级、chunked 解析、Basic Auth、连接池配对与回收、**端口组最小连接数调度**、资源配额、指标编码、面板鉴权与**写接口**、热重载字段判定、打洞会话、**审计日志（JSONL + 环形缓冲 + 过滤）**、**安全上下文（ACL→认证→RBAC→审计）**、**API v2（错误信封 / 分页 / 百分号解码）**、**VirtualNet 服务端路由与代答 ICMP** |
-| `server` 单元测试（bin） | 5 | 命令行与配置装载 |
-| `client` 单元测试 | 81 | QUIC 建连与口令握手、插件（http_proxy / socks5 / static_file）、健康检查状态机、打洞编排、`NewProxy` 字段映射（含与官方 frpc 抓包逐字节对拍）、服务端下发名 → 本地代理的翻译（`resolve_uploaded_proxy`）、**动态代理表**、**store 落盘与损坏文件容错**、**本地管理界面的路由与本地校验**、**PROXY 头注入** |
+| `common` 单元测试 | 279 | **v1 线协议**（消息类型字节、帧编解码、AES-128-CFB 密钥派生与流式状态机、**官方抓包密文解密回归**）、v2 线协议编解码、加密、配置解析、**原版 frp 配置兼容层**、打洞报文/口令/端口预测、**KCP（含 30% 丢包下的可靠传输）**、令牌桶、示例配置可加载、**OIDC 令牌源与 JWKS 验签**、**CIDR/ACL/RBAC 判定边界**、**WebSocket 帧编解码与 Ping/Pong**、**PROXY v1/v2 编解码与防注入 sniff**、**VirtualNet 帧/路由/地址池**、**HTTP/1.1 请求解析**、**HTTP 头 CRLF 注入防线（`strip_crlf` 双重剥离）**、**远程下发代理的本机资源字段拒绝（`validate_remote_proxy`）**、**回环地址判定（`is_loopback_addr`）** |
+| `server` 单元测试（lib） | 167 | 虚拟主机路由表与优先级、chunked 解析、Basic Auth、连接池配对与回收、**端口组最小连接数调度**、资源配额、指标编码、面板鉴权与**写接口**、热重载字段判定、打洞会话、**审计日志（JSONL + 环形缓冲 + 过滤）**、**安全上下文（ACL→认证→RBAC→审计）**、**API v2（错误信封 / 分页 / 百分号解码）**、**VirtualNet 服务端路由与代答 ICMP**、**vhost 请求边界（`Expect: 100-continue` 应答、CL+TE 拒绝、逐跳头剥离、`Host` 规范化、HTTP 代理口令常量时间比较）**、**RBAC 配额真正生效（`allowManage` / `maxProxies`）** |
+| `server` 单元测试（bin） | 8 | 命令行与配置装载、**面板鉴权启动校验（非回环 + 无凭据必须拒绝启动、逃生开关生效、回环无凭据合法）** |
+| `client` 单元测试 | 92 | QUIC 建连与口令握手、插件（http_proxy / socks5 / static_file）、健康检查状态机、打洞编排、`NewProxy` 字段映射（含与官方 frpc 抓包逐字节对拍）、服务端下发名 → 本地代理的翻译（`resolve_uploaded_proxy`）、**动态代理表**、**store 落盘与损坏文件容错**、**本地管理界面的路由与本地校验**、**PROXY 头注入**、**本地界面 CSRF 防线（`X-Nfrp-Client` 防伪头 + Origin 校验 + 非回环无凭据拒绝启动）**、**服务端下发配置的本机资源字段拒绝** |
 | `server` 端到端集成测试 | 18 | 真握手 + 真转发的 TCP / HTTP / stcp / QUIC 链路、**v1 与 v2 双协议握手**、group 负载均衡、面板鉴权边界、**SUDP 端到端（visitor→provider 的 UdpPacket 往返）**、**KCP 传输上的完整控制连接 + 多会话共端口** |
 
 CI（`.github/workflows/ci.yml`）在每次 push / PR 上跑：`cargo fmt --check` +

@@ -55,6 +55,13 @@ pub async fn add_proxy(
     let client = registry
         .client(run_id)
         .ok_or_else(|| format!("没有在线客户端 [{run_id}]"))?;
+    // RBAC 的 `allowManage = false`：角色不允许被面板管理。
+    // 曾经这个字段是死的（读进来就没人再看），用户以为禁掉了其实没有。
+    if !client.allow_manage() {
+        return Err(format!(
+            "客户端 [{run_id}] 所属角色不允许被面板管理（allowManage = false）"
+        ));
+    }
     let name = proxy.name.clone();
 
     // 1) 客户端先认下这条代理
@@ -109,6 +116,11 @@ pub async fn remove_proxy(registry: &Arc<Registry>, run_id: &str, name: &str) ->
     let client = registry
         .client(run_id)
         .ok_or_else(|| format!("没有在线客户端 [{run_id}]"))?;
+    if !client.allow_manage() {
+        return Err(format!(
+            "客户端 [{run_id}] 所属角色不允许被面板管理（allowManage = false）"
+        ));
+    }
 
     // 服务端这侧：端口 / 域名 / visitor 全摘掉（与客户端主动 CloseProxy 同款清理）
     let wire_name = nfrp_common::util::add_user_prefix(&client.user, name);
@@ -147,6 +159,20 @@ pub async fn remove_proxy(registry: &Arc<Registry>, run_id: &str, name: &str) ->
 
 /// 踢掉一个客户端：立刻切断它的所有代理，并结束它的控制连接。
 pub async fn kick(registry: &Arc<Registry>, run_id: &str, reason: &str) -> AdminResult {
+    // 先查 allowManage 再 remove —— `remove` 会把客户端从名册里摘掉，
+    // 摘掉之后就再也查不到它属于哪个角色了。
+    //
+    // ★ 这一条尤其要紧：`kick` 不像 `add_proxy` / `remove_proxy` 那样要经
+    // 客户端回执，它**无条件生效**。面板零鉴权的配置下，匿名者能踢掉任意
+    // 客户端（含官方 frpc），是共享 frps 上的直接 DoS，所以这层角色闸门
+    // 必须在最前面。
+    if let Some(c) = registry.client(run_id) {
+        if !c.allow_manage() {
+            return Err(format!(
+                "客户端 [{run_id}] 所属角色不允许被面板管理（allowManage = false）"
+            ));
+        }
+    }
     let client = registry
         .remove(run_id)
         .ok_or_else(|| format!("没有在线客户端 [{run_id}]"))?;

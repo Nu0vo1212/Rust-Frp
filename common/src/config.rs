@@ -508,11 +508,22 @@ pub struct ServerConfig {
     /// 内置面板 + `/metrics` 端点的监听端口（留空则不启用）。
     #[serde(default)]
     pub dashboard_port: Option<u16>,
-    /// 面板用户名（留空表示不做鉴权，只建议在回环地址上这样配置）。
+    /// 面板用户名（留空表示**不做鉴权**）。
+    ///
+    /// ★ 留空只在 `bind_addr` 是回环时被接受（本机自用）。配了
+    /// `dashboard_port` 却把面板绑在非回环地址上又留空用户名，服务端会
+    /// **拒绝启动** —— 那等于把面板连同"开端口 / 踢人"的写接口对外开放。
+    /// 确实需要就显式打开 [`Self::allow_insecure_dashboard`]。
     #[serde(default)]
     pub dashboard_user: String,
     #[serde(default)]
     pub dashboard_pwd: String,
+    /// 明确同意"面板不鉴权且对外监听"。
+    ///
+    /// 默认 `false` ⇒ 那种配置会被启动校验拦下。置 `true` 表示知情自担风险
+    /// （典型合法场景：面板只在跳板机能到的内网里，靠网络隔离兜底）。
+    #[serde(default)]
+    pub allow_insecure_dashboard: bool,
     /// 是否监听配置文件变化并自动重载可动态生效的字段。
     #[serde(default)]
     pub hot_reload: bool,
@@ -698,6 +709,7 @@ impl Default for ServerConfig {
             dashboard_port: None,
             dashboard_user: String::new(),
             dashboard_pwd: String::new(),
+            allow_insecure_dashboard: false,
             hot_reload: false,
             auth: Default::default(),
             acl: Default::default(),
@@ -1423,6 +1435,14 @@ pub struct WebServerConfig {
     /// Basic Auth 密码。
     pub password: String,
 
+    /// 明确同意"管理界面不鉴权且对外监听"。
+    ///
+    /// 默认 `false` ⇒ 非回环地址 + 无凭据的组合会让客户端**拒绝启动**。
+    /// 那条组合下任何能访问该端口的人都能增删隧道、直接停止客户端，
+    /// 而原先只打一条 warn 就放行。置 `true` 表示知情自担风险。
+    #[serde(default)]
+    pub allow_insecure_remote: bool,
+
     /// 静态资源目录（官方 frpc 的 `webServer.assetsDir`）。
     ///
     /// ★ 官方支持、nfrp **未实现**：声明它只是为了"官方配置能解析通过"——
@@ -1447,6 +1467,7 @@ impl Default for WebServerConfig {
             port: 0,
             user: String::new(),
             password: String::new(),
+            allow_insecure_remote: false,
             assets_dir: String::new(),
             pprof_enable: false,
         }
@@ -1834,18 +1855,23 @@ pub fn unimplemented_plugin_types() -> Vec<&'static str> {
         .collect()
 }
 
+/// 单条代理的类型 + 插件 + tcpmux 自检（配置文件与远程下发共用）。
+fn reject_bad_proxy(p: &ProxyConfig) -> Result<()> {
+    if !SUPPORTED_PROXY_TYPES.contains(&p.proxy_type.as_str()) {
+        return Err(crate::error::Error::Protocol(format!(
+            "代理 [{}] 的类型 {:?} 不受支持（NFrp 实现了 {}）",
+            p.name,
+            p.proxy_type,
+            SUPPORTED_PROXY_TYPES.join(" / ")
+        )));
+    }
+    reject_unimplemented_plugin(p)?;
+    reject_bad_tcpmux(p)
+}
+
 fn reject_unimplemented_types(cfg: &ClientConfig) -> Result<()> {
     for p in &cfg.proxies {
-        if !SUPPORTED_PROXY_TYPES.contains(&p.proxy_type.as_str()) {
-            return Err(crate::error::Error::Protocol(format!(
-                "代理 [{}] 的类型 {:?} 不受支持（NFrp 实现了 {}）",
-                p.name,
-                p.proxy_type,
-                SUPPORTED_PROXY_TYPES.join(" / ")
-            )));
-        }
-        reject_unimplemented_plugin(p)?;
-        reject_bad_tcpmux(p)?;
+        reject_bad_proxy(p)?;
     }
     for v in &cfg.visitors {
         if !SUPPORTED_VISITOR_TYPES.contains(&v.visitor_type.as_str()) {
@@ -1899,8 +1925,63 @@ fn reject_unimplemented_plugin(p: &ProxyConfig) -> Result<()> {
     )))
 }
 
-/// `tcpmux` 的两条必填约束，对齐官方 `validateTCPMuxProxyConfigForClient`。
+/// 校验**远程下发**的代理配置（`ServerCmd` / 客户端 Web API 两条入口共用）。
 ///
+/// # 为什么必须有这个函数
+///
+/// 走**配置文件**的代理要过三道关（[`reject_unimplemented_types`] /
+/// [`reject_unimplemented_plugin`] / [`reject_bad_tcpmux`]），但走
+/// **服务端 `ServerCmd`** 和**客户端本地 Web API** 的代理**一道都不过** ——
+/// 那两条路径原先只检查 `name` / `type` 非空。
+///
+/// 后果不是理论上的：`ProxyConfig` 里混着两类字段 ——
+///
+/// * **代理语义字段**（`name` / `type` / `remote_port` / `custom_domains`…），
+///   服务端下发了没问题，这正是"面板增删代理"功能要的；
+/// * **本机资源字段**（`plugin_local_path` / `plugin_local_addr` /
+///   `plugin_crt_path` / `plugin_key_path`），**只有本机用户才有资格决定**。
+///
+/// 服务端能把第二类一起下发，就等于让它指定客户端**读哪个文件**、
+/// **连哪个内网地址**（`plugin = "static_file"` + `local_path = "/etc"` 配
+/// 一个公网域名，就是可读的任意文件服务；`plugin_local_addr` 则是内网 SSRF）。
+///
+/// 所以这里的策略是：**远程来源一律不许携带任何本机资源字段**，
+/// 且代理类型 / 插件类型 / tcpmux 约束仍要照常过。
+///
+/// # 参数
+///
+/// `is_remote` 为 `true` 时启用"禁止本机资源字段"这条。配置文件路径传
+/// `false`（它本来就走完整校验，这里只是复用类型检查）。
+pub fn validate_remote_proxy(p: &ProxyConfig, is_remote: bool) -> Result<()> {
+    if is_remote {
+        // 一条代理里只要沾了本机资源字段就整条拒绝 —— 不做"悄悄丢弃该字段"，
+        // 那样服务端以为自己下发成功了，用户却拿到一条行为不同的代理。
+        let mut offending: Vec<&str> = Vec::new();
+        if !p.plugin_local_path.trim().is_empty() {
+            offending.push("pluginLocalPath");
+        }
+        if !p.plugin_local_addr.trim().is_empty() {
+            offending.push("pluginLocalAddr");
+        }
+        if !p.plugin_crt_path.trim().is_empty() {
+            offending.push("pluginCrtPath");
+        }
+        if !p.plugin_key_path.trim().is_empty() {
+            offending.push("pluginKeyPath");
+        }
+        if !offending.is_empty() {
+            return Err(crate::error::Error::Protocol(format!(
+                "代理 [{}] 来自远程下发，不允许携带本机资源字段（{}）—— \
+                 这些字段决定读哪个文件、连哪个内网地址，只能由本机配置文件指定。",
+                p.name,
+                offending.join(" / ")
+            )));
+        }
+    }
+    reject_bad_proxy(p)
+}
+
+/// `tcpmux` 的两条必填约束，对齐官方 `validateTCPMuxProxyConfigForClient`。
 /// 1. `multiplexer` 只认 `httpconnect`（官方报 `not support multiplexer: %s`）。
 ///    留空也算不认识 —— 官方那边空串同样过不了 `slices.Contains`。
 /// 2. 必须配 `customDomains` 或 `subdomain`。tcpmux **不绑端口**，全靠 CONNECT

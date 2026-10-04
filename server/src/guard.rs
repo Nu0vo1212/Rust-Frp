@@ -156,9 +156,16 @@ impl SecurityContext {
         self.rbac.role_for(user)
     }
 
-    /// ③ 注册代理前的权限检查。
-    pub fn check_proxy(&self, role: &Role, name: &str, ty: &str, port: u16) -> anyhow::Result<()> {
-        self.rbac.check_proxy(role, name, ty, port)
+    /// ③ 注册代理前的权限检查。`used_proxies` 见 [`CompiledRbac::check_proxy`]。
+    pub fn check_proxy(
+        &self,
+        role: &Role,
+        name: &str,
+        ty: &str,
+        port: u16,
+        used_proxies: usize,
+    ) -> anyhow::Result<()> {
+        self.rbac.check_proxy(role, name, ty, port, used_proxies)
     }
 
     pub fn rbac(&self) -> &CompiledRbac {
@@ -260,9 +267,9 @@ mod tests {
 
         // ③ RBAC
         let r = ctx.role_for("whoever").unwrap();
-        assert!(ctx.check_proxy(&r, "a", "tcp", 25000).is_ok());
-        assert!(ctx.check_proxy(&r, "b", "tcp", 80).is_err());
-        assert!(ctx.check_proxy(&r, "c", "http", 0).is_err());
+        assert!(ctx.check_proxy(&r, "a", "tcp", 25000, 0).is_ok());
+        assert!(ctx.check_proxy(&r, "b", "tcp", 80, 0).is_err());
+        assert!(ctx.check_proxy(&r, "c", "http", 0, 0).is_err());
     }
 
     #[test]

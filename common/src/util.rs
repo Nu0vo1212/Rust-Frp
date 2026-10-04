@@ -200,6 +200,35 @@ where
     relay_between(&mut a, &mut b).await
 }
 
+/// 这个监听地址是不是"只有本机能连"？
+///
+/// 用途是**给管理端口做安全默认值**：面板 / 客户端管理界面在回环上不配密码
+/// 可以接受（只有本机能碰），一旦绑到非回环就等于对外开放，必须要求凭据。
+///
+/// 判定口径刻意从严 —— **无法确认是回环的一律当作"非回环"**：
+/// 空串（`""` 在所有平台上都表示"监听全部网卡"）、`0.0.0.0`、`::` 都是非回环；
+/// 只有明确的 `127.x.x.x`（整个 127/8 都是回环）与 `::1` 才算。
+///
+/// `localhost` 也按**非回环**处理：它解析到哪个地址取决于本机 hosts 与 DNS，
+/// 解析到非回环地址时就是一个对外端口，不能靠名字赌。
+pub fn is_loopback_addr(addr: &str) -> bool {
+    let a = addr.trim();
+    if a.is_empty() {
+        return false;
+    }
+    // `[::1]` 带方括号的写法也要认
+    let bare = a
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(a);
+    match bare.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback(),
+        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback(),
+        // 解析不出来（域名等）⇒ 从严当作非回环
+        Err(_) => false,
+    }
+}
+
 /// 读取主机名。
 ///
 /// 只读环境变量（`COMPUTERNAME` / `HOSTNAME`），不使用任何平台专属 API。
@@ -300,5 +329,26 @@ mod tests {
         // 前缀不匹配时原样返回（与 Go 的 StripUserPrefix 一致）
         assert_eq!(strip_user_prefix("bob", "alice.ssh"), "alice.ssh");
         assert_eq!(strip_user_prefix("alice", "alice"), "alice");
+    }
+
+    /// 回环判定：口径从严 —— 确认不了的都算"非回环"。
+    #[test]
+    fn loopback_detection_is_strict() {
+        // 明确的回环
+        assert!(is_loopback_addr("127.0.0.1"));
+        assert!(is_loopback_addr("127.1.2.3"), "整个 127/8 都是回环");
+        assert!(is_loopback_addr("::1"));
+        assert!(is_loopback_addr("[::1]"));
+        assert!(is_loopback_addr("  127.0.0.1  "), "两侧空白要忽略");
+
+        // 对外（或无法确认）一律 false
+        assert!(!is_loopback_addr("0.0.0.0"));
+        assert!(!is_loopback_addr("::"));
+        assert!(!is_loopback_addr(""), "空串在所有平台都表示监听全部网卡");
+        assert!(!is_loopback_addr("192.168.1.10"));
+        assert!(
+            !is_loopback_addr("localhost"),
+            "名字解析结果不可控，不能当回环"
+        );
     }
 }

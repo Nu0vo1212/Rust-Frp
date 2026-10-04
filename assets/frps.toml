@@ -69,6 +69,10 @@ vhost_http_timeout = 60
 #   GET /api/status   JSON 快照
 #   GET /api/healthz  存活探针（始终免鉴权，供 k8s / 负载均衡器用）
 # 配了 dashboard_user 之后，前三个端点需要 HTTP Basic Auth。
+# ★ 没配 dashboard_user 时面板**不鉴权** —— 此时若 bind_addr 不是回环地址，
+#   服务端会**拒绝启动**（匿名者能读面板、踢掉任意客户端、并对 nfrp 客户端
+#   直接开公网端口）。三条出路：配用户名密码 / 把 bind_addr 改成 127.0.0.1 /
+#   显式写 allow_insecure_dashboard = true 表明知情。
 #
 # 面板还能**写**（同样需要 Basic Auth，未鉴权返回 401）：
 #   POST /api/proxies/add     给某个客户端动态加一条代理（JSON: run_id + proxy）
@@ -78,6 +82,8 @@ vhost_http_timeout = 60
 # dashboard_port = 7500
 # dashboard_user = "admin"
 # dashboard_pwd = "change_me"
+# 面板不鉴权且对外监听 —— 默认 false，那种配置会被启动校验拦下。确实需要才打开。
+# allow_insecure_dashboard = true
 #
 # API v2（v0.3.4 新增；v1 的路径与响应**一个字节都没改**）：
 #   GET  /api/v2/version        API 版本与本进程支持的线协议

@@ -519,9 +519,27 @@ fn extract_plugin(p: &mut toml::Table) {
         ("hostHeaderRewrite", "plugin_host_header_rewrite"),
     ];
     for (from, to) in pairs {
-        if let Some(v) = sub.remove(*from) {
-            if !p.contains_key(*to) {
-                p.insert((*to).to_string(), v);
+        // ★ v0.5.4 修（L8）：用**大小写折叠**查找，而不是精确匹配。
+        //
+        // 官方 frp 读配置走 `toml → json → json.Unmarshal`，Go 的
+        // `encoding/json` 匹配字段名用 `strings.EqualFold` —— 即 `localPath`
+        // 与 `LOCALPATH` 官方都认。而这里原来是 `sub.remove(*from)` 精确匹配，
+        // 于是官方能用的 `LocalPath` / `LOCALPATH` 被 NFrp **静默丢弃**，
+        // 随后报"必须配置 plugin_local_path" —— 用户明明配了却被告知没配。
+        //
+        // 定级说明：后果是 **fail-closed** 的（必填缺失 ⇒ 明确报错），
+        // 不构成安全漏洞；但与模块文档"对齐 Go 的 EqualFold"的承诺不符，
+        // 而且错误提示会误导人。
+        //
+        // ★ 已核实不存在反向风险：大小写折叠只影响"能不能找到这个键"，
+        //   不会把危险字段偷渡进 `validate_remote_proxy`
+        //   （那个函数读的是规范化后的结构体字段；远程下发路径不经过本兼容层）。
+        let key = sub.keys().find(|k| k.eq_ignore_ascii_case(from)).cloned();
+        if let Some(k) = key {
+            if let Some(v) = sub.remove(&k) {
+                if !p.contains_key(*to) {
+                    p.insert((*to).to_string(), v);
+                }
             }
         }
     }

@@ -1,187 +1,110 @@
-# NFrp
+<div align="center">
+  <h1>NFrp</h1>
+  <p><b>Rust 实现的内网穿透工具，兼容官方 frp 协议</b></p>
+</div>
 
-用 Rust 实现的内网穿透工具，**完整兼容 [fatedier/frp](https://github.com/fatedier/frp) 的 wire protocol v1 与 v2**，可以和官方 `frps` / `frpc`（v0.71.0 实测）直接互通。
+<p align="center">
+  <img src="https://img.shields.io/badge/version-0.5.4-blue" alt="Version">
+  <img src="https://img.shields.io/badge/protocol-frp%20v1%20%2F%20v2-orange" alt="Protocol">
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey" alt="Platform">
+  <img src="https://img.shields.io/badge/license-Apache--2.0-green" alt="License">
+</p>
 
-**默认就走 v1** —— 与官方 frp 的默认值一致，所以官方客户端 / 服务端**不需要改任何配置**就能连上；v1 覆盖官方源码里的全部算法（帧编码、AES-128-CFB 控制通道加密、yamux 复用、打洞报文），第三方 frp 平台下发的配置也能直接用。
+---
 
-以极小的资源占用换取同等甚至更好的核心能力：服务端常驻内存约 **3.5 MB**（同负载下 Go 版 frps 为 28.8~31.8 MB），单文件部署，无任何运行时依赖。
+NFrp 是 [fatedier/frp](https://github.com/fatedier/frp) 的 Rust 重实现，**完整兼容官方 wire protocol v1 与 v2**，可与官方 `frps` / `frpc`（v0.71.0 实测）直接互通，第三方 frp 平台下发的配置也能直接用。
 
-## 特性
+默认走 **v1**，与官方 frp 的默认值一致 —— 所以官方客户端 / 服务端**不需要改任何配置**就能连上。
 
-### 代理与传输
+资源占用很小：服务端常驻内存约 3.5 MB（同负载下 Go 版 frps 为 28.8~31.8 MB），单文件部署，无运行时依赖。
 
-- ✅ **frp v1 / v2 双线协议** — **默认 v1**（与官方默认值相同），官方 frpc / frps **零配置直连**；需要时可用 `transport.wireProtocol = "v2"` 显式启用 v2
-- ✅ **原版配置直接可用** — 原版 frpc / 第三方 frp 平台下发的配置（camelCase、`[[proxies]]`、`localIP`+`localPort`、`[metadatas]`）无需改写即可运行
-- ✅ **八种代理类型** — `tcp` / `udp` / `http` / `https` / `tcpmux` / `stcp` / `sudp` / `xtcp`，与官方 frp 的类型清单**完全一致**，多代理同时工作
-- ✅ **UDP 转发** — 每个 UDP 代理只占一条工作连接，靠访客地址区分会话
-- ✅ **HTTP 反向代理** — 按域名路由，支持 `locations` 前缀、Basic Auth、Host 改写、自定义请求/响应头
-- ✅ **HTTPS SNI 透传** — 只嗅探 ClientHello 里的 SNI 做路由，不终止 TLS，证书仍由内网服务提供
-- ✅ **tcpmux（HTTP CONNECT 复用）** — 多条代理共用一个服务端端口，按 `CONNECT` 的 authority 分发，支持 `routeByHTTPUser` 二级路由与 `httpUser` 鉴权，可选 `tcpmuxPassthrough` 原样透传
-- ✅ **stcp 私密隧道** — 服务端不开放公网端口，需 `secret_key` 校验 + 提供者端 `allow_users` 白名单，与官方 frp 互通
-- ✅ **sudp 秘密 UDP** — 与 stcp 同一套鉴权，但数据面是 UDP：访问方本地开 UDP socket，一条持久工作连接上跑 `UdpPacket` 帧，按访客地址回包；同样不占公网端口
-- ✅ **xtcp 真 P2P** — UDP 打洞 + QUIC / KCP 直连，数据不经服务端；打不通自动回退中继，不会比 stcp 更差
-- ✅ **对称 NAT 端口预测** — 靠多次观测推端口步长，锥型之外的对称 NAT 也有机会打洞成功
-- ✅ **KCP 弱网通道** — 既可作为 xtcp 的直连通道（`xtcp_transport = "kcp"`），也可作为**独立传输协议**（服务端 `kcp_bind_port` + 客户端 `transport_protocol = "kcp"`），丢包环境下靠重传换来更低延迟
-- ✅ **QUIC 传输** — `transport_protocol = "quic"`，1-RTT 握手、流级多路复用、丢包不阻塞其它流
-- ✅ **yamux 多路复用** — 对应 frp `transport.tcpMux`，控制连接与工作连接复用一条 TCP
-- ✅ **TLS 加密** — 对应 frp `transport.tls`，含 frp 自定义首字节 `0x17` 伪装，服务端自动生成自签名证书
+## 功能特性
 
-### 安全与认证
+### 代理类型
 
-- ✅ **OIDC 认证** — `auth.method = "oidc"`，对接 Keycloak / Google / Azure AD 等任意标准 IdP。
-  客户端用 **Client Credentials Grant** 换 access token，服务端验签 JWKS（RS256 / PS256 / ES256），
-  支持 `skipExpiryCheck` / `skipIssuerCheck` / `trustedCaFile` / `proxyURL`；内部手写 JWKS→DER 转换，
-  不引入 `jsonwebtoken` 之类的重型依赖
-- ✅ **细粒度访问控制** — `[[roles]]` 角色权限表（按序匹配 + `deny_unknown` / `default_role` 兜底）
-  + `[acl]` 客户端 IP 白/黑名单（CIDR，`deny` 优先，IPv4 / IPv6 分族比较）
-- ✅ **审计日志** — `[audit] enable = true`，JSONL 追加写（不阻塞业务线程）+ 内存环形缓冲便于查询；
-  登录、建代理、断代理、踢人、拒绝访问全部落盘；**关掉时零开销、零事件构造**
-- ✅ **默认安全（v0.5.2 起）** — 面板 / 客户端本地界面**绑非回环地址却没有凭据时直接拒绝启动**
-  （逃生开关 `allow_insecure_dashboard` / `allowInsecureRemote`）；凭据比较全走常量时间；
-  面板认证失败 200ms 退避 + 128 连接闸门；HTTP 转发做逐跳头剥离、`Host` 规范化、
-  CL+TE 走私拒绝、`Expect: 100-continue` 自行应答；本地界面写接口要求 `X-Nfrp-Client` 防伪头防 CSRF。
-  完整清单见仓库内 `SECURITY-FIXES.md`
+八种，与官方 frp 的类型清单完全一致：
 
-### 网络与传输扩展
+| 类型 | 说明 |
+|---|---|
+| `tcp` | 最常用的端口转发 |
+| `udp` | UDP 转发，每个代理只占一条工作连接，靠访客地址区分会话 |
+| `http` | 按域名路由，支持 `locations` 前缀、Basic Auth、Host 改写、自定义请求/响应头 |
+| `https` | 只嗅探 ClientHello 的 SNI 做路由，不终止 TLS，证书仍由内网服务提供 |
+| `tcpmux` | HTTP CONNECT 复用，多条代理共用一个服务端端口，支持 `routeByHTTPUser` 二级路由 |
+| `stcp` | 私密隧道，服务端不开公网端口，`secret_key` 校验 + `allow_users` 白名单 |
+| `sudp` | 与 stcp 同一套鉴权，数据面为 UDP，同样不占公网端口 |
+| `xtcp` | UDP 打洞 + QUIC / KCP 直连，数据不经服务端；打不通自动回退中继 |
 
-- ✅ **WebSocket / WSS 传输** — `websocket = true`，服务端在**同一个端口**上按路径 `/~!frp`
-  自动识别 HTTP Upgrade（与官方 frps 行为一致），穿透只放行 HTTP 的防火墙 / 企业代理；
-  手写 RFC 6455 帧编解码，不引第三方 WebSocket 库
-- ✅ **VirtualNet 虚拟网络** — `[vnet]` + `[virtualNet]`，TUN 设备 + 三层 IP 转发，
-  多台客户端组成一个虚拟局域网，服务端按目的 IP 做路由；帧格式与官方 frp `pkg/vnet` 一致
-- ✅ **Proxy Protocol** — 单条代理可配 `proxyProtocolVersion = "v1" / "v2"`，
-  客户端连内网服务前注入 PROXY 头，把真实客户端 IP 透传给 Nginx / HAProxy / 后端应用；
-  v2 支持 LOCAL 头，`sniff` 做了防注入处理
+### 传输层
+
+- frp v1 / v2 双线协议，默认 v1，可用 `transport.wireProtocol = "v2"` 显式启用
+- QUIC 传输（`transport_protocol = "quic"`）：1-RTT 握手、流级多路复用
+- KCP 弱网通道：既可作为 xtcp 直连通道，也可作为独立传输协议（`kcp_bind_port`）
+- yamux 多路复用（`transport.tcpMux`），控制连接与工作连接复用一条 TCP
+- TLS 加密（`transport.tls`），含官方自定义首字节伪装，服务端自动生成自签名证书
+- WebSocket / WSS（`websocket = true`），同一端口按路径自动识别，可穿透只放行 HTTP 的防火墙
+- Proxy Protocol v1 / v2，把真实客户端 IP 透传给 Nginx / HAProxy / 后端应用
+
+### 客户端插件
+
+官方 9 种全部实现：`http_proxy` / `socks5` / `static_file` / `unix_domain_socket` / `http2http` / `http2https` / `https2http` / `https2https` / `tls2raw`。frpc 本身即可作为正向代理、静态站点或 TLS 终结器。
+
+### 安全与访问控制
+
+- OIDC 认证（`auth.method = "oidc"`），对接 Keycloak / Google / Azure AD 等任意标准 IdP；客户端走 Client Credentials Grant，服务端验签 JWKS（RS256 / PS256 / ES256）
+- RBAC 角色权限表（`[[roles]]`），按序匹配 + `deny_unknown` / `default_role` 兜底
+- IP 白 / 黑名单（`[acl]`），CIDR 语法，`deny` 优先
+- 审计日志（`[audit]`），JSONL 追加写 + 内存环形缓冲；关闭时零开销
+- 凭据比较统一走常量时间；HTTP 转发做逐跳头剥离、`Host` 规范化、CL+TE 走私拒绝
+- 面板与客户端本地界面**绑非回环地址却没有凭据时拒绝启动**（逃生开关 `allow_insecure_dashboard` / `allowInsecureRemote`）
+
+完整修复清单见 [SECURITY-FIXES.md](SECURITY-FIXES.md)。
 
 ### 运维与调度
 
-- ✅ **group 负载均衡** — 同 `group` 的多个代理共享一个 `remote_port`，服务端按**最小连接数**分摊
-- ✅ **健康检查** — `tcp` / `http` 探测，连续失败自动摘除后端，恢复后自动回归
-- ✅ **客户端插件** — 官方 9 种全实现：`http_proxy` / `socks5` / `static_file` / `unix_domain_socket` / `http2http` / `http2https` / `https2http` / `https2https` / `tls2raw`，frpc 本身即正向代理、静态站点或 TLS 终结器
-- ✅ **带宽限流** — 每个代理可配 `bandwidth_limit`（如 `1MB`），令牌桶精确限速
-- ✅ **资源上限** — 客户端数 / 代理数 / 转发连接数 / 待处理队列，五个维度全部可限并计入指标
-- ✅ **端口白名单** — `allowPorts` + `maxPortsPerClient`（官方同名配置），限定客户端能申请哪些公网端口、最多占几个
-- ✅ **日志落盘与轮转** — `log.to` + `log.maxDays`，按天切分、按天数清理老备份，不引入时区依赖
-- ✅ **可观测性** — 内置 Web 面板 + Prometheus `/metrics` + 健康检查端点，支持 Basic Auth
-- ✅ **面板可写** — 在面板上直接增删代理、踢掉客户端，无需改配置重启（`/api/proxies/add` 等）
-- ✅ **配置热重载** — 改 `log_level` / 面板密码无需重启，静态项变更会明确提示需重启
+- group 负载均衡：同 `group` 的多个代理共享一个 `remote_port`，按最小连接数分摊
+- 健康检查：`tcp` / `http` 探测，连续失败自动摘除后端，恢复后自动回归
+- 带宽限流：每个代理可配 `bandwidth_limit`（如 `1MB`），令牌桶精确限速
+- 资源上限：客户端数 / 代理数 / 转发连接数 / 待处理队列，五个维度全部可限并计入指标
+- 端口白名单：`allowPorts` + `maxPortsPerClient`
+- 日志落盘与轮转：`log.to` + `log.maxDays`，按天切分与清理
+- 客户端 Store 持久化：动态添加的代理落盘，重启自动恢复
+- 配置热重载：改 `log_level` / 面板密码无需重启
 
-### 管理与集成
+### 可观测性与管理
 
-- ✅ **客户端 Store 持久化** — `[store] path = "..."`，把运行时动态添加的代理落盘，
-  重启后自动恢复；配置文件里写的代理**不会**写进 store，避免"删掉的隧道从 store 复活"
-- ✅ **客户端管理 Web UI / API** — `[webServer] port = 7400`，客户端本地起一个轻量 HTTP 界面：
-  查看当前隧道 / 连接 / 流量，并且能直接增删代理、热重载配置；写操作走会话主循环，
-  不会和控制连接抢锁
-- ✅ **Dashboard API v2** — `/api/v2/*` 版本化接口，统一错误信封（`error.code` / `message` / `details`）
-  + 列表分页（`page` / `page_size`）+ 强制稳定排序；v1 接口**行为完全不变**
+- 内置 Web 面板 + Prometheus `/metrics` + 免鉴权健康检查端点，支持 Basic Auth
+- 面板可直接增删代理、踢掉客户端，无需改配置重启
+- Dashboard API v2（`/api/v2/*`）：统一错误信封 + 分页 + 稳定排序；v1 接口行为不变
+- 客户端本地 Web UI / API（`[webServer] port = 7400`）：查看隧道 / 连接 / 流量，并可增删代理
 
 ### 工程质量
 
-- ✅ **584 个自动化测试** — 含真实 QUIC 栈握手、口令正反用例、端到端集成测试、**SUDP 端到端与 KCP 传输链路**、**与官方 frpc/frps 真实抓包密文的解密回归**
-- ✅ **CI 流水线** — `fmt` / `clippy` / 测试 / 四目标构建 / 冒烟，PR 必过；
-  第三方 Action **全部 pin 到 commit SHA**（标签是可变的，上游改一次 tag 就能让 CI 跑别人的代码）
-- ✅ **发布可验真** — `SHA256SUMS` + 可选 Ed25519 分离签名与本地验签脚本；
-  CI 的 cosign 签名**失败会红灯**（不允许"看起来签过了"）
-- ✅ **容器就绪** — 多阶段 `Dockerfile`（musl 静态）+ `docker-compose.yml`
-- ✅ **跨平台** — Windows / Linux amd64 / Linux arm64（arm64 全静态链接，无 glibc 依赖）
-
-## 架构
-
-```
-nfrp/
-├── common/                    # 公共库（协议实现核心）
-│   └── src/
-│       ├── frp/
-│       │   ├── v1.rs          #   v1 线协议（官方默认）：消息类型字节、帧编解码、
-│       │   │                  #     AES-128-CFB 控制通道加密（PBKDF2 salt = "frp"）
-│       │   ├── wire.rs        #   v2 线协议：magic 前缀、帧编解码、握手协商
-│       │   ├── crypto.rs      #   v2 控制通道加密：HKDF-SHA256 + AES-256-GCM
-│       │   ├── msg.rs         #   JSON 消息：Login/NewProxy/ReqWorkConn/NatHole*（v1/v2 共用）
-│       │   ├── conn.rs        #   加密连接的读写封装 + 版本自动识别（服务端）
-│       │   ├── tls.rs         #   frp 自定义 TLS（自签证书 + 0x17 首字节）
-│       │   ├── quic.rs        #   QUIC 传输（quinn），一条双向流 = 一条 frp 连接
-│       │   ├── mux.rs         #   yamux 会话封装
-│       │   ├── sni.rs         #   TLS ClientHello / SNI 嗅探
-│       │   └── stream.rs      #   统一流抽象 BoxStream
-│       ├── p2p.rs             #   xtcp 打洞：报文字典、口令、ALPN、角色
-│       ├── security.rs        #   ACL(CIDR) / RBAC 角色表 / 审计配置 / 凭证(AuthProvider)
-│       ├── auth/oidc.rs       #   OIDC：JWKS 验签(ring)、TokenSource(Client Credentials)
-│       ├── httpc.rs           #   极简 HTTP(S) 客户端（CONNECT 代理、chunked），供 OIDC 取 token
-│       ├── http1.rs           #   HTTP/1.1 服务端工具（解析 + 响应），面板与客户端界面共用
-│       ├── ws.rs              #   WebSocket：手写 RFC 6455 帧编解码 + Upgrade 握手
-│       ├── proxy_protocol.rs  #   PROXY v1/v2 编解码 + sniff（防注入）
-│       ├── vnet.rs            #   VirtualNet：帧格式、三层路由、地址池
-│       ├── vnet/tun_linux.rs  #   Linux TUN 设备（AsyncRead/AsyncWrite）
-│       ├── throttle.rs        #   令牌桶带宽限流
-│       ├── config.rs          #   两端配置结构与示例生成
-│       └── util.rs            #   地址解析、转发、run_id、日志热重载
-├── server/                    # frps 等价服务端
-│   └── src/
-│       ├── serve.rs           #   入口分层：TCP / QUIC / WS 嗅探 / vhost / 代理注册
-│       ├── registry.rs        #   全局状态：客户端表、端口组（group 负载均衡）
-│       ├── guard.rs           #   安全上下文：ACL → 认证 → RBAC → 审计 一条链
-│       ├── audit.rs           #   审计日志（JSONL 追加 + 内存环形缓冲）
-│       ├── api_v2.rs          #   面板 API v2：版本化 + 统一错误信封 + 分页
-│       ├── vnet.rs            #   VirtualNet 服务端：监听、路由转发、代答 ICMP
-│       ├── pool.rs            #   工作连接池：配对、排队、回收、配额
-│       ├── limits.rs          #   信号量资源上限
-│       ├── observability.rs   #   指标计数器与 Prometheus / JSON 编码
-│       ├── dashboard.rs       #   内置面板 + /metrics + /api/status + /api/v2
-│       ├── reload.rs          #   配置热重载（mtime 轮询 + 字段差异判定）
-│       ├── p2p.rs             #   xtcp 牵线中心（UDP rendezvous）
-│       ├── vhost.rs           #   HTTP/HTTPS 虚拟主机路由与反向代理
-│       ├── visitor.rs         #   stcp/xtcp 访客注册表
-│       └── udp_proxy.rs       #   UDP：公网 socket ⇄ 专用工作连接
-└── client/                    # frpc 等价客户端
-    └── src/
-        ├── main.rs            #   会话主循环、ServerLink、工作连接
-        ├── p2p.rs             #   xtcp 打洞（QUIC 建连 + 口令握手）
-        ├── store.rs           #   动态代理落盘与启动恢复（`[store]`）
-        ├── web.rs             #   本地管理界面 / API（`[webServer]`）
-        ├── vnet.rs            #   VirtualNet 客户端：TUN 读写循环
-        ├── health.rs          #   健康检查监视器（进程级）
-        ├── plugin.rs          #   四类客户端插件
-        ├── visitor.rs         #   stcp/xtcp：本地监听 → 回源
-        └── udp_proxy.rs       #   UDP：每个访客一个本地 socket
-```
-
-传输层次：
-
-```
-TCP  → [TLS] → [yamux] → frp v2 连接
-UDP  → QUIC（自带 TLS1.3 + 流多路复用）→ frp v2 连接
-```
-
-TLS 与 yamux 均为可选，由配置决定。服务端通过**首字节探测**自动识别：
-`0x00` = yamux 帧、`0x17`/`0x16` = TLS、`'F'` = frp v2 magic，
-因此开启 `tcp_mux` 后仍可同时服务 `tcpMux = false` 的旧客户端。
-
-QUIC 模式下服务端会在**同一个端口号**上额外监听 UDP，TCP 监听保持不动——
-所以切换 `transport_protocol` 不会一刀切，老客户端照旧能连。
+- 612 个自动化测试，含真实 QUIC 栈握手、端到端集成测试、与官方 frpc/frps 真实抓包密文的解密回归
+- CI 跑 `fmt` / `clippy` / 三系统全量测试 / 两个 musl 目标交叉构建 / 端到端冒烟
+- 第三方 GitHub Action 全部 pin 到 commit SHA；cosign 签名失败即红灯
+- 发布产物附 `SHA256SUMS` + Ed25519 分离签名
 
 ## 快速开始
 
-### 从源码构建
+### 构建
 
 ```bash
-git clone https://github.com/<you>/nfrp.git
-cd nfrp
 cargo build --release
 # 产物：target/release/nfrp-server（frps）、target/release/nfrp-client（frpc）
 ```
 
-Rust 1.75+。Windows 用 MSVC toolchain；Linux arm64 静态编译见下文。
+需要 Rust 1.75+。Windows 用 MSVC toolchain。
 
-### 启动服务端（公网机器）
+也可以直接下载发布包，包内二进制名为 `frps` / `frpc`（与官方一致）。
+
+### 服务端（公网机器）
 
 ```toml
 # frps.toml
 bind_addr = "0.0.0.0"
 bind_port = 7000
-token = "your_secret_token"
-tcp_mux = true
-tls_force = false
+token = "换成一个足够随机的口令"
 
 # 可选：xtcp 真 P2P 的牵线端口（需放行 UDP）
 p2p_port = 7002
@@ -189,31 +112,26 @@ p2p_port = 7002
 # 可选：内置面板 + Prometheus 指标
 dashboard_port = 7500
 dashboard_user = "admin"
-dashboard_pwd = "change_me"
-
-# 可选：改 log_level / 面板密码不用重启
-hot_reload = true
+dashboard_pwd = "换成一个强口令"
 ```
 
 ```bash
 ./nfrp-server -c frps.toml
-# 也可以直接生成带注释的示例配置：
+# 生成带注释的完整示例配置：
 ./nfrp-server --gen-config frps.toml
 ```
 
-### 启动客户端（内网机器）
+### 客户端（内网机器）
 
 ```toml
 # frpc.toml
 server_addr = "your.server.com"
 server_port = 7000
-token = "your_secret_token"
-tcp_mux = true
-tls_enable = false
-# protocol = "frp-v1"      # 默认就是 v1（与官方默认值一致），不用写
+token = "与服务端一致的口令"
 
 [[proxies]]
 name = "ssh"
+type = "tcp"
 local_addr = "127.0.0.1:22"
 remote_port = 6000
 ```
@@ -226,1421 +144,116 @@ remote_port = 6000
 
 ### 与官方 frp 互通
 
-NFrp 可运行在官方 frp 的任一侧：
+NFrp 可运行在官方 frp 的任一侧，双向实测通过：
 
 | 服务端 | 客户端 | 状态 |
 |---|---|---|
-| nfrp frps | 官方 frpc（tcpMux on/off、TLS on） | ✅ 实测通过 |
-| 官方 frps | nfrp frpc（tcp_mux on/off、TLS on） | ✅ 实测通过 |
-| nfrp frps | 官方 frpc（udp / http / https 代理） | ✅ 实测通过 |
-| 官方 frps | nfrp frpc（udp / http / https 代理） | ✅ 实测通过 |
-| nfrp frps | 官方 frpc（stcp 提供者 / 访客，tcpMux on/off、TLS on） | ✅ 实测通过 |
-| nfrp frps | 官方 frpc（stcp `allow_users`：`user=alice` 放行 / `user=mallory` 被拒，错误文本可回传） | ✅ 实测通过 |
-| 官方 frps | nfrp frpc（stcp 提供者 / 访客，tcp_mux on/off、TLS on） | ✅ 实测通过 |
-| 官方 frps | nfrp frpc（stcp `allow_users=["alice"]`，`user=alice` 放行） | ✅ 实测通过 |
-| nfrp frps | nfrp frpc（含 TLS、关 yamux 组合、stcp / xtcp、`allow_users` 空/名单/`*` 三种语义） | ✅ 实测通过 |
-| 第三方 frp 平台（LoliaFRP） | nfrp frpc（用平台下发的**原版配置**直接启动） | ✅ 实测通过（v0.3.1） |
-| 官方 frps v0.71.0 | nfrp frpc（**v1，零配置**） | ✅ 实测通过（v0.3.3） |
-| nfrp frps | 官方 frpc v0.71.0（**v1，零配置**） | ✅ 实测通过（v0.3.3） |
+| nfrp frps | 官方 frpc（tcpMux on/off、TLS on、各类代理） | 通过 |
+| 官方 frps | nfrp frpc（tcp_mux on/off、TLS on、各类代理） | 通过 |
+| nfrp frps | 官方 frpc（stcp 提供者 / 访客） | 通过 |
 
-### 线协议：默认 v1，和官方一致（v0.3.2 起）
+**兼容标识不可更改**：`frpc -v` 仍输出裸 `0.71.0`，线协议魔术字与版本串、包内 `frps` / `frpc` 命名全部保持。改动这三样会立刻破坏与官方 frp 及第三方平台的互通。
 
-官方 frp 的 `transport.wireProtocol` **缺省值就是 `v1`**（见 `pkg/config/v1/client.go`），
-v2 只有显式配置才会启用。所以"兼容 frp"的实现必须以 v1 为默认 —— v0.3.2 起 NFrp
-也照此默认，**官方 frpc / frps 不需要改任何配置**就能互通：
+## 配置
 
-```toml
-# 官方 frpc 侧 —— 什么都不用写，这就是默认值
-```
+配置字段与官方 frp 对齐，**原版 `frps.toml` / `frpc.toml` 可以直接使用**（支持 camelCase、`localIP` + `localPort` 两段式写法、`[metadatas]` 等）。
 
-想用 v2 时就显式打开（两端都要）：
+两处**有意偏离**官方，都需要注意：
 
-```toml
-# 官方 frpc 侧 / NFrp 侧均可
-transport.wireProtocol = "v2"
-```
+- `local_addr` 是合并式 `ip:port`（`127.0.0.1:8080`），不像官方分成 `localIP` + `localPort`。官方两段式也认，但两种写法**不要混用**。
+- 日志轮转按 **UTC** 零点切分（官方按本地时间），因为日志时间戳本身就是 UTC。
 
-NFrp 服务端**不需要预先知道对端用哪个版本**：它读满 8 字节与 v2 的魔术字逐字节比较
-（`pkg/proto/wire/wire.go` 的 `CheckMagic` 语义），相同就走 v2，不同就**把这 8 字节原样留在
-缓冲区里**按 v1 解析 —— 那 8 字节本来就是 v1 的类型字节 + 长度前缀。所以同一个端口
-同时接待 v1 与 v2 客户端。
+完整的带注释示例见仓库内 [`assets/frps.toml`](assets/frps.toml) 与 [`assets/frpc.toml`](assets/frpc.toml)，也可以用 `--gen-config` 生成。
 
-> **注意**：官方 frp 没有 QUIC 传输（只有 TCP/KCP/QUIC 三选一的 `transport.protocol`），
-> 所以 `transport_protocol = "quic"` 只在 NFrp 两端之间可用；
-> 与官方互通时请保持 `tcp`。
+## 升级注意
 
-### 直接使用原版 frp 的配置文件（v0.3.1 起）
+0.5.2 起有几处**行为变更**，升级前请确认：
 
-原版 frp 的配置**不需要改写**就能直接喂给这个 `frpc` —— 第三方 frp 平台
-（LoliaFRP / OpenFrp / SakuraFrp 等）下发的就是这种格式，拷过来即可运行。
-
-解析前会过一遍 `common/src/frp_config.rs` 的兼容层，把原版字段名规范化成 NFrp 风格：
-
-| 原版 frp 写法 | 归一化成 |
-|---|---|
-| `serverAddr` / `serverPort` | `server_addr` / `server_port` |
-| `localIP` + `localPort`（两段） | `local_addr = "ip:port"`（IPv6 自动加方括号） |
-| `auth.token` | `token` |
-| `[metadatas]` | `metas`（整表透传） |
-| `[proxies.transport] bandwidthLimit` | `bandwidth_limit` |
-| `[proxies.transport] bandwidthLimitMode` | `bandwidth_limit_mode` |
-| `[proxies.healthCheck]` 子表 | `health_check_*` 平铺 |
-| `[proxies.plugin]` 子表 | `plugin` / `plugin_local_path` / `plugin_strip_prefix` / … |
-
-原则是「只补不覆盖」：NFrp 自己的写法同时有效，两种写法混用时**原生字段优先**。
-
-两个容易搞反的地方：
-
-- **`[metadatas]` 不参与认证**，认证用顶层 `token`。它只是"随消息带给服务端的附加信息"，
-  整表透传（登录时进 `Login.metas`，代理级的 `[proxies.metadatas]` 进 `NewProxy.metas`）。
-  平台常把隧道凭证塞在这里 —— 删了登录不上；但把它当本地认证 token 也是错的
-  （会导致服务端回 `token in login doesn't match token from configuration`）。
-- **代理名的 `{user}.` 前缀由客户端加上**（对应官方 `naming.AddUserPrefix`），
-  且服务端保持幂等。注意官方 frpc 的日志 `proxy added: [xxx]` 打的是**配置里的原始名**，
-  很容易据此以为线上也不带前缀 —— 别信日志，要抓包看 `NewProxy.proxy_name`。
-
-## 代理类型
-
-| 类型 | 公网入口 | 说明 |
+| 变更 | 影响 | 处理 |
 |---|---|---|
-| `tcp` | `remote_port` | 每条访客连接一条工作连接 |
-| `udp` | `remote_port` | 每个代理一条专用工作连接，报文带访客地址；会话 30s 空闲回收 |
-| `http` | 服务端 `vhost_http_port` | 按 `Host` 路由，支持 `custom_domains` / `subdomain` / `locations` / `http_user` / `host_header_rewrite` |
-| `https` | 服务端 `vhost_https_port` | 按 TLS SNI 路由后原样透传（不终止 TLS） |
-| `tcpmux` | 服务端 `tcpmuxHTTPConnectPort` | **一个共享端口**上的 HTTP `CONNECT` 复用器：按 CONNECT 请求行里的 authority 分发，可再按 `routeByHTTPUser` 二级路由、用 `httpUser` / `httpPassword` 做 Basic 鉴权 |
-| `stcp` | 无（不占公网端口） | 私密隧道：由访客端在本地起监听，凭 `secret_key` + `allow_users` 鉴权后经服务端配对 |
-| `xtcp` | 无（不占公网端口） | 先试 **UDP 打洞 + QUIC 直连**；打不通自动回退服务端中继 |
-
-UDP 报文有两种编码：**二进制**（`type=19`，与官方 frp 默认一致）和 JSON（base64 载荷）。
-握手时由服务端在 ServerHello 里选定，客户端自动适配，两边都不支持二进制时退回 JSON。
-
-### stcp（私密隧道）
-
-`stcp` 让**提供者**（内网服务方）不占用任何公网端口，只有持相同 `secret_key` 且在白名单里的**访客**才能连上。
-
-提供者（内网机器）—— 与普通代理同处 `[[proxies]]`，但用 `secret_key` 代替 `remote_port`：
-
-```toml
-# frpc.toml（提供者）
-[[proxies]]
-name = "secret-ssh"
-type = "stcp"
-local_addr = "127.0.0.1:22"
-secret_key = "abcdefg"          # 也叫 sk，双方必须一致
-allow_users = ["alice"]         # 见下表；留空 = 只允许同 user
-```
-
-访客（另一台机器）—— 用 `[[visitors]]`，在本地监听一个端口：
-
-```toml
-# frpc.toml（访客）
-user = "alice"                  # ← allow_users 比对的是这里，不是 visitor 的 name
-server_addr = "your.server.com"
-server_port = 7000
-token = "your_secret_token"
-
-[[visitors]]
-name = "alice-local"            # 访客的本地标识，随便起
-type = "stcp"
-server_name = "secret-ssh"      # 提供者注册的代理名
-server_user = "alice"           # 目标 provider 所属客户端的 user（省略则用本客户端的 user）
-secret_key = "abcdefg"          # 必须与提供者一致
-bind_addr = "127.0.0.1"
-bind_port = 9000                # 本机 9000 即可访问到提供者的 22
-```
-
-`allow_users` 的语义与官方 frp 完全一致（对应 `server/visitor.Manager.NewConn`）：
-
-| `allow_users` | 允许谁接入 |
-|---|---|
-| 未配置 / 空 | 只允许**与 provider 同一 user** 的访客 |
-| `["*"]` | 所有访客 |
-| `["alice", "bob"]` | 顶层 `user` 为 alice 或 bob 的访客 |
-
-还有两个容易踩的点：
-
-1. 比对的是**访问方 frpc 在 `Login` 里声明的顶层 `user`**，不是 `[[visitors]]` 的 `name`。
-   访客写错会收到 `user [x] not allowed` 并被断开（不会静默超时）。
-2. 代理名在协议层带 user 前缀（官方 `naming.AddUserPrefix`）：`user` 非空时线协议名是
-   `"{user}.{name}"`。所以**访客要访问别人的 provider，必须把 `server_user` 写成对方的 user**，
-   否则会得到 `listener doesn't exist`。
-
-之后在访客机器上 `ssh -p 9000 127.0.0.1` 即可。服务端只做**中转配对**：把访客连接和提供者的工作连接对接起来，字节流不经过服务端解析。
-
-### xtcp（真 P2P）
-
-`xtcp` 在提供者与访客之间尝试建立**直连**，打通后流量完全不经服务端，带宽不再受服务端限制。
-整个流程分三步：
-
-```
-1. 牵线     访客在控制连接上发 NatHoleVisitor{proxy_name, sign_key, timestamp}
-            服务端校验 sk 后建会话、回 NatHoleResp{sid}，同时给提供者推 NatHoleClient{sid}
-2. 打洞     两端各自从「牵线用的那个 UDP socket」向服务端索要对方公网地址
-            （Hello{sid, role} → Peer{sid, addr}），SNAT 因此被提前建立
-3. 直连     两端用**同一个 socket** 对打 QUIC；谁先握上谁当服务端
-            连上后立刻做一次口令握手（HMAC-SHA256(secret_key, sid)），
-            不对就断开 —— 防止 NAT 外任意主机连进来
-```
-
-配置只需两端都写上同一个 `p2p_port`：
-
-```toml
-# frps.toml
-p2p_port = 7002          # 注意：防火墙 / 安全组要放行这个 UDP 端口
-
-# frpc.toml（提供者与访客都加）
-p2p_port = 7002
-p2p_enable = true        # 默认 true；设 false 就永远走中继
-```
-
-```toml
-# 提供者
-[[proxies]]
-name = "p2p-ssh"
-type = "xtcp"
-local_addr = "127.0.0.1:22"
-secret_key = "abcdefg"
-
-# 访客
-[[visitors]]
-name = "p2p-local"
-type = "xtcp"
-server_name = "p2p-ssh"
-secret_key = "abcdefg"
-bind_port = 9002
-```
-
-**回退是自动且静默的**：对称 NAT、UDP 被封、`p2p_port` 没配、打洞超时……
-任一环节失败都会退回 stcp 那条中继路径，只是日志里会记一行 `P2P 打洞失败，回退中继`。
-所以 xtcp 在任何网络环境下都不会比 stcp 更差。
-
-> 服务端如果没配 `p2p_port`，会明确拒绝 `NatHoleVisitor` 并回 `nat hole not enabled`，
-> 而不是让访客干等超时 —— 官方 frpc 的 xtcp 访客也会因此**快速失败**而不是挂起。
-
-### tcpmux（HTTP CONNECT 复用）
-
-上面几种代理要么各占一个公网端口 要么完全不占端口 `tcpmux` 是第三种：
-**所有 tcpmux 代理共用服务端同一个端口** 客户端用 HTTP `CONNECT` 指定要连哪个域名。
-
-场景：服务端只有一个端口可暴露（比如只放行了 443）但你有多条隧道要开。
-
-```toml
-# frps.toml
-tcpmuxHTTPConnectPort = 8443
-# tcpmuxPassthrough = true   # 内网本身就是 HTTP 代理时才开
-
-# frpc.toml —— 三条代理共用 8443
-[[proxies]]
-name = "web"
-type = "tcpmux"
-multiplexer = "httpconnect"     # 官方目前只有这一个取值
-local_addr = "127.0.0.1:8080"
-custom_domains = ["a.example.com"]
-
-[[proxies]]
-name = "web-b"
-type = "tcpmux"
-multiplexer = "httpconnect"
-local_addr = "127.0.0.1:8081"
-custom_domains = ["a.example.com"]   # 同一域名也能共存
-http_user = "alice"                  # 靠 Basic 鉴权区分
-http_pwd = "s3cret"
-```
-
-用法：
-
-```bash
-# 明文 HTTP 走 CONNECT（curl 的 --proxytunnel 就是干这个的）
-curl --proxytunnel -x http://alice:s3cret@server:8443 http://a.example.com/
-
-# HTTPS 也一样（CONNECT 里带 443 端口，服务端会去掉端口再匹配域名）
-curl -x http://server:8443 https://a.example.com/
-```
-
-行为要点：
-
-* 路由取的是 **`CONNECT` 请求行里的 authority**（去端口、转小写）而不是 `Host` 头；
-  支持 `custom_domains` 与 `subdomain`（配了 `subdomain_host` 之后）。
-* 与 http / https 代理**共用同一套**域名匹配、最长路径前缀、`routeByHTTPUser` 两级路由。
-  `routeByHTTPUser` 的用法是"同一域名 + 同一路径下 按访问用户名分给不同代理"。
-* 只有 `multiplexer = "httpconnect"` 被接受（与官方一致）服务端没配
-  `tcpmuxHTTPConnectPort` 时注册会**明确失败**而不是静默不生效。
-* 密码不对时回 `407 Proxy Authentication Required` 并带 `Proxy-Authenticate` 头。
-  ★ 这里与官方有一处**有意偏离**：官方先回 `200 OK` 再校验 于是密码错时客户端
-  **先收到 200**、再收到一个 407 隧道已经"建立成功" 那个 407 会被当成隧道里的数据；
-  NFrp 改成先校验再回 200 只发一个 407。
-
-## 传输层
-
-### QUIC
-
-```toml
-# 两端都要配成 quic
-transport_protocol = "quic"
-```
-
-选 QUIC 的收益：
-
-| 维度 | TCP + yamux | QUIC |
-|---|---|---|
-| 建连 | TCP 三次握手 + TLS 握手 | 1-RTT（会话复用可 0-RTT） |
-| 队头阻塞 | 一条流丢包，ymax 上其它流一起等 | 流间完全独立 |
-| 加密 | 需要额外套 TLS | 内置 TLS 1.3 |
-| 多路复用 | yamux 用户态分帧 | 协议原生，每条双向流即一条 frp 连接 |
-| NAT 友好 | 走 TCP | 需要放行 UDP |
-
-实现要点：
-
-- QUIC 模式下**跳过** TLS 与 yamux 两层（QUIC 自带加密与多路复用），
-  每条双向流直接当作一条 frp 连接处理，控制 / 工作 / visitor 都走这里；
-- 服务端在同一端口号上额外监听 UDP，TCP 监听保留，便于灰度；
-- 客户端 `ServerLink` 会同时持有 `Endpoint` 与 `Connection`——
-  quinn 的 `Endpoint` 一旦 drop，上面的连接会立刻断开，只留 `Connection` 是不够的。
-
-### TLS / yamux
-
-`tls_enable` / `tls_force` / `tcp_mux` 与官方 frp 语义一致，且服务端支持自动探测，
-能同时服务开了与没开这些选项的客户端。
-
-> ⚠️ **重要：客户端的 `transport.tls` 目前只加密、不校验对端证书**（v0.5.3 明确文档化）。
->
-> 现状如实写在这里：客户端侧没有 CA 校验，也不校验主机名。
-> 也就是说这个开关**能防被动偷看，但防不住中间人**（MITM 可以自己生成一对
-> 证书来接管连接，客户端不会察觉）。
->
-> 这与官方 frp 的行为一致（官方客户端的 `tls_enable` 同样不校验服务端证书），
-> 所以**升级不会改变现状**；但用户不该误以为它等同于 HTTPS 那种安全性。
->
-> 什么时候够用：链路本身可信（内网 / 专线 / 已有 WireGuard 等），
-> 只是想避免明文裸奔。什么时候不够用：跨公网直连且需要防 MITM ——
-> 那种场景请在**外层**再套一层真正的 TLS（stunnel / nginx stream / VPN），
-> 或者依赖 YAML 中 `token` / OIDC 的强度来限制影响面。
->
-> 服务端侧不受此影响：`tls_force` 校验的是自己那张证书，且服务端本来就持有私钥。
-
-## 负载均衡与服务发现
-
-### group：多后端共享一个端口
-
-同名 `group` 的多个代理可以**注册同一个 `remote_port`**，服务端为这个端口维护一组后端，
-每条新连接按**最小连接数**选一个（各后端在途连接数相等时退化为轮流）：
-
-```toml
-# 机器 A
-[[proxies]]
-name = "web-a"
-type = "tcp"
-local_addr = "127.0.0.1:8080"
-remote_port = 6100
-group = "web"                 # 同组
-group_key = "shared_secret"   # 组密钥，同组保持一致即可
-
-# 机器 B（同样的 remote_port 和 group）
-[[proxies]]
-name = "web-b"
-type = "tcp"
-local_addr = "127.0.0.1:8080"
-remote_port = 6100
-group = "web"
-```
-
-规则：
-
-- 组名相同 → 加入同一组（共享端口）；组名不同 → 冲突，注册失败并回明确错误；
-- **没配 `group` 的代理视为独占端口**，别人不能共享它，它也不能加入别人的组；
-- 组内最后一个后端掉线时端口才真正释放；客户端断线时它占的端口会被一次性收回。
-
-调度按**在途连接数**（不是 CPU / 内存这类需要后端上报的指标），所以既有"慢后端自动少接活"的
-弹性，又不给客户端增加任何上报负担；空闲时它等同于轮询，行为可预期。
-
-### 健康检查
-
-配了健康检查的代理，在探测不通过时会**拒绝新的工作连接**（表现为该后端临时不可用），
-配合 `group` 就实现了自动摘除/回归：
-
-```toml
-[[proxies]]
-name = "web-a"
-type = "tcp"
-local_addr = "127.0.0.1:8080"
-remote_port = 6100
-group = "web"
-
-health_check_type = "http"        # tcp / http，留空 = 不检查
-health_check_url = "/healthz"     # http 检查的路径，留空用 /
-health_check_interval_s = 10      # 探测间隔（秒）
-health_check_timeout_s = 3        # 单次超时（秒）
-health_check_max_failed = 3       # 连续失败几次判定不健康
-```
-
-探测是**进程级**的：跨重连持续运行，状态不会因为会话重建而丢失；
-用 `health_check_max_failed` 而不是"一次失败就下线"，是为了不被瞬时抖动误伤。
-
-## 客户端插件
-
-`plugin` 字段让工作连接不再连 `local_addr`，而是接到插件上——
-于是 frpc 本身就能当正向代理或静态站点服务器用。
-**官方 0.71 的 9 个插件类型全部实现**：
-
-| `plugin` | 说明 | 需要的字段 |
-|---|---|---|
-| `http_proxy` | HTTP 正向代理，支持 `CONNECT` 隧道 | 可选 `plugin_user` / `plugin_passwd` |
-| `socks5` | SOCKS5 代理（无认证 / 用户名密码） | 可选 `plugin_user` / `plugin_passwd` |
-| `static_file` | 直接把一个目录当静态站点服务 | 必填 `plugin_local_path`，可选 `plugin_strip_prefix` |
-| `unix_domain_socket` | 转发到本地 Unix 套接字 | 必填 `plugin_local_path`（仅 Unix） |
-| `http2http` | 收明文 HTTP、按 HTTP 转发到后端（可改写 Host、删/加请求头） | `plugin_local_addr`，可选 `plugin_host_header_rewrite` / `plugin_request_headers` |
-| `http2https` | 收明文 HTTP、以 **TLS 客户端**连后端 | 同上 |
-| `https2http` | **终止 TLS**（用 `plugin_crt_path` / `plugin_key_path` 的证书），再按明文 HTTP 转发 | 必填证书字段 |
-| `https2https` | 两端都走 TLS：对外终止、对内再起 TLS | 必填证书字段 |
-| `tls2raw` | 对外终止 TLS，把明文原样喂给后端（Redis / SMTP 这类裸协议） | 必填证书字段 |
-
-> `https2*` / `tls2raw` 收尾时会显式发 TLS `close_notify` 再关连接 ——
-> 直接 drop rustls 流只发 FIN，严格一点的客户端（Go 1.21+、OpenSSL 3）
-> 会报 `peer closed connection without sending TLS close_notify`。
-
-```toml
-[[proxies]]
-name = "proxy"
-type = "tcp"
-remote_port = 6200
-plugin = "http_proxy"
-plugin_user = "u"
-plugin_passwd = "p"
-```
-
-## 带宽限流
-
-给单个代理配 `bandwidth_limit` 就能限制它的吞吐，防止某条代理把整条上行链路吃满：
-
-```toml
-[[proxies]]
-name = "backup"
-type = "tcp"
-local_addr = "127.0.0.1:22"
-remote_port = 6300
-bandwidth_limit = "1MB"      # 单位：字节/秒；KB = 1000，KiB = 1024；不填或 0 = 不限
-```
-
-实现是标准**令牌桶**（`common/src/throttle.rs`），上下行各自限速，空闲时会累积额度、
-突发流量不会被硬砍。没配这个字段时代码走的就是原来的 `relay_between`，行为完全不变。
-
-## 可观测性
-
-```toml
-# frps.toml
-dashboard_port = 7500
-dashboard_user = "admin"
-dashboard_pwd = "change_me"
-```
-
-| 端点 | 说明 |
-|---|---|
-| `GET /` | 内置 HTML 面板：在线客户端、代理、访客、占用端口、实时指标（5 秒自动刷新） |
-| `GET /metrics` | Prometheus exposition format，可直接被 Prometheus / VictoriaMetrics 抓取 |
-| `GET /api/status` | 与面板同源的 JSON 快照 |
-| `GET /api/healthz` | 存活探针，返回 `ok`（不带鉴权，供 k8s / 负载均衡器使用） |
-| `POST /api/proxies/add` | 给指定客户端动态加一条代理（JSON：`run_id` + `proxy`），成功即端口已就绪 |
-| `POST /api/proxies/remove` | 移除客户端上的一条代理（`run_id` + `name`），端口随即收回 |
-| `POST /api/clients/kick` | 断开指定客户端（`run_id`） |
-
-写接口一律需要 Basic Auth（未鉴权返回 401），执行顺序是先问客户端、后动服务端状态：
-新增时客户端拒绝就回滚，不会留下"面板显示成功但没人干活"的端口。
-
-```bash
-curl -u admin:pwd -H 'Content-Type: application/json' \
-  -d '{"run_id":"<面板里的 run_id>","proxy":{"name":"web","type":"tcp","local_addr":"127.0.0.1:8080","remote_port":6100}}' \
-  http://127.0.0.1:7500/api/proxies/add
-```
-
-> 动态管理走 NFrp 两端之间的私有消息，**客户端先是 nfrp frpc 才支持**
-> （官方 frpc 连上来时面板会把它标为不可管理的，对应接口返回明确错误）。
-
-指标（前缀 `nfrp_`）：
-
-| 指标 | 类型 | 含义 |
-|---|---|---|
-| `clients_total` / `clients_active` / `clients_rejected` | counter / gauge / counter | 登录过的 / 在线的 / 被拒的客户端 |
-| `proxies_total` / `proxies_active` / `proxy_failures` | counter / gauge / counter | 注册过的 / 生效的 / 注册失败的代理 |
-| `conns_total` / `conns_active` / `conns_rejected` | counter / gauge / counter | 转发连接数（含因上限被拒的） |
-| `bytes_up_total` / `bytes_down_total` | counter | 上下行累计字节 |
-| `http_requests_total` / `https_conns_total` | counter | 虚拟主机处理的请求 / 透传连接 |
-| `visitor_conns_total` / `visitor_rejected_total` | counter | stcp/xtcp 访客接入与被拒次数 |
-| `p2p_success_total` / `p2p_failed_total` | counter | xtcp 打洞成功 / 失败回退次数 |
-| `uptime_seconds` | gauge | 服务端已运行秒数 |
-
-配置了 `dashboard_user` 后 `/`、`/metrics`、`/api/status` 需要 HTTP Basic Auth
-（`/api/healthz` 始终免鉴权）。鉴权用常量时间比较，只接受完整的 `user:password`。
-
-### Dashboard API v2
-
-v1 的 `/api/status`、`/api/proxies/add` 等接口**行为完全不变**（老脚本不用动）。
-新增的 `/api/v2/*` 面向程序化调用，三件事做规范：**版本化路径、统一错误信封、列表分页**。
-
-| 端点 | 说明 |
-|---|---|
-| `GET /api/v2/` `GET /api/v2/version` | 版本与能力声明（客户端据此判断字段是否存在） |
-| `GET /api/v2/status` | 汇总快照（客户端数、代理数、连接数、流量） |
-| `GET /api/v2/clients` | 客户端列表（**分页**） |
-| `GET /api/v2/proxies` | 代理列表（**分页**，可按 `client` 过滤） |
-| `GET /api/v2/visitors` | 访客列表（**分页**） |
-| `GET /api/v2/ports` | 已占用端口与归属 |
-| `GET /api/v2/audit` | 审计事件（需开启 `[audit]`；支持 `kind` / `since` 过滤） |
-| `POST /api/v2/proxies/add` | 动态加代理（与 v1 同一套执行顺序：先问客户端、后开端口） |
-| `POST /api/v2/proxies/remove` | 移除代理 |
-| `POST /api/v2/clients/kick` | 断开客户端 |
-
-分页参数：`page`（从 1 开始）、`page_size`（默认 20，上限 500；也接受 camelCase 的 `pageSize`）。
-响应里带 `total` / `page` / `page_size` / `items`。**列表一律强制稳定排序** ——
-注册表内部是 HashMap，不排序的话分页会随机重叠或漏项。
-
-错误信封（所有非 2xx 响应）：
-
-```json
-{ "error": { "code": "bad_request", "message": "page_size 必须是正整数", "details": {} } }
-```
-
-| `code` | HTTP | 含义 |
-|---|---|---|
-| `bad_request` | 400 | 参数缺失 / 格式错 |
-| `not_found` | 404 | 路径或对象不存在 |
-| `method_not_allowed` | 405 | 方法不匹配 |
-| `admin_failed` | 502 | 已转发给客户端但被它拒绝（原因在 `message`） |
-| `internal` | 500 | 服务端内部错误 |
-
-```bash
-curl -u admin:pwd 'http://127.0.0.1:7500/api/v2/clients?page=1&page_size=50'
-```
-
-### 配置热重载
-
-```toml
-hot_reload = true    # 需要配合 -c 指定配置文件（服务端会监视它的 mtime）
-```
-
-| 字段 | 行为 |
-|---|---|
-| `log_level` | **热生效**，立即切换日志过滤器 |
-| `dashboard_user` / `dashboard_pwd` | **热生效**，面板鉴权立即更新 |
-| 其余字段 | 记一条 WARN，提示这些项需要重启才能生效（不会静默忽略） |
-
-## 安全与访问控制
-
-> 本章所有能力**默认全部关闭**。不写这些段落时，认证仍是原来的 `token` 语义，
-> 行为与老版本**逐字节一致** —— 已有的配置文件一个字都不用改。
-
-### OIDC 认证
-
-用标准 OIDC 取代静态 token。客户端走 **Client Credentials Grant**（无用户交互，
-适合服务与 CI），服务端验签 IdP 的 JWKS。
-
-```toml
-# frps.toml
-[auth]
-method = "oidc"                 # token（默认）| oidc
-
-[auth.oidc]
-issuer = "https://keycloak.example.com/realms/myrealm"
-audience = "nfrp"
-# skipExpiryCheck = true        # 时钟偏差大 / 令牌有效期短时用
-# skipIssuerCheck = true
-# trustedCaFile = "/etc/ssl/private-ca.pem"   # 私有 CA 签的 IdP
-# insecureSkipVerify = true     # 仅调试
-# proxyURL = "http://127.0.0.1:8080"          # 经 HTTP 代理访问 IdP
-```
-
-```toml
-# frpc.toml
-[auth]
-method = "oidc"
-
-[auth.oidc]
-clientID = "nfrp-client"
-clientSecret = "见 IdP 控制台"
-tokenEndpointURL = "https://keycloak.example.com/realms/myrealm/protocol/openid-connect/token"
-# additionalScopes = ["profile"]
-```
-
-实现要点：
-
-- OIDC 模式下 `Login.privilege_key` 就是**原样的 access token**（不是 MD5 摘要），
-  控制通道的加密密钥也随之改用 access token —— 两端同源，否则会出现"能登录但后续消息解不开"。
-- `TokenSource` 带缓存与过期预判，重连前才换新 token，不会每次心跳都去打扰 IdP。
-- JWKS 的 RSA `n`/`e` 与 EC `x`/`y` 由内置代码转成 DER，验签用 `ring`，
-  只支持 `RS256` / `PS256` / `ES256`（其余算法直接拒绝，不做算法降级）。
-- 客户端在**启动时**就校验一遍认证字段，写错了立刻报错，而不是等每次连接都失败。
-
-> ⚠️ **安全提醒（v0.5.3 补充）：OIDC 模式必须配合 TLS 使用。**
->
-> 上面第一句说了"`privilege_key` 就是原样的 access token"—— 这意味着
-> **access token 会以明文出现在 `Login` 报文里**。若不启用 `transport.tls`
-> （或前面没有 TLS 终止的隧道），任何**被动抓包**的人都能拿到这个 token，
-> 然后在有效期内重放并完整接管会话。
->
-> 对比 token 认证方式：那种情况下重放 `Login` **拿不到**可用会话 ——
-> 因为后续加密用的是 token 本身而非报文里那串摘要，攻击者不知道 token
-> 就会在第一条加密帧上失败。**OIDC 没有这层保护**，因为它必须把 token 交出去。
->
-> ⇒ `method = "oidc"` + 明文传输 = 把长期凭据广播给链路上的每个人。
-> 请务必配 `transport.tls`，或确保链路本身可信。
-
-### IP 白 / 黑名单
-
-```toml
-# frps.toml
-[acl]
-allow = ["203.0.113.0/24", "2001:db8::/32"]
-deny  = ["203.0.113.66/32"]
-```
-
-- `deny` **优先于** `allow`；`allow` 为空表示"不限制"。
-- IPv4 与 IPv6 **按各自位宽分别比较**（不是统一升到 u128），跨地址族永不匹配 ——
-  否则 `/0`~`/96` 的白名单会退化成"全部放行"。
-- 判定发生在 TLS / 握手**之前**，被拒的连接不会进入认证流程。
-
-### 角色与权限
-
-```toml
-# frps.toml
-defaultRole = "guest"           # 没匹配到任何角色时用它；留空 = 无权限
-denyUnknown = false             # true = 没匹配到角色就直接拒绝登录
-
-[[roles]]
-name = "ops"
-users = ["alice", "deploy-bot"]     # 比对 Login.user
-allowProxyTypes = ["tcp", "http"]   # 留空 = 不限
-portRange = "6000-6999"             # 可申请的 remote_port 区间
-allowManage = true                  # 允许走面板动态增删代理
-allowVisitors = true                # 允许注册 stcp / xtcp 访客
-maxProxies = 20                     # 该角色下单个客户端的代理数上限
-```
-
-角色**按声明顺序匹配，第一个命中即生效**。被拒的请求会带上可执行的错误原因
-（是类型不允许、还是端口越界），并计入审计。
-
-### 审计日志
-
-```toml
-# frps.toml
-[audit]
-enable = true
-path = "/var/log/nfrp/audit.jsonl"   # 留空 = 只留内存，重启即失
-maxEntries = 1000                          # 内存环形缓冲条数（面板查询用）
-```
-
-每行一条 JSON（JSONL，可直接喂给 Loki / Filebeat / `jq`），覆盖：登录成功与失败、
-新建 / 关闭代理、踢出客户端、ACL 拒绝、RBAC 拒绝、OIDC 令牌校验失败。
-
-设计取舍：**写文件走追加并不阻塞业务路径**，内存环形缓冲只保留最近 N 条供面板查询；
-`enable = false`（默认）时连事件对象都不构造，开销为零。
-
-## 更多传输方式
-
-### WebSocket / WSS
-
-```toml
-# frpc.toml
-websocketEnable = true
-[websocket]
-path = "/~!frp"       # 默认就是官方路径，改了必须两端一致
-host = ""             # 前置代理按 Host 分流时才需要
-
-# frps.toml —— 服务端无需开关，按路径自动识别
-[websocket]
-path = "/~!frp"
-```
-
-服务端在**同一个端口**上识别 HTTP Upgrade 请求（与官方 frps 行为一致），
-因此不需要额外放行端口。配合普通 TLS 即 `wss://`。
-
-适用场景：企业防火墙 / 云 WAF 只放行 HTTP(S)，或者需要借 Nginx / Cloudflare
-做一层前置转发。实现是手写的 RFC 6455 帧编解码，没有引入第三方 WebSocket 库；
-Ping 会**就地写回 Pong**（不是排队等下一轮），避免对端阻塞在读取上导致死锁。
-
-### VirtualNet 虚拟网络
-
-把多台客户端组成一个虚拟局域网，服务端做三层转发。
-
-```toml
-# frps.toml
-vnet_port = 7501            # VirtualNet 监听端口（不配 = 不启用）
-
-[vnet]
-network = "default"         # 虚拟网络名：同名互通，异名隔离
-subnet = "100.64.0.0/24"    # 服务端用它分配地址
-mtu = 1400
-```
-
-```toml
-# frpc.toml
-[virtualNet]
-network = "default"
-serverPort = 7501           # 指服务端 vnet_port
-autoAssign = true           # 由服务端分配地址
-address = ""                # 也可以自己指定，如 100.64.0.2
-```
-
-- Linux 客户端会创建 **TUN 设备**（`/dev/net/tun`，需 root 或 `CAP_NET_ADMIN`），
-  用 `ip` 命令配好地址 / MTU / up；Windows 上不启用该能力。
-- 帧格式是 `[u32 小端长度][IP 报文]`，与官方 frp `pkg/vnet/message.go` 一致。
-- 地址池**从高地址往低地址分配**并跳过网络号与广播地址；客户端掉线时地址归还并抬回游标。
-- 服务端会替客户端应答 ICMP Echo（ping），这样"通不通"能直接 ping 出来。
-
-> 单独一个端口而不是复用控制端口：虚拟网络是长时间高速的纯数据流，
-> 混在控制通道里会拖慢心跳与面板命令，出故障时也不好隔离。
-
-### Proxy Protocol
-
-让内网服务（或它前面的 Nginx / HAProxy）拿到**真实客户端 IP**，而不是 frp 客户端的地址。
-
-```toml
-# frpc.toml
-[[proxies]]
-name = "web"
-type = "tcp"
-localIP = "127.0.0.1"
-localPort = 8080
-remotePort = 6000
-proxyProtocolVersion = "v2"     # "v1" 文本 / "v2" 二进制；不写 = 不发任何字节
-```
-
-- `v1` 是 `PROXY TCP4 <src> <dst> <sport> <dport>\r\n` 文本行；`v2` 是 16 字节二进制头。
-- 源地址取服务端下发的工作连接信息，目的地址为空时回落 `127.0.0.1`（与官方 frpc 一致）。
-- 解码侧的 `sniff` 做了**逐字节前缀比较**，半截签名不会被当成普通数据漏给后端，
-  避免 PROXY 注入。
-
-## 客户端管理
-
-### Store：动态代理持久化
-
-```toml
-# frpc.toml
-[store]
-path = "C:/Users/me/.nfrp/proxies.json"   # 留空 = 不持久化（与老版本一致）
-```
-
-- 只存**运行时动态添加**的代理（面板 / 本地界面加的那些）。
-  配置文件里写的代理**永远不会**写进 store —— 否则用户在面板删掉一条隧道后，
-  下次启动它又从 store 里"复活"。
-- 文件内容是 JSON，目录会自动创建；**与官方 frp 的 store 格式不通用**（官方是 Go 的
-  `configmgmt` 序列化结构），换实现时需要重新加一遍代理。
-- 落盘失败**不会**让"这次添加"失败（内存里已经生效、端口已经开了），
-  只记一条 WARN 提示"重启后这条会丢"。
-
-### 本地管理界面（Web UI）
-
-```toml
-# frpc.toml
-[webServer]
-addr = "127.0.0.1"       # 默认只监听本机
-port = 7400              # 0 = 不启用（默认）
-user = "admin"
-password = "change_me"
-```
-
-| 端点 | 说明 |
-|---|---|
-| `GET /` | 当前状态：隧道列表、连接数、上下行流量、健康检查 | 
-| `GET /api/status` | 同源 JSON |
-| `GET /api/proxies` | 代理列表 |
-| `POST /api/proxies/add` | 动态加一条代理（JSON，字段与 `[[proxies]]` 一致） |
-| `POST /api/proxies/remove` | 移除一条代理（`{"name": "..."}`） |
-| `GET /api/reload` / `POST /api/reload` | 重新读取配置文件 |
-
-> ⚠️ 这个界面**能动态开放端口**，默认只绑 `127.0.0.1`。要远程访问请显式写 `0.0.0.0`
-> **并务必配上 user/password** —— 否则等于把内网敞开。
-
-实现上说一句：写操作**不是**直接改内存表，而是通过 mpsc 排进会话主循环。
-因为控制连接被 `select!` 独占，并且"等 `NewProxyResp`"期间**必须顺手处理 `ReqWorkConn`**，
-否则服务端会以为本端掉线、把刚注册的代理收回。
-
-## 资源上限
-
-全部可配，`0` 或不填 = 不限。超限时拒绝**并计数**（对应 `clients_rejected` / `conns_rejected` / `proxy_failures`），
-不会静默丢弃：
-
-```toml
-# frps.toml
-max_clients = 100            # 同时在线的客户端数
-max_proxies_per_client = 50  # 单个客户端可注册的代理数
-max_conns_per_client = 200   # 单个客户端同时转发的连接数
-max_total_conns = 5000       # 全局同时转发的连接数
-max_pending_per_client = 64  # 单个客户端排队等工作连接的请求数
-```
-
-### 端口白名单（安全相关，对外提供服务时务必配）
-
-上面那组管的是"多少" 这一项管的是"**哪些**"：
-
-```toml
-# frps.toml —— 与官方 frps.toml 完全一致
-allowPorts = [
-  { start = 20000, end = 30000 },
-  { single = 8443 },
-]
-maxPortsPerClient = 20       # 单个客户端最多占用几个公网端口
-```
-
-* **不配 `allow_ports` = 不限制**（与官方一致）拿到 token 的客户端可以把 `22` / `3306`
-  直接映射到公网。多方共用一个服务端时这是最该配的一项。
-* 也接受字符串写法：`allowPorts = ["20000-30000", "8443"]`（legacy INI 的
-  `allow_ports = 20000-30000,8443` 同样会被搬进来）。
-* `allowPorts` 判在**绑定端口之前** —— 白名单外的端口连监听都不会建。
-* `maxPortsPerClient` 数的是**端口**不是代理：`http` / `https` / `tcpmux` / `stcp` /
-  `xtcp` / `sudp` 都不占公网端口 所以只受 `max_proxies_per_client` 约束
-  （与官方 `pxy.GetUsedPortsNum()` 的算法一致）。
-* 两项都能在启动日志里看到生效值：`allowPorts 已生效：客户端只能申请这些远端端口 …`。
-* 违规时服务端日志给完整原因 回给客户端的则受 `detailedErrorsToClient` 控制
-  （默认带上详情 想脱敏就设 `false`）。
-
-实现细节：用 `tokio::sync::Semaphore` 的 owned permit 做 RAII 配额，
-**配额令牌随连接/代理的生命周期存活**（而不是"检查一下就算过"），
-所以不会出现"上限配了但没生效"或"名额泄漏后越用越少"这两类问题。
-
-## 配置参考
-
-### 服务端（nfrp-server）
-
-| 项 | 说明 | 默认 |
-|---|---|---|
-| `bind_addr` | 监听地址 | `0.0.0.0` |
-| `bind_port` | 控制与工作连接共用端口（与 frp 一致） | `7000` |
-| `token` | 认证 token，客户端必须一致 | 必填 |
-| `tcp_mux` | 允许 yamux 多路复用（自动探测，不影响非 mux 客户端） | `true` |
-| `tls_force` | 强制客户端使用 TLS | `false` |
-| `transport_protocol` | `tcp` / `quic` / `kcp`（需客户端一致） | `tcp` |
-| `kcp_bind_port` | KCP 传输的 UDP 监听端口（不配 = 不开）；TCP 端口照旧保留 | 空 |
-| `vhost_http_port` | HTTP 代理入口端口（不配则拒绝 http 代理） | 空 |
-| `vhost_https_port` | HTTPS 代理入口端口 | 空 |
-| `tcpmuxHTTPConnectPort` | tcpmux 代理的 **HTTP CONNECT 共享端口**（不配则拒绝 tcpmux 代理） | 空 |
-| `tcpmuxPassthrough` | CONNECT 请求原样透传给内网（让内网自己回 200，适合内网本身就是 HTTP 代理） | `false` |
-| `vhostHTTPTimeout` | vhost HTTP 等内网服务**响应头**的秒数（0 = 不限） | `60` |
-| `custom404Page` | 没有代理匹配时返回的文件路径（不改状态码，仍 404） | 空（内置提示） |
-| `subdomain_host` | 泛域名后缀，配合客户端 `subdomain` | 空 |
-| `p2p_port` | xtcp 打洞牵线的 UDP 端口（不配则 xtcp 只走中继） | 空 |
-| `dashboard_port` | 内置面板 / 指标端口 | 空 |
-| `dashboard_user` / `dashboard_pwd` | 面板 Basic Auth（用户名留空 = 不鉴权） | 空 |
-| `hot_reload` | 监视配置文件 mtime 并热应用动态项 | `false` |
-| **`allowPorts`** | ★ **端口白名单**：客户端能申请的远端端口。空 = 不限制（任何客户端都能申请 22 / 3306） | 空 |
-| **`maxPortsPerClient`** | ★ 单客户端可占用的**端口数**上限（http / https / tcpmux / stcp 不占端口，不计入） | `0` |
-| **`detailedErrorsToClient`** | ★ 是否把详细失败原因回给客户端。关掉后只回 `new proxy [x] error` / `invalid ping`，不泄露别人的隧道名 | `true` |
-| `max_clients` | 同时在线的客户端数上限 | `0`（不限） |
-| `max_proxies_per_client` | 单客户端代理数上限 | `0` |
-| `max_conns_per_client` | 单客户端转发连接数上限 | `0` |
-| `max_total_conns` | 全局转发连接数上限 | `0` |
-| `max_pending_per_client` | 单客户端排队请求数上限 | `0` |
-| `heartbeat_timeout` | 心跳超时（秒） | `90` |
-| `websocket.path` | WebSocket Upgrade 路径（须与客户端一致） | `/~!frp` |
-| `websocket.host` | WebSocket 握手的 Host 头（前置代理分流时填） | 空 |
-| `vnet_port` | VirtualNet 监听端口（不配 = 不启用） | 空 |
-| `vnet.network` | 虚拟网络名（同名互通、异名隔离） | `default` |
-| `vnet.subnet` | 虚拟网段，服务端据此分配地址 | `100.64.0.0/24` |
-| `vnet.mtu` | 虚拟网卡 MTU | `1400` |
-| `auth.method` | `token`（默认）或 `oidc` | `token` |
-| `auth.oidc.issuer` / `audience` | IdP 签发者与预期受众 | 空 |
-| `auth.oidc.skipExpiryCheck` / `skipIssuerCheck` | 跳过过期 / 签发者校验（调试用） | `false` |
-| `auth.oidc.trustedCaFile` | 私有 CA 的 PEM 路径 | 空 |
-| `auth.oidc.proxyURL` | 经 HTTP 代理访问 IdP | 空 |
-| `acl.allow` / `acl.deny` | 客户端 IP 的 CIDR 白 / 黑名单（`deny` 优先） | 空（不限） |
-| `roles` | `[[roles]]` 角色权限表（按序匹配） | 空 |
-| `defaultRole` | 未匹配到角色时的兜底角色 | 空（无权限） |
-| `denyUnknown` | 未匹配到角色即拒绝登录 | `false` |
-| `audit.enable` | 开启审计日志 | `false` |
-| `audit.path` | 审计 JSONL 落盘路径（留空 = 仅内存） | 空 |
-| `audit.maxEntries` | 内存环形缓冲条数 | `1000` |
-| `log_level` | `error`/`warn`/`info`/`debug`/`trace` | `info` |
-| `log.to` | 日志落盘路径（空 / `console` = 标准输出）。写文件时**按天轮转**，备份名 `<名>.<YYYYMMDD-HHMMSS><扩展名>` | `console` |
-| `log.maxDays` | 备份日志保留天数（`<= 0` = 不清理） | `3` |
-
-### 客户端（nfrp-client）
-
-| 项 | 说明 | 默认 |
-|---|---|---|
-| `server_addr` | 服务端地址 | 必填 |
-| `server_port` | 服务端端口 | `7000` |
-| `token` | 认证 token | 必填 |
-| `tcp_mux` | 使用 yamux 多路复用 | `true` |
-| `tls_enable` | TLS 加密（不校验服务端证书，与 frpc 默认一致） | `false` |
-| `tls_server_name` | TLS SNI，留空用 `server_addr` | 空 |
-| `tls_custom_first_byte` | TLS 握手前发送 frp 伪装字节 `0x17` | `true` |
-| `transport_protocol` | `tcp` / `quic` / `kcp`（需服务端一致）。选 `kcp` 时 `server_port` 填服务端的 `kcp_bind_port` | `tcp` |
-| `p2p_port` | 服务端 xtcp 牵线端口，需与服务端 `p2p_port` 一致 | 空 |
-| `p2p_enable` | 是否允许 xtcp 尝试 P2P（失败自动回退中继） | `true` |
-| `pool_count` | 预建工作连接数（0 = 按需） | `1` |
-| `login_fail_exit` | 首次登录失败就退出（对齐官方 `loginFailExit`）。成功登录过之后断线仍无限重连 | `true` |
-| `reconnect_interval` | 断线重连间隔（秒），对齐官方 `reconnectInterval` | `10` |
-| `user` | 客户端用户名（frp 顶层 `user`），stcp/xtcp 的 `allow_users` 就是比对它 | 空 |
-| `[[proxies]]` | 代理列表，字段见下 | - |
-| `[[visitors]]` | stcp / xtcp 访客列表，字段见下 | - |
-| `websocketEnable` | 用 WebSocket 连接服务端（穿透只放行 HTTP 的防火墙） | `false` |
-| `websocket.path` / `websocket.host` | WS 路径 / Host 头（须与服务端一致） | `/~!frp` / 空 |
-| `auth.method` | `token`（默认）或 `oidc` | `token` |
-| `auth.oidc.clientID` / `clientSecret` | OIDC 客户端凭证（Client Credentials） | 空 |
-| `auth.oidc.tokenEndpointURL` | IdP 的 token 端点 | 空 |
-| `auth.oidc.additionalScopes` | 额外申请的 scope | 空 |
-| `store.path` | 动态代理落盘路径（留空 = 不持久化） | 空 |
-| `webServer.addr` / `port` | 本地管理界面监听地址 / 端口（0 = 关闭） | `127.0.0.1` / `0` |
-| `webServer.user` / `password` | 本地管理界面 Basic Auth | 空 |
-| `virtualNet.network` | 虚拟网络名（须与服务端一致） | `default` |
-| `virtualNet.serverPort` | 服务端 `vnet_port` | 空 |
-| `virtualNet.address` | 本机虚拟地址；留空且 `autoAssign` 时由服务端分配 | 空 |
-| `virtualNet.autoAssign` | 由服务端自动分配地址 | `false` |
-| `virtualNet.mtu` | 虚拟网卡 MTU | `1400` |
-| `log.to` | 日志落盘路径（空 / `console` = 标准输出）；写文件时按天轮转 | `console` |
-| `log.maxDays` | 备份日志保留天数（`<= 0` = 不清理） | `3` |
-
-> 配了 `log.to` 之后 **stdout 上就没有日志了**（与官方 frpc 一样是"控制台**或**文件"）。
-> NetTool 这类按行读 stdout 的第三方启动器面板上会看不到日志，排查时别以为是进程没起来。
-
-`[[proxies]]` 字段：
-
-| 字段 | 说明 |
-|---|---|
-| `name` | 代理名，全局唯一 |
-| `type` | `tcp` / `udp` / `http` / `https` / `tcpmux` / `stcp` / `xtcp` / `sudp` |
-| `local_addr` | 内网服务地址，如 `127.0.0.1:53` |
-| `remote_port` | tcp / udp 的公网端口（同 `group` 可与他人共享） |
-| `custom_domains` | http / https / tcpmux 的域名列表（支持 `*.example.com`） |
-| `subdomain` | 配合服务端 `subdomain_host` |
-| `locations` | http 路径前缀，留空等价 `/` |
-| `http_user` / `http_pwd` | http 基本认证 |
-| `host_header_rewrite` | 转发时改写的 Host |
-| `bandwidth_limit` | 带宽上限，如 `1MB`（`KB`=1000、`KiB`=1024）；留空 = 不限 |
-| `group` / `group_key` | 负载均衡组名与组密钥；同名组共享 `remote_port` |
-| `health_check_type` | `tcp` / `http`；留空 = 不检查 |
-| `health_check_url` | http 检查路径，留空用 `/` |
-| `health_check_interval_s` | 探测间隔（秒），默认 `10` |
-| `health_check_timeout_s` | 单次超时（秒），默认 `3` |
-| `health_check_max_failed` | 连续失败几次判定不健康，默认 `3` |
-| `plugin` | 官方 9 种全支持：`http_proxy` / `socks5` / `static_file` / `unix_domain_socket` / `http2http` / `http2https` / `https2http` / `https2https` / `tls2raw` |
-| `plugin_local_path` | `static_file` 的目录 / `unix_domain_socket` 的套接字路径 |
-| `plugin_strip_prefix` | `static_file` 回源时剥掉的路径前缀 |
-| `plugin_local_addr` | `http2*` / `https2*` / `tls2raw` 的后端地址（留空则回退到 `local_addr`） |
-| `plugin_host_header_rewrite` | 转发到后端时改写的 Host |
-| `plugin_crt_path` / `plugin_key_path` | `https2*` / `tls2raw` 的证书与私钥 PEM 路径 |
-| `plugin_request_headers` | 增删请求头：`{ set = { K = "V" } }`，值为空串表示删除 |
-| `plugin_user` / `plugin_passwd` | `http_proxy` / `socks5` 的认证 |
-| `routeByHTTPUser` | http / tcpmux 的**第二级路由**：同一域名 + 路径下按访问者用户名分给不同代理 |
-| `multiplexer` | tcpmux 专用，官方只有 `httpconnect` 一个取值 |
-| `secret_key` | stcp / xtcp / sudp 的共享密钥（别名 `secretKey`，legacy INI 里写 `sk`） |
-| `allow_users` | stcp / xtcp 允许的**访客客户端 `user`** 白名单（别名 `allowUsers`）；**留空 = 只允许与 provider 同一 user**，`["*"]` = 全部放行 |
-| `proxyProtocolVersion` | `v1` / `v2`，连内网服务前注入 PROXY 头透传真实客户端 IP；留空 = 不发 |
-
-`[[visitors]]` 字段：
-
-| 字段 | 说明 |
-|---|---|
-| `name` | 访客的本地标识（`allow_users` 不比对它，比对的是顶层 `user`） |
-| `type` | `stcp` / `xtcp`，默认 `stcp` |
-| `server_name` | 要连接的提供者代理名（别名 `serverName`） |
-| `server_user` | 目标 provider 所属客户端的 `user`（别名 `serverUser`）；留空用本客户端的 `user` |
-| `secret_key` | 共享密钥，必须与提供者一致（别名 `secretKey`） |
-| `bind_addr` | 本地监听地址，默认 `0.0.0.0` |
-| `bind_port` | 本地监听端口，为 0 时不监听（别名 `bindPort`） |
-
-## 性能
-
-同一转发负载下的常驻内存（RSS）：
-
-| 实现 | 常驻内存 |
-|---|---|
-| Go 官方 frps（默认） | 31.8 MB |
-| Go 官方 frps（GOGC/GOMEMLIMIT 调优后） | 28.8 MB |
-| **nfrp-server（Rust）** | **~3.5 MB** |
-
-### 吞吐实测（iperf3）
-
-**① 本机回环**（排除公网因素，单看代理本身的转发开销）
-
-`127.0.0.1` 上跑 iperf3 服务端，两种实现各自把 `5201` 投放到远端端口，再从同一台机器连过去，
-即数据全程不出本机 —— 测的是代理链路的纯开销。单位 Mbps，5 次取**中位数**，括号内为最好值：
-
-| 场景 | 直连（无隧道） | 官方 frp 0.71.0 | nfrp |
-|---|---|---|---|
-| yamux，单流 `-P1`，客户端→服务端 | 17813.0 (21956.9) | 1053.3 (1130.0) | **2034.6** (3941.1) |
-| yamux，单流 `-P1`，服务端→客户端 `-R` | 20417.8 (21674.3) | 1154.6 (1456.3) | 1090.5 (1097.8) |
-| yamux，4 流 `-P4`，客户端→服务端 | 73594.0 (74291.2) | 3303.1 (3342.5) | **12621.9** (13341.7) |
-| yamux，4 流 `-P4`，服务端→客户端 `-R` | 73332.7 (73855.3) | 3314.8 (3338.7) | **13185.6** (13407.4) |
-| 关闭 yamux，单流 `-P1`，客户端→服务端 | 25886.3 (26113.4) | 412.6 (441.2) | **1388.9** (1424.3) |
-| 关闭 yamux，单流 `-P1`，服务端→客户端 `-R` | 25430.2 (26085.6) | 415.1 (432.6) | **1390.5** (1471.7) |
-
-结论：**多流场景（`-P4`）NFrp 是官方 frp 的约 3.8~4 倍**（12.6 Gbps vs 3.3 Gbps）；
-单流场景两者同一量级（NFrp 单向量测波动较大，中位数略优于官方）；
-关闭 yamux 时 NFrp 约 1.39 Gbps，是官方（约 0.41 Gbps）的 **3.4 倍**。
-
-> 这一版把 yamux 的 `split_send_size` 从默认 16 KiB 提到 **128 KiB**、并把转发缓冲区从 tokio 默认的
-> 8 KiB 提到 **128 KiB**（`RELAY_BUF`）。前者是单流吞吐的主要瓶颈，这正是这里拉开差距的原因。
-> 上表用最终发布版二进制实测。
-
-**② 广域网**（家庭宽带 ↔ 阿里云轻量服务器，真实公网链路）
-
-本机 iperf3 服务端 → 本机客户端 → 云端服务端 → 云端 iperf3 客户端，每档 3 次 × 10s 取最好值。
-**跑了两次**，下表两个数字分别是两次的结果：
-
-| 方向 | 官方 frp 0.71.0 | nfrp |
-|---|---|---|
-| 云端→本机（下行） | 222.8 / 210.0 Mbps | 223.8 / 205.9 Mbps |
-| 本机→云端（上行 `-R`） | 51.6 / 51.7 Mbps | 52.3 / 52.0 Mbps |
-
-**结论要说实话：两次跑各有胜负（第一次 NFrp 略高、第二次官方略高），差值都在 2% 以内，
-属于链路抖动。** 真实公共链路的瓶颈是家庭宽带本身（下行约 200~220 Mbps、上行约 50 Mbps），
-两种实现都能跑满，说明协议开销在公网上可忽略 —— 差距只在回环（本机内）场景才看得出来。
-
-> 数据来源：`tmp/bench_loopback.py`（回环）、`tmp/bench_wan.py`（广域网）与 `tmp/wan_e2e.py`（端到端）实测。
-
-### 真机端到端验证（v0.2.0 发布版二进制，真实公网链路）
-
-家用 Windows 机器（家庭宽带）跑客户端，阿里云轻量（`118.178.189.143`）跑服务端，
-**两端都用发布包里那份二进制**，直接跨公网跑四种用法：
-
-| 用例 | 链路 | 结果 |
-|---|---|---|
-| `tcp` | 云端连 `127.0.0.1:15201` → 公网隧道 → 本机 `16101` 回显服务 | ✅ 收到 `ECHO:wan-tcp` |
-| `http` | 云端 `curl -H 'Host: e2e.test' http://127.0.0.1:15280/` → 公网 → 本机 `16111` | ✅ 返回本机静态服务目录页 |
-| `stcp` | 本机访客 `16102` → 公网服务端中转配对 → 本机 provider `16101` | ✅ 收到 `ECHO:wan-stcp` |
-| `stcp` 白名单 | 访客 `user=mallory`（借 `server_user=alice` 定位 provider） | ✅ 被拒：服务端 `WARN visitor 用户不在 allow_users 白名单内`，访客端读到 `visitor connection of [alice.secret] user [mallory] not allowed` |
-
-4/4 通过 —— 说明 tcp / http / stcp 三条链路在真实公网环境下（含 NAT、跨运营商）都能正常工作，
-白名单拒绝不只是「连不上」，而是服务端明确鉴权后的拒绝。复现脚本：`tmp/wan_e2e.py`。
-
-> v0.3.0 的新增能力（xtcp P2P、QUIC、插件、group、健康检查、限流）由自动化测试覆盖，
-> 其中包含**真实 QUIC 栈**的握手与数据往返、打洞口令正反用例、以及端到端集成测试；
-> 跨公网的真机复测见 v0.3.0 发布说明。
->
-> v0.3.1 是一个**第三方平台兼容性补丁**：`frpc` 现在能直接吃下原版 frp 平台下发的配置
-> （camelCase 字段名、`[[proxies]]` 分段、`localIP` + `localPort`），并且**线协议行为与官方
-> frpc 逐字节对齐**（`proxy_name` 带 `{user}.` 前缀、`bandwidthLimitMode` 字段）。
-> 已用 LoliaFRP 真实服务端跑通端到端隧道（公网端口 → 平台 → nfrp → 本地服务）。
-> 同版还修掉一个 xtcp 回归：provider 侧漏剥 `{user}.` 前缀，导致打洞通知被当「未知代理」
-> 忽略、P2P 静默退化成中继（本机冒烟 12/12 已覆盖"是否真走直连"）。
->
-> v0.3.2 补上了**官方默认的 v1 线协议**：在此之前 NFrp 只讲 v2，官方客户端必须显式
-> 写 `transport.wireProtocol = "v2"` 才能连 —— 而第三方 frp 平台一律走 v1，这正是上一版
-> 在樱花上失败的原因。现在 v1 是默认，官方 frpc / frps 零配置直连，服务端还能在同一个
-> 端口上同时接待 v1 与 v2。踩过的最大的坑写进了源码注释：**v1 控制通道的 PBKDF2 盐是
-> `"frp"` 而不是 golib master 里的 `"crypto"`**（frp 0.71.0 锁的是 golib v0.8.2）——
-> 照着 master 写会得到一个"自加密自解密全对、一接官方 frps 就连上即断"的实现。
-> 已用官方 frps / frpc v0.71.0 双向实测，并把**官方抓包的真实密文**做成回归用例锁死。
->
-> v0.3.3 把上一版列在「已知限制」里的四条短板一次性补掉：**xtcp 对称 NAT 端口预测**
-> （按观测端口的步长推候选，不再一击不中就回退中继）、**KCP 弱设备通道**
-> （`xtcp_transport = "kcp"`，自研 ikcp，30% 丢包下 20KB 仍可靠送达）、
-> **面板可写**（动态增删代理 / 踢客户端，私有消息 + 能力协商，对官方 frpc 零影响）、
-> **group 改最小连接数调度**（平局退化为轮询）。顺带修掉两个真 bug：
-> QUIC `Endpoint` 被提前 drop 导致 P2P 刚握完手就 `closed by peer: 0`、
-> 面板不读请求体导致跨 TCP 段的 POST 被截断。
->
-> v0.3.4 是**安全与生态**的一版：补齐 OIDC 认证、RBAC 角色权限、IP 白/黑名单、审计日志、
-> WebSocket/WSS 传输、VirtualNet 虚拟网络、Proxy Protocol v1/v2、客户端 Store 持久化、
-> 客户端本地管理界面、面板 API v2 共十项能力（默认全关，老配置零改动）。
-> 顺带修掉三个真 bug：Linux 下 `tun_linux.rs` 编译不过（E0716，本机 Windows 编不到那段
-> `cfg(linux)` 代码，是云端构建抓出来的）、`denyUnknown`/角色拒绝时**先回"登录成功"再断开**
-> 导致客户端无限重连而 `loginFailExit` 永不触发、`DELETE /api/v2/*` 被面板总闸拦成纯文本
-> 405 而绕过了 v2 的统一错误信封。
->
-> v0.4.0 是**补齐官方能力**的一版：新增 **sudp 秘密 UDP**（与 stcp 同一套 `sk` /
-> `allow_users` 鉴权，但数据面是 UDP，同样不占公网端口）与 **KCP 独立传输**
-> （服务端 `kcp_bind_port` + 客户端 `transport_protocol = "kcp"`），
-> 代理类型从六种补到七种，与官方 frp 的类型清单对齐。
-> 顺带修掉一个潜伏很久的真 bug：`KcpStream::poll_read` 会把"一次没读完的剩余字节"
-> 直接丢掉 —— 服务端探测 yamux 时只读 1 字节，frp v2 的 8 字节魔术字于是被吃掉 7 个，
-> 握手**静默卡死**（这个 bug 在 xtcp P2P 的 KCP 通道上一直存在，只因那边读写缓冲够大才没暴露）。
->
-> v0.5.0 是**改名与配置兼容**的一版：项目从 `rustunnel` 更名为 **NFrp**
-> （crate `nfrp-common` / `nfrp-server` / `nfrp-client`，源码目录 `nfrp/`）。
-> **对官方 frp 的兼容标识一个都没动** —— `-v` 仍输出裸 `0.71.0`、线协议魔术字/版本串、
-> 包内 `frps`/`frpc` 命名全部保持，所以官方 frpc / frps 与第三方 frp 平台的对接不受影响。
-> 同时补上两处"静默忽略"的缺口：**官方 frpc / frps 支持、但 NFrp 未实现的配置字段**
-> 现在会在启动日志里逐条列出（`useEncryption` / `useCompression` / `allowPorts` /
-> `maxPortsPerClient` 这类"配了没生效"最危险），并新增 `verify` / `status` / `stop`
-> 三个与原版 frpc 同名的子命令。私有能力协商字段由 `_rustunnel` 改为 `_nfrp`，
-> 因此**新旧版本混用时不协商私有能力**（退化为纯 frp 行为，不会出错）。
->
-> 改名之后又拿官方 0.71.0 做了一轮**逐项对拍**（协议、七种代理类型、配置兼容层），
-> 又抓出三个真 bug：
-> ① **官方文档里的配置键 `subDomainHost` 不生效** —— NFrp 的键名搬家表是**精确匹配**，
-> 而官方 frp 读配置走 `toml → json → json.Unmarshal`，Go 的 `encoding/json` 匹配字段名
-> 是**大小写不敏感**的（`strings.EqualFold`），所以 `subDomainHost` / `subdomainHost`
-> 官方都认。NFrp 于是把官方文档和 `frps_full_example.toml` 里那个拼写当未知键**静默丢掉**，
-> 表现是客户端只得到一句「代理注册失败：客户端用了 subdomain，但服务端未配置
-> subdomain_host」。现在键名匹配折叠 ASCII 大小写（★ **不折叠下划线**，与官方一致：
-> 官方同样不认 `subdomain_host`），同一处理也覆盖子表路径、`[proxies.plugin]`
-> 与"未实现字段"告警的识别；
-> ② **负载均衡组永远只用一个后端** —— 组成员去重只看 `run_id`，同一客户端的第二个同组
-> 代理会把兄弟成员挤掉，于是组里只剩一个后端（官方同配置会轮询到两个）。去重键改成
-> 「客户端 + 代理名」；
-> ③ **官方 frpc 的 xtcp visitor 打洞会干等 20 秒** —— NFrp 未实现官方 frp 的 NatHole
-> UDP 地址交换协议，现在会**明确拒绝**未签名的 `NatHoleVisitor`，官方 frpc 因此立刻转走
-> 它自己的 `fallbackTo` 中继（1 秒），而不是卡满 20 秒才放弃。
-> （★ 顺带纠正一个认知：官方 frp 的 xtcp "回退中继"只能指向 **stcp / sudp** 代理 ——
-> 服务端只有这两类代理会注册 visitor 监听器；指向 xtcp 代理只会得到
-> 「custom listener for [x] doesn't exist」，xtcp 代理本身**永远无法被中继**
-> （官方 frpc 的 `XTCPProxy::InWorkConn` 一上来只读 `NatHoleSid`）。）
-> ④ 仓库公开之后第一次看到 CI 的真实结果，发现 **musl 目标**（也就是
-> `release.yml` 和 Docker 镜像用的那个目标）**一直编不过**：
-> `common/src/vnet/tun_linux.rs` 把 `TUNSETIFF` 的请求码写死成 `libc::c_ulong`，
-> 而 libc 的 `ioctl(fd, request: Ioctl, …)` 里 `Ioctl` 是**按目标 libc 分的**
-> —— glibc / uclibc 是 `c_ulong`(u64)，**musl 与 android 是 `c_int`(i32)**
-> （libc `unix/linux_like/linux/musl/mod.rs`）。于是同一份代码 glibc 编得过、
-> musl 直接 `error[E0308]: expected i32, found u64`。这段又是
-> `cfg(target_os = "linux")`，本机 Windows 永远编不到 ⇒ 只有 CI 的交叉编译能发现。
-> 改成用 libc 自己的别名 `libc::Ioctl`，两个 libc 都对（`0x400454ca` 只有 31 位，
-> 窄化到 i32 不丢信息）。已发布的三平台包走的是 glibc 静态链接，**不受影响**。
-> （★ 记一笔坑：`cargo check --target *-musl` 在 Windows 上做不了 —— `ring` 的
-> 构建脚本要 `aarch64-linux-musl-gcc`。用一个**只依赖 `libc`** 的最小工程可以
-> 精确复现/验证这个类型差异，不需要交叉 C 工具链。）
->
-> **v0.5.2 是安全修复版**（2026-10-04 全仓安全审计，17 项问题全部修复并带回归测试）
-> 完整报告见仓库内 `SECURITY-FIXES.md`（随仓库走，不进发布包）。
-> ★★ **本版有四处行为变更，升级前务必看**：
->
-> ① **配了 `dashboard_port`、绑的是非回环地址、又没配 `dashboard_user` 的部署将拒绝启动。**
-> 这是有意为之 —— 那正是漏洞本身：面板**跟随 `bind_addr`**（默认 `0.0.0.0`），
-> `dashboard_user` 留空时鉴权整块被跳过，匿名者因此可以读 `/api/status`（全部客户端与代理名）、
-> `POST /api/clients/kick` **踢掉任意客户端**（这条无条件生效，连能力协商都不需要）、
-> 对 nfrp 客户端还能 `POST /api/proxies/add` **直接开公网端口**
-> （已用独立工程实测复现：留空 `dashboard_user` 时匿名 POST 返回 200 且端口真的打开）。
-> 三条出路任选：配上 `dashboard_user` / `dashboard_password`、
-> 改 `bind_addr = "127.0.0.1"`（回环无凭据仍合法，只有本机能连）、
-> 或显式写 `allow_insecure_dashboard = true` 承认风险。
-> ② 客户端 `[webServer]` **监听非回环地址且无凭据时同样拒绝启动**
-> （原先只打一条 warn 就放行），逃生开关 `allowInsecureRemote = true`。
-> ③ **调本地管理界面写接口的脚本要加 `X-Nfrp-Client: 1` 头**，且带 `Origin` 时必须是本机来源
-> —— 这是防 CSRF / DNS rebinding 的（自定义头会触发 CORS 预检，而本界面不回应预检，
-> 跨站写请求因此根本发不出去；命令行脚本默认不带 `Origin`，不受影响）。
-> ④ 面板**认证失败加了 200ms 延迟**（单连接降到约 5 次/秒，防爆破），
-> 且面板连接数上了 `MAX_DASHBOARD_CONNS = 128` 的闸门 ——
-> 面板与业务在同进程里，原先洪水式连接能把整个服务端拖垮。
->
-> 其余修复：**`ServerCmd` 可下发任意插件配置**（服务端下发的 `ProxyConfig` 原先只校验
-> `name`/`type` 非空，于是能指定客户端**读哪个文件、连哪个内网地址** ——
-> 新增 `validate_remote_proxy` 禁止远程来源携带 `pluginLocalPath` / `pluginLocalAddr` /
-> `pluginCrtPath` / `pluginKeyPath`）、**RBAC 两个死字段**
-> （`allowManage` / `maxProxies` 能从配置赋值却全仓零生产读取点，管理员以为限住了其实毫无作用
-> —— 改成真正生效；★ `allowVisitors` **一直是生效的**，不在此列）、
-> **CL+TE 请求走私**（两头并存直接 400）、**`Expect: 100-continue` 死锁**
-> （原先双方互等到 `vhostHTTPTimeout` 60 秒，**单条请求就能占住一条工作连接**，
-> 改成自己回 100 并摘掉该头）、**逐跳头未剥离**（`HOP_BY_HOP` 工具早就写好，
-> 只有 vhost 这条路径漏了调用）、**HTTP 头注入**（`http_relay` 的 `set()` 不剥 CRLF，
-> 而 `plugin_request_headers` 可由服务端下发 ⇒ 值里塞 `\r\nX-Admin: 1` 能往用户内网插入任意头；
-> 改成写入与序列化**双重剥离**）、**rustls 依赖漏洞** RUSTSEC-2026-0285
-> （0.23.44 → 0.23.45，CI 同时加上 `rustsec/audit-check` 门禁 ——
-> v0.5.1 就是带着这个漏洞发出去的，而当时没有任何环节会去查）、
-> **`Host` 头按 `:` 硬切**（`[::1]:8080` 会切出孤零零的 `[`，统一走 `canonical_host`）、
-> **`store.rs` 落盘权限**（这份文件含完整代理配置与 `secret_key`，却走默认 umask 0644，
-> 同机其他用户可直接读走密钥 ⇒ 改 0600 + `create_new` 防软链 TOCTOU）、
-> **HTTP 代理 Basic Auth 用普通 `==`**（改 `constant_time_eq`，与全项目另外四处凭据比较口径一致）、
-> **裸 `lock().unwrap()`**（`health.rs` / `p2p.rs` 改 `unwrap_or_else(|e| e.into_inner())`，
-> 否则锁一旦被写脏后续**每次**调用都 panic，而 `is_healthy` 会退化成"永远健康"把故障掩盖；
-> 顺带修 `p2p.rs request()` 失败时漏删 waiter 的泄漏）、
-> **示例配置默认把 SSH 暴露到公网**（`assets/frpc.toml` 那条 `[[proxies]]` 是未注释的启用状态，
-> 而 `docker-compose.yml` 又原样挂载它 ⇒ 跟着示例跑一遍 SSH 就裸奔在公网 6000 端口；
-> ★ **有意保留默认启用、只加醒目警告** —— 改成默认注释掉会让 `docker compose up`
-> 跑起来一个代理都没有，用户以为在演示、实际什么都没转发，同样是破坏）。
-> 审计中另有两处「疑似高危」**实测后判定为误报**（`sni.rs::parse_sni` 越界 panic：
-> 30 万次 fuzz + 定向构造零 panic；审计日志 CRLF/ANSI 注入：实测 `serde_json`
-> 把 `\r\n` 输出为转义序列而非真实换行），**别再重复排查**。
-> ★ `Dockerfile` 有意**不加 `HEALTHCHECK`**：唯一适合做探针的免鉴权 `/api/healthz`
-> 挂在面板端口上，而示例配置里 `dashboard_port` 默认注释掉 ⇒ 写死探针会让用户
-> 一 `docker compose up` 就看到 `unhealthy` 且不知道改哪儿
-> —— 「容器看起来一直 unhealthy」比「没有健康检查」更难排查。理由已写进 Dockerfile。
->
-> 质量门：`cargo fmt --check` 干净、`cargo clippy --workspace --all-targets -- -D warnings`
-> **0 告警**、**564 个测试全绿**（542 → 564，新增 22 条安全回归测试）、
-> `cargo audit` **exit 0 零漏洞**（修复前 1 条）。
-> 发布版二进制真机冒烟 **18/18**（含面板鉴权 401 / 写接口鉴权 / 面板增删代理 / QUIC /
-> xtcp 真 P2P / group 均衡 / 限流），与 v0.5.1 基线**逐项一致**（基线同样 18/18）。
-> 线协议未改动（魔术字 / 版本串 / 消息结构都没变），与官方 frp 的互通性不受影响；
-> 配置层新增两个**可选**字段（`allow_insecure_dashboard` / `allow_insecure_remote`），> 老配置在**回环或已配凭据**的前提下照常工作。
->
-> **v0.5.3 是第二轮安全审计的修复版**（在 v0.5.2 交付之后又独立复审了一遍）
-> 完整报告见仓库内 `SECURITY-FIXES.md`。
->
-> ★★ 这一轮问的不是"有没有漏洞"，而是**"上一轮新写的那道防线本身能不能被绕过"** ——
-> 结果抓到一个高危：
->
-> ① **热重载可以一次性、永久地绕过面板鉴权**（`server/src/reload.rs`）。
-> 场景：`bind_addr = "0.0.0.0"` + `dashboard_user = "admin"` + `hot_reload = true`
-> 启动（合法，有凭据）→ 运行中把 `dashboard_user` 改成空 → 面板**当场变成匿名可写**
-> （`/api/status` 从 401 变 200，`/metrics` 可读，`POST /api/clients/kick` 能踢人）。
-> 三个根因：`reload.rs` 允许清空凭据；启动期那道「非回环 + 无凭据 ⇒ 拒绝启动」
-> **只在启动路径跑过一次**（`serve.rs` 的"防御性兜底"在函数体里是一次性语句）；
-> 而 `watch()` 拿的是一份**永不更新的启动快照**做 diff ⇒ 清空之后**改回 `admin` 也不恢复**，
-> 必须重启进程。日志还是 `INFO 面板鉴权已热更新（用户：）`（空值、无告警），
-> 运维会误以为已经改好了。
-> 现在：热重载对新配置**重跑一次同样的安全校验**（不通过就整份拒绝并说明原因）、
-> `apply_dynamic` 的凭据分支加安全闸门、`watch()` 真正推进基线快照（修掉不可逆），
-> 日志改 `WARN` 并点名后果。**6 条回归测试**锁死，含"清空后改回必须能恢复"。
->
-> ② **OIDC 的核验器被丢弃** ⇒ 配了 `method = "oidc"` 的服务端**拒绝所有人登录**。
-> `SecurityContext` 里 `auth` 是不可变字段，`refresh_oidc(&self)` 拿不到 `&mut`，
-> 于是新拉的 JWKS **没有任何地方能存**，函数一结束 verifier 就被 drop，
-> 状态永远停在 `OidcUnavailable`；文档引用的 `Self::ensure_ready` **全仓根本不存在**。
-> 这是 fail-closed（没有绕过、不会放行未认证者），但功能是死的，
-> 而且意味着 `oidc.rs` 里那些"已核实安全"的实现**从未在真实流量上跑过**。
-> 现在 `auth` 改成 `Arc<RwLock<AuthProvider>>` 并**真正回填**（已用 mock IdP 实弹验证：
-> 日志里同时出现「JWKS 已加载」与「JWKS 已就绪」）。
->
-> ③ **OIDC 的 `additionalScopes` 复核没绑会话**（`oidc.rs`）。原来是一个只增不减的
-> 全局 `HashSet<subject>`，只问"这个 sub 曾在**某个**连接上登录过吗" ⇒
-> 攻击者拿自己的合法 token 登录一次，就能用**同一个 token** 给**受害者的 run_id**
-> 开工作连接。现在改成 `run_id → sub` 的二维绑定，且会话结束可精确移除
-> （顺带消掉那个无界增长点）。
->
-> ④ **`tcpmux` 的用户名/口令还在用 `==` 比较** —— 上一轮「凭据一律常量时间比较」
-> 的修复**唯一漏掉的一处**（同文件 815 行那段 HTTP 路径早就改了）。
-> 如实说：跨网络字节级耗时侧信道会被抖动淹没，工程上难以远程爆破，
-> 但没理由留两套口径。
->
-> ⑤ **`chunked` 长度 ACL 的算术回绕**（`http_relay.rs` / `httpc.rs`）：
-> `out.len() + size` 里 `size` 来自报文（攻击者可控），而 release profile
-> **没开 `overflow-checks`** ⇒ 裸 `+` 会静默回绕成小值、绕过 32 MiB 上限。
-> 改 `saturating_add` / `checked_add`。（★ 如实说明：下游 `read_n` 还有一道独立 ACL
-> 兜着，所以实际不是无限内存增长，约 64 MiB/连接封顶 —— 属纵深防御缺口。）
->
-> ⑥ **`run_id` 改用 `OsRng`**。它事实是"可取工作连接的持有票据"
-> （`handle_work` 只要拿到一个存在的 run_id 就能把连接塞进那个客户端的连接池），
-> 而原实现把安全性押在 std **从未承诺**为密码学 PRF 的 `RandomState` 上。
->
-> ⑦ **visitor 路径的错误文案没走脱敏开关**：会把**代理名是否存在**（可枚举 stcp 隧道）、
-> `allow_users` 里的**真实用户名**回给尚未认证的来访者。现在详情只进服务端日志。
->
-> ⑧ **弱/占位 token 启动告警**。v1 的登录凭证是 `md5(token + timestamp)`，
-> 而服务端**不校验时间戳新鲜性** ⇒ 抓到一条登录报文后，离线枚举一个候选只要
-> **1 次 MD5**。token 强度完全取决于自身随机性（PBKDF2 的 64 次迭代是官方 golib
-> 硬编码值，改了即断互通，**不能改**）。所以启动时检测占位值（`your_secret_token`
-> 等）与低强度 token 并强告警 —— 不拒绝启动，以免破坏既有部署。
->
-> ⑨ **配置结构的 `Debug` 全面脱敏**（`ServerConfig` / `ClientConfig` /
-> `ServerAuthConfig` / `ClientOidcConfig` / `WebServerConfig`）。
-> 原来是 `#[derive(Debug)]`，任何一句调试用的 `println!("{cfg:?}")` 都会把
-> **明文 token / 面板口令 / `client_secret`** 写进日志。**3 条锁定测试**盯着这件事
-> （写这两条测试时当场抓到两处真实泄漏）。序列化不受影响 —— `--gen-config` 照常输出真值。
->
-> ⑩ **审计日志落盘权限 0600**（原来是默认 umask，通常 0644 ⇒ 同机其他用户可读走
-> 整条审计轨迹：谁、什么时候、从哪个 IP 做了什么）。与 `logfile.rs` 的口径对齐。
->
-> ⑪ **CI 加固**：`.github/workflows/` 里 **29 处第三方 Action 全部 pin 到 commit SHA**
-> （`@v4` / `@stable` 是可变的 —— 上游挪一次 tag 就能让 CI 跑别人的代码，
-> 而这条链上 `rust-toolchain` 决定工具链、`action-gh-release` 持 `contents: write` 与
-> 全部制品、`cosign-installer` / `docker/login-action` 持 `id-token` 与 GHCR 凭据）；
-> 修掉 `release.yml` 里 cosign 的**三重失效**（两个 `continue-on-error` + shell 内
-> `|| echo` ⇒ **一个字节都没签出来也会全绿通过**，而 README 宣称"发布可验真"，
-> 那是自相矛盾的发布）；tag 输入不再直接拼进 shell（表达式注入面）。
->
-> ⑫ **凭据卫生**：`android/gradle.properties` 里的 keystore 口令明文挪到
-> **环境变量 / `local.properties`**（后者已在 `.gitignore` 里，实测构建仍能正确签名 ——
-> APK 用的是 `CN=NFrp Android` 发布证书）；补上**仓库根**与 `android/` 的 `.gitignore`
-> （根目录之前**根本没有**，`/dist`、`*.log`、`tmp/` 全无遮挡）。
-> ★ 说明：这两处的凭据**当前都没有被推上远端**（已用 GitHub API 逐项核实：
-> `android/**` 与 keystore 在远端均为 404；四块发布包 grep 真机 token 零命中），
-> 所以是"堵住枪口"而不是"事后补救"。
->
-> 质量门：**584 个测试全绿**（564 → 584，本轮新增 20 条回归/锁定测试）、
-> fmt 干净、clippy `-D warnings` **0 告警**（Windows 与 Linux 各一遍）、
-> `cargo audit` exit 0。线协议**未改动**，与官方 frp 的互通性不受影响。
->
-> **v0.5.1 是补齐与官方 0.71 差距的一版**
-> 起因是把"NFrp 到底比官方 0.71 少什么"逐项对了一遍 结论是代理类型少 1 种
-> 客户端插件少 5 个 配置字段静默忽略 46 项（客户端 20 服务端 26）
-> 加上两处已经查实的 bug 于是把能一次收口的全部收口 结果如下
->
-> ① **补上第 8 种代理类型 `tcpmux`** —— 它是官方那套"一个共享端口上的 HTTP CONNECT
-> 复用器" 所有 tcpmux 代理都挂在服务端同一个 `tcpmuxHTTPConnectPort` 上 靠 CONNECT
-> 请求行里的 authority 分发。实现时把 官方 `server/proxy/tcpmux.go` +
-> `pkg/util/tcpmux/httpconnect.go` + `pkg/util/vhost` 三条路径合成了服务端的一个
-> `VhostKind` 枚举 于是域名匹配 / 最长路径前缀 / `routeByHTTPUser` 两级路由 /
-> `httpUser` 鉴权全部与 http / https 共用同一段代码 只有"域名从哪来"和"怎么交给内网"
-> 两处不同。`tcpmuxPassthrough` 也实现了（把 CONNECT 原样转给内网 由内网自己回 200）。
-> ★ 一处**有意偏离**：官方先回 `200 OK` 再校验密码 于是密码不对时客户端**先收到 200**、
-> 再收到一个 407 curl 这类客户端已经把隧道当建好了 那个 407 会被当成隧道里的数据。
-> 这里改成**先校验再回 200** 协议上才是对的。
->
-> ② **补上 5 个客户端插件 官方 9 种现在全实现**：`http2http` / `http2https` /
-> `https2http` / `https2https` / `tls2raw`。这一族是"插件自己扮演前端" 收明文或 TLS、
-> 按 HTTP 或裸字节送到后端 支持 `pluginHostHeaderRewrite` / `pluginRequestHeaders`。
-> 踩到的坑：**rustls 的流被 drop 时只发 FIN、不发 TLS `close_notify`** Go 1.21+ 与
-> OpenSSL 3 的客户端会报 `peer closed connection without sending TLS close_notify`
-> 于是 `https2*` / `tls2raw` 收尾必须显式 `shutdown()`。
->
-> ③ **7 个"便宜 + 安全相关"的配置字段落地**（其余 39 项仍按默认值忽略 启动日志会逐条列出）：
-> `allowPorts` 与 `maxPortsPerClient` 是**安全项** 一个管"哪些公网端口能被申请"
-> 一个管"单个客户端最多占几个端口" 两项都在**绑定端口之前**判定
-> （`http` / `https` / `tcpmux` / `stcp` 不占公网端口 所以只算代理数 不算端口数
-> 与官方 `pxy.GetUsedPortsNum()` 的算法一致）
-> `detailedErrorsToClient` 关掉后只回官方那两句短句
-> （`new proxy [x] error` / `invalid ping`）不会再把"这个域名已被代理 bob.web 占用"
-> 这种**别人的隧道名**泄露给客户端
-> `vhostHTTPTimeout` 卡的是"内网连上了却不回响应头" 超时回 502（与 Go ReverseProxy
-> 默认错误处理器一致 不是 504）
-> `custom404Page` 没代理匹配时返回指定文件的原文 `Content-Type: text/html`
-> 另外 `log.to` + `log.maxDays` 实现了日志落盘与按天轮转。
-> ★ 轮转按官方 `golib/log/output_rotatefile.go` 的规则重写：同名文件 append
-> 跨天改名成 `<名>.<YYYYMMDD-HHMMSS><扩展名>` 再建新的 按 `maxDays` 裁剪老备份
-> 没有引入 `chrono` / `time` 之类的时区依赖（一处小差异：官方按**本地**零点轮转
-> 这里按 **UTC** 零点 因为 NFrp 日志时间戳本身就是 UTC 按本地切反而会让文件名与
-> 行内日期错开 8 小时）。
->
-> ④ **两处已查实的 bug**：`visitors.bindPort = -1` 直接解析失败（官方文档明写
-> "-1 表示不监听" 而 NFrp 用 `u16` 接）以及 `verify` 对**未实现的插件 / 代理类型**
-> 假绿灯（它只检查"必填字段全不全" 于是 `plugin = "http2http"` 这种当时根本没实现的
-> 配置会报"校验通过" —— 对宿主软件来说这比报错危险 因为它会显示"已就绪"）
-> 现在 `verify` 跟着 `SUPPORTED_PLUGIN_TYPES` 走 且插件代理不再显示误导性的
-> `127.0.0.1:0` 而是显示真实上游。
->
-> ⑤ **顺手抓出的三处"不报错但不对"**：
-> 启动日志里"支持的代理类型"清单漏了 `tcpmux`（功能能用 但用户按日志判断会得到相反结论
-> 现在这份清单与 `register_proxy` 的 match 分支一一对应）
-> legacy INI 的键是 **`tcpmux_httpconnect_port`**（`http` 与 `connect` 之间没有下划线）
-> 照着 TOML 的 `tcpmux_http_connect_port` 去查一个都匹配不到 老 frps.ini 的 tcpmux 端口
-> 会被静默丢掉
-> 以及官方 `Convert_ServerCommonConf_To_v1` 里 `out.AllowPorts, _ = …` 把解析错误
-> **吞掉** 于是一份把 `allow_ports` 写错一个字符的 frps.ini 会**静默放开全部端口**
-> —— NFrp 在这里反过来 解析失败直接报错 绝不降级成"不限制"。
->
-> 质量门：`cargo fmt --check` 干净 `cargo clippy --workspace --all-targets -- -D warnings`
-> 0 告警 **564 个测试全绿**（common 279 / server lib 167 / client 92 / server bin 8 /
-> e2e 18）。另外用**发布版二进制**（不是 debug）跑了三轮真机冒烟：
-> 标准冒烟 **26/26**（RBAC / 审计 JSONL / WebSocket / API v2 / 客户端本地界面 / PROXY
-> v1+v2 / SUDP / KCP 传输）、tcpmux 冒烟 **4/4**（CONNECT 复用 +
-> `routeByHTTPUser` 二级路由 + 未知域名 404）、配置字段冒烟 **15/15**：白名单内的
-> `17200` / `17201` 真实监听、白名单外的 `22` 与超出上限的 `17202` 被拒（客户端拿到的是
-> 脱敏短句 `new proxy [x] error` 服务端日志里保留了完整原因）自定义 404 页逐字节返回
-> 慢后端 2 秒的响应被 1 秒超时切成 `502` 且耗时实测 **1.00 秒** `log.to` 指定的文件里
-> 出现了启动日志而 stdout 是空的。
+| 面板绑非回环地址且无 `dashboard_user` | 拒绝启动 | 配凭据 / 改 `bind_addr = "127.0.0.1"` / 显式写 `allow_insecure_dashboard = true` |
+| 客户端 `[webServer]` 绑非回环且无凭据 | 拒绝启动 | 逃生开关 `allowInsecureRemote = true` |
+| 本地界面写接口 | 需要 `X-Nfrp-Client: 1` 头 | 调写接口的脚本要加上 |
+| 空 token 且**显式**绑对外地址 | 拒绝启动 | 配 token / 绑回环 / 显式写 `allow_insecure_no_auth = true` |
+| `[acl]` 段拼错的键名 | 现在会报错（原先静默失效） | 检查拼写 |
+
+其余需注意：
+
+- **OIDC 部署必须配 TLS**。OIDC 的 `privilege_key` 是原样的 access token，会明文出现在登录报文里；不加密链路上任何被动抓包的人都能拿走它。
+- **客户端 `transport.tls` 只加密、不校验对端证书**（与官方 frp 行为一致）。它防被动偷看，不防中间人；跨公网直连且需要防 MITM 时请在**外层**再套一层 TLS。
+- 示例配置里默认**不包含**任何代理，需要什么自己打开对应的注释段。示例不再默认暴露 SSH。
 
 ## 质量保障
 
 ```bash
-cargo fmt --all -- --check          # 格式
-cargo clippy --workspace --all-targets   # 静态检查（当前 0 告警）
-cargo test --workspace              # 584 个测试
+cargo fmt --all -- --check                # 格式
+cargo clippy --workspace --all-targets    # 静态检查（当前 0 告警）
+cargo test --workspace                    # 612 个测试
 ```
 
 测试分布：
 
-| 目标 | 数量 | 覆盖重点 |
-|---|---|---|
-| `common` 单元测试 | 288 | **v1 线协议**（消息类型字节、帧编解码、AES-128-CFB 密钥派生与流式状态机、**官方抓包密文解密回归**）、v2 线协议编解码、加密、配置解析、**原版 frp 配置兼容层**、打洞报文/口令/端口预测、**KCP（含 30% 丢包下的可靠传输）**、令牌桶、示例配置可加载、**OIDC 令牌源与 JWKS 验签**、**CIDR/ACL/RBAC 判定边界**、**WebSocket 帧编解码与 Ping/Pong**、**PROXY v1/v2 编解码与防注入 sniff**、**VirtualNet 帧/路由/地址池**、**HTTP/1.1 请求解析**、**HTTP 头 CRLF 注入防线（`strip_crlf` 双重剥离）**、**远程下发代理的本机资源字段拒绝（`validate_remote_proxy`）**、**回环地址判定（`is_loopback_addr`）**、**chunked 长度算术回绕防线（`saturating_add` / `checked_add`）**、**`run_id` 来自密码学随机源**、**OIDC subject 的会话绑定**、**配置 `Debug` 全面脱敏（3 条锁定测试）** |
-| `server` 单元测试（lib） | 176 | 虚拟主机路由表与优先级、chunked 解析、Basic Auth、连接池配对与回收、**端口组最小连接数调度**、资源配额、指标编码、面板鉴权与**写接口**、热重载字段判定、打洞会话、**审计日志（JSONL + 环形缓冲 + 过滤）**、**安全上下文（ACL→认证→RBAC→审计）**、**API v2（错误信封 / 分页 / 百分号解码）**、**VirtualNet 服务端路由与代答 ICMP**、**vhost 请求边界（`Expect: 100-continue` 应答、CL+TE 拒绝、逐跳头剥离、`Host` 规范化、HTTP/tcpmux 口令常量时间比较）**、**RBAC 配额真正生效（`allowManage` / `maxProxies`）**、**热重载安全闸门（对外面板不得清空鉴权 / 改回去必须能恢复 / 逃生开关 / 回环放行，6 条）**、**OIDC 核验器可回填（否则 oidc 永久不可用）** |
-| `server` 单元测试（bin） | 10 | 命令行与配置装载、**面板鉴权启动校验（非回环 + 无凭据必须拒绝启动、逃生开关生效、回环无凭据合法）**、**弱/占位 token 的启动告警（且不拦启动）** |
-| `client` 单元测试 | 92 | QUIC 建连与口令握手、插件（http_proxy / socks5 / static_file）、健康检查状态机、打洞编排、`NewProxy` 字段映射（含与官方 frpc 抓包逐字节对拍）、服务端下发名 → 本地代理的翻译（`resolve_uploaded_proxy`）、**动态代理表**、**store 落盘与损坏文件容错**、**本地管理界面的路由与本地校验**、**PROXY 头注入**、**本地界面 CSRF 防线（`X-Nfrp-Client` 防伪头 + Origin 校验 + 非回环无凭据拒绝启动）**、**服务端下发配置的本机资源字段拒绝** |
-| `server` 端到端集成测试 | 18 | 真握手 + 真转发的 TCP / HTTP / stcp / QUIC 链路、**v1 与 v2 双协议握手**、group 负载均衡、面板鉴权边界、**SUDP 端到端（visitor→provider 的 UdpPacket 往返）**、**KCP 传输上的完整控制连接 + 多会话共端口** |
+| 目标 | 数量 |
+|---|---|
+| `common` 单元测试 | 300 |
+| `server` 单元测试（lib） | 181 |
+| `server` 单元测试（bin） | 16 |
+| `client` 单元测试 | 97 |
+| `server` 端到端集成测试 | 18 |
 
-CI（`.github/workflows/ci.yml`）在每次 push / PR 上跑：`cargo fmt --check` +
-`cargo clippy -- -D warnings` → **Linux / Windows / macOS** 三个系统的全量测试 →
-**两个 musl 目标的交叉构建**（x86_64 / aarch64，提前拦住"tag 那天才发现编不过"）→
-端到端冒烟（真建连真转发的集成测试，外加 `--gen-config` / `--check` 自检）。
-
-★ 工作流里**所有第三方 Action 都 pin 到 commit SHA**（v0.5.3 起）。
-`@v4` / `@stable` 这类是**可变引用**：上游挪一次 tag（或被攻陷的维护者账号推一个新 commit），
-下一次 CI 跑的就是别人的代码。这条链上尤其敏感的是 `dtolnay/rust-toolchain`（决定工具链）、
-`softprops/action-gh-release`（持 `contents: write` 与全部制品）、
-`sigstore/cosign-installer` 与 `docker/login-action`（持 `id-token` 与镜像仓库凭据）。
-升级方式：把 `# vX` 换成新的 40 位 SHA（或用 Dependabot）。
-
-★ CI 的 cosign 签名**失败即红灯**（v0.5.3 修）。原来两个 `continue-on-error: true`
-加 shell 内的 `|| echo` 三重叠加，**一个字节都没签出来也会全绿通过** ——
-那会让 Release 里只剩一个可被随意替换的裸校验和，而 README 却宣称"发布可验真"。
-现在签完立刻 `cosign verify-blob` 自检一次。
-
-打 tag（或手动触发 `.github/workflows/release.yml`）会构建三平台产物 +
-cosign 无密钥签名 + 推 ghcr.io 镜像。**本地 `scripts/release.py` 与 CI 是两条独立的
-发布路线**，签名体系不同（本地是 Ed25519 分离签名），同一版本只用一条。
+CI（`.github/workflows/ci.yml`）在每次 push / PR 上跑 `fmt --check` + `clippy -D warnings`，然后在 Linux / Windows / macOS 上跑全量测试，再做两个 musl 目标的交叉构建与端到端冒烟。
 
 ## 发布与部署
 
-### 发布包自带校验
+### 打包
 
 ```bash
 # 打三平台包（包内统一命名 frps / frpc，附示例配置与 README）
-python scripts/release.py pack --target windows-amd64:target/release \
-                               --target linux-amd64:/path/to/amd64 \
-                               --target linux-arm64:/path/to/arm64 \
-                               --out dist/release
+python scripts/release.py pack \
+  --target windows-amd64:target/release \
+  --target linux-amd64:/path/to/amd64 \
+  --target linux-arm64:/path/to/arm64 \
+  --out dist/release
 
-# 生成 SHA256SUMS（加 --sign 还会产出 ed25519 分离签名）
+# 生成 SHA256SUMS（--sign 还会产出 Ed25519 分离签名）
 python scripts/release.py checksum --dir dist/release --sign
 
 # 本地验签 + 校验
 python scripts/release.py verify --dir dist/release
 ```
 
-`SHA256SUMS` 用标准 `sha256sum -c` 格式，供下载者独立验证；
-签名私钥若存在（`release.key`）则自动做 Ed25519 分离签名，公钥 `release.pub` 可随包分发。
+Linux 包在云端交叉编译（本机没有 Linux C 工具链，`ring` 需要编译 C）。arm64 走 `+crt-static` 全静态链接，无 glibc 依赖。
+
+`release.py` 不依赖任何第三方 Python 包，也不依赖 Rust 工具链。签名缺失或失败会**非零退出**；确实要发未签名制品需显式加 `--allow-unsigned`。
 
 ### Docker
 
 ```bash
-docker build -t nfrp .                # 多阶段构建，产物是 musl 静态二进制
-docker compose up -d                       # 或直接用 compose（含配置挂载与端口映射）
+docker build -t nfrp .
+docker run --rm -p 17000:17000 -p 17002:17002/udp \
+  -v $PWD/frps.toml:/etc/nfrp/frps.toml nfrp
 ```
 
-### crates.io
+镜像以非 root 用户运行，多阶段构建（musl 静态），最终镜像只含两个二进制与示例配置。
 
-三个 crate 的 `description` / `license` / `repository` / `keywords` / `categories` 元数据已就位，
-`LICENSE`（Apache License 2.0）与 `NOTICE`（版权声明 + 第三方组件许可）随源码树分发。
-`Cargo.toml` 里的 `repository` / `homepage` 已指向
-<https://github.com/Nu0vo1212/Rust-Frp>，直接发布即可：
-
-```bash
-cargo publish -p nfrp-common
-cargo publish -p nfrp-server
-cargo publish -p nfrp-client
-```
-
-## 交叉编译（Linux ARM64 静态链接）
-
-在 x86_64 Linux 主机上（以 RHEL/AlmaLinux 8 为例）：
-
-```bash
-rustup target add aarch64-unknown-linux-gnu
-dnf install -y gcc-aarch64-linux-gnu
-# 补 aarch64 glibc 头文件与静态库（el8 无现成交叉 libc 包）：
-dnf download --forcearch=aarch64 glibc-devel glibc kernel-headers glibc-static
-# rpm2cpio 解包后，将 usr/include 拷入 /usr/aarch64-linux-gnu/include，
-# usr/lib64 拷入 /usr/aarch64-linux-gnu/lib{,64}，并 sed 修正 .so 链接脚本内的 /lib64 路径
-ln -sf libgcc.a /usr/lib/gcc/aarch64-linux-gnu/12/libgcc_eh.a
-
-export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-feature=+crt-static"
-cargo build --release --target aarch64-unknown-linux-gnu
-```
-
-产物为全静态二进制，可直接运行于任意 ARM64 Linux。
+`Dockerfile` **有意不加 `HEALTHCHECK`**：唯一合适的探针 `- /api/healthz` 挂在面板端口上，而示例配置里 `dashboard_port` 默认是注释掉的，写死探针会让容器一直显示 `unhealthy`。理由已写在文件里。
 
 ## 当前限制
 
-- `xtcp` 已实现 UDP 打洞 + QUIC / KCP 直连，并对**对称 NAT 做端口预测**，但仍有一类
-  严格对称 NAT（每次分配完全随机、无步长可推）打不通，此时照旧回退中继；
-  `p2p_port` 需要放行 UDP，否则只能走中继；
-- **QUIC 传输仅限 NFrp 两端之间** —— 官方 frp 的 `transport.protocol` 语义不同，互通时用 `tcp`；
-- 面板的动态管理（增删代理 / 踢人）需要**对端也是 nfrp frpc**：官方 frpc 不支持这套
-  私有消息，面板会把它标为不可管理，其余功能不受影响；
-- v1 线协议已完整实现并且是**默认**（与官方一致）；官方 v2 专有的 **UDP 二进制报文编码**
-  （`V2BinaryUDPPacketReadWriter`）在 NFrp 两端之间 v1/v2 都启用，与官方互通时走 JSON —— 功能等价，仅包体略大。
-- **VirtualNet 仅 Linux 客户端可用**：需要创建 TUN 设备与 `ip` 命令，Windows 上没有对应实现
-  （服务端不受平台限制）。同时需要 root 或 `CAP_NET_ADMIN`。
-- 本章新增的 **OIDC 认证 / ACL / RBAC / 审计 / WebSocket / VirtualNet / Proxy Protocol /
-  API v2 / 客户端本地界面**都是 NFrp 两端之间的能力：与官方 frp 互通时，官方那一端
-  不认识这些扩展 —— 官方 frpc 连上来时按普通 token 客户端处理，不会因为对方不支持而失败。
-- 客户端 `[store]` 的落盘格式是 NFrp 自己的 JSON，**与官方 frp 的 store 不通用**
-  （官方是 Go `configmgmt` 的序列化结构），从官方 frpc 迁移过来需要重新加一遍动态代理。
-- **仍有若干官方配置字段未实现**（客户端侧 17 项、服务端侧 18 项，例如
-  `useEncryption` / `useCompression` / `userConnTimeout` / `udpPacketSize` /
-  `quicBindPort` / `assetsDir` / `disablePrintColor` / `httpPlugins` 等）。
-  这些字段**不会让解析报错，但也不会生效** —— 启动日志会以 WARN 逐条列出
-  "官方支持、nfrp 未实现"的字段名，看到告警就去查这一项是不是你想要的效果。
-  （v0.5.1 已把其中 7 项落地：`allowPorts` / `maxPortsPerClient` /
-  `detailedErrorsToClient` / `vhostHTTPTimeout` / `custom404Page` / `log.to` / `log.maxDays`。）
+- **VirtualNet 在 Windows 上未实现**（需要 TUN 设备），Linux 与 Android 上可用；配置了会明确报错而不是静默失败
+- 官方 frp 的 xtcp NatHole UDP 地址交换协议未实现，所以**官方 frpc 的 xtcp visitor 打不了洞**；服务端会明确拒绝并让官方客户端立刻转走它自己的 `fallbackTo` 中继
+- 与官方 0.71 相比仍有部分配置字段未实现，启动日志会逐条列出「配了但不会生效」的字段
 
 ## License
 
+本项目基于 [Apache License 2.0](LICENSE) 发布。
+
+```
 Copyright 2026 nfrp contributors
+```
 
-遵循 **Apache License 2.0**，全文见 [`LICENSE`](LICENSE)，版权与第三方组件许可见 [`NOTICE`](NOTICE)。
+---
 
-选择 Apache-2.0 而不是 MIT 的原因：它带**显式专利授权**（第 3 节）。
-内网穿透是网络基础设施里被大量商用的东西，使用者需要这份明确性 ——
-MIT 对专利只字未提，企业法务通常要额外确认一轮。
-
-与官方 frp（Apache-2.0）也更省事：两边许可一致，`frp v1 / v2` 协议的互操作说明不需要再夹一层许可解释。
+<p align="center">
+  Made by Nu0vo1212
+</p>

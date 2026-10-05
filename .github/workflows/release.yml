@@ -45,15 +45,15 @@ jobs:
             target: aarch64-unknown-linux-musl
             asset: nfrp-linux-arm64.tar.gz
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: install cross (linux targets)
         if: runner.os == 'Linux'
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: cross
 
@@ -92,7 +92,7 @@ jobs:
           tar czf ${{ matrix.asset }} -C staging .
 
       - name: upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.name }}
           path: ${{ matrix.asset }}
@@ -103,9 +103,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
 
@@ -121,19 +121,40 @@ jobs:
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
 
+      # ★★ 签名必须"真的签出来"（v0.5.3 修）。
+      #
+      # 这里原来两个步骤都写了 `continue-on-error: true`，shell 里还有
+      # `|| echo "::warning::..."` —— 三重失效叠加，结果是
+      # **一个字节都没签出来这条流水线也会全绿通过**，Release 里剩一个
+      # 谁都能替换的裸 SHA256SUMS。而 README 宣称"发布可验真"，
+      # 那在 CI 这条路径上是不成立的（自相矛盾的发布比没有签名更糟）。
+      #
+      # 现在：装不上 cosign 或签名失败 = **红灯**，不允许"看起来签过了"。
+      # 紧接着加一步 verify-blob 自检，确保签出来的东西当场能验。
       - name: sign with cosign (keyless)
-        continue-on-error: true
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
 
       - name: cosign sign blobs
-        continue-on-error: true
         run: |
           cd out
           for f in *; do
-            cosign sign-blob --yes --output-signature "$f.sig" "$f" || echo "::warning::sign failed for $f"
+            [ "$f" = "SHA256SUMS" ] && continue
+            cosign sign-blob --yes --output-signature "$f.sig" "$f"
           done
+          cosign sign-blob --yes --output-signature SHA256SUMS.sig SHA256SUMS
+          echo "--- 签出来的文件 ---"
+          ls -la *.sig
 
-      - uses: actions/upload-artifact@v4
+      # 自检：当场用刚生成的公钥验证一遍，避免"签了但验不过"
+      - name: verify signatures
+        run: |
+          cd out
+          cosign verify-blob \
+            --certificate-identity-regexp '^https://github.com/' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --signature SHA256SUMS.sig SHA256SUMS
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: checksums
           # ★ 必须连 `*.sig` 一起传：只传 SHA256SUMS 的话，上面 cosign 签出来的
@@ -147,7 +168,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build, checksums]
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
 
@@ -158,7 +179,7 @@ jobs:
           ls -l out
 
       - name: create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           # ★ 显式给 tag_name：手动触发（workflow_dispatch）时 `github.ref_name` 是
           # **分支名**，不指定的话会打出个叫 `main` 的 Release。
@@ -174,9 +195,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -186,9 +207,24 @@ jobs:
         id: ver
         # 手动触发时优先用输入的标签；GITHUB_REF_NAME 在 dispatch 下是**分支名**，
         # 只有打 tag 触发时它才是标签，所以不能把它放在前面当首选。
-        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+        #
+        # ★ v0.5.3：不再把 `${{ github.event.inputs.tag }}` 直接拼进 shell。
+        #   那是**表达式注入**面 —— 输入里带 `; rm -rf /` 之类会被当命令执行。
+        #   虽然说能触发 workflow_dispatch 的人本就有 write 权限（不是提权），
+        #   但没有理由留一个"参数能变成命令"的入口。
+        #   改成先经 env 传值（env 不参与 shell 解析），再做正则白名单校验。
+        env:
+          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag="$RAW_TAG"
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::标签格式非法（要求形如 v1.2.3）：$tag"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: ./Dockerfile

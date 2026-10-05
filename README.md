@@ -1,4 +1,5 @@
 <div align="center">
+  <img src="assets/icons/nfrp-icon-256.png" alt="NFrp Logo" width="120">
   <h1>NFrp</h1>
   <p><b>Rust 实现的内网穿透工具，兼容官方 frp 协议</b></p>
 </div>

@@ -46,6 +46,12 @@ const MAX_LINE: usize = 8 * 1024;
 /// 取 128 是个很松的值：正常永远碰不到，但足以挡住洪水式连接。
 const MAX_DASHBOARD_CONNS: usize = 128;
 
+/// 读完整请求头的总超时（v0.5.4，L1）。
+///
+/// 没有它的话，128 个连接各发一个字节就能长期占满上面那道并发闸门
+/// （slowloris）—— 而面板与业务同进程，会连带拖累业务。
+const HEAD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// 启动面板服务。
 pub async fn run(
     listener: TcpListener,
@@ -106,24 +112,42 @@ async fn handle(
     //   鉴权失败的 POST 就正好卡在这条上：面板明明回了 401，客户端却看不到。
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
-    loop {
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        let head_done = buf.windows(4).any(|w| w == b"\r\n\r\n");
-        if !head_done {
-            if buf.len() > MAX_LINE * 4 {
+    // ★★ v0.5.4 修（L1）：读头阶段加**整体超时**。
+    //
+    // 原先这个循环没有任何时限 —— 128 个连接各发一个字节就能长期占满
+    // 面板的并发闸门（`MAX_DASHBOARD_CONNS`），构成 slowloris。
+    // 面板与业务跑在**同一个进程**里，被占满会连带拖累业务。
+    //
+    // 取 10s 与 vhost 路径同一量级；正常面板请求是毫秒级，无可感知影响。
+    let read_head = async {
+        loop {
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
                 break;
             }
-            continue;
+            buf.extend_from_slice(&chunk[..n]);
+            let head_done = buf.windows(4).any(|w| w == b"\r\n\r\n");
+            if !head_done {
+                if buf.len() > MAX_LINE * 4 {
+                    break;
+                }
+                continue;
+            }
+            // 头齐了：按 Content-Length 补齐请求体（没有该字段就当作没有体）
+            let want = content_length_of(&String::from_utf8_lossy(&buf));
+            let have = buf_body_len(&buf);
+            if have >= want || buf.len() > MAX_LINE * 4 {
+                break;
+            }
         }
-        // 头齐了：按 Content-Length 补齐请求体（没有该字段就当作没有体）
-        let want = content_length_of(&String::from_utf8_lossy(&buf));
-        let have = buf_body_len(&buf);
-        if have >= want || buf.len() > MAX_LINE * 4 {
-            break;
+        Ok::<(), std::io::Error>(())
+    };
+    match tokio::time::timeout(HEAD_READ_TIMEOUT, read_head).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => {
+            debug!(%peer, "面板读头超时（{:?}），断开", HEAD_READ_TIMEOUT);
+            return Ok(());
         }
     }
     let req = String::from_utf8_lossy(&buf).to_string();

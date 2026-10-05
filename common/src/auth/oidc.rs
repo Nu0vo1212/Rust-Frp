@@ -71,7 +71,9 @@ pub struct ServerOidcConfig {
 }
 
 /// 客户端 OIDC 配置（对应 frp 的 `auth.oidc`）。
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// ★ v0.5.3：手工实现 `Debug`（见下方），`client_secret` 不进日志。
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClientOidcConfig {
     /// ★ 官方 frp 的 JSON tag 就是 `clientID`（不是 `clientId`），
@@ -93,6 +95,26 @@ pub struct ClientOidcConfig {
     pub insecure_skip_verify: bool,
     #[serde(rename = "proxyURL")]
     pub proxy_url: String,
+}
+
+impl std::fmt::Debug for ClientOidcConfig {
+    /// ★ v0.5.3：`client_secret` 永不进日志。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let secret = if self.client_secret.is_empty() {
+            "<empty>".to_string()
+        } else {
+            format!("<redacted:{} chars>", self.client_secret.chars().count())
+        };
+        f.debug_struct("ClientOidcConfig")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &secret)
+            .field("audience", &self.audience)
+            .field("scope", &self.scope)
+            .field("token_endpoint_url", &self.token_endpoint_url)
+            .field("insecure_skip_verify", &self.insecure_skip_verify)
+            .field("proxy_url", &self.proxy_url)
+            .finish()
+    }
 }
 
 impl ClientOidcConfig {
@@ -271,8 +293,19 @@ pub struct OidcVerifier {
     /// 拼 `<issuer>/.well-known/jwks.json`。
     jwks_uri: RwLock<Option<String>>,
     jwks: RwLock<Option<Arc<Jwks>>>,
-    /// 登录成功过的 subject 集合（对应官方的 `subjectsFromLogin`）。
-    subjects: RwLock<std::collections::HashSet<String>>,
+    /// ★ v0.5.3：登录成功过的 **subject → run_id** 绑定表。
+    ///
+    /// 原来这里是一个**只增不减的全局 `HashSet<String>`**（对应官方的
+    /// `subjectsFromLogin`），于是 `verify_post_login` 只检查
+    /// "这个 sub 曾经**在某个连接上**登录成功过"，完全不看当前的 run_id。
+    ///
+    /// 攻击形态：恶意客户端用自己的合法 token 登录一次 ⇒ 自己的 sub 进集合 ⇒
+    /// 之后拿**同一个 token** 去给**受害者的 run_id** 开工作连接，
+    /// `verify_post_login` 照样通过。防线只对"从未登录成功过的人"生效。
+    ///
+    /// 现在改成 `run_id → sub` 的二维绑定：每个会话只认**自己在登录时**
+    /// 用过的那个 subject。并且登出/断开时可以精确移除，不再无限增长。
+    subjects: RwLock<std::collections::HashMap<String, String>>,
 }
 
 impl OidcVerifier {
@@ -473,37 +506,68 @@ impl OidcVerifier {
         Ok(())
     }
 
-    /// 记住登录过的 subject。之后心跳 / 新工作连接上的 token 必须同 subject。
-    pub fn remember_subject(&self, token: &str) -> Result<String> {
+    /// 记住登录过的 subject，并把它**绑定到本次会话的 run_id**。
+    ///
+    /// 之后该 run_id 上的心跳 / 新工作连接必须用同一个 subject 的 token。
+    /// `run_id` 为空时退化为"只验签、不绑定"（调用方在无法提供会话标识时使用）。
+    pub fn remember_subject(&self, token: &str, run_id: &str) -> Result<String> {
         let payload = self.verify_token(token)?;
         let sub = payload
             .get("sub")
             .and_then(|x| x.as_str())
             .ok_or_else(|| anyhow!("token 里没有 sub"))?
             .to_string();
-        let mut g = self.subjects.write().unwrap_or_else(|e| e.into_inner());
-        g.insert(sub.clone());
+        if !run_id.is_empty() {
+            let mut g = self.subjects.write().unwrap_or_else(|e| e.into_inner());
+            g.insert(run_id.to_string(), sub.clone());
+        }
         Ok(sub)
     }
 
-    /// 校验"登录之后"的 token：必须验签通过，且 subject 与登录时一致。
-    pub fn verify_post_login(&self, token: &str, what: &str) -> Result<String> {
+    /// 会话结束时解除绑定（避免这张表无限增长）。
+    pub fn forget_session(&self, run_id: &str) {
+        let mut g = self.subjects.write().unwrap_or_else(|e| e.into_inner());
+        g.remove(run_id);
+    }
+
+    /// 校验"登录之后"的 token：必须验签通过，且 subject 与**本会话**
+    /// （该 run_id）登录时用过的那个一致。
+    ///
+    /// ★ v0.5.3：判据从"全局 subject 集合里有没有"改成
+    /// "**这个 run_id 绑定的 subject** 是否等于 token 里的 sub"。
+    /// 旧写法让"曾在任意连接上登录过的 sub"可以给任何 run_id 开工作连接。
+    pub fn verify_post_login(&self, token: &str, what: &str, run_id: &str) -> Result<String> {
         let payload = self.verify_token(token)?;
         let sub = payload
             .get("sub")
             .and_then(|x| x.as_str())
             .ok_or_else(|| anyhow!("token 里没有 sub"))?;
-        let g = self.subjects.read().unwrap_or_else(|e| e.into_inner());
-        if !g.contains(sub) {
-            bail!(
-                "{what} 的 token subject [{sub}] 与登录时的不一致：\
-                 同一个连接上的后续消息必须用同一身份的 token"
-            );
+
+        if run_id.is_empty() {
+            // 没有会话标识可绑：只能要求该 sub 至少登录过（旧行为）。
+            // 正常路径不会走到这里 —— 调用方都会带上 run_id。
+            let g = self.subjects.read().unwrap_or_else(|e| e.into_inner());
+            if !g.values().any(|s| s == sub) {
+                bail!("{what} 的 token subject [{sub}] 与登录时的不一致");
+            }
+            return Ok(sub.to_string());
         }
-        Ok(sub.to_string())
+
+        let g = self.subjects.read().unwrap_or_else(|e| e.into_inner());
+        match g.get(run_id) {
+            Some(bound) if bound == sub => Ok(sub.to_string()),
+            Some(bound) => bail!(
+                "{what} 的 token subject [{sub}] 与本会话登录时的 [{bound}] 不一致：\
+                 同一个连接上的后续消息必须用同一身份的 token"
+            ),
+            None => bail!(
+                "{what} 的 token subject [{sub}] 没有对应的已登录会话 [{run_id}]：\
+                 不能用一个独立登录过的身份来给你自己的连接背书"
+            ),
+        }
     }
 
-    /// 已登录 subject 数（面板展示用）。
+    /// 已绑定会话数（面板展示用）。
     pub fn subject_count(&self) -> usize {
         self.subjects
             .read()
@@ -914,8 +978,61 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let g = v.subjects.read().unwrap();
-        assert!(!g.contains("nobody"));
         assert_eq!(v.subject_count(), 0);
+        // 表里没有这个会话 ⇒ 任何后续校验都不该放行
+        let g = v.subjects.read().unwrap();
+        assert!(g.get("no-such-run").is_none());
+    }
+
+    /// ★★ v0.5.3 回归：**subject 必须绑定到会话**，不能"登录过一次就到处通用"。
+    ///
+    /// 旧实现用一个只增不减的全局 `HashSet<String>` 存 subject，
+    /// `verify_post_login` 只问"这个 sub 曾经在**某个**连接上登录过吗"。
+    /// 攻击形态：恶意客户端用自己的合法 token 登录一次 ⇒ 自己的 sub 进集合 ⇒
+    /// 之后拿同一个 token 去给**受害者的 run_id** 开工作连接，照样通过。
+    #[test]
+    fn subject_必须绑定到会话_不能跨_run_id_通用() {
+        let v = OidcVerifier::new(ServerOidcConfig {
+            issuer: "https://idp".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        // 模拟"攻击者的会话 A 登录成功，绑定 sub=attacker"
+        {
+            let mut g = v.subjects.write().unwrap();
+            g.insert("run-A".to_string(), "attacker".to_string());
+        }
+        assert_eq!(v.subject_count(), 1);
+
+        // 攻击者用自己的 token 校验**自己的**会话 ⇒ 通过（这是正常的）
+        // 校验**受害者的**会话 ⇒ 必须拒绝（旧实现这里会错误地放行）
+        {
+            let g = v.subjects.read().unwrap();
+            assert_eq!(g.get("run-A").map(|s| s.as_str()), Some("attacker"));
+            assert_eq!(g.get("run-victim"), None, "受害者会话不应有绑定");
+        }
+
+        // 解除绑定后表应当缩回去（旧实现只增不减，是个无界增长点）
+        v.forget_session("run-A");
+        assert_eq!(v.subject_count(), 0, "登出后绑定必须被移除");
+    }
+
+    /// 同一会话改绑不同 subject 时，绑定值必须被覆盖而不是并列存在。
+    #[test]
+    fn 同一会话只保留一个_subject_绑定() {
+        let v = OidcVerifier::new(ServerOidcConfig {
+            issuer: "https://idp".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        {
+            let mut g = v.subjects.write().unwrap();
+            g.insert("run-1".to_string(), "alice".to_string());
+            g.insert("run-1".to_string(), "bob".to_string());
+        }
+        assert_eq!(v.subject_count(), 1, "同一 run_id 只应有一条绑定");
+        let g = v.subjects.read().unwrap();
+        assert_eq!(g.get("run-1").map(|s| s.as_str()), Some("bob"));
     }
 }

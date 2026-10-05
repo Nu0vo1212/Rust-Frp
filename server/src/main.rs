@@ -125,6 +125,19 @@ async fn main() -> Result<()> {
         }
     }
 
+    // ★ v0.5.3：弱/占位 token 的强告警。
+    //
+    // 背景（第二轮审计的 B 项）：v1 控制通道的登录凭证是
+    // `md5(token + timestamp)`，而且服务端**对 timestamp 不做新鲜性校验**
+    // （只用报文自报的 ts 重算比对）。攻击者抓到**一条** Login 报文后，
+    // 枚举一个候选 token 只需要 **1 次 MD5** —— 也就是说 token 的实际强度
+    // 取决于它自己够不够随机，PBKDF2 那 64 次迭代帮不上忙（那个参数是
+    // 官方 golib 硬编码的，改了就跟官方断互通，**不能改**）。
+    //
+    // 所以这里只能在**启动期**把风险摆出来。不拒绝启动：用户的既有部署
+    // 可能正用着某个短 token，直接拒绝会比漏洞本身更难处理。
+    check_token_strength(&cfg);
+
     let level = cli
         .log_level
         .clone()
@@ -199,6 +212,66 @@ async fn main() -> Result<()> {
         log_handle,
     };
     nfrp_server::serve_with(cfg, registry, extras).await
+}
+
+/// 弱 token 检测（v0.5.3）。
+///
+/// 为什么值得单独做一件事：v1 的登录凭证是 `md5(token + timestamp)`，
+/// 服务端对 `timestamp` **没有新鲜性校验**，所以抓到一条 Login 之后
+/// 离线枚举一条候选只要 1 次 MD5。token 的强度**完全取决于它自身的随机性**，
+/// 协议层面没有补救空间（PBKDF2 的 64 次迭代是官方 golib 的硬编码值）。
+///
+/// 这里只告警、不拒绝启动 —— 既有部署可能正在用短 token，
+/// 直接拦下来会比风险本身造成更大的破坏。但要把"为什么危险"说清楚。
+fn check_token_strength(cfg: &ServerConfig) {
+    let token = cfg.token.trim();
+    if token.is_empty() {
+        return; // 空 token 走上面那条"未配置 token"的告警，别重复报
+    }
+
+    // 常见的占位/示例值：照抄文档里那句 `your_secret_token` 等于没设
+    const PLACEHOLDERS: &[&str] = &[
+        "your_secret_token",
+        "change_me",
+        "changeme",
+        "your_token",
+        "secret",
+        "password",
+        "123456",
+        "admin",
+        "test",
+        "token",
+    ];
+    let lower = token.to_ascii_lowercase();
+    if PLACEHOLDERS.contains(&lower.as_str()) {
+        tracing::warn!(
+            "token 是示例里的占位值（{:?}）—— 这等于没有设置 token：\
+             任何看过示例配置的人都能直接连上本服务端。请换成随机串。",
+            token
+        );
+    }
+
+    // 长度与字符集：太短或只有单一字符类的，都在"可离线枚举"的范围里
+    let len = token.chars().count();
+    let classes = [
+        token.chars().any(|c| c.is_ascii_lowercase()),
+        token.chars().any(|c| c.is_ascii_uppercase()),
+        token.chars().any(|c| c.is_ascii_digit()),
+        token.chars().any(|c| !c.is_ascii_alphanumeric()),
+    ]
+    .iter()
+    .filter(|b| **b)
+    .count();
+
+    if len < 16 || classes < 2 {
+        tracing::warn!(
+            "token 强度偏低（长度 {len}，字符类 {classes} 种）：\
+             v1 登录凭证是 md5(token+timestamp) 且服务端不校验时间戳新鲜性，\
+             攻击者抓到一条登录报文后枚举一个候选只要 1 次 MD5。\
+             建议换成 **至少 16 位、含大小写/数字/符号** 的随机串\
+             （例如 `openssl rand -base64 24`），或用 [auth] method = \"oidc\"。"
+        );
+    }
 }
 
 /// 启动前把明显不合理 / 互相冲突的配置挡下来。
@@ -363,5 +436,39 @@ mod tests {
         let c = cfg();
         assert!(c.dashboard_port.is_none());
         assert!(validate(&c).is_ok());
+    }
+
+    /// ★ v0.5.3：弱 token 只告警不拦启动（不能破坏既有部署）。
+    #[test]
+    fn 弱token不阻止启动() {
+        for weak in [
+            "short",
+            "your_secret_token",
+            "aaaaaaaaaaaaaaaaaaaa",
+            "123456",
+        ] {
+            let mut c = cfg();
+            c.token = weak.into();
+            assert!(
+                validate(&c).is_ok(),
+                "token={weak:?} 不该拦启动（只能告警）"
+            );
+            check_token_strength(&c); // 不应 panic
+        }
+    }
+
+    /// 强 token 与空 token 都不该触发占位值分支。
+    #[test]
+    fn 强token与空token都能通过检查() {
+        let mut c = cfg();
+        c.token = String::new();
+        check_token_strength(&c);
+
+        c.token = "Xk9#mQ2$vL7@pR4!wZ8&".into();
+        check_token_strength(&c);
+
+        // 占位值判定应当大小写不敏感
+        c.token = "Your_Secret_Token".into();
+        check_token_strength(&c);
     }
 }

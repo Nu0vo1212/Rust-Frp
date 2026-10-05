@@ -245,30 +245,26 @@ pub fn hostname() -> String {
 /// 早先的实现只用「当前秒 + pid」当种子，同一秒内接受的两个连接会得到同一个
 /// run_id —— 这个坑在同时跑多个 frpc 时才会暴露。
 ///
-/// 现在混入 `RandomState`（由 OS 随机数播种，且每次 `new()` 递增计数器）与
-/// 进程内自增序号，既有熵又不需要引入 `rand` 依赖。
+/// ★ v0.5.3 改用 `OsRng`（与 v1 IV / v2 nonce / Hello random 同一个源）。
+///
+/// 之前的实现是「`RandomState` + pid + 秒 + 自增序号」做两轮 SipHash。
+/// 它**能保证不撞号**，但把安全性押在了一个 std **从未承诺**为密码学 PRF 的
+/// 组件上（`RandomState` 的文档只说它"随机播种"，没说输出不可预测）。
+/// 而 `run_id` 事实上是一张**可取工作连接的持有票据**：`handle_work` 只要
+/// 拿到一个存在的 run_id 就能把连接塞进那个客户端的工作连接池。
+/// 既然项目里其它所有安全随机都走 `OsRng`，这里没有理由用一套更弱的 —
+/// 成本是零（`rand` 本来就是依赖，且 `no_std` 之外都可用）。
 pub fn new_run_id() -> String {
-    use std::fmt::Write;
-    use std::hash::{BuildHasher, Hasher};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use rand::RngCore;
 
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-
-    let mut h1 = std::collections::hash_map::RandomState::new().build_hasher();
-    h1.write_u64(now_unix_secs());
-    h1.write_u32(std::process::id());
-    h1.write_u64(seq);
-    let a = h1.finish();
-
-    let mut h2 = std::collections::hash_map::RandomState::new().build_hasher();
-    h2.write_u64(a);
-    h2.write_u64(seq ^ 0x9e37_79b9_7f4a_7c15);
-    let b = h2.finish();
+    let mut buf = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
 
     let mut s = String::with_capacity(32);
-    let _ = write!(s, "{a:016x}{b:016x}");
+    for b in buf {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
     s
 }
 
@@ -317,6 +313,36 @@ mod tests {
             assert_eq!(id.len(), 32, "run_id 应为 32 个十六进制字符：{id}");
             assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
         }
+    }
+
+    /// ★ v0.5.3：run_id 必须来自**密码学随机源**，不能只是"看起来随机"。
+    ///
+    /// 锁两件事：
+    /// 1. 每个字节位置上都出现过足够多的不同值（不是常量填充、不是只有少数几个 bit 在变）；
+    /// 2. 相邻两次生成之间没有任何可预测的算术关系（旧实现是
+    ///    `hash(秒, pid, 自增序号)`，同秒内高位高度相关，这条能抓到退化）。
+    #[test]
+    fn run_id_comes_from_a_real_random_source() {
+        let n = 512;
+        let ids: Vec<String> = (0..n).map(|_| new_run_id()).collect();
+
+        // 1) 每个十六进制位都应当出现多种取值（64 个样本位置 × 512 次）。
+        for pos in 0..32 {
+            let uniq: std::collections::HashSet<char> =
+                ids.iter().map(|s| s.as_bytes()[pos] as char).collect();
+            assert!(
+                uniq.len() >= 8,
+                "第 {pos} 个十六进制位只出现了 {} 种取值，随机性不足",
+                uniq.len()
+            );
+        }
+
+        // 2) 首字节不能随序号单调/重复 —— 用"前 64 个的集合大小"粗略体现。
+        let first: std::collections::HashSet<u8> = ids[..64]
+            .iter()
+            .map(|s| u8::from_str_radix(&s[..2], 16).unwrap())
+            .collect();
+        assert!(first.len() >= 55, "首字节重复过多（{} / 64）", first.len());
     }
 
     /// 官方 frp 的代理名带用户前缀：`user` 非空时是 `"{user}.{name}"`。

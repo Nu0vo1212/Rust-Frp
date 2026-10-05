@@ -154,7 +154,13 @@ impl ServerAuthConfig {
 }
 
 /// 客户端认证配置。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// ★ v0.5.4 修（M5）：**手工实现 `Debug`**，`token` 必须脱敏。
+///
+/// 原来这里是 `#[derive(Debug)]`，而同文件的 `ServerAuthConfig` 早就手工脱敏了
+/// —— 同一个文件、同一个项目、两种标准。任何一句 `tracing::debug!(?auth_cfg)`
+/// 都会把客户端 token 明文写进日志文件。
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientAuthConfig {
     #[serde(default)]
@@ -180,6 +186,23 @@ pub struct ClientAuthConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub token_source: Option<toml::Value>,
+}
+
+impl std::fmt::Debug for ClientAuthConfig {
+    /// ★ v0.5.4（M5）：`token` 永不进日志，与 `ServerAuthConfig::Debug` 同口径。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let token = if self.token.is_empty() {
+            "<empty>".to_string()
+        } else {
+            format!("<redacted:{} chars>", self.token.chars().count())
+        };
+        f.debug_struct("ClientAuthConfig")
+            .field("method", &self.method)
+            .field("token", &token)
+            .field("additional_scopes", &self.additional_scopes)
+            .field("oidc", &self.oidc)
+            .finish()
+    }
 }
 
 impl ClientAuthConfig {
@@ -458,7 +481,36 @@ impl Cidr {
 ///
 /// 判定顺序：**deny 优先**。命中 deny 直接拒；deny 没命中时，
 /// `allow` 为空表示"放行"，非空则必须命中才放行。
+///
+/// ★★ v0.5.4 修（M9）：加 `deny_unknown_fields`。
+///
+/// 这不是洁癖 —— 少了它，**一个拼写错误会让整个访问控制静默消失**：
+///
+/// ```toml
+/// [acl]
+/// denny = ["203.0.113.0/24"]     # ← 把 deny 拼错了
+/// ```
+///
+/// 整条解析链上没有任何环节能兜住：`unsupported_server_fields` 扫描只比对
+/// "官方存在、NFrp 未实现"的**正确名字**清单（`denny` 不在里面），
+/// 随后 serde 又不拒绝未知字段 ⇒ `denny` 被**静默丢弃**、`deny` 保持空。
+///
+/// 净效果分两种情形：
+///
+/// * **只配黑名单**（后果最重）：`deny` 与 `allow` 都空 ⇒ `check()` 两个分支
+///   都不命中 ⇒ **对所有 IP 一律放行**。管理员以为封了一段，实际是完全敞开，
+///   而且零告警（`guard.rs` 里那句 `is_empty()` 判定把日志也跳过了）。
+/// * **黑白名单同时配**：`deny` 失效但 `allow` 仍在 ⇒ 仍是白名单模式
+///   （不会变成完全放行），但被显式排除的那段 IP 若落在 `allow` 内会**意外获得
+///   放行** —— "deny 优先"这条被文档与注释反复强调的语义被静默撤销。
+///
+/// 同文件的 `RoleConfig` 早就这么做了 —— 机制存在，只是没铺到最需要它的地方。
+///
+/// ★ 为什么这里可以直接加、而顶层的 `ServerConfig` 不能：`[acl]` 是
+///   NFrp **自己**的配置段（官方 frp 没有同名的 `[acl]` 表），加严不会
+///   影响"官方配置拿来直接用"的场景。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AclConfig {
     /// 白名单。留空 = 不按白名单放行（但要经过 deny）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1184,5 +1236,88 @@ mod tests {
         assert!(rbac.is_disabled());
         let aud = AuditConfig::default();
         assert!(!aud.enable && aud.max_entries == 1000);
+    }
+
+    // ------------------------------------------------------------------
+    // M5（v0.5.4）：ClientAuthConfig 的 Debug 必须脱敏
+    // ------------------------------------------------------------------
+
+    /// ★★ M5 回归：客户端认证配置的 `Debug` 不得泄漏 token。
+    ///
+    /// 原先 `ClientAuthConfig` 是 `#[derive(Debug)]`，而同文件的
+    /// `ServerAuthConfig` 早就手工脱敏了 —— 一个文件两种标准。
+    /// 任何 `tracing::debug!(?auth_cfg)` 都会把 token 明文写进日志。
+    #[test]
+    fn client_auth_debug_不得泄漏_token() {
+        let c = ClientAuthConfig {
+            method: AuthMethod::Token,
+            token: "CLIENT-SECRET-TOKEN-XYZ".into(),
+            ..Default::default()
+        };
+        let s = format!("{c:?}");
+        assert!(!s.contains("CLIENT-SECRET-TOKEN-XYZ"), "token 泄漏了：{s}");
+        assert!(s.contains("redacted"), "应当保留可排障的脱敏标记：{s}");
+        assert!(s.contains("Token"), "非机密信息可以保留：{s}");
+
+        // 空 token 显示为 <empty>
+        let e = format!("{:?}", ClientAuthConfig::default());
+        assert!(e.contains("<empty>"), "{e}");
+    }
+
+    /// 服务端侧同理（早已修，这里锁住防回退）。
+    #[test]
+    fn server_auth_debug_不得泄漏_token() {
+        let c = ServerAuthConfig {
+            token: "SERVER-SECRET-TOKEN-ABC".into(),
+            ..Default::default()
+        };
+        let s = format!("{c:?}");
+        assert!(!s.contains("SERVER-SECRET-TOKEN-ABC"), "token 泄漏了：{s}");
+        assert!(s.contains("redacted"));
+    }
+
+    // ------------------------------------------------------------------
+    // M9（v0.5.4）：[acl] 拼写错误必须报错，而不是静默失效
+    // ------------------------------------------------------------------
+
+    /// ★★ M9 回归：`deny_unknown_fields` 让拼错的键名当场报错。
+    ///
+    /// 少了它，`denny = [...]` 会被静默丢弃 —— 只配黑名单时后果是
+    /// **对所有 IP 一律放行**（管理员以为封了一段，实际完全敞开），
+    /// 而且零告警（`is_empty()` 判定把日志也跳过了）。
+    #[test]
+    fn acl_拼错的键名必须报错而不是静默失效() {
+        // 拼错的 deny：必须解析失败
+        let bad = r#"
+denny = ["203.0.113.0/24"]
+"#;
+        let r: Result<AclConfig, _> = toml::from_str(bad);
+        assert!(
+            r.is_err(),
+            "拼错的 `denny` 必须报错，否则访问控制会静默消失：{:?}",
+            r.map(|c| c.deny.len())
+        );
+
+        // 拼错的 allow 同理
+        let bad2 = r#"
+alow = ["10.0.0.0/8"]
+"#;
+        assert!(toml::from_str::<AclConfig>(bad2).is_err());
+
+        // 正确的写法照常工作
+        let good = r#"
+allow = ["10.0.0.0/8"]
+deny = ["10.1.0.0/16"]
+"#;
+        let c: AclConfig = toml::from_str(good).expect("正确写法必须能解析");
+        assert_eq!(c.allow.len(), 1);
+        assert_eq!(c.deny.len(), 1);
+    }
+
+    /// 空 `[acl]` 段仍是合法的（不破坏"写了段但没填"的配置）。
+    #[test]
+    fn 空_acl_段仍然合法() {
+        let c: AclConfig = toml::from_str("").expect("空表必须合法");
+        assert!(c.is_empty());
     }
 }

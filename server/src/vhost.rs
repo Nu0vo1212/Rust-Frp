@@ -877,13 +877,34 @@ where
         //
         // 直接 400 最省事也最安全：合法客户端不会同时发这两个头。
         let has_te = req.get("transfer-encoding").is_some();
-        let has_cl = req.get("content-length").is_some();
+        // ★ v0.5.4（H2）：`get()` 只返回**第一个**同名头，而 `to_bytes()` 会把
+        //   `headers` 里的**所有**同名头都转发出去 —— "读一个、写两个"正是
+        //   CL.CL 请求走私的成因。所以这里用 `count()` 判"有没有/有几个"，
+        //   而不是 `get().is_some()`。
+        let cl_count = req.count("content-length");
+        let has_cl = cl_count > 0;
         if has_te && has_cl {
             debug!(%peer, "同时带 Transfer-Encoding 与 Content-Length，按走私风险直接拒绝");
             io.stream
                 .write_all(&simple_response(
                     "400 Bad Request",
                     "Transfer-Encoding 与 Content-Length 不能同时出现\n",
+                ))
+                .await?;
+            return Ok(());
+        }
+        // ★ v0.5.4（H2）：**重复的 Content-Length 一律拒绝**。
+        //
+        // 哪怕两个值完全相同也拒绝 —— 不同实现对此合并策略不一致
+        // （取第一个 / 取最后一个 / 报错），而"只读第一个、转发全部"的组合同样
+        // 构成 CL.CL 走私面。RFC 7230 §3.3.2 允许值相同时合并，但拒绝更安全，
+        // 且合法客户端不会重复发这个头。
+        if cl_count > 1 {
+            debug!(%peer, cl_count, "重复的 Content-Length，按走私风险直接拒绝");
+            io.stream
+                .write_all(&simple_response(
+                    "400 Bad Request",
+                    "重复的 Content-Length 头\n",
                 ))
                 .await?;
             return Ok(());
@@ -895,8 +916,23 @@ where
             } else {
                 Vec::new()
             }
-        } else if let Some(cl) = req.get("content-length") {
-            let n: usize = cl.trim().parse().unwrap_or(0);
+        } else if has_cl {
+            // ★ v0.5.4（H2）：严格解析。原先是 `cl.trim().parse().unwrap_or(0)`
+            //   —— **垃圾值静默变 0**（`Content-Length: abc` 被当成"没有请求体"，
+            //   而同一个头又原样转发给上游）。现在非法值一律 400。
+            let n = match req.content_length_strict() {
+                Ok(n) => n as usize,
+                Err(e) => {
+                    debug!(%peer, "Content-Length 非法：{e:#}");
+                    io.stream
+                        .write_all(&simple_response(
+                            "400 Bad Request",
+                            "非法的 Content-Length\n",
+                        ))
+                        .await?;
+                    return Ok(());
+                }
+            };
             if n > 0 {
                 io.read_n(n).await?
             } else {
@@ -923,6 +959,17 @@ where
         hop.extend(connection_tokens(&req));
         for k in hop {
             req.remove(&k);
+        }
+
+        // ★ v0.5.4（H2 第三层，纵深防御）：**同名头去重**。
+        //
+        // 上面已经对重复的 Content-Length 直接 400 了，这一步是"即便将来某个
+        // 环节漏了检查，也不会把重复头原样送到下游"。它保证一个不变量：
+        // **转发出去的头，每个名字最多出现一次**（少数列表型头除外）。
+        // `set-cookie` 之类必须逐个保留，交由 `dedup_headers` 内部白名单处理。
+        let dropped = req.dedup_headers();
+        if dropped > 0 {
+            debug!(%peer, dropped, "转发前剥掉了重复的同名请求头");
         }
 
         if !route.rewrite_host.is_empty() {
@@ -978,8 +1025,16 @@ where
         }
         upstream.flush().await?;
 
-        let mut up = HttpIo::with_prefill(upstream, Vec::new());
-        let _ = leftover;
+        // ★ v0.5.4 修（L3）：把 `leftover` 喂回预读缓冲，**不要丢掉**。
+        //
+        // `leftover` 是工作连接上已经读进缓冲区、但还没被消费的字节。
+        // 原先是 `let _ = leftover;` 直接扔了 —— 若内网服务在握手后立刻
+        // 吐了响应（或预读时顺带读到了响应开头），这部分字节就永久丢失，
+        // 表现为**响应体被截断**。
+        //
+        // 必须在 write/flush **之后**构造（`HttpIo::with_prefill` 会拿走
+        // `upstream` 的所有权）。
+        let mut up = HttpIo::with_prefill(upstream, leftover);
 
         // ---- 读响应头 ----
         //
@@ -1007,6 +1062,24 @@ where
             return Ok(());
         };
         let mut resp = HeadParts::parse(&resp_lines)?;
+
+        // ★★ v0.5.4 修（L2）：**响应侧也要剥逐跳头**。
+        //
+        // 原先只有请求侧剥了（见上面那段加入 `HOP_BY_HOP` 的注释），
+        // 响应侧原样转发 ⇒ 内网服务回的 `Connection: keep-alive, X-Secret`
+        // 会让**客户端**把 `X-Secret` 也当逐跳头处理；`Upgrade` / `Proxy-*`
+        // 同理。逐跳头的语义就是"只对当前这一段连接有意义"，
+        // 跨过代理转发本身就是错的 —— 两个方向都得剥。
+        //
+        // 顺序：**先剥再设置**我们自己的 `Connection`，否则会把刚写的那条也剥掉。
+        {
+            let mut hop: Vec<String> = HOP_BY_HOP.iter().map(|s| (*s).to_string()).collect();
+            hop.extend(connection_tokens(&resp));
+            for k in hop {
+                resp.remove(&k);
+            }
+        }
+
         if let Some(start) = resp.start_line.split_whitespace().nth(1) {
             let code: u32 = start.parse().unwrap_or(200);
             let no_body =

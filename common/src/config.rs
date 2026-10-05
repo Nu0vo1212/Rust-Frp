@@ -312,7 +312,10 @@ pub fn port_allowed(allow: &[PortRange], port: u16) -> bool {
 // ---------------------------------------------------------------------------
 
 /// 服务端配置，对应 `server.toml`。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// ★ v0.5.3：手工实现 `Debug`（见文件下方），`token` 与 `dashboard_pwd`
+/// 一律脱敏，避免任何调试打印把密钥写进日志。
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// 监听地址，`0.0.0.0` 表示所有网卡。
     #[serde(default = "default_bind_addr")]
@@ -599,6 +602,39 @@ pub struct ServerConfig {
     /// [`crate::frp_config::unsupported_server_fields`]。
     #[serde(skip)]
     pub unsupported_fields: Vec<String>,
+}
+
+impl std::fmt::Debug for ServerConfig {
+    /// ★ v0.5.3：`token` / `dashboard_pwd` 永不进日志。
+    ///
+    /// 这两个字段原来会随 `#[derive(Debug)]` 一起打出来 ——
+    /// 任何一句 `tracing::debug!(?cfg)` 都会把面板口令写进日志文件。
+    /// 只保留"有没有配、多长"这类排障够用的信息。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn redact(s: &str) -> String {
+            if s.is_empty() {
+                "<empty>".to_string()
+            } else {
+                format!("<redacted:{} chars>", s.chars().count())
+            }
+        }
+        f.debug_struct("ServerConfig")
+            .field("bind_addr", &self.bind_addr)
+            .field("bind_port", &self.bind_port)
+            .field("control_port", &self.control_port)
+            .field("token", &redact(&self.token))
+            .field("dashboard_port", &self.dashboard_port)
+            .field("dashboard_user", &self.dashboard_user)
+            .field("dashboard_pwd", &redact(&self.dashboard_pwd))
+            .field("allow_insecure_dashboard", &self.allow_insecure_dashboard)
+            .field("hot_reload", &self.hot_reload)
+            .field("log_level", &self.log_level)
+            .field("auth", &self.auth)
+            .field("acl", &self.acl)
+            .field("roles", &self.roles.len())
+            .field("audit", &self.audit)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ServerConfig {
@@ -1140,7 +1176,10 @@ fn default_visitor_type() -> String {
 }
 
 /// 客户端配置，对应 `client.toml`。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// ★ v0.5.3：手工实现 `Debug`（见文件下方），`token` 与各代理的
+/// `secret_key` / `http_pwd` 一律脱敏。
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
     /// 服务端地址（域名或 IP，不含端口）。
     pub server_addr: String,
@@ -1421,7 +1460,7 @@ pub struct StoreConfig {
 /// 客户端 Web 管理界面配置（`[webServer]`）。
 ///
 /// 官方 frpc 也有同名段落，字段名保持一致（`addr` / `port` / `user` / `password`）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebServerConfig {
     /// 监听地址。**默认 `127.0.0.1`** —— 这个界面能动态开端口，
@@ -1460,6 +1499,25 @@ fn default_webserver_addr() -> String {
     "127.0.0.1".into()
 }
 
+impl std::fmt::Debug for WebServerConfig {
+    /// ★ v0.5.3：`password` 脱敏（本地管理界面的 Basic Auth 口令）。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pwd = if self.password.is_empty() {
+            "<empty>".to_string()
+        } else {
+            format!("<redacted:{} chars>", self.password.chars().count())
+        };
+        f.debug_struct("WebServerConfig")
+            .field("addr", &self.addr)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password", &pwd)
+            .field("allow_insecure_remote", &self.allow_insecure_remote)
+            .field("assets_dir", &self.assets_dir)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for WebServerConfig {
     fn default() -> Self {
         Self {
@@ -1477,6 +1535,34 @@ impl Default for WebServerConfig {
 impl WebServerConfig {
     pub fn is_enabled(&self) -> bool {
         self.port != 0
+    }
+}
+
+impl std::fmt::Debug for ClientConfig {
+    /// ★ v0.5.3：所有凭据字段脱敏。
+    ///
+    /// 客户端配置里含 `token`（顶层）、`webServer.password`，
+    /// 以及每条代理的 `secret_key` / `http_pwd`。原来 `#[derive(Debug)]`
+    /// 会把它们原样打出来。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn redact(s: &str) -> String {
+            if s.is_empty() {
+                "<empty>".to_string()
+            } else {
+                format!("<redacted:{} chars>", s.chars().count())
+            }
+        }
+        f.debug_struct("ClientConfig")
+            .field("server_addr", &self.server_addr)
+            .field("server_port", &self.server_port)
+            .field("token", &redact(&self.token))
+            .field("proxies", &self.proxies.len())
+            .field("visitors", &self.visitors.len())
+            .field("web_server", &self.web_server)
+            .field("log_level", &self.log_level)
+            .field("login_fail_exit", &self.login_fail_exit)
+            .field("auth", &self.auth)
+            .finish_non_exhaustive()
     }
 }
 
@@ -2042,6 +2128,87 @@ pub fn parse_server_toml(raw: &str) -> Result<ServerConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Debug 脱敏（v0.5.3）
+    // -----------------------------------------------------------------------
+
+    /// ★★ 密钥绝不能通过 `Debug` 泄漏 —— 这是"等着被踩"的坑的锁定测试。
+    ///
+    /// 项目里眼下没有 `println!("{cfg:?}")`，但配置结构被到处传递，
+    /// 只要有人加一句调试打印，明文 token / 口令 / secret_key 就会进日志。
+    /// 这条测试保证：**即使有人这么写，也打不出密钥**。
+    #[test]
+    fn debug_输出不得泄漏服务端密钥() {
+        let c = ServerConfig {
+            token: "SUPER-SECRET-TOKEN-XYZ".into(),
+            dashboard_user: "admin".into(),
+            dashboard_pwd: "PANEL-PASSWORD-123".into(),
+            ..Default::default()
+        };
+
+        let s = format!("{c:?}");
+        assert!(!s.contains("SUPER-SECRET-TOKEN-XYZ"), "token 泄漏了：{s}");
+        assert!(!s.contains("PANEL-PASSWORD-123"), "面板口令泄漏了：{s}");
+        // 但应当看得出"配了多长"，便于排障
+        assert!(s.contains("redacted"), "应当保留可排障的脱敏标记：{s}");
+        // 用户名这类非机密信息可以保留
+        assert!(s.contains("admin"));
+    }
+
+    /// 认证子结构的 Debug 也必须脱敏。
+    #[test]
+    fn debug_输出不得泄漏认证配置的密钥() {
+        let a = crate::security::ServerAuthConfig {
+            token: "AUTH-SECTION-TOKEN".into(),
+            ..Default::default()
+        };
+        let s = format!("{a:?}");
+        assert!(!s.contains("AUTH-SECTION-TOKEN"), "token 泄漏了：{s}");
+        assert!(s.contains("redacted"));
+    }
+
+    /// 客户端配置里的 token / webServer 口令 / 代理 secret_key 都要脱敏。
+    #[test]
+    fn debug_输出不得泄漏客户端密钥() {
+        let c = ClientConfig {
+            token: "CLIENT-TOKEN-ABC".into(),
+            web_server: WebServerConfig {
+                password: "WEB-PASSWORD-456".into(),
+                ..Default::default()
+            },
+            proxies: vec![ProxyConfig {
+                name: "p1".into(),
+                proxy_type: "stcp".into(),
+                secret_key: "PROXY-SECRET-KEY".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let s = format!("{c:?}");
+        assert!(!s.contains("CLIENT-TOKEN-ABC"), "客户端 token 泄漏了：{s}");
+        assert!(!s.contains("WEB-PASSWORD-456"), "Web 口令泄漏了：{s}");
+        // 代理是按数量展示的，不会展开 secret_key
+        assert!(s.contains("proxies"), "{s}");
+    }
+
+    /// 序列化（serde）**不受影响** —— 脱敏只针对 Debug 输出。
+    ///
+    /// 这条很重要：如果为了"脱敏"把 serde 也改了，`--gen-config` 之类的
+    /// 功能就会输出假的密钥，那是另一种破坏。
+    #[test]
+    fn 脱敏不影响_serde_序列化() {
+        let c = ServerConfig {
+            token: "ROUNDTRIP-TOKEN".into(),
+            ..Default::default()
+        };
+        let text = toml::to_string(&c).unwrap();
+        assert!(
+            text.contains("ROUNDTRIP-TOKEN"),
+            "序列化必须保留真实 token：{text}"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // allowPorts（PortRange / parse_port_ranges / port_allowed）

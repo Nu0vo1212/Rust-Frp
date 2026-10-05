@@ -65,7 +65,7 @@ pub async fn run(conn: FrpConn, local_addr: String, proxy_name: String) -> Resul
                         };
                         // 注意：锁必须在本语句内释放，不能在 match 的临时变量里跨越 await
                         let existing = {
-                            sessions.lock().unwrap().get(&remote.key()).cloned()
+                            sessions.lock().unwrap_or_else(|e| e.into_inner()).get(&remote.key()).cloned()
                         };
                         let tx = match existing {
                             Some(tx) => tx,
@@ -78,7 +78,7 @@ pub async fn run(conn: FrpConn, local_addr: String, proxy_name: String) -> Resul
                             },
                         };
                         if tx.send(pkt.payload().to_vec()).await.is_err() {
-                            sessions.lock().unwrap().remove(&remote.key());
+                            sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(&remote.key());
                         }
                     }
                     FrpMessage::Ping(_) => {}
@@ -96,7 +96,7 @@ pub async fn run(conn: FrpConn, local_addr: String, proxy_name: String) -> Resul
         }
     };
 
-    sessions.lock().unwrap().clear();
+    sessions.lock().unwrap_or_else(|e| e.into_inner()).clear();
     result
 }
 
@@ -169,10 +169,16 @@ async fn new_session(
                     }
                 }
             }
-            sessions.lock().unwrap().remove(&key);
+            sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
         });
     }
 
-    sessions.lock().unwrap().insert(remote.key(), tx.clone());
+    sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(remote.key(), tx.clone());
     Ok(tx)
 }

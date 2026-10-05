@@ -187,7 +187,15 @@ impl<S: AsyncRead + Unpin> HttpIo<S> {
                 }
                 return Ok(out);
             }
-            if out.len() + size > MAX_BODY {
+            // ★ 必须用 `saturating_add`（v0.5.3 修）。
+            //
+            // `out.len() + size` 里 `size` 是**攻击者可控**的：它直接来自报文中的
+            // chunk 长度（十六进制解析，最大可达 `usize::MAX`）。release profile
+            // 没开 `overflow-checks`（见 Cargo.toml 的 `[profile.release]`），
+            // 裸 `+` 会**静默回绕**成一个很小的值，于是这条 32 MiB 的 ACL 被判为
+            // "通过"。后面 `read_n(size)` 里还有一道独立 ACL 兜着（所以实际不是
+            // 无限内存增长），但纵深防御不该指望下游 —— 这里当场判死。
+            if out.len().saturating_add(size) > MAX_BODY {
                 bail!("chunked 报文超过 {MAX_BODY} 字节");
             }
             let data = self.read_n(size).await?;
@@ -660,6 +668,29 @@ mod tests {
         a.write_all(raw).await.unwrap();
         let mut io = HttpIo::new(b);
         assert_eq!(io.read_chunked().await.unwrap(), raw.to_vec());
+    }
+
+    /// ★★ v0.5.3 回归：chunk 长度大到能让 `len + size` **算术回绕**时，
+    /// ACL 必须照常拒绝（而不是因为回绕成小值而"通过"）。
+    ///
+    /// release profile 没开 `overflow-checks`，裸 `+` 会静默回绕 ——
+    /// 这是本轮审计抓到的真实缺陷（虽然下游 `read_n` 还有一道 ACL 兜着）。
+    #[tokio::test]
+    async fn chunked_长度回绕不能绕过体积上限() {
+        // 先塞入接近 MAX_BODY 的数据不现实（32 MiB），所以直接用一个
+        // "只要发生回绕就必然变成小值"的巨大 chunk 长度来验判据本身。
+        // usize::MAX 会让 out.len() + size 回绕成 out.len() - 1（小值），
+        // 于是旧代码会放行。
+        let (mut a, b) = duplex(1024);
+        let huge = format!("{:x}", usize::MAX);
+        a.write_all(format!("{huge}\r\n").as_bytes()).await.unwrap();
+        let mut io = HttpIo::new(b);
+        let r = io.read_chunked().await;
+        assert!(
+            r.is_err(),
+            "usize::MAX 的 chunk 长度必须被拒绝，实际拿到 {:?}",
+            r.map(|v| v.len())
+        );
     }
 
     #[tokio::test]

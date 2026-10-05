@@ -587,11 +587,26 @@ def cmd_checksum(args: argparse.Namespace) -> int:
         return 0
 
     if shutil.which("gpg") is None:
-        log(
-            f"既没有 {key_file} 也没有 gpg，跳过签名"
-            f"（校验值照样可用，只是无法验证来源）。生成密钥：release.py keygen"
+        # ★★ v0.5.4 修（M2）：签名失败/缺失**必须非零退出**，不能静默放过。
+        #
+        # 原先这里 `return 0` —— 于是"忘了放私钥"或"环境里没 gpg"会
+        # **静默发出一批未签名的制品**，而发布说明还写着"附 Ed25519 分离签名"。
+        # 那是自相矛盾的发布，比明说"没签名"更糟。
+        #
+        # 确实想跳过签名：显式加 `--allow-unsigned`（见下面 args 定义）。
+        if getattr(args, "allow_unsigned", False):
+            log(
+                f"既没有 {key_file} 也没有 gpg —— 因为显式给了 --allow-unsigned，"
+                f"本次**不签名**（校验值仍可用，但无法验证来源）。"
+            )
+            return 0
+        print(
+            f"ERROR: 既没有 {key_file} 也没有 gpg，无法签名。\n"
+            f"  生成密钥：release.py keygen\n"
+            f"  确实要发未签名的制品：加 --allow-unsigned（会明确记录在日志里）",
+            file=sys.stderr,
         )
-        return 0
+        return 1
 
     if sig_file.exists():
         sig_file.unlink()
@@ -602,9 +617,18 @@ def cmd_checksum(args: argparse.Namespace) -> int:
     )
     if r.returncode == 0:
         log(f"已用 gpg 签名 -> {sig_file.name}")
-    else:
-        log(f"gpg 签名失败（不影响使用）：{r.stderr.strip()}")
-    return 0
+        # 签完立刻自检，避免"签是签了、但验不过"
+        if not verify_signature(sums, sig_file):
+            print("ERROR: gpg 签名自检失败，拒绝继续", file=sys.stderr)
+            return 1
+        return 0
+    # ★ 原先这里只打一行日志然后 `return 0` —— 签名失败仍然算成功
+    print(
+        f"ERROR: gpg 签名失败：{r.stderr.strip()}\n"
+        f"  确实要发未签名的制品：加 --allow-unsigned",
+        file=sys.stderr,
+    )
+    return 1
 
 
 # ---------------------------------------------------------------------------
@@ -648,9 +672,20 @@ def cmd_verify(args: argparse.Namespace) -> int:
     # ---- 签名 ----
     sig_file = out / SIG_NAME
     if not sig_file.is_file():
-        print("  注意：没有签名文件，只能校验完整性、无法验证来源")
-        print(f"校验{'全部通过' if ok else '存在问题'}")
-        return 0 if ok else 1
+        # ★★ v0.5.4 修（M2）：**没有签名文件就是校验失败**，不能返回 0。
+        #
+        # 原先这里打个"注意"就 `return 0` —— 于是 `verify` 对"完整性没问题但
+        # 来源不可验证"的产物报"校验全部通过"。而 CI 里跑的就是这条命令：
+        # 它本该是"发布前的最后一道关"，结果对"签名整个丢了"这种情况完全无感。
+        #
+        # 校验完整性（sha256）与验证来源（签名）是两件事，后者缺失必须算失败。
+        print(
+            f"  失败：缺少签名文件 {sig_file.name} —— 只能确认完整性，无法验证来源。\n"
+            f"  先生成签名：release.py checksum --dir <目录> --sign",
+            file=sys.stderr,
+        )
+        print("校验存在问题")
+        return 1
 
     signed = verify_signature(sums, sig_file)
     ok = ok and signed
@@ -733,6 +768,13 @@ def main() -> int:
     )
     p_sum.add_argument(
         "--pub", default=str(DEFAULT_KEYS / PUB_NAME), help="Ed25519 公钥路径（用于随包分发）"
+    )
+    # ★ v0.5.4（M2）：签名缺失/失败默认**非零退出**；确实要发未签名制品
+    #   必须显式声明，让意图留在日志里。
+    p_sum.add_argument(
+        "--allow-unsigned",
+        action="store_true",
+        help="确实要发布未签名制品（默认：签不出来就报错退出）",
     )
     p_sum.set_defaults(func=cmd_checksum)
 

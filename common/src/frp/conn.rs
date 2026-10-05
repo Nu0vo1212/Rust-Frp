@@ -727,7 +727,7 @@ where
     //
     // 失败时回的文案与官方 frps **逐字一致**（token 方式下），因为第三方
     // 平台的错误提示会拿它做匹配 —— 换了措辞用户会以为是自己配置错了。
-    let subject = match auth.verify_login(&login.privilege_key, login.timestamp) {
+    let subject = match auth.verify_login(&login.privilege_key, login.timestamp, run_id) {
         Ok(s) => s,
         Err(e) => {
             // 官方 frps 也是明文回这条错误（此时还没建立加密）

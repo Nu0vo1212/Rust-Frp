@@ -399,7 +399,11 @@ async fn serve_conn(
     }
 
     // ③ 认证：与普通控制连接**同一套凭证**（token / OIDC 都走这里）
-    if let Err(e) = sec.verify_login(&reg.token, reg.timestamp) {
+    //
+    // ★ v0.5.3：这里把 OIDC 的 subject 绑定到 `reg.client`（VirtualNet 的会话标识），
+    //   与普通控制连接绑定到 run_id 是同一个道理 —— 不能让"曾在别处登录过的
+    //   subject"给本次注册背书。
+    if let Err(e) = sec.verify_login(&reg.token, reg.timestamp, &reg.client) {
         let _ = write_resp(&mut stream, &VnetRegisterResp::denied("认证失败")).await;
         // 审计里只写"失败"，不回显凭证，也不给攻击者更多信息
         sec.audit.record(

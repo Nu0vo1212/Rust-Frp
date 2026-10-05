@@ -76,18 +76,14 @@ pub fn apply_dynamic(
         // ★ 注意这里判的是 `new` 而不是 `old`：旧的 `old` 带着凭据，
         //   `dashboard_is_exposed(old)` 恒为 false，拿它做判据等于没拦
         //   （这正是我第一版写错、被测试抓出来的地方）。
-        //   但 `bind_addr` 要取 `old` 的 —— 它**不可热改**（见下面 changed 列表），
-        //   新配置里那个值当次并不生效，拿它判会误判。
+        // ★ `bind_addr` / `dashboard_port` 要取 `old`（运行期生效那份）——
+        //   它们都不可热改，新配置里那个值当次并不生效。漏掉后者就是 H1 的绕过点。
         let clears_creds = new.dashboard_user.trim().is_empty();
-        let mut effective = new.clone();
-        effective.bind_addr = old.bind_addr.clone();
-        if clears_creds && dashboard_is_exposed(&effective) {
+        if clears_creds && dashboard_exposed_after_reload(old, new) {
             warn!(
-                "热重载被拒：bind_addr = {:?} 是对外地址，且面板端口已启用 —— \
-                 不允许在运行期把 dashboard_user 清空（那会让匿名者可以读面板、\
-                 踢掉任意客户端、并直接开公网端口）。已保持原有面板鉴权不变。\
+                "热重载被拒：{} 不允许在运行期把 dashboard_user 清空。已保持原有面板鉴权不变。\
                  确实要关掉鉴权请改 bind_addr 或重启服务端。",
-                old.bind_addr
+                reject_reason(old)
             );
         } else if let Ok(mut g) = auth.write() {
             *g = if clears_creds {
@@ -199,8 +195,7 @@ fn mtime(path: &Path) -> Option<u128> {
 ///
 /// ★ 这里返回 `bool` 而不是 `Result`，并且**必须**与 `main.rs::validate` 里
 /// 那条同口径 —— 但**不能直接复用它**：`validate` 是纯函数只看配置，
-/// 而热重载时要拿**运行期实际生效的监听地址**去判（`bind_addr` 不可热改，
-/// 见下面 `watch()` 的说明）。
+/// 而热重载时要拿**运行期实际生效的监听参数**去判。
 ///
 /// 抽成公共函数是为了让「启动校验」与「热重载校验」用同一段逻辑，
 /// 免得两处口径漂移 —— 早先的 bug 正是「只在启动时校验过一次」。
@@ -209,6 +204,41 @@ pub fn dashboard_is_exposed(cfg: &ServerConfig) -> bool {
         && cfg.dashboard_user.trim().is_empty()
         && !nfrp_common::util::is_loopback_addr(&cfg.bind_addr)
         && !cfg.allow_insecure_dashboard
+}
+
+/// ★★ 热重载场景下的判据（v0.5.4 修 H1）：**所有"不可热改"的字段都必须取运行期那份**。
+///
+/// 上一版（v0.5.3）这里只把 `bind_addr` 换成了 `live` 的值，却漏了
+/// `dashboard_port` —— 于是存在一条绕过：
+///
+/// ```text
+///   ① 启动：bind_addr = "0.0.0.0" + dashboard_port = 7500 + dashboard_user = "admin"
+///      ⇒ 合法放行（有凭据），且 `serve.rs` 里那个监听器**已经 bind 在 0.0.0.0:7500 上**
+///   ② 运行期：把配置文件里的 `dashboard_port` 那一行**删掉**，同时清空 dashboard_user
+///   ③ 判据看到 new.dashboard_port == None ⇒ 认为"面板没开" ⇒ 放行
+///   ④ 但监听器还活着（`dashboard_port` 在下面 changed 列表里明确属于"需重启"），
+///      而 `apply_dynamic` 已经把 auth 置成 None ⇒ **对外面板变成匿名可写**
+/// ```
+///
+/// 根因是同一类错误：**拿"配置里写没写"代表"运行期有没有在监听"**。
+/// 正确做法是：判据里凡是"需要重启才生效"的字段（`bind_addr`、`dashboard_port`）
+/// 一律用**运行期已生效的那份**取值，只有真正的可热改字段（`dashboard_user`、
+/// `dashboard_pwd`、`allow_insecure_dashboard`）才看新配置。
+fn dashboard_exposed_after_reload(live: &ServerConfig, new: &ServerConfig) -> bool {
+    let mut effective = new.clone();
+    // 这两项在下面 `changed(...)` 清单里都属于"需重启"，新值当次**不会**生效
+    effective.bind_addr = live.bind_addr.clone();
+    effective.dashboard_port = live.dashboard_port;
+    dashboard_is_exposed(&effective)
+}
+
+/// 启动期与热重载期共用的那条错误文案。
+fn reject_reason(live: &ServerConfig) -> String {
+    format!(
+        "面板在非回环地址 {:?} 上监听（端口 {:?}）却没有凭据 —— \
+         匿名者可以读面板、踢掉任意客户端、并（对 nfrp 客户端）直接开公网端口。",
+        live.bind_addr, live.dashboard_port
+    )
 }
 
 /// 后台任务：盯着配置文件，变了就重载。
@@ -246,21 +276,17 @@ pub async fn watch(
         // 只在启动路径跑过，对"运行期漂移"完全无效 —— 这正是 v0.5.2 那个
         // 高危漏洞的成因。这里对新配置**照同样口径**再判一次，不通过就整份拒绝。
         //
-        // ★ `bind_addr` 用**当前生效的**那份：它不可热改，新配置里那个值
-        //   本次并不生效，拿它判会误判（比如老的是 0.0.0.0、新的写 127.0.0.1，
-        //   实际 socket 还在 0.0.0.0 上对外开着）。
-        {
-            let mut effective = new.clone();
-            effective.bind_addr = current.bind_addr.clone();
-            if dashboard_is_exposed(&effective) {
-                warn!(
-                    "热重载被拒：新配置会让面板在非回环地址 {:?} 上无鉴权运行 —— \
-                     这正是 v0.5.2 修掉的那个漏洞场景，运行期不允许制造它。\
-                     已保持旧配置不变。",
-                    current.bind_addr
-                );
-                continue;
-            }
+        // ★ 判据里 `bind_addr` 与 `dashboard_port` 都取 `current`（运行期已生效那份）：
+        //   两者都不可热改，新配置里那个值本次并不生效。**只换 bind_addr 是不够的** ——
+        //   删掉 `dashboard_port` 那一行同样能让判据误以为"面板没开"，而监听器还活着
+        //   （这就是 v0.5.3 漏掉的 H1 绕过点）。
+        if dashboard_exposed_after_reload(&current, &new) {
+            warn!(
+                "热重载被拒：{} 这正是 v0.5.2 修掉的那个漏洞场景，运行期不允许制造它。\
+                 已保持旧配置不变。",
+                reject_reason(&current)
+            );
+            continue;
         }
 
         let pending = apply_dynamic(&current, &new, log.as_ref(), &auth);
@@ -433,6 +459,11 @@ mod tests {
     }
 
     /// 没开面板端口时，清空用户名不影响任何安全语义。
+    ///
+    /// ★ 注意：这条测的是"**运行期也没绑**面板"的情形（`old.dashboard_port` 为空）。
+    /// 它**不能**推广成"新配置里没写 dashboard_port 就等于面板没开" ——
+    /// 那正是 H1 绕过点的错误假设，对应场景见下面
+    /// `已绑定面板后删掉端口行仍应被视为暴露`。
     #[test]
     fn 没开面板端口时清空用户名不受影响() {
         let mut a = cfg();
@@ -446,6 +477,90 @@ mod tests {
         c.dashboard_user.clear();
         apply_dynamic(&a, &c, None, &auth);
         assert!(auth.read().unwrap().is_none());
+    }
+
+    /// ★★ v0.5.4 回归（H1）：**运行期已绑定面板，配置里删掉 `dashboard_port` 行，
+    /// 仍然必须被视为"暴露"**。
+    ///
+    /// 这是 v0.5.3 漏掉的绕过点，根因是拿"配置里写没写"代表"运行期有没有在监听"：
+    ///
+    /// ```text
+    ///   ① 启动：0.0.0.0 + dashboard_port = 7500 + dashboard_user = "admin"（合法）
+    ///      ⇒ serve.rs 里监听器已经 bind 在 0.0.0.0:7500 上
+    ///   ② 运行期：删掉 dashboard_port 行 + 清空 dashboard_user
+    ///   ③ 旧判据看到 new.dashboard_port == None ⇒ 以为"面板没开" ⇒ 放行
+    ///   ④ 但监听器还活着（dashboard_port 属"需重启"字段）⇒ 对外面板变成匿名可写
+    /// ```
+    #[test]
+    fn 已绑定面板后删掉端口行仍应被视为暴露() {
+        // 运行期状态：面板确实绑在对外地址上
+        let mut live = cfg();
+        live.bind_addr = "0.0.0.0".into();
+        live.dashboard_port = Some(7500);
+        live.dashboard_user = "admin".into();
+        live.dashboard_pwd = "s3cret".into();
+
+        // 新配置：删掉端口行 + 清空用户名（攻击者/误操作）
+        let mut evil = live.clone();
+        evil.dashboard_port = None;
+        evil.dashboard_user.clear();
+        evil.dashboard_pwd.clear();
+
+        // 判据必须仍然认为"暴露"
+        assert!(
+            dashboard_exposed_after_reload(&live, &evil),
+            "运行期已绑定的面板不能因为新配置删了端口行就被当成'没开'"
+        );
+
+        // 端到端：apply_dynamic 必须拒绝关闭鉴权
+        let auth: DashboardAuth = Arc::new(std::sync::RwLock::new(Some((
+            "admin".to_string(),
+            "s3cret".to_string(),
+        ))));
+        apply_dynamic(&live, &evil, None, &auth);
+        assert_eq!(
+            auth.read().unwrap().clone(),
+            Some(("admin".to_string(), "s3cret".to_string())),
+            "删掉 dashboard_port 行不能成为绕过闸门的手段，旧凭据必须保持"
+        );
+    }
+
+    /// 同一场景的对称面：运行期**没**绑面板，新配置也没写 ⇒ 确实不该拦。
+    #[test]
+    fn 运行期未绑面板时删掉端口行不误报() {
+        let mut live = cfg();
+        live.bind_addr = "0.0.0.0".into();
+        live.dashboard_port = None;
+        live.dashboard_user = "admin".into();
+
+        let mut new = live.clone();
+        new.dashboard_user.clear();
+
+        assert!(
+            !dashboard_exposed_after_reload(&live, &new),
+            "运行期本来就没绑面板，不构成暴露"
+        );
+    }
+
+    /// 另一条"不可热改字段"的对称性：运行期绑在回环，新配置写 0.0.0.0。
+    ///
+    /// `bind_addr` 改不了，所以实际仍只在回环上 —— 判据必须用运行期那份，
+    /// 否则会把"安全但配置写得不一致"误判成暴露而拒绝合法重载。
+    #[test]
+    fn 运行期回环时新配置写对外地址不算暴露() {
+        let mut live = cfg();
+        live.bind_addr = "127.0.0.1".into();
+        live.dashboard_port = Some(7500);
+        live.dashboard_user = "admin".into();
+
+        let mut new = live.clone();
+        new.bind_addr = "0.0.0.0".into(); // 写错了，但本次不生效
+        new.dashboard_user.clear();
+
+        assert!(
+            !dashboard_exposed_after_reload(&live, &new),
+            "bind_addr 不可热改，运行期仍在回环上 ⇒ 不该误报"
+        );
     }
 
     /// `dashboard_is_exposed` 的口径与启动校验一致。

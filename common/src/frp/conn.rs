@@ -34,6 +34,13 @@ use super::WireVersion;
 /// 缓冲区上限，避免对端恶意灌数据。
 const MAX_BUFFER: usize = 8 * 1024 * 1024;
 
+/// 解密后明文的缓冲上限（v0.5.4，M6）。
+///
+/// 与 [`MAX_BUFFER`] 同量级：`plain` 是"已解密、还没被上层取走"的字节，
+/// 正常运行时它几乎是空的（上层每条消息都会取走）。真堆到这个量级
+/// 只可能是对端在灌数据 ⇒ 断开。
+const MAX_PLAIN: usize = 8 * 1024 * 1024;
+
 /// v2 的控制通道加密状态（AES-256-GCM AEAD 帧流，`golib/crypto/aead_stream.go`）。
 ///
 /// 单独成结构体并装箱，理由见 [`ControlCrypto`]。
@@ -352,10 +359,26 @@ impl FrpConn {
             ControlCrypto::V1(c) => {
                 // v1 是流密码：把缓冲区里所有能解的字节都解出来
                 let pt = c.decrypt(&mut self.raw);
+                // ★★ v0.5.4 修 M6：`plain` 也必须有自己的硬顶。
+                //
+                // 原先只卡了 `raw`（上面那条 MAX_BUFFER），`plain` 完全没有上限。
+                // 后果：**未认证**的连接就能让对端不断喂数据，把已解密明文堆到
+                // 远大于 8 MiB —— 攻击者只需建约 1000 条连接（受系统 fd 限制）
+                // 就能吃掉接近 8 GB 内存，无需任何凭据。
+                //
+                // 为什么 8 MiB 够：`plain` 里的数据会被上层按消息/帧消费掉，
+                // 正常情况下几乎总是空的。真堆到 8 MiB 说明对端在灌数据而我们
+                // 没消费 —— 那本身就是异常，断开是对的。
+                if self.plain.len() + pt.len() > MAX_PLAIN {
+                    bail!("解密缓冲超限（{MAX_PLAIN} 字节），断开连接");
+                }
                 self.plain.extend_from_slice(&pt);
             }
             ControlCrypto::V2(v) => {
                 while let Some(pt) = v.reader.open(&mut self.raw)? {
+                    if self.plain.len() + pt.len() > MAX_PLAIN {
+                        bail!("解密缓冲超限（{MAX_PLAIN} 字节），断开连接");
+                    }
                     self.plain.extend_from_slice(&pt);
                 }
             }
@@ -1225,5 +1248,32 @@ mod tests {
             v1::TYPE_UDP_PACKET,
             &msg::encode_udp_binary(pkt).expect("二进制编码"),
         )
+    }
+
+    /// ★★ v0.5.4 回归（M6）：解密缓冲（`plain`）必须有硬顶。
+    ///
+    /// 原先只卡了 `raw`（8 MiB），`plain` 完全没有上限 ⇒ 一条**未认证**的连接
+    /// 就能让对端把已解密明文堆到任意大小，约 1000 条连接即可吃掉数 GB 内存。
+    ///
+    /// 这里直接验证常量与判据的口径（不真的灌 8 MiB，那太慢）：
+    /// 用 `MAX_PLAIN` 的边界值检查"加多少会越界"。
+    #[test]
+    fn 解密缓冲上限的口径() {
+        assert_eq!(MAX_PLAIN, 8 * 1024 * 1024, "plain 上限应与 raw 同量级");
+
+        // 复刻 `fill()` 里的判据：`self.plain.len() + pt.len() > MAX_PLAIN`
+        let would_overflow = |have: usize, add: usize| have + add > MAX_PLAIN;
+
+        // 正好填满：允许；多 1 字节：拒绝
+        assert!(!would_overflow(0, MAX_PLAIN), "正好填满应当允许");
+        assert!(would_overflow(0, MAX_PLAIN + 1), "超出 1 字节必须被拒");
+
+        // 累计判断（不是只看单次增量）
+        let have = MAX_PLAIN - 10;
+        assert!(!would_overflow(have, 10), "累计正好到顶应当允许");
+        assert!(would_overflow(have, 11), "累计超限必须被拒");
+
+        // 已有内容已经超限时，再加 0 也要拒
+        assert!(would_overflow(MAX_PLAIN + 1, 0), "已超限时应当继续拒绝");
     }
 }

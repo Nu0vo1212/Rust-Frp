@@ -347,11 +347,25 @@ fn decode_chunked(raw: &[u8]) -> Result<Vec<u8>> {
         if size == 0 {
             break;
         }
-        if raw.len() < i + size {
+        // ★ 全部改 `checked_add` / `saturating_add`（v0.5.3 修）。
+        //
+        // `size` 来自被访问服务器返回的 chunk 长度（攻击者可控 —— 我们可能正在
+        // 访问一个恶意上游，或中间人改过的响应），最大可达 `usize::MAX`。
+        // release profile 未开 overflow-checks，裸 `+` 会静默回绕：
+        //   * `i + size` 回绕 ⇒ 截断检查被绕过；
+        //   * `i += size + 2` 回绕 ⇒ 游标倒退，可能造成死循环或越界切片。
+        let end = match i.checked_add(size) {
+            Some(e) => e,
+            None => bail!("chunked 段长度溢出：{size_text:?}"),
+        };
+        if raw.len() < end {
             bail!("chunked 数据被截断");
         }
-        out.extend_from_slice(&raw[i..i + size]);
-        i += size + 2; // 跳过数据与结尾 CRLF
+        out.extend_from_slice(&raw[i..end]);
+        i = match end.checked_add(2) {
+            Some(v) => v, // 跳过数据与结尾 CRLF
+            None => break,
+        };
         if out.len() > MAX_BODY {
             bail!("chunked 响应体超过 {MAX_BODY} 字节");
         }
@@ -599,5 +613,32 @@ mod tests {
             "截断的 chunked 不能被当成正常响应"
         );
         assert!(decode_chunked(b"ff\r\nshort\r\n").is_err());
+    }
+
+    /// ★★ v0.5.3 回归：chunk 长度导致 `i + size` / `i += size + 2` 算术回绕。
+    ///
+    /// `size` 来自被访问服务器的响应（攻击者可控：恶意上游或中间人）。
+    /// 旧代码用裸 `+`，在 release（未开 overflow-checks）下会回绕：
+    /// `i + size` 回绕会绕过截断检查、`i += size + 2` 回绕会让游标倒退。
+    #[test]
+    fn chunked_长度回绕不能绕过截断检查() {
+        // usize::MAX 的 chunk 长度：i=0 时 0 + MAX 不溢出不报错，
+        // 但 i += MAX + 2 会溢出 —— 旧写法在此处回绕成 1，游标倒退。
+        let huge = format!("{:x}\r\n", usize::MAX);
+        let raw = format!("{huge}AAAA\r\n");
+        let r = decode_chunked(raw.as_bytes());
+        assert!(
+            r.is_err(),
+            "巨大 chunk 长度必须报错，实际 {:?}",
+            r.map(|v| v.len())
+        );
+
+        // 另一种形态：size = usize::MAX - 1，i 非 0 时 i + size 会溢出。
+        let near = format!("{:x}\r\n", usize::MAX - 1);
+        let raw2 = format!("1\r\nA\r\n{near}BB\r\n");
+        assert!(
+            decode_chunked(raw2.as_bytes()).is_err(),
+            "接近 usize::MAX 的 chunk 长度必须被拒绝"
+        );
     }
 }

@@ -668,8 +668,18 @@ async fn handle_tcpmux(
     };
 
     if !route.http_user.is_empty() {
-        let ok = user.as_deref() == Some(route.http_user.as_str())
-            && pwd.as_deref() == Some(route.http_pwd.as_str());
+        // ★ 常量时间比较（v0.5.3 修）。
+        //
+        // 这里原来写的是 `user.as_deref() == Some(...)` —— 与同文件 815 行那段
+        // HTTP 路径的口径不一致，是上一轮「凭据一律常量时间比较」修复**唯一漏掉**的一处。
+        // 如实说：跨网络的字节级耗时侧信道会被抖动淹没，工程上难以远程逐位爆破，
+        // 所以它是"修复不完整"而不是可利用漏洞 —— 但没有理由留两套口径。
+        let ok = match (&user, &pwd) {
+            (Some(u), Some(p)) => {
+                constant_time_eq(u, &route.http_user) && constant_time_eq(p, &route.http_pwd)
+            }
+            _ => false,
+        };
         if !ok {
             debug!(%peer, %host, "tcpmux 认证失败");
             io.stream.write_all(&proxy_auth_required()).await?;

@@ -48,6 +48,16 @@ const YAMUX_VERSION_BYTE: u8 = 0x00;
 /// 探测首字节的超时时间。
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// **整个登录握手**的总超时（v0.5.4，M6）。
+///
+/// `PROBE_TIMEOUT` 只作用在每次 `read` 上 ⇒ 对端每 9 秒发一个字节就能
+/// 无限期挂住一条**未认证**的连接（slowloris）。而 `max_clients` 要等登录
+/// 之后才检查，所以这条路径完全没有闸门。
+///
+/// 取 30s：正常握手是毫秒级（本地实测 ~2ms），30s 足以覆盖高延迟链路
+/// 与 OIDC 首次验签（JWKS 已在启动时预热），超时即断开。
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// WebSocket 升级请求的前缀：`"GET " + FrpWebsocketPath`。
 ///
 /// **与官方 frps 的判定完全一致**（`server/service.go`）：
@@ -647,57 +657,82 @@ async fn handle_frp_stream(
     // ★ 取一份当前认证校验器传给握手（`sec.auth()` 是短锁读快照）——
     //   OIDC 的 JWKS 可能是启动后才刷新成功的，不能在这里缓存旧值。
     let auth_snapshot = sec.auth();
-    match conn::server_handshake_authz(stream, &auth_snapshot, &run_id, authorize).await {
-        Ok(ServerAccept::Control {
-            conn,
-            login,
-            role,
-            udp_binary,
-            caps,
-        }) => {
-            let wire_version = conn.version();
-            // (4) 审计：登录成功也要记 —— 只记失败的话，
-            //     "这个 IP 到底有没有进来过"就永远查不出来。
+
+    // ★★ v0.5.4 修 M6：给**整个握手**加总超时，而不只是探测阶段。
+    //
+    // 原先只有 `PROBE_TIMEOUT`（10s）作用在**每次 read** 上，而握手本身
+    // （读 Login → 认证 → 回 LoginResp）没有任何总时限。攻击者只要每 9 秒
+    // 发一个字节，就能把一条**未认证**的连接无限期挂住；配合
+    // "此时 `max_clients` 还没生效"（它要等到登录之后才检查），
+    // 可以耗光文件描述符与内存（每条连接还占着 8 MiB 的 raw/plain 缓冲）。
+    //
+    // 取 30s：正常客户端握手是毫秒级（本地实测 ~2ms），30s 足够覆盖
+    // 高延迟链路 + OIDC 首次验签（JWKS 已在启动时预热）。超时即断开，
+    // 对合法用户无任何可感知影响。
+    let handshake = conn::server_handshake_authz(stream, &auth_snapshot, &run_id, authorize);
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
+        Err(_) => {
             registry.audit().record(
-                crate::audit::AuditEvent::new(crate::audit::kind::LOGIN, true)
+                crate::audit::AuditEvent::new(crate::audit::kind::LOGIN_DENIED, false)
                     .client(run_id.clone())
-                    .user(login.user.clone())
                     .ip(peer.ip().to_string())
-                    .detail(format!("role={} wire={wire_version}", role.name)),
+                    .detail(format!("握手超过 {HANDSHAKE_TIMEOUT:?} 未完成，断开")),
             );
-            handle_control(
+            debug!(%peer, "握手总超时（{:?}），断开", HANDSHAKE_TIMEOUT);
+            Ok(())
+        }
+        Ok(result) => match result {
+            Ok(ServerAccept::Control {
                 conn,
-                *login,
-                run_id,
+                login,
+                role,
                 udp_binary,
                 caps,
-                wire_version,
-                peer,
-                role,
-                cfg,
-                registry,
-            )
-            .await
-        }
-        Ok(ServerAccept::Work { conn, msg }) => handle_work(conn, msg, &sec, registry).await,
-        Ok(ServerAccept::Visitor { conn, msg }) => {
-            handle_visitor(conn, msg, registry, cfg.clone()).await
-        }
-        Err(e) => {
-            // 握手失败（含认证失败）也要留痕：这是最需要被看见的一类事件。
-            // 授权失败已经在 authorize 闭包里记过（那条带 user），别记两遍。
-            let text = format!("{e:#}");
-            if !text.starts_with("授权失败") {
+            }) => {
+                let wire_version = conn.version();
+                // (4) 审计：登录成功也要记 —— 只记失败的话，
+                //     "这个 IP 到底有没有进来过"就永远查不出来。
                 registry.audit().record(
-                    crate::audit::AuditEvent::new(crate::audit::kind::LOGIN_DENIED, false)
+                    crate::audit::AuditEvent::new(crate::audit::kind::LOGIN, true)
                         .client(run_id.clone())
+                        .user(login.user.clone())
                         .ip(peer.ip().to_string())
-                        .detail(text.clone()),
+                        .detail(format!("role={} wire={wire_version}", role.name)),
                 );
+                handle_control(
+                    conn,
+                    *login,
+                    run_id,
+                    udp_binary,
+                    caps,
+                    wire_version,
+                    peer,
+                    role,
+                    cfg,
+                    registry,
+                )
+                .await
             }
-            debug!("握手失败：{e:#}");
-            Err(e)
-        }
+            Ok(ServerAccept::Work { conn, msg }) => handle_work(conn, msg, &sec, registry).await,
+            Ok(ServerAccept::Visitor { conn, msg }) => {
+                handle_visitor(conn, msg, registry, cfg.clone()).await
+            }
+            Err(e) => {
+                // 握手失败（含认证失败）也要留痕：这是最需要被看见的一类事件。
+                // 授权失败已经在 authorize 闭包里记过（那条带 user），别记两遍。
+                let text = format!("{e:#}");
+                if !text.starts_with("授权失败") {
+                    registry.audit().record(
+                        crate::audit::AuditEvent::new(crate::audit::kind::LOGIN_DENIED, false)
+                            .client(run_id.clone())
+                            .ip(peer.ip().to_string())
+                            .detail(text.clone()),
+                    );
+                }
+                debug!("握手失败：{e:#}");
+                Err(e)
+            }
+        },
     }
 }
 
@@ -1133,7 +1168,13 @@ async fn register_tcp(
     // group 共享端口时**只有第一个成员**能 bind，后来者直接复用已有监听器：
     // 再 bind 一次必然是 `Address already in use`，组里就永远只剩一个后端。
     let claim = registry
-        .reserve_port(m.remote_port, &m.group, &m.proxy_name, client.clone())
+        .reserve_port(
+            m.remote_port,
+            &m.group,
+            &m.group_key,
+            &m.proxy_name,
+            client.clone(),
+        )
         .map_err(|e| anyhow!("{e}"))?;
 
     if claim == PortClaim::Fresh {
@@ -1179,7 +1220,13 @@ async fn register_udp(
     // 要负责一整套来源地址的报文，按连接轮询会把同一个会话的报文拆到不同后端去，
     // 结果比不均衡还糟。与其让它"看着配了却没生效"，不如直接说清楚。
     let claim = registry
-        .reserve_port(m.remote_port, &m.group, &m.proxy_name, client.clone())
+        .reserve_port(
+            m.remote_port,
+            &m.group,
+            &m.group_key,
+            &m.proxy_name,
+            client.clone(),
+        )
         .map_err(|e| anyhow!("{e}"))?;
     if claim == PortClaim::Joined {
         registry.release_port(m.remote_port, client, &m.proxy_name);

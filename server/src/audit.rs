@@ -156,9 +156,25 @@ impl AuditLog {
                         })?;
                     }
                 }
-                let f = OpenOptions::new()
-                    .create(true)
-                    .append(true)
+                // ★ v0.5.3：审计日志落盘用 0600（新建时），与 `logfile.rs` 口径一致。
+                //
+                // 这份文件里是**谁在什么时候做什么**的完整时间线（含用户名、
+                // 来源 IP、被拒绝的原因），默认 umask 通常是 0644 ——
+                // 同机其他用户可以直接读走整条审计轨迹。
+                // `logfile.rs` 早就按 0600 落盘了，这里一直漏了。
+                let mut opt = OpenOptions::new();
+                opt.create(true).append(true);
+                #[cfg(unix)]
+                {
+                    // 两个 trait 都要：`OpenOptionsExt` 提供 `.mode()`，
+                    // `PermissionsExt` 提供 `permissions().mode()`。
+                    // 少后者只有 **Linux** 报 E0599（Windows 上整块被 cfg 掉）。
+                    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+                    // 文件已存在时沿用它的权限（别把用户显式改过的改回去）
+                    let mode = std::fs::metadata(p).map(|m| m.permissions().mode()).ok();
+                    opt.mode(mode.unwrap_or(0o600));
+                }
+                let f = opt
                     .open(p)
                     .map_err(|e| anyhow::anyhow!("打开审计日志 {} 失败：{e}", p.display()))?;
                 Some(f)

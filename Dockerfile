@@ -5,7 +5,22 @@
 #
 # 最终镜像里同时有 frps 与 frpc，用命令参数决定启动哪个。
 
-FROM rust:alpine AS builder
+# ★ 基础镜像的供应链说明（v0.5.3 补记）。
+#
+# 理想做法是按 **digest** 固定（`FROM alpine:3.20@sha256:...`）——那样上游
+# 重新推送同名标签时构建会直接失败，而不是"下次 CI 编出来的东西悄悄变了"。
+#
+# **但目前没有这么做**，原因如实写在这里：定 digest 需要先 `docker pull`
+# 拿到真实值，而本机与国内 CI 环境都不一定连得上 Docker Hub；
+# 写一个猜的 digest 会让构建**必然失败**，比可变标签更糟。
+#
+# 已经做到的改善：`rust:alpine` 没有版本号（等于永远跟最新的 Rust 跑，
+# 上游换 Rust 大版本会把构建打挂且原因不明显）⇒ 钉到明确的 `1.90-alpine`。
+#
+# TODO（有 docker 的环境里补）：
+#   docker pull alpine:3.20 && docker inspect --format='{{index .RepoDigests 0}}' alpine:3.20
+#   然后写成 FROM alpine:3.20@sha256:<上面查到的值>
+FROM rust:1.90-alpine AS builder
 
 RUN apk add --no-cache musl-dev build-base
 
@@ -38,8 +53,13 @@ COPY --from=builder /src/target/release/nfrp-server /usr/local/bin/frps
 COPY --from=builder /src/target/release/nfrp-client /usr/local/bin/frpc
 
 # 默认配置（可用 -v 覆盖）；模板随源码走，放在仓库根的 assets/
+#
+# ★ v0.5.3：**只拷 frps.toml**。
+#   原来把 frpc.toml 也拷进来了，但那是**客户端**配置，服务端镜像里根本不用它；
+#   而它里面有一条默认启用的 SSH 代理示例 —— 等于白送攻击者一份"这套部署
+#   打算怎么暴露内网"的说明书。要用 frpc 就跑客户端镜像 / 另外挂载。
+#   （compose 里的 frpc 演示段本来就是挂载挂进去的，不依赖镜像内这份。）
 COPY assets/frps.toml /etc/nfrp/frps.toml
-COPY assets/frpc.toml /etc/nfrp/frpc.toml
 
 # 17000 控制+数据，17002/udp xtcp 打洞牵线，17500 面板
 EXPOSE 17000 17002/udp 17500

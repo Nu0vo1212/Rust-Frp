@@ -241,21 +241,27 @@ impl Registry {
     ///
     /// 规则与官方 frps 一致：
     /// - 端口没人用 -> 占用成功，并记下 group 名（返回 [`PortClaim::Fresh`]）；
-    /// - group 名相同 -> 视为同一组，追加一个后端（返回 [`PortClaim::Joined`]）；
-    /// - group 名不同（或已有的是独占端口）-> 冲突。
+    /// - group 名相同**且 group_key 相同** -> 视为同一组，追加一个后端（返回 [`PortClaim::Joined`]）；
+    /// - group 名不同（或已有的是独占端口）-> 冲突；
+    /// - group 名相同但 group_key 不同 -> 认证失败（对应官方 `ErrGroupAuthFailed`）。
+    ///
+    /// ★ `group_key` 是**认证凭据**而非标签：只比对组名会让任何知道组名的客户端
+    /// 混入他人的负载均衡组、分走该端口的流量份额（跨租户流量劫持）。
+    /// 官方的 `TCPGroup.Listen` 在加入分支上做同样的校验。
     ///
     /// 返回值决定调用方要不要 bind 监听器 —— 见 [`PortClaim`]。
     pub fn reserve_port(
         &self,
         port: u16,
         group: &str,
+        group_key: &str,
         proxy_name: &str,
         client: Arc<ClientState>,
     ) -> Result<PortClaim, String> {
         let mut g = self.ports.lock().unwrap_or_else(|e| e.into_inner());
         match g.entry(port) {
             Entry::Vacant(v) => {
-                v.insert(PortGroup::new(group, client, proxy_name));
+                v.insert(PortGroup::new(group, group_key, client, proxy_name));
                 Ok(PortClaim::Fresh)
             }
             Entry::Occupied(mut o) => {
@@ -276,6 +282,10 @@ impl Registry {
                         "端口 {port} 已被组 [{}] 占用，与组 [{group}] 不同",
                         pg.name
                     ))
+                } else if !nfrp_common::frp::msg::constant_time_eq(&pg.key, group_key) {
+                    // 组名对得上但密钥不对 —— 与官方 ErrGroupAuthFailed 同义。
+                    // 用常量时间比较，避免按字节泄露密钥前缀。
+                    Some(format!("组 [{group}] 的 group_key 校验失败（端口 {port}）"))
                 } else {
                     None
                 };
@@ -521,6 +531,11 @@ pub enum PortClaim {
 /// 用户连接会在成员之间轮询 —— 这就是 group 负载均衡。
 struct PortGroup {
     name: String,
+    /// 组密钥（`groupKey`）。官方 frps 在第二个成员加入时用 `tg.groupKey != groupKey`
+    /// 拒绝不匹配者（`server/group/tcp.go` 的 `ErrGroupAuthFailed`）。
+    ///
+    /// 只有 `name` 非空时才有意义：独占端口的 `key` 恒为空串。
+    key: String,
     members: Vec<Backend>,
     /// 轮询游标。用 `fetch_add` 取模，天然无锁。
     cursor: std::sync::atomic::AtomicUsize,
@@ -532,9 +547,10 @@ struct PortGroup {
 }
 
 impl PortGroup {
-    fn new(name: &str, client: Arc<ClientState>, proxy_name: &str) -> Self {
+    fn new(name: &str, key: &str, client: Arc<ClientState>, proxy_name: &str) -> Self {
         Self {
             name: name.to_string(),
+            key: key.to_string(),
             members: vec![Backend {
                 client,
                 proxy_name: proxy_name.to_string(),
@@ -772,19 +788,19 @@ mod tests {
         let a = client("a");
         let b = client("b");
         assert_eq!(
-            r.reserve_port(6000, "", "a", a.clone()).unwrap(),
+            r.reserve_port(6000, "", "", "a", a.clone()).unwrap(),
             PortClaim::Fresh,
             "端口没人占时必须告诉调用方去 bind"
         );
         assert!(
-            r.reserve_port(6000, "", "b", b.clone()).is_err(),
+            r.reserve_port(6000, "", "", "b", b.clone()).is_err(),
             "同一个端口不能被两个代理同时占"
         );
-        assert!(r.reserve_port(6001, "", "a", a.clone()).is_ok());
+        assert!(r.reserve_port(6001, "", "", "a", a.clone()).is_ok());
         assert_eq!(r.reserved_ports(), vec![6000, 6001]);
         r.release_port(6000, &a, "a");
         assert!(
-            r.reserve_port(6000, "", "b", b.clone()).is_ok(),
+            r.reserve_port(6000, "", "", "b", b.clone()).is_ok(),
             "release 之后应可再次申领"
         );
         // release 一个没占过的端口不应 panic
@@ -801,11 +817,11 @@ mod tests {
         let r = Registry::unlimited();
         let one = client("same-session");
         assert_eq!(
-            r.reserve_port(6000, "web", "a", one.clone()).unwrap(),
+            r.reserve_port(6000, "web", "", "a", one.clone()).unwrap(),
             PortClaim::Fresh
         );
         assert_eq!(
-            r.reserve_port(6000, "web", "b", one.clone()).unwrap(),
+            r.reserve_port(6000, "web", "", "b", one.clone()).unwrap(),
             PortClaim::Joined
         );
         assert_eq!(r.backend_count(6000), 2, "同一客户端的两个成员都要在组里");
@@ -815,7 +831,7 @@ mod tests {
         assert_eq!(r.backend_count(6000), 1, "只摘掉指名的那一个成员");
 
         // 重复注册同一个代理名才应该去重
-        r.reserve_port(6000, "web", "b", one.clone()).unwrap();
+        r.reserve_port(6000, "web", "", "b", one.clone()).unwrap();
         assert_eq!(r.backend_count(6000), 1, "同名代理重复注册不该撑大成员表");
 
         // 整个客户端掉线才清空
@@ -829,7 +845,7 @@ mod tests {
         let r = Registry::unlimited();
         // 第一个成员负责 bind
         assert_eq!(
-            r.reserve_port(6000, "web", "alice.web-a", client("a"))
+            r.reserve_port(6000, "web", "", "alice.web-a", client("a"))
                 .unwrap(),
             PortClaim::Fresh,
             "组里第一个成员要负责创建监听器"
@@ -837,25 +853,92 @@ mod tests {
         // 后续成员**必须**拿到 Joined —— 否则它们会再去 bind 同一端口，
         // 得到 `Address already in use`，组里就永远只剩一个后端。
         assert_eq!(
-            r.reserve_port(6000, "web", "bob.web-b", client("b"))
+            r.reserve_port(6000, "web", "", "bob.web-b", client("b"))
                 .unwrap(),
             PortClaim::Joined,
             "同组后续成员不该重复 bind 端口"
         );
         assert_eq!(
-            r.reserve_port(6000, "web", "carol.web-c", client("c"))
+            r.reserve_port(6000, "web", "", "carol.web-c", client("c"))
                 .unwrap(),
             PortClaim::Joined
         );
         assert_eq!(r.backend_count(6000), 3, "三个后端都挂在同一个端口上");
     }
 
+    /// ★ 回归测试（H5）：组名相同但 `group_key` 不同**必须被拒绝**。
+    ///
+    /// `group_key` 是认证凭据，不是标签。早先 `reserve_port` 只比对组名，
+    /// 于是任何知道组名的客户端（多租户 frps 上就是任意一个持合法 token 的用户）
+    /// 都能混进他人的负载均衡组、分走该端口的流量份额。
+    /// 官方 frps 在 `TCPGroup.Listen` 的加入分支上返回 `ErrGroupAuthFailed`。
+    #[test]
+    fn same_group_with_wrong_key_is_rejected() {
+        let r = Registry::unlimited();
+        // 受害者建组，密钥是 "s3cret"
+        assert_eq!(
+            r.reserve_port(6001, "web", "s3cret", "alice.web-a", client("a"))
+                .unwrap(),
+            PortClaim::Fresh
+        );
+
+        // 攻击者知道组名 "web" 与端口 6001，但不知道密钥 —— 必须被拒。
+        let err = r
+            .reserve_port(6001, "web", "guess", "mallory.web-x", client("m"))
+            .expect_err("组名对但 group_key 不对，绝不能加入");
+        assert!(
+            err.contains("group_key"),
+            "错误信息应点明是 group_key 校验失败，实际：{err}"
+        );
+        assert_eq!(
+            r.backend_count(6001),
+            1,
+            "被拒绝的攻击者不得进入成员表（否则就会分走流量）"
+        );
+
+        // 连"密钥为空"也不能蹭进有密钥的组。
+        assert!(
+            r.reserve_port(6001, "web", "", "mallory.web-y", client("m"))
+                .is_err(),
+            "空密钥不能加入已设密钥的组"
+        );
+
+        // 密钥正确才放行。
+        assert_eq!(
+            r.reserve_port(6001, "web", "s3cret", "bob.web-b", client("b"))
+                .unwrap(),
+            PortClaim::Joined,
+            "密钥正确应当正常加入"
+        );
+        assert_eq!(r.backend_count(6001), 2);
+    }
+
+    /// 组密钥可用（双方都留空）时，行为与老版本一致 —— 不能因为加了校验
+    /// 就把"没配 group_key 的普通负载均衡组"一起打死。
+    ///
+    /// 这是兼容性回归：官方 frp 里 `groupKey` 是可选字段，两个成员都不写
+    /// 就都是空串，空 == 空，照常成组。
+    #[test]
+    fn same_group_with_both_keys_empty_still_joins() {
+        let r = Registry::unlimited();
+        assert_eq!(
+            r.reserve_port(6002, "web", "", "a", client("a")).unwrap(),
+            PortClaim::Fresh
+        );
+        assert_eq!(
+            r.reserve_port(6002, "web", "", "b", client("b")).unwrap(),
+            PortClaim::Joined,
+            "双方都未配 group_key 时应照常成组（不能破坏既有部署）"
+        );
+        assert_eq!(r.backend_count(6002), 2);
+    }
+
     #[test]
     fn different_groups_still_conflict() {
         let r = Registry::unlimited();
-        assert!(r.reserve_port(6000, "web", "a", client("a")).is_ok());
+        assert!(r.reserve_port(6000, "web", "", "a", client("a")).is_ok());
         let e = r
-            .reserve_port(6000, "api", "b", client("b"))
+            .reserve_port(6000, "api", "", "b", client("b"))
             .expect_err("不同组不能抢同一个端口");
         assert!(
             e.contains("api") && e.contains("web"),
@@ -864,8 +947,8 @@ mod tests {
 
         // 独占端口同样不能被组抢走
         let r2 = Registry::unlimited();
-        assert!(r2.reserve_port(7000, "", "a", client("a")).is_ok());
-        assert!(r2.reserve_port(7000, "web", "b", client("b")).is_err());
+        assert!(r2.reserve_port(7000, "", "", "a", client("a")).is_ok());
+        assert!(r2.reserve_port(7000, "web", "", "b", client("b")).is_err());
     }
 
     /// 空闲时轮询：连续取 N 次必须把 N 个后端都轮到一遍。
@@ -877,7 +960,7 @@ mod tests {
     fn pick_round_robins_over_group_members() {
         let r = Registry::unlimited();
         for n in ["a", "b", "c"] {
-            assert!(r.reserve_port(6000, "web", n, client(n)).is_ok());
+            assert!(r.reserve_port(6000, "web", "", n, client(n)).is_ok());
         }
         // 一轮 3 次，每个后端各一次
         let mut seen = std::collections::HashSet::new();
@@ -909,7 +992,7 @@ mod tests {
     fn pick_prefers_the_least_loaded_backend() {
         let r = Registry::unlimited();
         for n in ["a", "b"] {
-            assert!(r.reserve_port(6100, "web", n, client(n)).is_ok());
+            assert!(r.reserve_port(6100, "web", "", n, client(n)).is_ok());
         }
         // 直接给 a 挂 5 条在途连接（令牌**留着**不 drop，计数才一直在）
         let a = r.backend_of(6100, "a").expect("组里应当有 a");
@@ -937,7 +1020,7 @@ mod tests {
     #[test]
     fn load_guard_returns_the_count_on_drop() {
         let r = Registry::unlimited();
-        assert!(r.reserve_port(6200, "web", "a", client("a")).is_ok());
+        assert!(r.reserve_port(6200, "web", "", "a", client("a")).is_ok());
         let (b, g) = r.pick_and_hold(6200).expect("应有后端");
         assert_eq!(b.inflight(), 1, "hold 之后立刻是 1");
         drop(g);
@@ -955,7 +1038,7 @@ mod tests {
     fn ties_are_broken_round_robin() {
         let r = Registry::unlimited();
         for n in ["a", "b", "c"] {
-            assert!(r.reserve_port(6300, "web", n, client(n)).is_ok());
+            assert!(r.reserve_port(6300, "web", "", n, client(n)).is_ok());
         }
         // 每次取完立刻还回去，三个后端的计数始终都是 0（永远平局）
         let mut seen = std::collections::HashSet::new();
@@ -976,10 +1059,10 @@ mod tests {
     fn picked_backend_carries_its_own_proxy_name() {
         let r = Registry::unlimited();
         assert!(r
-            .reserve_port(6000, "web", "alice.web-a", client("a"))
+            .reserve_port(6000, "web", "", "alice.web-a", client("a"))
             .is_ok());
         assert!(r
-            .reserve_port(6000, "web", "bob.web-b", client("b"))
+            .reserve_port(6000, "web", "", "bob.web-b", client("b"))
             .is_ok());
 
         // 每个 run_id 对应哪条代理名，是我们注册时指定的，一一对上才算对
@@ -1006,8 +1089,8 @@ mod tests {
         let r = Registry::unlimited();
         let a = client("a");
         let b = client("b");
-        assert!(r.reserve_port(6000, "web", "a", a.clone()).is_ok());
-        assert!(r.reserve_port(6000, "web", "b", b.clone()).is_ok());
+        assert!(r.reserve_port(6000, "web", "", "a", a.clone()).is_ok());
+        assert!(r.reserve_port(6000, "web", "", "b", b.clone()).is_ok());
         // 第一个成员（也就是创建监听器的那个）先挂着监听器
         let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
         let h = tokio::spawn(async move {
@@ -1043,9 +1126,9 @@ mod tests {
         let r = Registry::unlimited();
         let a = client("a");
         let b = client("b");
-        assert!(r.reserve_port(6000, "web", "a", a.clone()).is_ok());
-        assert!(r.reserve_port(6001, "", "a", a.clone()).is_ok());
-        assert!(r.reserve_port(6000, "web", "b", b.clone()).is_ok());
+        assert!(r.reserve_port(6000, "web", "", "a", a.clone()).is_ok());
+        assert!(r.reserve_port(6001, "", "", "a", a.clone()).is_ok());
+        assert!(r.reserve_port(6000, "web", "", "b", b.clone()).is_ok());
 
         // 客户端掉线：它占的端口要全部收回，同组其他后端不受影响
         r.release_ports_of(&a);
@@ -1060,7 +1143,7 @@ mod tests {
         let r = Registry::unlimited();
         let a = client("a");
         for _ in 0..3 {
-            assert!(r.reserve_port(6000, "web", "a", a.clone()).is_ok());
+            assert!(r.reserve_port(6000, "web", "", "a", a.clone()).is_ok());
         }
         assert_eq!(
             r.backend_count(6000),

@@ -341,7 +341,13 @@ async fn handle(mut stream: TcpStream, peer: SocketAddr, hub: Arc<Hub>) -> anyho
     //    浏览器的 CORS 预检，而本界面**不回应任何预检**，于是跨站
     //    写请求根本发不出来。命令行调用方带一下这个头即可。
     if is_write_method(method) {
-        if let Some(origin) = req.header("origin") {
+        // ★ v0.5.4 修（L7）：检查**所有** `Origin` 头，而不是只看第一个。
+        //
+        // 原先用 `req.header("origin")` —— 它只返回第一个同名头的值。
+        // 攻击者发两个 `Origin`（一个本机、一个跨站）时，若某个中间层/浏览器
+        // 取的是**后一个**，就会出现"我们放行了、对方认为是跨站"的认知差。
+        // 逐跳校验任何一条不本机就拒绝，代价为零。
+        for origin in req.headers_all("origin") {
             if !origin_is_local(&origin) {
                 debug!(%peer, origin, "拒绝跨站写请求");
                 http1::send_json(

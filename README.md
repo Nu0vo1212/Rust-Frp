@@ -78,9 +78,11 @@
 
 ### 工程质量
 
-- ✅ **564 个自动化测试** — 含真实 QUIC 栈握手、口令正反用例、端到端集成测试、**SUDP 端到端与 KCP 传输链路**、**与官方 frpc/frps 真实抓包密文的解密回归**
-- ✅ **CI 流水线** — `fmt` / `clippy` / 测试 / 四目标构建 / 冒烟，PR 必过
-- ✅ **发布可验真** — `SHA256SUMS` + 可选 Ed25519 分离签名与本地验签脚本
+- ✅ **584 个自动化测试** — 含真实 QUIC 栈握手、口令正反用例、端到端集成测试、**SUDP 端到端与 KCP 传输链路**、**与官方 frpc/frps 真实抓包密文的解密回归**
+- ✅ **CI 流水线** — `fmt` / `clippy` / 测试 / 四目标构建 / 冒烟，PR 必过；
+  第三方 Action **全部 pin 到 commit SHA**（标签是可变的，上游改一次 tag 就能让 CI 跑别人的代码）
+- ✅ **发布可验真** — `SHA256SUMS` + 可选 Ed25519 分离签名与本地验签脚本；
+  CI 的 cosign 签名**失败会红灯**（不允许"看起来签过了"）
 - ✅ **容器就绪** — 多阶段 `Dockerfile`（musl 静态）+ `docker-compose.yml`
 - ✅ **跨平台** — Windows / Linux amd64 / Linux arm64（arm64 全静态链接，无 glibc 依赖）
 
@@ -500,6 +502,22 @@ transport_protocol = "quic"
 `tls_enable` / `tls_force` / `tcp_mux` 与官方 frp 语义一致，且服务端支持自动探测，
 能同时服务开了与没开这些选项的客户端。
 
+> ⚠️ **重要：客户端的 `transport.tls` 目前只加密、不校验对端证书**（v0.5.3 明确文档化）。
+>
+> 现状如实写在这里：客户端侧没有 CA 校验，也不校验主机名。
+> 也就是说这个开关**能防被动偷看，但防不住中间人**（MITM 可以自己生成一对
+> 证书来接管连接，客户端不会察觉）。
+>
+> 这与官方 frp 的行为一致（官方客户端的 `tls_enable` 同样不校验服务端证书），
+> 所以**升级不会改变现状**；但用户不该误以为它等同于 HTTPS 那种安全性。
+>
+> 什么时候够用：链路本身可信（内网 / 专线 / 已有 WireGuard 等），
+> 只是想避免明文裸奔。什么时候不够用：跨公网直连且需要防 MITM ——
+> 那种场景请在**外层**再套一层真正的 TLS（stunnel / nginx stream / VPN），
+> 或者依赖 YAML 中 `token` / OIDC 的强度来限制影响面。
+>
+> 服务端侧不受此影响：`tls_force` 校验的是自己那张证书，且服务端本来就持有私钥。
+
 ## 负载均衡与服务发现
 
 ### group：多后端共享一个端口
@@ -750,6 +768,20 @@ tokenEndpointURL = "https://keycloak.example.com/realms/myrealm/protocol/openid-
 - JWKS 的 RSA `n`/`e` 与 EC `x`/`y` 由内置代码转成 DER，验签用 `ring`，
   只支持 `RS256` / `PS256` / `ES256`（其余算法直接拒绝，不做算法降级）。
 - 客户端在**启动时**就校验一遍认证字段，写错了立刻报错，而不是等每次连接都失败。
+
+> ⚠️ **安全提醒（v0.5.3 补充）：OIDC 模式必须配合 TLS 使用。**
+>
+> 上面第一句说了"`privilege_key` 就是原样的 access token"—— 这意味着
+> **access token 会以明文出现在 `Login` 报文里**。若不启用 `transport.tls`
+> （或前面没有 TLS 终止的隧道），任何**被动抓包**的人都能拿到这个 token，
+> 然后在有效期内重放并完整接管会话。
+>
+> 对比 token 认证方式：那种情况下重放 `Login` **拿不到**可用会话 ——
+> 因为后续加密用的是 token 本身而非报文里那串摘要，攻击者不知道 token
+> 就会在第一条加密帧上失败。**OIDC 没有这层保护**，因为它必须把 token 交出去。
+>
+> ⇒ `method = "oidc"` + 明文传输 = 把长期凭据广播给链路上的每个人。
+> 请务必配 `transport.tls`，或确保链路本身可信。
 
 ### IP 白 / 黑名单
 
@@ -1318,8 +1350,94 @@ maxPortsPerClient = 20       # 单个客户端最多占用几个公网端口
 > 发布版二进制真机冒烟 **18/18**（含面板鉴权 401 / 写接口鉴权 / 面板增删代理 / QUIC /
 > xtcp 真 P2P / group 均衡 / 限流），与 v0.5.1 基线**逐项一致**（基线同样 18/18）。
 > 线协议未改动（魔术字 / 版本串 / 消息结构都没变），与官方 frp 的互通性不受影响；
-> 配置层新增两个**可选**字段（`allow_insecure_dashboard` / `allow_insecure_remote`），
-> 老配置在**回环或已配凭据**的前提下照常工作。
+> 配置层新增两个**可选**字段（`allow_insecure_dashboard` / `allow_insecure_remote`），> 老配置在**回环或已配凭据**的前提下照常工作。
+>
+> **v0.5.3 是第二轮安全审计的修复版**（在 v0.5.2 交付之后又独立复审了一遍）
+> 完整报告见仓库内 `SECURITY-FIXES.md`。
+>
+> ★★ 这一轮问的不是"有没有漏洞"，而是**"上一轮新写的那道防线本身能不能被绕过"** ——
+> 结果抓到一个高危：
+>
+> ① **热重载可以一次性、永久地绕过面板鉴权**（`server/src/reload.rs`）。
+> 场景：`bind_addr = "0.0.0.0"` + `dashboard_user = "admin"` + `hot_reload = true`
+> 启动（合法，有凭据）→ 运行中把 `dashboard_user` 改成空 → 面板**当场变成匿名可写**
+> （`/api/status` 从 401 变 200，`/metrics` 可读，`POST /api/clients/kick` 能踢人）。
+> 三个根因：`reload.rs` 允许清空凭据；启动期那道「非回环 + 无凭据 ⇒ 拒绝启动」
+> **只在启动路径跑过一次**（`serve.rs` 的"防御性兜底"在函数体里是一次性语句）；
+> 而 `watch()` 拿的是一份**永不更新的启动快照**做 diff ⇒ 清空之后**改回 `admin` 也不恢复**，
+> 必须重启进程。日志还是 `INFO 面板鉴权已热更新（用户：）`（空值、无告警），
+> 运维会误以为已经改好了。
+> 现在：热重载对新配置**重跑一次同样的安全校验**（不通过就整份拒绝并说明原因）、
+> `apply_dynamic` 的凭据分支加安全闸门、`watch()` 真正推进基线快照（修掉不可逆），
+> 日志改 `WARN` 并点名后果。**6 条回归测试**锁死，含"清空后改回必须能恢复"。
+>
+> ② **OIDC 的核验器被丢弃** ⇒ 配了 `method = "oidc"` 的服务端**拒绝所有人登录**。
+> `SecurityContext` 里 `auth` 是不可变字段，`refresh_oidc(&self)` 拿不到 `&mut`，
+> 于是新拉的 JWKS **没有任何地方能存**，函数一结束 verifier 就被 drop，
+> 状态永远停在 `OidcUnavailable`；文档引用的 `Self::ensure_ready` **全仓根本不存在**。
+> 这是 fail-closed（没有绕过、不会放行未认证者），但功能是死的，
+> 而且意味着 `oidc.rs` 里那些"已核实安全"的实现**从未在真实流量上跑过**。
+> 现在 `auth` 改成 `Arc<RwLock<AuthProvider>>` 并**真正回填**（已用 mock IdP 实弹验证：
+> 日志里同时出现「JWKS 已加载」与「JWKS 已就绪」）。
+>
+> ③ **OIDC 的 `additionalScopes` 复核没绑会话**（`oidc.rs`）。原来是一个只增不减的
+> 全局 `HashSet<subject>`，只问"这个 sub 曾在**某个**连接上登录过吗" ⇒
+> 攻击者拿自己的合法 token 登录一次，就能用**同一个 token** 给**受害者的 run_id**
+> 开工作连接。现在改成 `run_id → sub` 的二维绑定，且会话结束可精确移除
+> （顺带消掉那个无界增长点）。
+>
+> ④ **`tcpmux` 的用户名/口令还在用 `==` 比较** —— 上一轮「凭据一律常量时间比较」
+> 的修复**唯一漏掉的一处**（同文件 815 行那段 HTTP 路径早就改了）。
+> 如实说：跨网络字节级耗时侧信道会被抖动淹没，工程上难以远程爆破，
+> 但没理由留两套口径。
+>
+> ⑤ **`chunked` 长度 ACL 的算术回绕**（`http_relay.rs` / `httpc.rs`）：
+> `out.len() + size` 里 `size` 来自报文（攻击者可控），而 release profile
+> **没开 `overflow-checks`** ⇒ 裸 `+` 会静默回绕成小值、绕过 32 MiB 上限。
+> 改 `saturating_add` / `checked_add`。（★ 如实说明：下游 `read_n` 还有一道独立 ACL
+> 兜着，所以实际不是无限内存增长，约 64 MiB/连接封顶 —— 属纵深防御缺口。）
+>
+> ⑥ **`run_id` 改用 `OsRng`**。它事实是"可取工作连接的持有票据"
+> （`handle_work` 只要拿到一个存在的 run_id 就能把连接塞进那个客户端的连接池），
+> 而原实现把安全性押在 std **从未承诺**为密码学 PRF 的 `RandomState` 上。
+>
+> ⑦ **visitor 路径的错误文案没走脱敏开关**：会把**代理名是否存在**（可枚举 stcp 隧道）、
+> `allow_users` 里的**真实用户名**回给尚未认证的来访者。现在详情只进服务端日志。
+>
+> ⑧ **弱/占位 token 启动告警**。v1 的登录凭证是 `md5(token + timestamp)`，
+> 而服务端**不校验时间戳新鲜性** ⇒ 抓到一条登录报文后，离线枚举一个候选只要
+> **1 次 MD5**。token 强度完全取决于自身随机性（PBKDF2 的 64 次迭代是官方 golib
+> 硬编码值，改了即断互通，**不能改**）。所以启动时检测占位值（`your_secret_token`
+> 等）与低强度 token 并强告警 —— 不拒绝启动，以免破坏既有部署。
+>
+> ⑨ **配置结构的 `Debug` 全面脱敏**（`ServerConfig` / `ClientConfig` /
+> `ServerAuthConfig` / `ClientOidcConfig` / `WebServerConfig`）。
+> 原来是 `#[derive(Debug)]`，任何一句调试用的 `println!("{cfg:?}")` 都会把
+> **明文 token / 面板口令 / `client_secret`** 写进日志。**3 条锁定测试**盯着这件事
+> （写这两条测试时当场抓到两处真实泄漏）。序列化不受影响 —— `--gen-config` 照常输出真值。
+>
+> ⑩ **审计日志落盘权限 0600**（原来是默认 umask，通常 0644 ⇒ 同机其他用户可读走
+> 整条审计轨迹：谁、什么时候、从哪个 IP 做了什么）。与 `logfile.rs` 的口径对齐。
+>
+> ⑪ **CI 加固**：`.github/workflows/` 里 **29 处第三方 Action 全部 pin 到 commit SHA**
+> （`@v4` / `@stable` 是可变的 —— 上游挪一次 tag 就能让 CI 跑别人的代码，
+> 而这条链上 `rust-toolchain` 决定工具链、`action-gh-release` 持 `contents: write` 与
+> 全部制品、`cosign-installer` / `docker/login-action` 持 `id-token` 与 GHCR 凭据）；
+> 修掉 `release.yml` 里 cosign 的**三重失效**（两个 `continue-on-error` + shell 内
+> `|| echo` ⇒ **一个字节都没签出来也会全绿通过**，而 README 宣称"发布可验真"，
+> 那是自相矛盾的发布）；tag 输入不再直接拼进 shell（表达式注入面）。
+>
+> ⑫ **凭据卫生**：`android/gradle.properties` 里的 keystore 口令明文挪到
+> **环境变量 / `local.properties`**（后者已在 `.gitignore` 里，实测构建仍能正确签名 ——
+> APK 用的是 `CN=NFrp Android` 发布证书）；补上**仓库根**与 `android/` 的 `.gitignore`
+> （根目录之前**根本没有**，`/dist`、`*.log`、`tmp/` 全无遮挡）。
+> ★ 说明：这两处的凭据**当前都没有被推上远端**（已用 GitHub API 逐项核实：
+> `android/**` 与 keystore 在远端均为 404；四块发布包 grep 真机 token 零命中），
+> 所以是"堵住枪口"而不是"事后补救"。
+>
+> 质量门：**584 个测试全绿**（564 → 584，本轮新增 20 条回归/锁定测试）、
+> fmt 干净、clippy `-D warnings` **0 告警**（Windows 与 Linux 各一遍）、
+> `cargo audit` exit 0。线协议**未改动**，与官方 frp 的互通性不受影响。
 >
 > **v0.5.1 是补齐与官方 0.71 差距的一版**
 > 起因是把"NFrp 到底比官方 0.71 少什么"逐项对了一遍 结论是代理类型少 1 种
@@ -1395,16 +1513,16 @@ maxPortsPerClient = 20       # 单个客户端最多占用几个公网端口
 ```bash
 cargo fmt --all -- --check          # 格式
 cargo clippy --workspace --all-targets   # 静态检查（当前 0 告警）
-cargo test --workspace              # 564 个测试
+cargo test --workspace              # 584 个测试
 ```
 
 测试分布：
 
 | 目标 | 数量 | 覆盖重点 |
 |---|---|---|
-| `common` 单元测试 | 279 | **v1 线协议**（消息类型字节、帧编解码、AES-128-CFB 密钥派生与流式状态机、**官方抓包密文解密回归**）、v2 线协议编解码、加密、配置解析、**原版 frp 配置兼容层**、打洞报文/口令/端口预测、**KCP（含 30% 丢包下的可靠传输）**、令牌桶、示例配置可加载、**OIDC 令牌源与 JWKS 验签**、**CIDR/ACL/RBAC 判定边界**、**WebSocket 帧编解码与 Ping/Pong**、**PROXY v1/v2 编解码与防注入 sniff**、**VirtualNet 帧/路由/地址池**、**HTTP/1.1 请求解析**、**HTTP 头 CRLF 注入防线（`strip_crlf` 双重剥离）**、**远程下发代理的本机资源字段拒绝（`validate_remote_proxy`）**、**回环地址判定（`is_loopback_addr`）** |
-| `server` 单元测试（lib） | 167 | 虚拟主机路由表与优先级、chunked 解析、Basic Auth、连接池配对与回收、**端口组最小连接数调度**、资源配额、指标编码、面板鉴权与**写接口**、热重载字段判定、打洞会话、**审计日志（JSONL + 环形缓冲 + 过滤）**、**安全上下文（ACL→认证→RBAC→审计）**、**API v2（错误信封 / 分页 / 百分号解码）**、**VirtualNet 服务端路由与代答 ICMP**、**vhost 请求边界（`Expect: 100-continue` 应答、CL+TE 拒绝、逐跳头剥离、`Host` 规范化、HTTP 代理口令常量时间比较）**、**RBAC 配额真正生效（`allowManage` / `maxProxies`）** |
-| `server` 单元测试（bin） | 8 | 命令行与配置装载、**面板鉴权启动校验（非回环 + 无凭据必须拒绝启动、逃生开关生效、回环无凭据合法）** |
+| `common` 单元测试 | 288 | **v1 线协议**（消息类型字节、帧编解码、AES-128-CFB 密钥派生与流式状态机、**官方抓包密文解密回归**）、v2 线协议编解码、加密、配置解析、**原版 frp 配置兼容层**、打洞报文/口令/端口预测、**KCP（含 30% 丢包下的可靠传输）**、令牌桶、示例配置可加载、**OIDC 令牌源与 JWKS 验签**、**CIDR/ACL/RBAC 判定边界**、**WebSocket 帧编解码与 Ping/Pong**、**PROXY v1/v2 编解码与防注入 sniff**、**VirtualNet 帧/路由/地址池**、**HTTP/1.1 请求解析**、**HTTP 头 CRLF 注入防线（`strip_crlf` 双重剥离）**、**远程下发代理的本机资源字段拒绝（`validate_remote_proxy`）**、**回环地址判定（`is_loopback_addr`）**、**chunked 长度算术回绕防线（`saturating_add` / `checked_add`）**、**`run_id` 来自密码学随机源**、**OIDC subject 的会话绑定**、**配置 `Debug` 全面脱敏（3 条锁定测试）** |
+| `server` 单元测试（lib） | 176 | 虚拟主机路由表与优先级、chunked 解析、Basic Auth、连接池配对与回收、**端口组最小连接数调度**、资源配额、指标编码、面板鉴权与**写接口**、热重载字段判定、打洞会话、**审计日志（JSONL + 环形缓冲 + 过滤）**、**安全上下文（ACL→认证→RBAC→审计）**、**API v2（错误信封 / 分页 / 百分号解码）**、**VirtualNet 服务端路由与代答 ICMP**、**vhost 请求边界（`Expect: 100-continue` 应答、CL+TE 拒绝、逐跳头剥离、`Host` 规范化、HTTP/tcpmux 口令常量时间比较）**、**RBAC 配额真正生效（`allowManage` / `maxProxies`）**、**热重载安全闸门（对外面板不得清空鉴权 / 改回去必须能恢复 / 逃生开关 / 回环放行，6 条）**、**OIDC 核验器可回填（否则 oidc 永久不可用）** |
+| `server` 单元测试（bin） | 10 | 命令行与配置装载、**面板鉴权启动校验（非回环 + 无凭据必须拒绝启动、逃生开关生效、回环无凭据合法）**、**弱/占位 token 的启动告警（且不拦启动）** |
 | `client` 单元测试 | 92 | QUIC 建连与口令握手、插件（http_proxy / socks5 / static_file）、健康检查状态机、打洞编排、`NewProxy` 字段映射（含与官方 frpc 抓包逐字节对拍）、服务端下发名 → 本地代理的翻译（`resolve_uploaded_proxy`）、**动态代理表**、**store 落盘与损坏文件容错**、**本地管理界面的路由与本地校验**、**PROXY 头注入**、**本地界面 CSRF 防线（`X-Nfrp-Client` 防伪头 + Origin 校验 + 非回环无凭据拒绝启动）**、**服务端下发配置的本机资源字段拒绝** |
 | `server` 端到端集成测试 | 18 | 真握手 + 真转发的 TCP / HTTP / stcp / QUIC 链路、**v1 与 v2 双协议握手**、group 负载均衡、面板鉴权边界、**SUDP 端到端（visitor→provider 的 UdpPacket 往返）**、**KCP 传输上的完整控制连接 + 多会话共端口** |
 
@@ -1412,6 +1530,18 @@ CI（`.github/workflows/ci.yml`）在每次 push / PR 上跑：`cargo fmt --chec
 `cargo clippy -- -D warnings` → **Linux / Windows / macOS** 三个系统的全量测试 →
 **两个 musl 目标的交叉构建**（x86_64 / aarch64，提前拦住"tag 那天才发现编不过"）→
 端到端冒烟（真建连真转发的集成测试，外加 `--gen-config` / `--check` 自检）。
+
+★ 工作流里**所有第三方 Action 都 pin 到 commit SHA**（v0.5.3 起）。
+`@v4` / `@stable` 这类是**可变引用**：上游挪一次 tag（或被攻陷的维护者账号推一个新 commit），
+下一次 CI 跑的就是别人的代码。这条链上尤其敏感的是 `dtolnay/rust-toolchain`（决定工具链）、
+`softprops/action-gh-release`（持 `contents: write` 与全部制品）、
+`sigstore/cosign-installer` 与 `docker/login-action`（持 `id-token` 与镜像仓库凭据）。
+升级方式：把 `# vX` 换成新的 40 位 SHA（或用 Dependabot）。
+
+★ CI 的 cosign 签名**失败即红灯**（v0.5.3 修）。原来两个 `continue-on-error: true`
+加 shell 内的 `|| echo` 三重叠加，**一个字节都没签出来也会全绿通过** ——
+那会让 Release 里只剩一个可被随意替换的裸校验和，而 README 却宣称"发布可验真"。
+现在签完立刻 `cosign verify-blob` 自检一次。
 
 打 tag（或手动触发 `.github/workflows/release.yml`）会构建三平台产物 +
 cosign 无密钥签名 + 推 ghcr.io 镜像。**本地 `scripts/release.py` 与 CI 是两条独立的

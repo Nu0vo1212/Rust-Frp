@@ -73,6 +73,12 @@ const MAX_HANDSHAKE: usize = 16 * 1024;
 /// 正常不会有更大的帧；给到 16 MiB 是留出余量，同时挡住"声称 2^63 字节"的帧头。
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 
+/// 控制帧（ping / pong / close）的载荷上限（v0.5.4，L9）。
+///
+/// RFC 6455 §5.5 规定控制帧载荷不得超过 125 字节。不检查的后果是
+/// "对端发 16 MiB 的 Ping ⇒ 我们回 16 MiB 的 Pong"这种放大型 DoS。
+const MAX_CONTROL_PAYLOAD: usize = 125;
+
 const OP_CONT: u8 = 0x0;
 const OP_TEXT: u8 = 0x1;
 const OP_BINARY: u8 = 0x2;
@@ -414,6 +420,21 @@ fn take_frame(buf: &mut Vec<u8>) -> WsResult<Option<(u8, bool, Vec<u8>)>> {
     if payload_len > MAX_FRAME {
         return Err(WsError::Protocol(format!(
             "帧载荷 {payload_len} 超过上限 {MAX_FRAME}"
+        )));
+    }
+
+    // ★★ v0.5.4 修（L9）：**控制帧载荷不得超过 125 字节**（RFC 6455 §5.5）。
+    //
+    // 原先只查了通用的 `MAX_FRAME`（16 MiB）。于是恶意对端可以发一个
+    // 16 MiB 载荷的 `Ping`，而 `poll_read` 会**原样回一个 16 MiB 的 `Pong`**
+    // —— 把"发一个字节、回一个字节"变成"发 16 MiB、回 16 MiB"，
+    // 而 `tx` 队列没有独立上限。这是廉价的放大型 DoS。
+    //
+    // RFC 规定控制帧必须 ≤125 且不可分片；这里只查长度（分片由别处的
+    // FIN / OP_CONT 逻辑处理）。
+    if matches!(opcode, OP_PING | OP_PONG | OP_CLOSE) && payload_len > MAX_CONTROL_PAYLOAD {
+        return Err(WsError::Protocol(format!(
+            "控制帧（opcode {opcode:#x}）载荷 {payload_len} 超过 {MAX_CONTROL_PAYLOAD} 字节上限（RFC 6455 §5.5）"
         )));
     }
     let mask_len = if masked { 4 } else { 0 };
@@ -883,5 +904,54 @@ mod tests {
             .expect("不能卡住")
             .unwrap();
         assert_eq!(got, payload);
+    }
+
+    /// ★★ v0.5.4 回归（L9）：控制帧载荷必须 ≤125 字节（RFC 6455 §5.5）。
+    ///
+    /// 不检查的后果：对端发一个 16 MiB 的 Ping，我们会**原样回一个 16 MiB 的
+    /// Pong** —— 而 `tx` 队列没有独立上限，属廉价的放大型 DoS。
+    #[test]
+    fn 控制帧载荷不得超过_125() {
+        assert_eq!(MAX_CONTROL_PAYLOAD, 125);
+
+        // 造一个带掩码的 PING 帧，载荷长度可控
+        let make = |op: u8, len: usize| -> Vec<u8> {
+            let mut v = vec![0x80 | op];
+            if len < 126 {
+                v.push(0x80 | len as u8);
+            } else if len <= u16::MAX as usize {
+                v.push(0x80 | 126);
+                v.extend_from_slice(&(len as u16).to_be_bytes());
+            } else {
+                v.push(0x80 | 127);
+                v.extend_from_slice(&(len as u64).to_be_bytes());
+            }
+            v.extend_from_slice(&[0, 0, 0, 0]); // 掩码键
+            v.extend(std::iter::repeat(0u8).take(len));
+            v
+        };
+
+        // 125 字节：合法
+        let mut ok = make(OP_PING, 125);
+        assert!(take_frame(&mut ok).is_ok(), "125 字节的控制帧应当允许");
+
+        // 126 字节：必须拒绝
+        let mut bad = make(OP_PING, 126);
+        let e = take_frame(&mut bad).unwrap_err();
+        assert!(
+            format!("{e:?}").contains("125"),
+            "错误信息应点明 125 上限：{e:?}"
+        );
+
+        // PONG / CLOSE 同理
+        assert!(take_frame(&mut make(OP_PONG, 126)).is_err(), "PONG 也要限");
+        assert!(
+            take_frame(&mut make(OP_CLOSE, 126)).is_err(),
+            "CLOSE 也要限"
+        );
+
+        // ★ 数据帧不受这条限制（只受 MAX_FRAME）
+        let mut data = make(OP_BINARY, 126);
+        assert!(take_frame(&mut data).is_ok(), "数据帧不该被 125 限制误伤");
     }
 }

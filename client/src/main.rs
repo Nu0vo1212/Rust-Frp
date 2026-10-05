@@ -1931,6 +1931,53 @@ bandwidthLimitMode = 'server'
         }
     }
 
+    /// ★★ v0.5.4 回归（H4）：服务端下发的 `local_addr` **只能指向本机回环**。
+    ///
+    /// 威胁模型：`local_addr` 决定客户端**往哪里连**（见本文件里
+    /// `TcpStream::connect(local)`）。它原先不在远程黑名单里，于是不可信的
+    /// 服务端/面板只要下发 `169.254.169.254:80`，就能让客户端去连**云元数据服务**
+    /// —— 服务端可控的 SSRF。内网地址（`10.0.0.5:6379`）同理可做横向。
+    #[tokio::test]
+    async fn 远程下发的_local_addr_只能指向本机() {
+        // —— 这些必须被拒 ——
+        for bad in [
+            "169.254.169.254:80", // 云元数据服务
+            "10.0.0.5:6379",      // 内网 Redis
+            "192.168.1.1:22",     // 内网主机
+            "0.0.0.0:80",         // "监听全部"不是"连本机"
+            "[fd00::1]:80",       // IPv6 内网
+            "example.com:80",     // 域名（解析结果不可控）
+        ] {
+            let (mut me, _peer) = cmd_pair();
+            let table = registry::ProxyTable::default();
+            let cmd = add_cmd_with("ssrf", |p| p.local_addr = bad.to_string());
+            let err = apply_server_cmd(&table, &no_store(), &cmd, &mut me)
+                .await
+                .expect_err(&format!("{bad} 必须被拒绝"));
+            assert!(
+                err.to_string().contains("local_addr"),
+                "错误里要点名 local_addr：{err}"
+            );
+            assert_eq!(table.len(), 0, "{bad} 被拒时不该留下代理");
+        }
+
+        // —— 这些是合法用法，必须放行 ——
+        for ok in [
+            "127.0.0.1:8080",
+            "127.0.0.2:9000",
+            "[::1]:8080",
+            "localhost:3000",
+        ] {
+            let (mut me, _peer) = cmd_pair();
+            let table = registry::ProxyTable::default();
+            let cmd = add_cmd_with("local-ok", |p| p.local_addr = ok.to_string());
+            apply_server_cmd(&table, &no_store(), &cmd, &mut me)
+                .await
+                .unwrap_or_else(|e| panic!("{ok} 是合法的本机地址，不该被拒：{e}"));
+            assert_eq!(table.len(), 1, "{ok} 应当成功加入");
+        }
+    }
+
     /// ★ 回归测试：服务端下发**不认识的插件类型**要在解析阶段就被拒。
     ///
     /// 原先这条路径一道校验都不过，拼错的插件名能一路溜到运行期，

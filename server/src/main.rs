@@ -103,28 +103,6 @@ async fn main() -> Result<()> {
     if let Some(token) = &cli.token {
         cfg.token = token.clone();
     }
-    if cfg.token.is_empty() {
-        // 空 token = 不做认证，这是官方 frp 的行为（靠网络隔离兜底），
-        // 不能改成拒绝启动 —— 那会破坏一大票内网部署。但要把话说全：
-        // 只写"建议设置"的话，用户看不出"绑在 0.0.0.0 上"意味着什么。
-        if nfrp_common::util::is_loopback_addr(&cfg.bind_addr) {
-            tracing::warn!(
-                "未配置 token：任何人只要能连上 {}:{} 就能使用本服务端（当前只监听回环，仅本机可达）",
-                cfg.bind_addr,
-                cfg.frp_bind_port()
-            );
-        } else {
-            tracing::warn!(
-                "未配置 token 且监听在对外地址 {}：**任何人**都能连上 {}:{} 并注册代理、\
-                 申请公网端口 —— 等于把你的服务器开放成一个公共内网穿透节点。\
-                 请设置 token，或用 [acl] 限制来源 IP。",
-                cfg.bind_addr,
-                cfg.bind_addr,
-                cfg.frp_bind_port()
-            );
-        }
-    }
-
     // ★ v0.5.3：弱/占位 token 的强告警。
     //
     // 背景（第二轮审计的 B 项）：v1 控制通道的登录凭证是
@@ -347,6 +325,63 @@ fn validate(cfg: &ServerConfig) -> Result<()> {
             );
         }
     }
+
+    // ---- 认证：空 token + 显式对外监听 ⇒ **拒绝启动**（v0.5.4 修 M4）----
+    //
+    // 与上面面板那条同一标准；但★★ **这里有个关键差异，不能照抄**：
+    //
+    // 面板是**可选功能** —— 不配 `dashboard_port` 就压根没有面板，所以
+    // "配了面板 + 无凭据 + 对外"可以安全地判为"用户搞错了"。
+    //
+    // 而 `bind_addr` / `token` 是**核心项**，且 `ServerConfig::default()` 的
+    // 出厂值就是 `bind_addr = "0.0.0.0"` + 空 token（与官方 frps 一致）。
+    // 若无条件 `ensure!` 拒绝，**出厂默认配置将完全无法启动** ——
+    // 连 `--gen-config` 生成的示例都起不来。这不是理论担忧：实测加上
+    // 无条件 ensure 后当场打破 5 条既有测试。
+    //
+    // 所以口径分三档：
+    //   * 绑**回环** ⇒ 合法（只有本机能连），只 warn；
+    //   * 绑**对外** + 用户**显式写过** `bind_addr` ⇒ 拒绝启动，
+    //     除非显式 `allow_insecure_no_auth = true`（知情选择）；
+    //   * 绑**对外** + `bind_addr` 是**默认值**（用户没写过）⇒
+    //     不拒绝启动（否则默认配置废掉），但给出可操作的强告警。
+    if cfg.token.is_empty() {
+        if nfrp_common::util::is_loopback_addr(&cfg.bind_addr) {
+            tracing::warn!(
+                "未配置 token：任何人只要能连上 {}:{} 就能使用本服务端（当前只监听回环，仅本机可达）",
+                cfg.bind_addr,
+                cfg.frp_bind_port()
+            );
+        } else if cfg.bind_addr_explicitly_set {
+            anyhow::ensure!(
+                cfg.allow_insecure_no_auth,
+                "未配置 token，却把 bind_addr 显式设成了对外地址 {}:{} —— \
+                 这等于对外开放一个**无认证**的 frps：任何人都能连上来注册代理、\
+                 申请公网端口，把你的服务器当成公共内网穿透节点。\n\
+                 请三选一：① 配置 token（推荐）；\
+                 ② 把 bind_addr 设成 127.0.0.1 只让本机访问；\
+                 ③ 确实要这样跑就显式写 allow_insecure_no_auth = true（自担风险）。",
+                cfg.bind_addr,
+                cfg.frp_bind_port()
+            );
+            tracing::warn!(
+                "已显式允许「无 token + 对外监听」：{}:{} 上任何人都能使用本服务端。\
+                 仅在你确认网络层已隔离（安全组 / 防火墙 / 跳板机）时才这样跑。",
+                cfg.bind_addr,
+                cfg.frp_bind_port()
+            );
+        } else {
+            // 出厂默认（用户没写过 bind_addr）：不拒绝启动，但把话说到位
+            tracing::warn!(
+                "未配置 token 且正在监听对外地址 {}:{}（默认值）—— \
+                 **任何人**都能连上来注册代理、申请公网端口。\
+                 若这台机器有公网入口，请务必配置 token（或用 [acl] 限制来源 IP）；\
+                 纯内网使用可忽略本告警。",
+                cfg.bind_addr,
+                cfg.frp_bind_port()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -470,5 +505,96 @@ mod tests {
         // 占位值判定应当大小写不敏感
         c.token = "Your_Secret_Token".into();
         check_token_strength(&c);
+    }
+
+    // ------------------------------------------------------------------
+    // M4（v0.5.4）：空 token + **显式**对外监听必须拒绝启动
+    // ------------------------------------------------------------------
+
+    /// ★★ M4 核心回归：**显式**把 bind_addr 写成对外地址 + 空 token ⇒ 拒绝启动。
+    ///
+    /// 原先只打一条 `warn!` 就放行：那等于对外开放一个任何人都能用的 frps
+    /// （注册代理 + 申请公网端口），而同一个风险在面板路径上是 `ensure!` 拒绝的。
+    #[test]
+    fn 空token且显式对外监听必须拒绝启动() {
+        let mut c = cfg();
+        c.token = String::new();
+        c.bind_addr = "0.0.0.0".into();
+        c.bind_addr_explicitly_set = true; // 用户确实写过这一行
+        let e = validate(&c).expect_err("显式对外 + 空 token 必须被拒绝");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("allow_insecure_no_auth"),
+            "错误里要给出逃生开关：{msg}"
+        );
+        assert!(msg.contains("无认证"), "错误要说清后果：{msg}");
+    }
+
+    /// ★★ **出厂默认配置必须能启动** —— 这是"拒绝启动"不能无条件的理由。
+    ///
+    /// `ServerConfig::default()` 就是 `bind_addr = "0.0.0.0"` + 空 token
+    /// （与官方 frps 一致）。若无条件拒绝，连 `--gen-config` 生成的示例
+    /// 都起不来。实测：加上无条件 `ensure!` 后当场打破 5 条既有测试。
+    #[test]
+    fn 出厂默认配置必须能启动() {
+        let c = cfg();
+        assert!(c.token.is_empty(), "默认就是空 token");
+        assert!(!c.bind_addr_explicitly_set, "默认没写过 bind_addr");
+        assert!(
+            validate(&c).is_ok(),
+            "出厂默认配置必须能启动，否则默认部署全废"
+        );
+    }
+
+    /// 逃生开关生效：显式声明后可启动。
+    #[test]
+    fn 空token对外监听可用逃生开关放行() {
+        let mut c = cfg();
+        c.token = String::new();
+        c.bind_addr = "0.0.0.0".into();
+        c.bind_addr_explicitly_set = true;
+        c.allow_insecure_no_auth = true;
+        assert!(validate(&c).is_ok(), "显式声明后应当放行（知情选择）");
+    }
+
+    /// 空 token 绑回环是合法的（只有本机能连），不该拦。
+    #[test]
+    fn 空token绑回环可以启动() {
+        for lo in ["127.0.0.1", "::1", "127.5.5.5"] {
+            let mut c = cfg();
+            c.token = String::new();
+            c.bind_addr = lo.into();
+            c.bind_addr_explicitly_set = true;
+            assert!(validate(&c).is_ok(), "{lo} 是回环，不该拦");
+        }
+    }
+
+    /// 配了 token 就与这条规则无关（无论绑哪里）。
+    #[test]
+    fn 有token时对外监听不受影响() {
+        let mut c = cfg();
+        c.token = "a-sufficiently-long-token-123456".into();
+        c.bind_addr = "0.0.0.0".into();
+        c.bind_addr_explicitly_set = true;
+        assert!(validate(&c).is_ok());
+    }
+
+    /// `parse_server_toml` 必须正确识别"用户写没写过 bind_addr"
+    /// —— 这是上面那套判定的输入。
+    #[test]
+    fn 能识别用户是否显式写过_bind_addr() {
+        use nfrp_common::config::parse_server_toml;
+
+        // 没写 ⇒ false（走"默认值"分支，不拒绝启动）
+        let c = parse_server_toml("bind_port = 7000\n").unwrap();
+        assert!(!c.bind_addr_explicitly_set);
+
+        // 写了 ⇒ true（走"显式"分支）
+        let c = parse_server_toml("bind_addr = \"0.0.0.0\"\nbind_port = 7000\n").unwrap();
+        assert!(c.bind_addr_explicitly_set);
+
+        // 官方驼峰写法也算
+        let c = parse_server_toml("bindAddr = \"0.0.0.0\"\n").unwrap();
+        assert!(c.bind_addr_explicitly_set, "官方 bindAddr 写法也要认");
     }
 }

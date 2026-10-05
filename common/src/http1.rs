@@ -53,6 +53,15 @@ impl Request {
         header_in_head(&self.head, name)
     }
 
+    /// 取某个头的**全部**同名值（v0.5.4，L7）。
+    ///
+    /// `header()` 只返回第一个。凡是"必须逐条校验"的语义（比如 `Origin`）
+    /// 都要用这个 —— 否则攻击者发两个同名头、中间层取后一个时，
+    /// 就会出现"我们放行了、对方认为是另一个来源"的认知差。
+    pub fn headers_all(&self, name: &str) -> Vec<String> {
+        headers_all_in_head(&self.head, name)
+    }
+
     /// 请求头里的 `Content-Length`（没有就是 0）。
     pub fn content_length(&self) -> usize {
         self.header("content-length")
@@ -77,6 +86,19 @@ fn header_in_head(head: &str, name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// 取某个头的**全部**同名值（v0.5.4，L7）。顺序与报文中出现的一致。
+fn headers_all_in_head(head: &str, name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in head.split("\r\n").skip(1) {
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().eq_ignore_ascii_case(name) {
+                out.push(v.trim().to_string());
+            }
+        }
+    }
+    out
 }
 
 /// 读一条完整的 HTTP 请求（到请求体读完为止；每个连接只处理一条）。
@@ -457,5 +479,47 @@ mod tests {
         assert!(text.contains("Connection: close\r\n"), "{text}");
         assert!(text.ends_with("{\"e\":1}"), "{text}");
         writer.await.unwrap();
+    }
+
+    /// ★★ v0.5.4 回归（L7）：必须能枚举**全部**同名头。
+    ///
+    /// `header()` 只返回第一个。若某处只查第一个 `Origin`，攻击者发两个
+    /// （一个本机、一个跨站）就可能让"我们放行、对方认为是跨站"。
+    #[test]
+    fn 同名头必须能完整枚举() {
+        let req = Request {
+            method: "POST".into(),
+            path: "/api/stop".into(),
+            query: String::new(),
+            body: String::new(),
+            head: [
+                "POST /api/stop HTTP/1.1",
+                "Host: 127.0.0.1",
+                "Origin: http://evil.com",
+                "Origin: http://127.0.0.1:7400",
+            ]
+            .join("\r\n"),
+        };
+
+        // 单值接口只给第一个
+        assert_eq!(req.header("origin").as_deref(), Some("http://evil.com"));
+        // 全量接口给出两个（保序）
+        assert_eq!(
+            req.headers_all("origin"),
+            vec!["http://evil.com", "http://127.0.0.1:7400"]
+        );
+        // 大小写不敏感
+        assert_eq!(req.headers_all("ORIGIN").len(), 2);
+        // 不存在的头给空
+        assert!(req.headers_all("x-nope").is_empty());
+        // 请求行不能被误当成头（`GET /a:b` 里的 `a`）
+        let r2 = Request {
+            method: "GET".into(),
+            path: "/a:b".into(),
+            query: String::new(),
+            body: String::new(),
+            head: "GET /a:b HTTP/1.1".into(),
+        };
+        assert!(r2.headers_all("a").is_empty(), "请求行不该被当成头");
     }
 }

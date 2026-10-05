@@ -85,7 +85,21 @@ pub struct AeadWriter {
     stream_nonce: [u8; NONCE_LEN],
     nonce: [u8; NONCE_LEN],
     header_sent: bool,
+    /// 已发帧数（v0.5.4，M7）。
+    ///
+    /// 上游 Go 实现在帧数达到 2³² 时会 **fail-closed**（主动断开），
+    /// 因为 nonce 是 96 位里带着一个 32 位计数器 —— 越过 2³² 就有重用风险。
+    /// NFrp 原先没有这个计数，等于丢掉了上游的一道防御（fail-open 回归）。
+    ///
+    /// ★ 诚实说明：由于 `nonce` 每帧都真正 +1，**当前不存在 nonce 重用**，
+    ///   所以这不是"当前可利用的漏洞"。但缺了它，未来任何一次加密层重构
+    ///   都可能把"丢帧计数"变成真的 nonce 重用 ⇒ 灾难性失密（CFB/GCM 下
+    ///   重用 nonce 会让攻击者直接恢复明文异或）。加这一条成本几乎为零。
+    frame_count: u64,
 }
+
+/// nonce 空间的硬上限（与上游一致：2³² 帧后必须换密钥或断开）。
+pub const MAX_FRAMES: u64 = 1 << 32;
 
 impl AeadWriter {
     pub fn new(key: &[u8]) -> Result<Self> {
@@ -98,6 +112,7 @@ impl AeadWriter {
             stream_nonce: nonce,
             nonce,
             header_sent: false,
+            frame_count: 0,
         })
     }
 
@@ -109,6 +124,11 @@ impl AeadWriter {
             self.header_sent = true;
         }
         for chunk in plaintext.chunks(MAX_PAYLOAD) {
+            // ★ v0.5.4（M7）：帧数逼近 nonce 空间上限时 **fail-closed**。
+            //   与上游一致：宁可断开，也不能冒 nonce 重用的风险。
+            if self.frame_count >= MAX_FRAMES {
+                bail!("AEAD 帧数达到上限（{MAX_FRAMES}），为避免 nonce 重用强制断开");
+            }
             let header = ((chunk.len() + TAG_LEN) as u32).to_be_bytes();
             let mut aad = Vec::with_capacity(NONCE_LEN + 4);
             aad.extend_from_slice(&self.stream_nonce);
@@ -126,8 +146,14 @@ impl AeadWriter {
             out.extend_from_slice(&header);
             out.extend_from_slice(&ct);
             increment_nonce(&mut self.nonce);
+            self.frame_count += 1;
         }
         Ok(out)
+    }
+
+    /// 已发帧数（测试与诊断用）。
+    pub fn frames_sent(&self) -> u64 {
+        self.frame_count
     }
 }
 
@@ -245,5 +271,51 @@ mod tests {
         let (c2s, s2c) = derive_control_keys(b"token", ALGORITHM, &[0u8; 32]).unwrap();
         assert_eq!(c2s.len(), 32);
         assert_ne!(c2s, s2c);
+    }
+
+    /// ★★ v0.5.4 回归（M7）：AEAD 必须记帧数，并在逼近 2³² 时 **fail-closed**。
+    ///
+    /// 上游 Go 实现在帧数达上限时主动断开（nonce 是 96 位里含一个 32 位计数器）。
+    /// NFrp 原先没有这个计数 —— 属 fail-open 回归。
+    ///
+    /// 诚实说明：因为 nonce 每帧真的 +1，**当前不存在 nonce 重用**，
+    /// 所以这不是"当前可利用的漏洞"，而是丢掉了一道防御。这条测试锁住它。
+    #[test]
+    fn aead_帧计数与上限() {
+        let key = [7u8; 32];
+        let mut w = AeadWriter::new(&key).unwrap();
+        assert_eq!(w.frames_sent(), 0, "新建时帧数应为 0");
+
+        // 一帧：明文小于 MAX_PAYLOAD
+        w.seal(b"hello").unwrap();
+        assert_eq!(w.frames_sent(), 1, "seal 一次应当记 1 帧");
+
+        // 跨多帧：明文大于 MAX_PAYLOAD 会被切成多帧
+        let big = vec![0u8; MAX_PAYLOAD * 3 + 5];
+        let before = w.frames_sent();
+        w.seal(&big).unwrap();
+        assert_eq!(w.frames_sent(), before + 4, "3*MAX_PAYLOAD+5 应当切成 4 帧");
+
+        // 上限常量与上游一致
+        assert_eq!(MAX_FRAMES, 1u64 << 32, "上限应当与上游一致（2^32）");
+    }
+
+    /// 直接把计数器推到上限，确认 **fail-closed**（报错而不是继续）。
+    #[test]
+    fn aead_帧数达上限必须拒绝而不是继续() {
+        let key = [9u8; 32];
+        let mut w = AeadWriter::new(&key).unwrap();
+        // 直接篡改计数器到上限（模拟"已经用满 nonce 空间"）
+        w.frame_count = MAX_FRAMES;
+        let e = w.seal(b"x").expect_err("到上限后必须拒绝加密");
+        assert!(
+            e.to_string().contains("nonce"),
+            "错误信息应点明 nonce 重用风险：{e}"
+        );
+
+        // 上限前一个仍然可以
+        w.frame_count = MAX_FRAMES - 1;
+        assert!(w.seal(b"x").is_ok(), "上限前应当仍可加密");
+        assert_eq!(w.frames_sent(), MAX_FRAMES);
     }
 }

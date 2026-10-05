@@ -49,7 +49,14 @@ impl AuthMethod {
 }
 
 /// 服务端认证配置（`[auth]` 段）。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// ★ v0.5.3：**手工实现 `Debug`**，`token` 一律脱敏。
+///
+/// 原来派生 `Debug` 时，任何一句调试用的 `println!("{cfg:?}")` 或
+/// `tracing::debug!(?cfg)` 都会把**明文 token** 打进日志。项目里眼下没有
+/// 这样的打印，但配置结构被到处传递，属于"等着被踩"的坑 ——
+/// `AuthProvider` 早就手工脱敏了，这里与它对齐。
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerAuthConfig {
     /// `token`（默认）/ `oidc`。
@@ -89,6 +96,26 @@ pub struct ServerAuthConfig {
 /// 官方 frp 的默认 `additionalScopes`：两个都开。
 pub fn default_scopes() -> Vec<String> {
     vec!["HeartBeats".to_string(), "NewWorkConns".to_string()]
+}
+
+impl std::fmt::Debug for ServerAuthConfig {
+    /// ★ v0.5.3：`token` 永不进日志。
+    ///
+    /// 只暴露"有没有配、多长"，够排障用，又不会把密钥写进任何日志文件。
+    /// （`AuthProvider::Debug` 早就是这么做的，这里与它对齐。）
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let token = if self.token.is_empty() {
+            "<empty>".to_string()
+        } else {
+            format!("<redacted:{} chars>", self.token.chars().count())
+        };
+        f.debug_struct("ServerAuthConfig")
+            .field("method", &self.method)
+            .field("token", &token)
+            .field("additional_scopes", &self.additional_scopes)
+            .field("oidc", &self.oidc)
+            .finish()
+    }
 }
 
 impl ServerAuthConfig {
@@ -260,7 +287,9 @@ impl AuthProvider {
     /// 校验登录凭证。`cred` 就是报文里的 `privilege_key` 原文。
     ///
     /// 返回身份标识（token 方式为空串，OIDC 方式为 `sub`）。
-    pub fn verify_login(&self, cred: &str, ts: i64) -> anyhow::Result<String> {
+    ///
+    /// `run_id` 用于把 OIDC 的 subject **绑定到本次会话**（v0.5.3 起）。
+    pub fn verify_login(&self, cred: &str, ts: i64, run_id: &str) -> anyhow::Result<String> {
         match self {
             Self::Token(secret) => {
                 if secret.is_empty() {
@@ -274,7 +303,7 @@ impl AuthProvider {
                 }
                 Ok(String::new())
             }
-            Self::Oidc(v) => v.remember_subject(cred),
+            Self::Oidc(v) => v.remember_subject(cred, run_id),
             Self::OidcUnavailable(e) => {
                 anyhow::bail!("OIDC 认证不可用（{e}），拒绝本次登录")
             }
@@ -285,15 +314,25 @@ impl AuthProvider {
     ///
     /// 为什么需要：登录时校验过就永久信任的模型下，任何能连上控制端口的人
     /// 只要在同一个 `run_id` 上发消息就能搭便车。OIDC 方式下这里要求
-    /// **验签通过且 `sub` 与登录时一致**。
-    pub fn verify_followup(&self, cred: &str, what: &str) -> anyhow::Result<()> {
+    /// **验签通过且 `sub` 与本会话登录时一致**。
+    ///
+    /// `run_id` 是必需的（v0.5.3）：旧实现只查一个全局 subject 集合，
+    /// 于是"自己登录过一次"就能给**别人的** run_id 背书。
+    pub fn verify_followup(&self, cred: &str, what: &str, run_id: &str) -> anyhow::Result<()> {
         match self {
             Self::Token(_) => Ok(()), // 与官方一致：token 方式不复核
             Self::Oidc(v) => {
-                v.verify_post_login(cred, what)?;
+                v.verify_post_login(cred, what, run_id)?;
                 Ok(())
             }
             Self::OidcUnavailable(e) => anyhow::bail!("OIDC 认证不可用（{e}），拒绝{what}"),
+        }
+    }
+
+    /// 会话结束时解除 subject 绑定（避免绑定表无限增长）。
+    pub fn forget_session(&self, run_id: &str) {
+        if let Self::Oidc(v) = self {
+            v.forget_session(run_id);
         }
     }
 

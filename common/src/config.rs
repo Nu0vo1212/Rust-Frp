@@ -321,6 +321,20 @@ pub struct ServerConfig {
     #[serde(default = "default_bind_addr")]
     pub bind_addr: String,
 
+    /// ★ 用户是否**显式写过** `bind_addr`（v0.5.4，配合 M4 的判定）。
+    ///
+    /// 为什么需要这个标志：认不出"默认值"和"用户明确写了 0.0.0.0"，
+    /// 就没法区分这两种情形 ——
+    ///
+    /// * 用户**主动**把监听地址改成对外地址却没配 token ⇒ 明显是搞错了，该拦；
+    /// * 用户**什么都没写**、直接 `nfrp-server` 起来 ⇒ 这是出厂默认，
+    ///   拦住会让"默认配置无法启动"，比漏洞本身更糟。
+    ///
+    /// `#[serde(skip)]`：它不进配置文件、也不参与序列化，只作为**解析副产品**
+    /// 由 `load` 在读完原始 TOML 后填上（见 [`ServerConfig::bind_addr_explicitly_set`] 的赋值点）。
+    #[serde(skip)]
+    pub bind_addr_explicitly_set: bool,
+
     /// 控制端口：客户端在这里建控制连接。
     #[serde(default = "default_control_port")]
     pub control_port: u16,
@@ -527,6 +541,21 @@ pub struct ServerConfig {
     /// （典型合法场景：面板只在跳板机能到的内网里，靠网络隔离兜底）。
     #[serde(default)]
     pub allow_insecure_dashboard: bool,
+    /// 明确同意"**服务端不做认证**且对外监听"（v0.5.4 新增，修 M4）。
+    ///
+    /// 背景：`token` 留空时认证被完全跳过（与官方 frps 一致，靠网络隔离兜底）。
+    /// 但"留空 + 绑 0.0.0.0"等于对外开放一个**任何人都能用**的 frps ——
+    /// 谁都能注册代理、申请公网端口，把服务器变成公共内网穿透节点。
+    ///
+    /// 原先这种组合只打一条 `warn!` 就放行，而**同一个风险在面板路径上
+    /// 是硬性 `ensure!` 拒绝启动的** —— 两种标准。现在统一：
+    /// 默认 `false` ⇒ 拒绝启动；确实需要（比如纯内网lab）显式置 `true`。
+    ///
+    /// ★ 为什么不干脆禁止：官方 frp 允许空 token，而且确实有大量内网部署
+    /// 这么跑。直接砍掉会破坏兼容性；"拒绝启动 + 显式逃生开关"既堵住了
+    /// 无意的误配置（把空 token 部署到公网），又保留了知情选择。
+    #[serde(default)]
+    pub allow_insecure_no_auth: bool,
     /// 是否监听配置文件变化并自动重载可动态生效的字段。
     #[serde(default)]
     pub hot_reload: bool,
@@ -627,6 +656,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("dashboard_user", &self.dashboard_user)
             .field("dashboard_pwd", &redact(&self.dashboard_pwd))
             .field("allow_insecure_dashboard", &self.allow_insecure_dashboard)
+            .field("allow_insecure_no_auth", &self.allow_insecure_no_auth)
             .field("hot_reload", &self.hot_reload)
             .field("log_level", &self.log_level)
             .field("auth", &self.auth)
@@ -712,6 +742,8 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind_addr: default_bind_addr(),
+            // 默认（没从文件读过）⇒ 视为"用户没显式写过"
+            bind_addr_explicitly_set: false,
             control_port: default_control_port(),
             work_port: default_work_port(),
             token: String::new(),
@@ -746,6 +778,7 @@ impl Default for ServerConfig {
             dashboard_user: String::new(),
             dashboard_pwd: String::new(),
             allow_insecure_dashboard: false,
+            allow_insecure_no_auth: false,
             hot_reload: false,
             auth: Default::default(),
             acl: Default::default(),
@@ -2063,8 +2096,80 @@ pub fn validate_remote_proxy(p: &ProxyConfig, is_remote: bool) -> Result<()> {
                 offending.join(" / ")
             )));
         }
+
+        // ★★ v0.5.4 修 H4：`local_addr` 必须**只允许回环**。
+        //
+        // 为什么这是必需的：`local_addr` 决定客户端**往哪里连**
+        // （`client/src/main.rs` 里每个工作连接都会 `TcpStream::connect(local)`）。
+        // 它原先**不在**上面那份黑名单里，于是一个不可信的服务端
+        // （或能下发 `ServerCmd` 的面板）只要下发
+        // `local_addr = "169.254.169.254:80"`，就能让客户端去连**云元数据服务** ——
+        // 这就是服务端可控的 SSRF。同理 `10.0.0.5:6379` 可做内网横向。
+        //
+        // ★ 这里刻意**反过来用允许清单**（默认拒绝），而不是继续往黑名单里加一条。
+        //   H3 与 H4 是同一类错误的两个实例：「防线写对了，但没铺满它声称要保护的
+        //   字段/路径」。黑名单每漏一个字段就是一次漏洞；允许清单漏一个字段
+        //   只是"少支持一个场景"。远程下发**本来就不该**决定客户端连哪里。
+        //
+        // 兼容性说明：远程下发通常来自面板的"添加代理"功能，而面板自己填的
+        // `local_addr` 本来就是内网服务地址（`127.0.0.1:xxxx` 最常见）。
+        // 真有跨机场景的，应当由本机配置文件写死，而不是让服务端远程指定。
+        if !p.local_addr.trim().is_empty() {
+            let host = local_addr_host(&p.local_addr);
+            if !is_loopback_host(host) {
+                return Err(crate::error::Error::Protocol(format!(
+                    "代理 [{}] 来自远程下发，`local_addr` 只能指向本机回环地址，\
+                     收到 {:?}（主机部分 {:?}）—— 远程下发不该决定客户端往哪里连。\
+                     若确实需要连别的地址，请写在本机配置文件里。",
+                    p.name, p.local_addr, host
+                )));
+            }
+        }
     }
     reject_bad_proxy(p)
+}
+
+/// 从 `host:port` 里切出主机部分（兼容 `[::1]:80` 这种带方括号的 IPv6）。
+///
+/// 单独抽出来是因为 `rsplit_once(':')` 对 IPv6 是错的：
+/// `[::1]:80` 会切成 `[:`，`::1` 会切成 `:`。项目里 `canonical_host`
+/// 已经在处理同类问题，这里保持一致的口径。
+fn local_addr_host(addr: &str) -> &str {
+    let a = addr.trim();
+    if let Some(rest) = a.strip_prefix('[') {
+        // `[::1]:80` -> `::1`
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    // ★ 无方括号时的关键判断：冒号**只有一个**才可能是 `host:port`。
+    //
+    // 裸 IPv6（`::1`、`fd00::1`）有多个冒号，按 `rsplit_once(':')` 切会得到
+    // `":"` 这种垃圾 —— 而那会让**合法的 `::1` 被误拒**（诊断时实测踩到）。
+    // 所以先数冒号：多于一个就整串当主机。
+    if a.matches(':').count() != 1 {
+        return a;
+    }
+    match a.rsplit_once(':') {
+        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => a,
+    }
+}
+
+/// 这个主机名/地址是不是"只有本机"。
+///
+/// 接受 `127.0.0.0/8`、`::1`、`localhost`。**不接受** `0.0.0.0`（那是"监听全部"，
+/// 不是"连本机"），也不接受任何解析不出 IP 的域名 —— 域名可能解析到任意地址，
+/// 而且解析结果在连接时才确定，判据不能靠它。
+fn is_loopback_host(host: &str) -> bool {
+    let h = host.trim();
+    if h.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match h.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback(),
+        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback(),
+        // 解析不出（域名等）⇒ 从严当作"非本机"
+        Err(_) => false,
+    }
 }
 
 /// `tcpmux` 的两条必填约束，对齐官方 `validateTCPMuxProxyConfigForClient`。
@@ -2119,9 +2224,21 @@ pub fn parse_server_toml(raw: &str) -> Result<ServerConfig> {
     let mut value: toml::Value = toml::from_str(raw)?;
     // 与客户端同理：必须在 normalize **之前**扫（normalize 会改键名）。
     let unsupported = crate::frp_config::unsupported_server_fields(&value);
+    // ★ v0.5.4（M4）：在 normalize **之前**记录"用户有没有显式写过 bind_addr"。
+    //
+    // normalize 会把官方键名（`bindAddr` 之类）搬成规范名，所以要在它之前看。
+    // 两种写法都算"显式写过"。
+    let bind_addr_explicit = value
+        .as_table()
+        .map(|t| {
+            t.keys()
+                .any(|k| k.eq_ignore_ascii_case("bind_addr") || k.eq_ignore_ascii_case("bindAddr"))
+        })
+        .unwrap_or(false);
     crate::frp_config::normalize_server(&mut value);
     let mut cfg: ServerConfig = value.try_into()?;
     cfg.unsupported_fields = unsupported;
+    cfg.bind_addr_explicitly_set = bind_addr_explicit;
     Ok(cfg)
 }
 

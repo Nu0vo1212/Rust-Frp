@@ -1,19 +1,143 @@
 # NFrp 安全修复报告
 
-日期 2026-10-04
+日期 2026-10-04（第一轮）/ 2026-10-05（第二轮）
 范围 全仓（common / client / server 三个 crate、184 个依赖、Docker / CI / 打包链路）
-状态 **已修 17 项 全部带回归测试** 质量门全绿 尚未发版
+状态 **已修 28 项 全部带回归测试** 质量门全绿 已作为 v0.5.3 发版
 
 质量门结果
 
 | 项 | 结果 |
 |---|---|
-| 测试 | **564 通过 0 失败**（修复前 542） |
+| 测试 | **584 通过 0 失败**（第一轮前 542 → 第一轮 564 → 第二轮 584） |
 | `cargo fmt --check` | 干净（exit 0） |
-| `cargo clippy -D warnings` | **0 告警** |
-| `cargo audit` | **exit 0 零漏洞**（修复前 1 条） |
+| `cargo clippy -D warnings` | **0 告警**（Windows 与 Linux 各一遍） |
+| `cargo audit` | **exit 0 零漏洞**（第一轮修复前 1 条） |
 
 ---
+
+# 第二轮审计（2026-10-05，v0.5.3）
+
+★ 这一轮的问题不是"还有没有漏洞"，而是**"第一轮新写的那道防线本身能不能被绕过"**。
+产品代码在审计期间**一行未改**（纯只读 + 实弹验证）。
+
+## 🔴 高危：热重载可一次性永久绕过面板鉴权
+
+**位置** `server/src/reload.rs:64-104`（`apply_dynamic`）、`reload.rs:186`（`watch` 的快照）
+
+**实弹复现**（`bind_addr = "0.0.0.0"` + `dashboard_user = "admin"` + `hot_reload = true`）：
+
+| 操作 | 匿名 `GET /api/status` |
+|---|---|
+| 启动（有凭据，合法） | `401` ✅ |
+| 运行中把 `dashboard_user` 改成空 | **`200`** ❌ |
+| 再改回 `admin` | **`200`** ❌ 不恢复，必须重启 |
+
+危害面与第一轮第 1 项完全相同（匿名读全量状态 / 业务指标、`kick` 返回 400 说明已穿过鉴权）。
+
+**三个根因**：
+1. `apply_dynamic` 允许运行期把 `dashboard_user` 清空（`*g = None`）；
+2. 启动期那道「非回环 + 无凭据 ⇒ 拒绝启动」**只在启动路径跑过一次** ——
+   `serve.rs:244` 的"防御性兜底"其实是 `serve_on_with()` 函数体里的**一次性顺序语句**，
+   第 266 行 `spawn(dashboard)` 之后再也不会执行，`reload::watch` 到第 269 行才 spawn；
+3. `watch()` 用一份**永不更新的启动快照**做 diff ⇒ 清空后 `old == new`，
+   改回去时分支不再进入，`auth` 永久为 `None`（**不可逆**）。
+
+日志是 `INFO 面板鉴权已热更新（用户：）` —— 空值、无告警，管理员会以为已经改好。
+
+**修法**：
+- 抽出 `dashboard_is_exposed(&ServerConfig) -> bool`，**启动校验与热重载校验共用同一口径**；
+- `watch()` 在应用前对新配置**重跑一次安全校验**，不通过就整份拒绝并说明原因；
+- `apply_dynamic` 的凭据分支加安全闸门（对外面板 + 清空用户名 ⇒ 拒绝本次热改、保持旧凭据）；
+- `watch()` 真正推进基线快照（修掉"不可逆"）；
+- 清空鉴权从 `info!` 改 `warn!` 并点名后果。
+
+**回归测试 6 条**（`reload.rs::tests`）：对外面板不得清空鉴权 / 回环上允许清空 /
+**清空后改回必须能恢复**（锁死不可逆）/ 逃生开关放行 / 没开面板端口时不受影响 /
+`dashboard_is_exposed` 口径。★ 写这批测试时**当场抓出我自己第一版的判据写错了**
+（判的是 `old` 而不是 `new`，拿去判恒为 false 等于没拦）。
+
+## 🔴 OIDC 核验器被丢弃 ⇒ 该认证方式完全不可用
+
+**位置** `server/src/guard.rs:74-82`（丢弃）、`guard.rs:129-142`（刷新后局部 drop）
+
+`SecurityContext.auth` 是普通字段 + 外层 `Arc<SecurityContext>`，`refresh_oidc(&self)`
+拿不到 `&mut` ⇒ 新拉的 JWKS **没有任何地方能存**，函数结束 verifier 即被 drop，
+状态永远是 `OidcUnavailable`。文档引用的 `Self::ensure_ready` **全仓不存在**。
+
+后果：`method = "oidc"` 时**拒绝所有人登录**（fail-closed，无绕过），
+且 `oidc.rs` 里那些"已核实安全"的实现**从未在真实流量上执行过**（e2e 未覆盖 OIDC）。
+
+**修法**：`auth` 改 `Arc<RwLock<AuthProvider>>`（新增 `AuthSlot` 类型 + `auth()` 短锁读快照），
+`refresh_oidc` **真正回填**。**已用 mock IdP 实弹验证**：日志同时出现
+「OIDC JWKS 已加载」与「OIDC JWKS 已就绪」（修复前只有前者）。
+回归测试 3 条（槽位可写回 / 已就绪时刷新是空操作 / token 方式下是空操作）。
+
+## 🔴 OIDC 的 `additionalScopes` 复核未绑会话
+
+**位置** `common/src/auth/oidc.rs:490-504`（原 `verify_post_login`）
+
+原来是一个**只增不减的全局 `HashSet<subject>`**，只问"这个 sub 曾在**某个**连接上登录过吗"
+⇒ 攻击者用自己的合法 token 登录一次，就能用**同一个 token** 给**受害者的 run_id**
+开工作连接（`serve.rs` 的 `verify_followup` 会放行）。
+
+**修法**：改成 `HashMap<run_id, sub>` 二维绑定，新增 `forget_session()` 供会话结束时清理
+（顺带消掉无界增长点）。`verify_login` / `verify_followup` / `verify_post_login`
+都加了 `run_id` 参数；`vnet.rs` 的注册路径用 `reg.client` 作为会话标识。
+回归测试 2 条（跨 run_id 不得通用 / 同一会话只保留一条绑定）。
+
+## 🟠 其余
+
+| # | 位置 | 问题 | 修法 |
+|---|---|---|---|
+| 1 | `server/src/vhost.rs:670` | `tcpmux` 用户名/口令仍用 `==`（第一轮常量时间修复**唯一漏的一处**） | `constant_time_eq` |
+| 2 | `common/src/http_relay.rs:190`、`common/src/httpc.rs:350-354` | `out.len() + size` 用裸 `+`，release 未开 `overflow-checks` ⇒ 静默回绕绕过 32 MiB ACL | `saturating_add` / `checked_add` |
+| 3 | `common/src/util.rs:250` | `run_id`（事实上的"工作连接持有票据"）押在 std 未承诺为密码学 PRF 的 `RandomState` 上 | `OsRng.fill_bytes` |
+| 4 | `server/src/serve.rs` visitor 路径 | 错误文案未走脱敏开关：回显**代理名是否存在**、`allow_users` 里的**真实用户名** | 新增 `reject_with`，详情只进日志 |
+| 5 | `server/src/main.rs` | 弱/占位 token 无任何提示（v1 是 `md5(token+ts)` 且不校验时间戳新鲜性 ⇒ 离线枚举 1 次 MD5/候选） | 新增 `check_token_strength`，检测占位值与低强度并强告警（**不拦启动**） |
+| 6 | `common/src/config.rs`、`security.rs`、`auth/oidc.rs` | 7 个配置结构 `#[derive(Debug)]` ⇒ 任何调试打印都会泄漏明文 token / 面板口令 / `client_secret` | 手工脱敏 `Debug` + **3 条锁定测试**（写测试时**当场抓到两处真实泄漏**） |
+| 7 | `server/src/audit.rs:159` | 审计日志用默认 umask（通常 0644）⇒ 同机用户可读走整条审计轨迹 | 新建时 0600，与 `logfile.rs` 对齐 |
+| 8 | `.github/workflows/*` | **29 处**第三方 Action 全部用可变标签（含 `@stable` 这种 branch ref） | 全部 pin 到 commit SHA |
+| 9 | `.github/workflows/release.yml:125-133` | cosign 两个 `continue-on-error` + shell `\|\| echo` ⇒ **一个字节都没签出来也全绿** | 删掉 `continue-on-error`，加 `verify-blob` 自检 |
+| 10 | `.github/workflows/release.yml:210` | `github.event.inputs.tag` 直接拼进 shell（表达式注入面） | 改经 `env` 传值 + 正则白名单 |
+| 11 | `Dockerfile:42` | 把客户端配置 `frpc.toml`（含默认启用的 SSH 代理示例）拷进服务端镜像 | 只拷 `frps.toml`；`rust:alpine` → `rust:1.90-alpine` |
+| 12 | `android/gradle.properties` | keystore 口令**明文写在入库文件里** | 移到环境变量 / `local.properties`（已 gitignore），实测重建 APK 用正确发布证书 |
+| 13 | 仓库根 / `android/` | **完全没有 `.gitignore`** ⇒ `/dist`、`*.log`、keystore 全无遮挡 | 补两份并逐条实测生效 |
+
+## ✅ 第二轮确认「安全」的（避免重复排查）
+
+- `is_loopback_addr` 是 fail-safe 的（解析失败/空串/`localhost` 一律当非回环）；
+  面板**没有**独立监听地址（`dashboard_addr` 只是 INI 样例残留，实测无法绕过）；
+  面板实际 bind 地址与判定逻辑一致（`netstat` 实测）。
+- CSRF 防线实弹通过：跨站 Origin / `Origin: null` / `path` 伪造全部 403；
+  带防伪头的三种大小写变体正确放行（HTTP 头名大小写折叠是标准行为）。
+- 面板 128 并发闸门覆盖 `/api/healthz`（免鉴权但同走 `try_acquire_owned`）。
+- `allow_insecure_*` 在生产代码里只有默认值 `false`（两处 `= true` 都在 `#[cfg(test)]` 内）。
+- **第一轮 17 项修复的 21 个关键点逐个 grep 比对，零文档漂移**。
+- 9 个解析器 × 约 66 万次 fuzz + 定向边界，**零 panic**。
+- v1 CFB IV 不复用；v2 GCM nonce 唯一且 tag 失败会断连；**无明文降级**
+  （`conn.rs:170-172` 的版本守卫挡住 v2→v1 的看似降级路径）。
+- OIDC 的 alg 白名单 / 先验签后信 claim / kid fail-closed / exp 无 skew 重放窗口。
+- `cargo audit` 实跑 exit 0；unmaintained 交叉比对中唯一命中的 `ring` 是误报
+  （三条公告分别"已撤回"/"`unaffected = <0.17`"/"`patched >= 0.17.12`"，锁定 0.17.14 全豁免）。
+- Dockerfile 有 `USER nfrp`（非 root）；compose 无 docker.sock / privileged /
+  多余端口，挂载均 `:ro`。
+
+## ⚠️ 第二轮如实标注的"不足为患"项
+
+- `http_relay` 的 ACL 回绕**有次生兜底**：能绕过它的 `size` 恒 ≥ 2^64−out_len，
+  必被 `read_n` 的独立 ACL 拒绝 ⇒ 实际约 64 MiB/连接封顶，**不是无限内存**。
+  穷举 7 组 `out_len` 验证过。
+- `tcpmux` 的 `==` 是跨网络字节级侧信道，被抖动淹没，工程上难以远程爆破 ⇒
+  属"修复不完整"而非可利用漏洞。
+- token 方式下重放 `Login` **拿不到可用会话**（密钥材料是 token 本身）
+  ⇒ 弱 token 的实际杀伤是"强度退化到单次 MD5"，**强 token 不可重放**。
+- `android/gradle.properties` 与生产 token **当前都没被推上远端**
+  （GitHub API 实测 404 / 四块包 grep 零命中）⇒ 是"堵枪口"不是"事故"。
+
+---
+
+# 第一轮审计（2026-10-04，v0.5.2）
+
 
 ## 一 严重 / 高危（6 项）
 

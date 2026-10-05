@@ -139,20 +139,51 @@ jobs:
           cd out
           for f in *; do
             [ "$f" = "SHA256SUMS" ] && continue
+            case "$f" in *.sig) continue ;; esac
             cosign sign-blob --yes --output-signature "$f.sig" "$f"
           done
           cosign sign-blob --yes --output-signature SHA256SUMS.sig SHA256SUMS
           echo "--- 签出来的文件 ---"
           ls -la *.sig
 
-      # 自检：当场用刚生成的公钥验证一遍，避免"签了但验不过"
+      # ★★ v0.5.4 修（M2）：**逐个**验证所有签名，并断言"每个产物都有对应签名"。
+      #
+      # 原先只验了 `SHA256SUMS.sig` 一个（4 个签名里的 1 个），
+      # 于是"某个包的签名丢了/签错了"这条流水线完全无感。
       - name: verify signatures
         run: |
+          set -euo pipefail
           cd out
+
+          # 1) 每个非 .sig 产物都必须有 .sig（缺一即失败）
+          missing=0
+          for f in *; do
+            case "$f" in
+              *.sig|SHA256SUMS) continue ;;
+            esac
+            if [ ! -f "$f.sig" ]; then
+              echo "::error::产物 $f 没有对应签名"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+
+          # 2) 逐个验签（不是只验 SHA256SUMS 那一个）
+          for sig in *.sig; do
+            target="${sig%.sig}"
+            echo "--- verify $target ---"
+            cosign verify-blob \
+              --certificate-identity-regexp '^https://github.com/' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --signature "$sig" "$target"
+          done
+
+          # 3) SHA256SUMS 自身的签名也要验
           cosign verify-blob \
             --certificate-identity-regexp '^https://github.com/' \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             --signature SHA256SUMS.sig SHA256SUMS
+          echo "全部签名验证通过"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

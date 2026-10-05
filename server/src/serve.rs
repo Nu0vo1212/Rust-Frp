@@ -268,6 +268,10 @@ pub async fn serve_on_with(
     // 配置热重载：改完日志级别/面板密码不用重启
     if cfg.hot_reload {
         if let Some(path) = extras.config_path.clone() {
+            // ★ watch 持有这份快照的**所有权**（`Arc<ServerConfig>` 按值传入，
+            // 由它自己 `current = Arc::new(new)` 更新），所以这里给它一份克隆。
+            // 关键点是它**内部会更新自己那份**，不再像 v0.5.2 那样拿一份永不
+            // 更新的启动快照做 diff（那会导致「改回去不生效」的不可逆状态）。
             tokio::spawn(crate::reload::watch(
                 path,
                 cfg.clone(),
@@ -640,7 +644,10 @@ async fn handle_frp_stream(
             e.to_string()
         })
     };
-    match conn::server_handshake_authz(stream, &sec.auth, &run_id, authorize).await {
+    // ★ 取一份当前认证校验器传给握手（`sec.auth()` 是短锁读快照）——
+    //   OIDC 的 JWKS 可能是启动后才刷新成功的，不能在这里缓存旧值。
+    let auth_snapshot = sec.auth();
+    match conn::server_handshake_authz(stream, &auth_snapshot, &run_id, authorize).await {
         Ok(ServerAccept::Control {
             conn,
             login,
@@ -673,7 +680,9 @@ async fn handle_frp_stream(
             .await
         }
         Ok(ServerAccept::Work { conn, msg }) => handle_work(conn, msg, &sec, registry).await,
-        Ok(ServerAccept::Visitor { conn, msg }) => handle_visitor(conn, msg, registry).await,
+        Ok(ServerAccept::Visitor { conn, msg }) => {
+            handle_visitor(conn, msg, registry, cfg.clone()).await
+        }
         Err(e) => {
             // 握手失败（含认证失败）也要留痕：这是最需要被看见的一类事件。
             // 授权失败已经在 authorize 闭包里记过（那条带 user），别记两遍。
@@ -885,10 +894,9 @@ async fn handle_control(
                         // token 都要重新验签、且 subject 与登录时一致。
                         // 少了这一步，"登录时验过一次"就等于之后永久信任。
                         if sec.auth_cfg.check_heartbeats()
-                            && sec.auth.method()
-                                == nfrp_common::security::AuthMethod::Oidc
+                            && sec.auth_method() == nfrp_common::security::AuthMethod::Oidc
                         {
-                            if let Err(e) = sec.auth.verify_followup(&p.privilege_key, "心跳") {
+                            if let Err(e) = sec.verify_followup(&p.privilege_key, "心跳", &run_id) {
                                 registry.audit().record(
                                     crate::audit::AuditEvent::new(
                                         crate::audit::kind::LOGIN_DENIED,
@@ -1377,9 +1385,9 @@ async fn handle_work(
     // 这条挡的是：拿到 run_id 的人自己新建一条工作连接，绕过
     // "工作连接必须来自同一个客户端"这个隐含前提。
     if sec.auth_cfg.check_new_work_conns()
-        && sec.auth.method() == nfrp_common::security::AuthMethod::Oidc
+        && sec.auth_method() == nfrp_common::security::AuthMethod::Oidc
     {
-        if let Err(e) = sec.auth.verify_followup(&msg.privilege_key, "新工作连接") {
+        if let Err(e) = sec.verify_followup(&msg.privilege_key, "新工作连接", &msg.run_id) {
             registry.audit().record(
                 crate::audit::AuditEvent::new(crate::audit::kind::LOGIN_DENIED, false)
                     .client(msg.run_id.clone())
@@ -1428,6 +1436,7 @@ async fn handle_visitor(
     mut conn: FrpConn,
     msg: NewVisitorConn,
     registry: Arc<Registry>,
+    cfg: Arc<ServerConfig>,
 ) -> Result<()> {
     let proxy_name = msg.proxy_name.clone();
 
@@ -1438,11 +1447,33 @@ async fn handle_visitor(
         err: String,
         registry: &Registry,
     ) -> Result<()> {
+        reject_with(conn, proxy_name, err, registry, None).await
+    }
+
+    /// 同上，但把"回给对端的文案"与"日志里的详情"分开。
+    ///
+    /// ★ v0.5.3 修：visitor 这条路径原来**完全没走** `detailed_errors_to_client`
+    /// 开关，把内部细节原样回给了**尚未通过任何认证**的来访者，包括：
+    ///
+    /// * 代理名是否存在（可用来枚举 stcp 隧道名）；
+    /// * `allow_users` 里的真实用户名（`visitor connection of [x] user [alice] not allowed`）；
+    /// * `run_id` 是否在线。
+    ///
+    /// 现在：`client_msg = None` 时按开关脱敏成短句，详情只留在服务端日志/审计里。
+    async fn reject_with(
+        conn: &mut FrpConn,
+        proxy_name: &str,
+        err: String,
+        registry: &Registry,
+        client_msg: Option<String>,
+    ) -> Result<()> {
         registry.metrics().visitor_rejected.inc();
+        // 日志始终保留完整详情（排障需要），但对端只看到脱敏后的文案
+        let shown = client_msg.unwrap_or_else(|| err.clone());
         let _ = conn
             .send_msg(&FrpMessage::NewVisitorConnResp(NewVisitorConnResp {
                 proxy_name: proxy_name.to_string(),
-                error: err.clone(),
+                error: shown,
             }))
             .await;
         // 必须优雅关闭：直接 drop 会变成 RST，对端读不到 error，只会看到 connection reset
@@ -1452,22 +1483,35 @@ async fn handle_visitor(
 
     // 1) run_id 必须能对上一条已登录的控制会话（对应 frps 的 admitVisitorByRunID）
     if !msg.run_id.is_empty() && registry.get(&msg.run_id).is_none() {
-        return reject(
+        return reject_with(
             &mut conn,
             &proxy_name,
             format!("no client control found for run id [{}]", msg.run_id),
             &registry,
+            // ★ 脱敏：不回显 run_id（那是在探测某个会话是否在线）。
+            Some(cfg.error_to_client(
+                "visitor connection failed",
+                &format!("no client control found for run id [{}]", msg.run_id),
+            )),
         )
         .await;
     }
 
     // 2) 代理必须已注册
+    //
+    // ★ 脱敏：不能把"这个代理名到底存不存在"告诉外来者 —— 那是一个
+    //   stcp / sudp 隧道名的枚举接口。短句与"密钥不对"保持同一形态，
+    //   攻击者无法据此区分"名字错"还是"名字对但密钥错"。
     let Some(entry) = registry.visitors.get(&proxy_name) else {
-        return reject(
+        return reject_with(
             &mut conn,
             &proxy_name,
             format!("custom listener for [{proxy_name}] doesn't exist"),
             &registry,
+            Some(cfg.error_to_client(
+                "visitor connection failed",
+                &format!("custom listener for [{proxy_name}] doesn't exist"),
+            )),
         )
         .await;
     };
@@ -1475,11 +1519,17 @@ async fn handle_visitor(
     // 3) 密钥签名校验：hex(md5(secret_key + timestamp))
     if !entry.check_sign(&msg.sign_key, msg.timestamp) {
         warn!(proxy = %proxy_name, "visitor 密钥校验失败");
-        return reject(
+        // 这条本身不含敏感信息（只说"认证失败"），但仍统一走开关，
+        // 保证关掉 detailed_errors_to_client 时访客看到的文案形态一致。
+        return reject_with(
             &mut conn,
             &proxy_name,
             format!("visitor connection of [{proxy_name}] auth failed"),
             &registry,
+            Some(cfg.error_to_client(
+                "visitor connection failed",
+                &format!("visitor connection of [{proxy_name}] auth failed"),
+            )),
         )
         .await;
     }
@@ -1494,11 +1544,17 @@ async fn handle_visitor(
         .unwrap_or_default();
     if !entry.check_user(&visitor_user) {
         warn!(proxy = %proxy_name, user = %visitor_user, "visitor 用户不在 allow_users 白名单内");
-        return reject(
+        // ★ 脱敏：**绝不能**把 allow_users 里的真实用户名回显出去 ——
+        //   那直接泄露了"谁被允许访问这条隧道"，也等于确认了这个用户名有效。
+        return reject_with(
             &mut conn,
             &proxy_name,
             format!("visitor connection of [{proxy_name}] user [{visitor_user}] not allowed"),
             &registry,
+            Some(cfg.error_to_client(
+                "visitor connection failed",
+                &format!("visitor connection of [{proxy_name}] user not allowed"),
+            )),
         )
         .await;
     }

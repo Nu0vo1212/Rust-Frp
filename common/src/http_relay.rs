@@ -264,6 +264,107 @@ impl HeadParts {
             .map(|(_, v)| v.as_str())
     }
 
+    /// 取同名头的**全部**值（保序）。
+    ///
+    /// ★ v0.5.4 新增（H2）。为什么必须有它：`get()` 只返回**第一个**，
+    /// 而 `to_bytes()` 会把 `headers` 里的**所有**同名头都序列化出去 ——
+    /// "读只读第一个、写却写出去两个"正是 CL.CL 请求走私的温床。
+    /// 任何需要判断"这个头出现了几次"的地方都要用它，不要用 `get().is_some()`。
+    pub fn get_all(&self, name: &str) -> Vec<&str> {
+        self.headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
+
+    /// 同名头出现了几次（大小写不敏感）。用于重复头检测。
+    pub fn count(&self, name: &str) -> usize {
+        self.headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+            .count()
+    }
+
+    /// 写一个头（同名则替换）。
+    ///
+    /// ★ 名字和值里的 **CR / LF 会被就地剥掉**。
+    ///
+    /// 这不是洁癖：`plugin_request_headers`（插件自定义请求头）能由**服务端
+    /// 经 `ServerCmd` 下发**，`set()` 又直接 `push_str` 到报文里 —— 值里塞一个
+    /// `"\r\nX-Admin: 1"` 就能往用户**内网服务**的请求里插任意头，甚至借
+    /// `Content-Length` 做请求走私。配置文件的路径上这是用户自己的输入，
+    /// 但远程下发之后就变成不可信数据了。
+    ///
+    /// 剥掉而不是报错：调用方遍布转发热路径，逐处处理 `Result` 不值得；
+    /// 而且 HTTP 头的名字/值本来就不允许含 CRLF，剥掉等于"按规范收敛"。
+    /// 严格解析 `Content-Length`（v0.5.4，H2）。
+    ///
+    /// 返回 `Ok(0)` 表示"没有这个头"（合法，等价于没有请求体）。
+    ///
+    /// 拒绝的情况：
+    /// * **出现多次** —— 哪怕是两个相同的值也拒绝。RFC 7230 §3.3.2 允许
+    ///   "值完全相同则合并"，但真正安全的做法是拒绝：不同实现合并策略不一致，
+    ///   而"读一个、转发两个"正是 CL.CL 走私的成因。
+    /// * 含非纯数字字符 —— 包括 `+5` / `-1` / 前后夹杂空白。`usize::from_str`
+    ///   会接受 `+5` 这种带符号写法，那属于"解析成功但语义可疑"。
+    /// * 数字溢出 `u64`。
+    ///
+    /// 早先的写法是 `cl.trim().parse().unwrap_or(0)` —— **垃圾值静默变 0**，
+    /// 于是 `Content-Length: abc` 会被当成"没有请求体"，而同一个头又被原样
+    /// 转发给上游（上游可能按 abc 报错、也可能按别的规则解读）。
+    pub fn content_length_strict(&self) -> Result<u64> {
+        let vals = self.get_all("content-length");
+        if vals.is_empty() {
+            return Ok(0);
+        }
+        if vals.len() > 1 {
+            bail!(
+                "重复的 Content-Length 头（出现 {} 次）：按 RFC 7230 §3.3.2 拒绝，\
+                 避免读写口径不一致造成请求走私",
+                vals.len()
+            );
+        }
+        let s = vals[0].trim();
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            bail!("非法的 Content-Length: {:?}（只接受纯十进制数字）", vals[0]);
+        }
+        s.parse::<u64>()
+            .map_err(|_| anyhow!("Content-Length 数值溢出: {s:?}"))
+    }
+
+    /// 同名头去重（v0.5.4，H2 的第三层纵深防御）。
+    ///
+    /// 调用点：转发前。确保"读到的"与"写出去的"永远一致 ——
+    /// 即便上游某个环节漏了检查，也不会把重复头原样送到下游。
+    ///
+    /// 策略：**除少数允许重复的头外，同名头只保留第一个**。
+    /// 允许重复的是 RFC 明确可合并的列表型头（`set-cookie` 不能合并，
+    /// 但它本来就要全部保留；其余列表型的 `,` 合并语义由下游处理）。
+    pub fn dedup_headers(&mut self) -> usize {
+        // 这些头**允许多次出现**（语义上就是列表，或必须逐个保留）
+        const ALLOW_MULTI: &[&str] = &[
+            "set-cookie",
+            "www-authenticate",
+            "proxy-authenticate",
+            "warning",
+        ];
+        let mut seen: Vec<String> = Vec::new();
+        let before = self.headers.len();
+        self.headers.retain(|(k, _)| {
+            let lk = k.to_ascii_lowercase();
+            if ALLOW_MULTI.contains(&lk.as_str()) {
+                return true;
+            }
+            if seen.contains(&lk) {
+                return false; // 重复：丢掉后来的
+            }
+            seen.push(lk);
+            true
+        });
+        before - self.headers.len()
+    }
+
     /// 写一个头（同名则替换）。
     ///
     /// ★ 名字和值里的 **CR / LF 会被就地剥掉**。
@@ -589,6 +690,122 @@ mod tests {
         assert_eq!(h.start_token(1), Some("/x?y=1"));
         assert_eq!(h.start_token(2), Some("HTTP/1.1"));
         assert_eq!(h.start_token(9), None);
+    }
+
+    // ------------------------------------------------------------------
+    // H2（v0.5.4）：重复 Content-Length / 同名头去重
+    // ------------------------------------------------------------------
+
+    /// ★★ `get_all` / `count` 必须能看到**全部**同名头 —— 这是 H2 的地基。
+    ///
+    /// `get()` 只看第一个，而 `to_bytes()` 会把所有同名头都写出去。
+    /// 如果只有 `get()`，"读一个、写两个"的走私面就无法被检测。
+    #[test]
+    fn 同名头必须能被完整枚举() {
+        let h = HeadParts::parse(&lines(&[
+            "POST / HTTP/1.1",
+            "Content-Length: 5",
+            "Content-Length: 6",
+            "X-Other: 1",
+        ]))
+        .unwrap();
+
+        assert_eq!(h.get("content-length"), Some("5"), "get 只返回第一个");
+        assert_eq!(h.get_all("content-length"), vec!["5", "6"]);
+        assert_eq!(h.count("content-length"), 2);
+        assert_eq!(h.count("CONTENT-LENGTH"), 2, "大小写不敏感");
+        assert_eq!(h.count("x-missing"), 0);
+
+        // 序列化时两个都会出去 —— 这正是必须在上游拦住的理由
+        let bytes = String::from_utf8(h.to_bytes()).unwrap();
+        assert_eq!(
+            bytes.matches("Content-Length").count(),
+            2,
+            "to_bytes 会写出全部同名头"
+        );
+    }
+
+    /// ★★ H2 核心：严格解析 Content-Length。
+    #[test]
+    fn content_length_严格解析() {
+        let p = |v: &[&str]| HeadParts::parse(&lines(v)).unwrap();
+
+        // 正常
+        assert_eq!(
+            p(&["POST / HTTP/1.1", "Content-Length: 0"])
+                .content_length_strict()
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            p(&["POST / HTTP/1.1", "Content-Length: 42"])
+                .content_length_strict()
+                .unwrap(),
+            42
+        );
+        assert_eq!(
+            p(&["POST / HTTP/1.1", "Content-Length:  7  "])
+                .content_length_strict()
+                .unwrap(),
+            7
+        );
+        // 没有这个头 ⇒ 0
+        assert_eq!(p(&["POST / HTTP/1.1"]).content_length_strict().unwrap(), 0);
+
+        // ★ 重复 —— 哪怕值相同也拒绝（CL.CL 走私面）
+        let dup_same = p(&["POST / HTTP/1.1", "Content-Length: 5", "Content-Length: 5"]);
+        assert!(
+            dup_same.content_length_strict().is_err(),
+            "重复且值相同也要拒绝"
+        );
+        let dup_diff = p(&["POST / HTTP/1.1", "Content-Length: 5", "Content-Length: 6"]);
+        let e = dup_diff.content_length_strict().unwrap_err().to_string();
+        assert!(e.contains("重复"), "{e}");
+
+        // ★ 带符号 / 非数字 —— 旧实现 `unwrap_or(0)` 会静默当成 0
+        for bad in ["+5", "-1", "abc", "5x", "", "0x10", "1 2"] {
+            let h = p(&["POST / HTTP/1.1", &format!("Content-Length: {bad}")]);
+            assert!(
+                h.content_length_strict().is_err(),
+                "Content-Length: {bad:?} 必须被拒绝，而不是当成 0"
+            );
+        }
+
+        // 溢出
+        let huge = p(&[
+            "POST / HTTP/1.1",
+            "Content-Length: 99999999999999999999999999",
+        ]);
+        assert!(huge.content_length_strict().is_err());
+    }
+
+    /// ★★ H2 第三层：转发前同名头去重（纵深防御）。
+    #[test]
+    fn 转发前同名头去重() {
+        let mut h = HeadParts::parse(&lines(&[
+            "POST / HTTP/1.1",
+            "X-Dup: a",
+            "X-Dup: b",
+            "x-dup: c",
+            "Content-Length: 1",
+            "Content-Length: 2",
+            "Set-Cookie: s1=1",
+            "Set-Cookie: s2=2",
+        ]))
+        .unwrap();
+
+        let dropped = h.dedup_headers();
+        assert_eq!(dropped, 3, "X-Dup 两个 + Content-Length 一个应被丢掉");
+
+        // 普通头只留第一个
+        assert_eq!(h.get_all("x-dup"), vec!["a"]);
+        assert_eq!(h.count("content-length"), 1);
+        // ★ set-cookie 必须逐个保留（合并会破坏语义）
+        assert_eq!(
+            h.get_all("set-cookie"),
+            vec!["s1=1", "s2=2"],
+            "set-cookie 不能去重"
+        );
     }
 
     #[test]

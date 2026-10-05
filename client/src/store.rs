@@ -96,6 +96,35 @@ impl Store {
                                 if p.name.is_empty() {
                                     continue;
                                 }
+                                // ★★ v0.5.4 修 H3：store 里的内容**同样不可信**，
+                                //    必须与 `ServerCmd` 路径跑同一道闸门。
+                                //
+                                // 为什么 store 也算远程来源：这个文件的用途就是
+                                // "把服务端面板增删过的代理持久化下来"（见模块头注释），
+                                // 所以里面完全可能出现服务端下发的字段。早先这里
+                                // 只查 `name` 非空，于是：
+                                //
+                                //   有人在 store 里写入
+                                //     {"plugin":"static_file","plugin_local_path":"/etc"}
+                                //   重启后**直接生效** ⇒ 任意文件读取，
+                                //   而且绕过了为拦截它专门写的那道 `validate_remote_proxy`
+                                //   （威胁模型与第一轮修复 #2 完全相同，只是换了扇门进来）。
+                                //
+                                // 处理策略：**跳过该条目并 WARN**，而不是整份拒绝。
+                                // 理由：store 里可能同时躺着别的合法代理，
+                                // 一条脏数据不该让整个客户端起不来（用户此刻可能
+                                // 正在外面用手机远程重启它，见上面 `from_config` 的注释）。
+                                // 关键是**绝不能让它静默生效**。
+                                if let Err(e) = nfrp_common::config::validate_remote_proxy(&p, true)
+                                {
+                                    warn!(
+                                        path = %path.display(),
+                                        proxy = %p.name,
+                                        error = %e,
+                                        "store 中的代理未通过安全校验，已跳过（不会进入运行态）"
+                                    );
+                                    continue;
+                                }
                                 dynamic.insert(p.name.clone(), p);
                             }
                         }
@@ -243,6 +272,11 @@ impl std::fmt::Debug for Store {
 /// 理由是配置文件是用户"我看着它写下的"那份东西，必须说话算数；
 /// 而且从配置文件里删掉一条隧道时，用户期待的是它真的消失
 /// （如果让 store 优先，它会被 store 里的旧副本复活，且无处可查）。
+///
+/// ★ v0.5.4（H3 纵深防御）：这里对 `stored` 再做一遍 `validate_remote_proxy`。
+/// `Store::from_config` 才是主入口（已经拦了），但本函数是 public 的、
+/// 也是"配置 + 动态"合流的唯一汇聚点 —— 在这儿再挡一次，
+/// 保证**任何**未来新增的调用点都不会把未校验的条目送进运行态。
 pub fn merge_initial(config: &[ProxyConfig], stored: Vec<ProxyConfig>) -> Vec<ProxyConfig> {
     let mut out: Vec<ProxyConfig> = config.to_vec();
     let mut seen: std::collections::HashSet<String> =
@@ -252,6 +286,18 @@ pub fn merge_initial(config: &[ProxyConfig], stored: Vec<ProxyConfig>) -> Vec<Pr
             warn!(
                 proxy = %p.name,
                 "store 里的动态代理与配置文件同名，按配置文件为准（store 里那条已忽略）"
+            );
+            continue;
+        }
+        // ★ 与 `ServerCmd` / 配置文件同口径的安全校验（store 内容不可信）
+        if p.name.is_empty() {
+            continue;
+        }
+        if let Err(e) = nfrp_common::config::validate_remote_proxy(&p, true) {
+            warn!(
+                proxy = %p.name,
+                error = %e,
+                "store 中的代理未通过安全校验，已跳过"
             );
             continue;
         }
@@ -360,5 +406,141 @@ mod tests {
         assert_eq!(names, vec!["web", "ssh", "tmp"]);
         // web 只出现一次，且来自配置文件
         assert_eq!(merged.iter().filter(|p| p.name == "web").count(), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // H3（v0.5.4）：store 恢复路径必须走 validate_remote_proxy
+    // ------------------------------------------------------------------
+
+    /// ★★ H3 核心回归：store 里的危险字段**必须在恢复时被拦下**。
+    ///
+    /// 威胁模型：store 文件的用途是持久化"服务端面板增删过的代理"，
+    /// 所以它的内容与服务端下发的 ServerCmd 属于**同一信任级别**。
+    /// 早先这里只查 `name` 非空，于是一份写着
+    /// `{"plugin":"static_file","plugin_local_path":"/etc"}` 的 store 文件
+    /// 重启后直接生效 ⇒ 任意文件读取，且绕过了第一轮专门为此写的闸门。
+    #[test]
+    fn store_里的危险字段必须在恢复时被拦下() {
+        let dir = std::env::temp_dir().join(format!("nfrp-store-h3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.json");
+
+        // 手工构造一份含危险字段的 store（模拟被写入/被篡改）
+        //
+        // ★ 字段名必须是 **snake_case** —— `ProxyConfig` 的 serde 没加 rename。
+        // ★ `local_addr` 是 ProxyConfig 的**必填字段**（没有 serde default）：
+        //   漏了它会让**整份文件**反序列化失败、落到"解析失败已忽略"分支，
+        //   于是条目压根没进内存 —— 测试就会因为这个原因假通过，
+        //   而不是因为校验真的拦住了它。我第一版正是这么写错的，
+        //   靠"还原旧代码后测试仍绿"才发现（见 tmp/verify_h3_test.py）。
+        let evil = r#"{
+  "version": 1,
+  "proxies": [
+    {
+      "name": "evil",
+      "type": "tcp",
+      "local_addr": "127.0.0.1:9999",
+      "plugin": "static_file",
+      "plugin_local_path": "/etc",
+      "remote_port": 6001
+    }
+  ]
+}"#;
+        std::fs::write(&path, evil).unwrap();
+
+        let c = cfg_with_path(&path);
+        let s = Store::from_config(&c).unwrap();
+
+        assert!(
+            !s.dynamic_names().iter().any(|n| n == "evil"),
+            "带 pluginLocalPath 的 store 条目绝不能进入运行态，实际：{:?}",
+            s.dynamic_names()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 四种危险字段逐个验证（不止 pluginLocalPath）。
+    #[test]
+    fn store_里四种本机资源字段都要拦() {
+        let dir = std::env::temp_dir().join(format!("nfrp-store-h3b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let cases = [
+            ("plugin_local_path", "\"plugin_local_path\": \"/etc\""),
+            (
+                "plugin_local_addr",
+                "\"plugin_local_addr\": \"169.254.169.254:80\"",
+            ),
+            (
+                "plugin_crt_path",
+                "\"plugin_crt_path\": \"/etc/ssl/private/k.pem\"",
+            ),
+            (
+                "plugin_key_path",
+                "\"plugin_key_path\": \"/etc/ssl/private/k.key\"",
+            ),
+        ];
+
+        for (field, line) in cases {
+            let path = dir.join(format!("store-{field}.json"));
+            // ★ 必须带齐必填字段（`local_addr`），否则整份文件解析失败 ⇒ 假通过
+            let content = format!(
+                "{{\"version\":1,\"proxies\":[{{\"name\":\"e\",\"type\":\"tcp\",\
+                  \"local_addr\":\"127.0.0.1:9999\",{line}}}]}}"
+            );
+            std::fs::write(&path, content).unwrap();
+            let c = cfg_with_path(&path);
+            let s = Store::from_config(&c).unwrap();
+            assert!(
+                s.dynamic_names().is_empty(),
+                "{field} 没被拦住：{:?}",
+                s.dynamic_names()
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 干净的 store 仍要正常恢复 —— 修复不能误伤合法用法。
+    #[test]
+    fn store_里的合法代理仍能恢复() {
+        let dir = std::env::temp_dir().join(format!("nfrp-store-h3c-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.json");
+
+        // 注意：`ProxyConfig` 的 serde 字段名是 **snake_case**（没加 rename），
+        // 所以这里写 `local_addr` / `remote_port` 而不是 camelCase。
+        let good = r#"{
+  "version": 1,
+  "proxies": [
+    {"name": "ok", "type": "tcp", "local_addr": "127.0.0.1:8080", "remote_port": 6002}
+  ]
+}"#;
+        std::fs::write(&path, good).unwrap();
+
+        let c = cfg_with_path(&path);
+        let s = Store::from_config(&c).unwrap();
+        assert!(
+            s.dynamic_names().iter().any(|n| n == "ok"),
+            "合法条目必须照常恢复，实际：{:?}",
+            s.dynamic_names()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `merge_initial` 是合流点，也要挡住危险条目（纵深防御）。
+    #[test]
+    fn merge_initial_也要挡住危险条目() {
+        let mut bad = proxy("bad");
+        bad.plugin_local_path = "/etc".into();
+
+        let merged = merge_initial(&[proxy("good")], vec![bad]);
+        let names: Vec<String> = merged.iter().map(|p| p.name.clone()).collect();
+        assert_eq!(names, vec!["good"], "危险条目不能通过 merge_initial 混进来");
     }
 }

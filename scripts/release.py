@@ -461,16 +461,46 @@ def collect(targets: list[str], out: Path, assets: Path) -> dict[str, list[Path]
         (dest / "README.md").write_text(readme, encoding="utf-8", newline="\n")
         files.append(dest / "README.md")
 
+        # ★ v0.5.4：README 顶部引用了 `assets/icons/` 下的 logo，
+        #   不一起打包的话，包内 README 会显示一个裂开的图。
+        #   保留 `assets/icons/` 的层级结构（README 在包根，相对路径才对得上）。
+        icons_src = assets / "icons"
+        if icons_src.is_dir():
+            for icon in sorted(icons_src.glob("*.png")):
+                rel = Path("assets") / "icons" / icon.name
+                (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(icon, dest / rel)
+                files.append(dest / rel)
+
         staged[platform] = files
         log(f"已暂存 {platform}：{len(files)} 个文件")
     return staged
+
+
+def _arcname(f: Path) -> str:
+    """归档内的条目名（v0.5.4）。
+
+    默认取**文件名** —— 包内平铺，用户解压即用，这是有意的设计
+    （`frps` / `frpc` / 示例配置都直接躺在包根）。
+
+    唯一的例外是 `assets/` 下的素材：README 里用相对路径引用它们
+    （例如 `assets/icons/nfrp-icon-256.png`），平铺过去就对不上了，
+    包内 README 会显示裂图。所以这类文件**保留 `assets/...` 层级**。
+    """
+    parts = f.parts
+    if "assets" in parts:
+        # 从后往前找最后一个 `assets` 段，取它及其之后的部分
+        i = len(parts) - 1 - parts[::-1].index("assets")
+        if i < len(parts) - 1:  # 后面确实还有内容，不是恰好叫 assets 的文件
+            return "/".join(parts[i:])
+    return f.name
 
 
 def make_zip(files: list[Path], out_path: Path) -> None:
     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as z:
         for f in files:
             # 固定时间戳：同样的输入永远得到同样的包，便于校验值复现
-            zi = zipfile.ZipInfo(f.name, date_time=(1980, 1, 1, 0, 0, 0))
+            zi = zipfile.ZipInfo(_arcname(f), date_time=(1980, 1, 1, 0, 0, 0))
             zi.compress_type = zipfile.ZIP_DEFLATED
             is_bin = f.stem in ("frps", "frpc")
             zi.external_attr = (0o755 if is_bin else 0o644) << 16
@@ -481,7 +511,7 @@ def make_zip(files: list[Path], out_path: Path) -> None:
 def make_tar(files: list[Path], out_path: Path) -> None:
     with tarfile.open(out_path, "w:gz") as t:
         for f in files:
-            ti = t.gettarinfo(str(f), arcname=f.name)
+            ti = t.gettarinfo(str(f), arcname=_arcname(f))
             ti.mode = 0o755 if f.stem in ("frps", "frpc") else 0o644
             ti.mtime = 0  # 同上：可复现
             ti.uid = ti.gid = 0

@@ -369,7 +369,7 @@ python scripts/release.py pack \
 python scripts/pack_android.py
 
 # 源码包（可复现：同一个树打两次字节一致，脚本自己验）
-python ../tmp/make_src_tarball.py      # 产物：dist/release/nfrp-src-<ver>.tar.gz
+python scripts/make_src_tarball.py     # 产物：dist/release/nfrp-src-<ver>.tar.gz
 
 # 生成 SHA256SUMS（--sign 还会产出 Ed25519 分离签名）
 python scripts/release.py checksum --dir dist/release --sign

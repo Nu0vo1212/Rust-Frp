@@ -143,6 +143,15 @@ def main() -> int:
     h = sha256(zip_path)
     log(f"{zip_path}  {zip_path.stat().st_size / 1e6:.2f} MB")
     log(f"sha256 {h}")
+
+    # 再放一份到 dist/release：那里是"Release 资产目录"，
+    # `verify_dist_matches_release.py` 会把它和 GitHub 上的资产逐个比对。
+    # 只在 dist/android 留一份的话，闸门会报"Release 里有、本地没有"。
+    release_dir = ROOT.parent / "dist" / "release"
+    if release_dir.is_dir():
+        target = release_dir / zip_path.name
+        shutil.copy2(zip_path, target)
+        log(f"同步到发布目录：{target}")
     return 0
 
 

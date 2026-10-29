@@ -5961,3 +5961,66 @@ aarch64 任务把它还原出来、放进**自己那个基础镜像更老的容�
    同一份代码在两种环境里"一个绿一个红"，先怀疑共用的中间产物。
 3. **收口要有闸门**：这轮加的"打包后 sha256 自检"和"dist 与 Release 比对"
    都不是为了这一次，是为了下一次不用靠人记得。
+
+---
+
+## v0.6.7 发布记录（2026-10-29）
+
+Release id 427869196，tag 0.6.7，指向 2fb1ffa9。
+
+### CI：连续 3 次全绿
+
+| # | run | 提交 | 结果 |
+|---|---|---|---|
+| 1 | 40866116928 | 20e7a53（只改 CI） | 7/7 绿 |
+| 2 | 40873116721 | 1e21ddaa（C 组修复 + 版本号） | 7/7 绿 |
+| 3 | 40874794218 | 2fb1ffa9（发版脚本进仓库 + README 对齐） | 7/7 绿 |
+
+### 8 个资产（sha256 取自 SHA256SUMS.txt）
+
+| 资产 | 大小 | sha256（前 16 位） |
+|---|---|---|
+| 
+frp-windows-amd64.zip | 4.32 MB | c7db7fb5b089abda |
+| 
+frp-linux-amd64.tar.gz | 5.03 MB | 8dcd68f8070ada45 |
+| 
+frp-linux-arm64.tar.gz | 5.64 MB | 701279545115c8a6 |
+| 
+frp-android-v0.6.7.zip | 9.28 MB | 6247308907774dce |
+| 
+frp-src-067.tar.gz | 1.19 MB | 5818d8e4d7259e1 |
+| SHA256SUMS.txt / .sig / 
+elease.pub | — | Ed25519 指纹 763896b5…（与 0.6.6 同一把钥匙） |
+
+闸门实测：erify_dist_matches_release.py --check-android → 8/8 名称与 sha256 全部一致。
+
+### 各产物在哪编（下次照着做）
+
+| 产物 | 位置 | 命令要点 |
+|---|---|---|
+| windows-amd64 | 本机 | cargo build --release --workspace |
+| linux-amd64 | 云服务器 | cargo build --release（glibc 动态，形状与 0.6.6 一致） |
+| linux-arm64 | **本机 WSL Ubuntu 24.04** | pt install gcc-aarch64-linux-gnu；RUSTFLAGS="-C target-feature=+crt-static"；CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc |
+| android ×2 | 本机 | NDK 30 的 arch64/x86_64-linux-android26-clang，见 memory/ANDROID-BUILD.md |
+
+### 两个真实踩到的坑
+
+1. **云服务器编 arm64 被 OOM 杀**。机器只有 1.8 GB 内存，release profile 是
+   lto + codegen-units=1 + opt-level=z，两个 bin 同时链接时 rustc 峰值顶穿内存，
+   内核直接 SIGKILL（日志里是 rror: could not compile ... (signal: 9)）。
+   结论：**在内存小的机器上编就加 -j 1**，一个 bin 一个 bin 来。
+   （清理服务器时顺带删掉了那棵树留下的 9.6 GB 构建缓存，见桌面清理记录。）
+2. **WSL 里没法直接 cargo build**：static.rust-lang.org 不通（用中科大镜像装 rustup），
+   crates.io 索引只有 68 B/s（cargo vendor 跑十几分钟一个文件都没写）。
+   最终做法：从 Cargo.lock 取每个 crate 的 checksum，为 Windows 上已解压的
+   
+egistry/src/<crate> 目录补一个 .cargo-checksum.json（iles 留空），
+   再用 [source.crates-io] replace-with 指过去，CARGO_NET_OFFLINE=true 编译。
+   —— 记在这里，是为了下次不用再试一遍。
+
+### 安卓包的位置约定（这轮补的）
+
+pack_android.py 现在把 zip 同时写到 dist/android（当前版本核对用）和
+dist/release（Release 资产目录）。只写前者的话，发版闸门会报
+“Release 里有、本地 dist/release 没有”。

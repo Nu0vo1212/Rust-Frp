@@ -85,13 +85,22 @@ impl<S: AsyncRead + Unpin> HttpIo<S> {
     }
 
     /// 再读一段进缓冲，返回读到的字节数（0 = 对端关闭）。
+    ///
+    /// # 取消安全（v0.6.7 重构的关键）
+    ///
+    /// 用 [`AsyncReadExt::read_buf`] **直接读进 `self.buf`**，而不是
+    /// `read(&mut 局部数组)` 再 `extend_from_slice`。区别在于：
+    ///
+    /// * 局部数组版：`poll_read` 已经把字节取走、`extend` 还没执行时 future 被
+    ///   `select!` 取消 ⇒ **这批字节凭空消失**；
+    /// * `read_buf` 版：字节落在**属于 `self` 的缓冲**里，future 被取消也还在。
+    ///
+    /// 这正是 `plugin_bridge` 那个"Linux 上 5/10 超时、请求从未转给上游"
+    /// 的根因（第十五轮记录、第十七轮仍未修）。现在补上。
     pub async fn fill(&mut self) -> Result<usize> {
-        let mut chunk = [0u8; 16 * 1024];
-        let n = self.stream.read(&mut chunk).await?;
-        if n == 0 {
-            return Ok(0);
-        }
-        self.buf.extend_from_slice(&chunk[..n]);
+        // 预留一次读取的空间：`read_buf` 只在**预留容量**里写，不会无限膨胀。
+        self.buf.reserve(16 * 1024);
+        let n = self.stream.read_buf(&mut self.buf).await?;
         Ok(n)
     }
 
@@ -106,39 +115,34 @@ impl<S: AsyncRead + Unpin> HttpIo<S> {
     /// （★ v0.5.8，第八轮审计 **F8T-1**：`https2*` 悬挂上游 + 访问方撤离，
     /// 上游连接原先永不释放）。
     ///
-    /// # ★★ v0.6.4：这里有一个**已知的取消安全缺陷，本轮未修好**
+    /// # 取消安全（v0.6.7 修好了，第十五 / 十七轮的已知缺陷已关闭）
     ///
-    /// 用 `read(&mut chunk)` 读进**局部数组**。若这个 future 在 `select!`
-    /// 里被另一支抢先 drop，已经 `poll_read` 进来的字节会随局部 `chunk`
-    /// 一起消失。
+    /// 第十五轮实测：同一测试在 Linux 上 10 次里 5 次 5 秒超时，表现是
+    /// "插件收到连接却从未把请求转给上游"。根因是旧实现 `read(&mut chunk)`
+    /// 读进**局部数组**，future 被 `select!` 取消时那批字节随局部变量一起消失。
     ///
-    /// 实测表现（Linux）：`plugin_bridge` 的 `http2*` / `https2*` 端到端用例
-    /// 10 次跑出 5 通过 / 5 次 5 秒超时；超时时插件收到连接却从未把请求
-    /// 转给上游。Windows 上 21/21 稳定通过。
+    /// 旧的两版修法都不对（都引入 100% CPU 忙等）：
+    /// 1. `read_buf` + "缓冲非空就立即返回 `Ok(false)`" ⇒ 调用方
+    ///    `loop { select! }` 每轮都被立刻叫醒 ⇒ 忙等；
+    /// 2. 在循环里加 `if io.available() > 0 { return Ok(fut.await) }` 只治了
+    ///    一半 —— 判断放在了 `watch_closed` **返回之后**，那一轮已经空转了。
     ///
-    /// ## 两次失败的修复尝试（如实记录）
+    /// v0.6.7 的修法（两处一起改才成立）：
+    /// * 本函数改用 [`Self::fill`]（`read_buf` 写进 `self.buf`）⇒ 取消不丢字节；
+    /// * **调用方**在 `select!` **之前**先看 `available()`：缓冲里有字节就直接
+    ///   `fut.await`，不再进 `select!` ⇒ 没有任何一路会"永远就绪"。
     ///
-    /// 1. 改成 `read_buf` 直接读进 `self.buf` + 缓冲非空时立即返回
-    ///    ⇒ 调用方 `wait_upstream` 的 `loop { select! }` 变成 **100% CPU
-    ///    忙等死循环**（云端 4 进程各烧 20 分钟 CPU，本地单进程烧 1288 秒）。
-    /// 2. 再在循环里加 `if io.available() > 0 { return Ok(fut.await) }`
-    ///    ⇒ 仍然空转，因为 `read_buf` 已经把数据吸进缓冲，`available()` 恒 > 0。
-    ///
-    /// ## 正确方向（未实施）
-    ///
-    /// 让"读"只有一个所有者：单独一个读协程独占 `stream`，把字节推进共享
-    /// 队列，`wait_upstream` 只等队列信号。这样两个 future 不会抢同一个
-    /// stream，取消也就不会丢数据。这需要重构 `HttpIo` 的所有权结构。
-    ///
-    /// 在此之前保持原实现 —— **宁可保留已知缺陷，也不引入忙等**。
+    /// ★ 使用约束（别写回旧形状）：本函数在缓冲非空时会**立即**返回
+    ///   `Ok(false)`。调用方必须保证"返回 false 之后不会再次立刻调用它"，
+    ///   否则就是忙等。`wait_upstream` 已按这个约束写，并有
+    ///   `wait_upstream_不许忙等` 回归测试盯着。
     pub async fn watch_closed(&mut self) -> Result<bool> {
-        let mut chunk = [0u8; 1024];
-        let n = self.stream.read(&mut chunk).await?;
-        if n == 0 {
-            return Ok(true);
+        if self.available() > 0 {
+            // 缓冲里已经有数据 ⇒ 对端至少到那时还活着；并且"关闭"要靠下一次
+            // read 才能观测，而这里不能读（读了就丢进缓冲、又不敢保证调用方消费）。
+            return Ok(false);
         }
-        self.buf.extend_from_slice(&chunk[..n]);
-        Ok(false)
+        Ok(self.fill().await? == 0)
     }
 
     /// 读出一个 `\r\n\r\n` 结尾的头部块，返回行列表（不含结尾空行）。
@@ -878,6 +882,7 @@ pub fn strip_hop_by_hop(head: &mut HeadParts) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tokio::io::duplex;
 
     fn lines(v: &[&str]) -> Vec<String> {
@@ -1142,8 +1147,13 @@ mod tests {
     /// ★ v0.5.8（第八轮审计 F8T-1，低危）配套：`watch_closed` 要能识别 EOF，
     /// 且**读到的字节不会丢**（存进缓冲，后续照常消费）。
     ///
-    /// 这是"等待上游时同时盯着访问侧"的底层积木：识别不了 EOF 就退化成
-    /// 原来的"替已经离开的访问者一直等"；丢了字节就会破坏管道化请求。
+    /// ★ v0.6.7 起语义补一条：**缓冲里还有数据时返回 `Ok(false)`** ——
+    /// 不读就无法观测 EOF，硬读又会把字节藏进缓冲。调用方契约是
+    /// "先看 `available()`、有数据就先消费"，`wait_upstream` 已按此写。
+    ///
+    /// ★ 这一调用必须**立刻**返回：老实现（无条件 `read`）在缓冲非空时仍会去读，
+    /// 而对端此时沉默 ⇒ 永久挂起。用 `timeout` 兜住，让这种回退**快速失败**
+    /// 而不是把整个测试进程挂死（挂死看起来只是"CI 超时"，查不出原因）。
     #[tokio::test]
     async fn watch_closed_识别_eof_且不丢字节() {
         let (mut a, b) = duplex(64);
@@ -1151,11 +1161,73 @@ mod tests {
         // 先来一段数据：不能算"关闭"，且字节要留在缓冲里
         a.write_all(b"hello").await.unwrap();
         assert!(!io.watch_closed().await.unwrap(), "收到数据不算关闭");
+        let again = tokio::time::timeout(Duration::from_millis(500), io.watch_closed()).await;
+        assert!(
+            again.is_ok(),
+            "缓冲非空时必须立刻返回 false，不许再去 read（会永久挂起）"
+        );
+        assert!(!again.unwrap().unwrap(), "缓冲非空时保守返回 false");
+        assert_eq!(io.available(), 5, "返回 false 不能顺手把字节消费掉");
+        assert_eq!(
+            io.read_n(5).await.unwrap(),
+            b"hello".to_vec(),
+            "之前读到的 5 字节一个都不能少"
+        );
         // 对端关闭：必须识别为关闭
         drop(a);
         assert!(io.watch_closed().await.unwrap(), "EOF 必须被识别");
-        // 之前读到的 5 字节一个都不能少
-        assert_eq!(io.read_n(5).await.unwrap(), b"hello".to_vec());
+    }
+
+    /// ★★ v0.6.7：`watch_closed` 被 `select!` 取消后，字节必须还在。
+    ///
+    /// 锁住的不变式：读取结果落在 **`self.buf`**（`read_buf`）而不是某个局部
+    /// 数组里，所以 future 被 drop 不会带走数据。
+    ///
+    /// ★ 如实标注这条测试的边界：它**证明不了**第十五轮那个 Linux 竞态已经消失
+    /// —— 那是时序相关的，Windows 上 21/21 都复现不出来。这里能做的是
+    /// "取消一次 → 字节一个不少 → 之后再读还能读全"这条确定性检查；
+    /// 真正盯住 Linux 的闸门是 CI 上 `http2*` / `https2*` 用例连跑，
+    /// 以及同一文件里的 `wait_upstream_不许忙等`（防第三次忙等回滚）。
+    #[tokio::test]
+    async fn watch_closed_被取消时不丢字节() {
+        let (mut a, b) = duplex(4096);
+        let mut io = HttpIo::new(b);
+
+        // 第一阶段：对端还没发数据，watch_closed 必然挂起；这里把它取消掉。
+        {
+            let fut = io.watch_closed();
+            tokio::pin!(fut);
+            tokio::select! {
+                r = &mut fut => panic!("对端沉默时 watch_closed 不该就绪：{r:?}"),
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+        assert_eq!(io.available(), 0, "取消之后缓冲里不该凭空多出字节");
+
+        // 第二阶段：数据到了，照常读全 —— 一个字节都不能少。
+        a.write_all(b"hello").await.unwrap();
+        assert_eq!(
+            io.read_n(5).await.unwrap(),
+            b"hello".to_vec(),
+            "取消过一次 watch_closed 之后，后续读取仍然必须拿到完整字节"
+        );
+
+        // 第三阶段：再来一轮"数据在途 + 与另一支一起 select"，模拟管道化请求。
+        a.write_all(b"world").await.unwrap();
+        for _ in 0..64 {
+            tokio::select! {
+                _ = io.watch_closed() => {}
+                _ = tokio::task::yield_now() => {}
+            }
+            if io.available() > 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            io.take_buffered(),
+            b"world".to_vec(),
+            "watch_closed 被取消时不能吃掉字节"
+        );
     }
 
     #[tokio::test]

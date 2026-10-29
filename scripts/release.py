@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -346,6 +347,60 @@ def find_binary(src: Path, stem: str) -> Path:
     raise SystemExit(f"在 {src} 下找不到 {stem} / {stem}.exe")
 
 
+def cargo_target_dir() -> Path:
+    """`cargo metadata` 认定的产物目录 —— 唯一事实来源。
+
+    为什么不写死 `target/release`：本机把构建目录挪到 D 盘（见
+    `memory/PROJECT.md`），仓库里那份 `target/` 可能停留在几周前。
+    打包脚本一旦读错目录，就会把**上一版的二进制**打进新版本的包
+    （v0.5.5 安卓包被打进 v0.5.6 就是这么来的，踩过两次）。
+
+    `--target 平台:@release` 这种写法就是用这个函数解析的。
+    """
+    env = os.environ.get("CARGO_TARGET_DIR")
+    if env:
+        p = Path(env)
+        return p if p.is_absolute() else (ROOT / p)
+    r = subprocess.run(
+        ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+        cwd=ROOT,
+        capture_output=True,
+        # 必须显式 utf-8：cargo 永远输出 UTF-8，而 Windows 上 `text=True`
+        # 会用本地代码页（简体中文机器 = GBK）解码。项目路径里有中文
+        # （`E:\项目\RustFrp`）时，GBK 解不出 UTF-8 字节，读取线程直接抛
+        # UnicodeDecodeError，`r.stdout` 变成 None —— 表现为
+        # `TypeError: the JSON object must be str...not NoneType`，
+        # 跟"产物目录"一点关系都看不出来。2026-10-29 踩过一次。
+        encoding="utf-8",
+        errors="replace",
+    )
+    if r.returncode != 0:
+        raise SystemExit(
+            "cargo metadata 跑不起来，没法推导产物目录：\n"
+            + (r.stderr or "").strip()[:400]
+            + "\n  可以显式用 `--target 平台:/绝对/路径/release` 绕过"
+        )
+    raw = r.stdout or ""
+    if not raw.strip():
+        raise SystemExit(
+            "cargo metadata 没有输出（返回码却是 0），没法推导产物目录；"
+            "请显式用 `--target 平台:/绝对/路径/release`"
+        )
+    return Path(json.loads(raw)["target_directory"])
+
+
+def resolve_src(spec_dir: str) -> Path:
+    """把 `--target` 的目录部分解析成真实路径。
+
+    - `@release` / `@aarch64-unknown-linux-musl/release` ⇒ 相对 `cargo metadata`
+      的 `target_directory`（推荐写法，永不读错目录）
+    - 其它 ⇒ 当成普通路径，原样使用（跨平台构建机给绝对路径时用）
+    """
+    if spec_dir.startswith("@"):
+        return cargo_target_dir() / spec_dir[1:]
+    return Path(spec_dir)
+
+
 def check_toml_assets(assets: Path) -> None:
     """随包的示例配置必须**能解析**。
 
@@ -421,9 +476,16 @@ def build_readme(out_dir: Path) -> str:
     return header + body
 
 
-def collect(targets: list[str], out: Path, assets: Path) -> dict[str, list[Path]]:
-    """把各平台的产物复制到一个临时 staging 目录，返回 {平台: [文件]}。"""
+def collect(
+    targets: list[str], out: Path, assets: Path
+) -> tuple[dict[str, list[Path]], dict[str, dict[str, Path]]]:
+    """把各平台的产物复制到临时 staging 目录。
+
+    返回 `({平台: [文件]}, {平台: {包内名: 源产物路径}})` —— 后者给打包后的
+    sha256 自检用：比对的是**源产物**，不是 staging 里的副本。
+    """
     staged: dict[str, list[Path]] = {}
+    origins: dict[str, dict[str, Path]] = {}
     staging = out / ".staging"
     if staging.exists():
         shutil.rmtree(staging)
@@ -434,20 +496,27 @@ def collect(targets: list[str], out: Path, assets: Path) -> dict[str, list[Path]
         if ":" not in spec:
             raise SystemExit(f"--target 需要写成 平台:目录，收到 {spec!r}")
         platform, src = spec.split(":", 1)
-        src_dir = Path(src)
+        src_dir = resolve_src(src)
         if not src_dir.is_dir():
-            raise SystemExit(f"产物目录不存在：{src_dir}")
+            raise SystemExit(
+                f"产物目录不存在：{src_dir}\n"
+                f"  （`@release` 会解析到 cargo metadata 的 target_directory；"
+                f"本机当前是 {cargo_target_dir()}）"
+            )
         dest = staging / platform
         dest.mkdir(parents=True, exist_ok=True)
 
         files: list[Path] = []
+        origins[platform] = {}
         # Windows 上可执行文件必须有 .exe 后缀，否则双击/命令行都跑不起来
         suffix = ".exe" if platform.startswith("windows") else ""
         for packaged, stem in BINARIES:
             name = packaged + suffix
-            shutil.copy2(find_binary(src_dir, stem), dest / name)
+            source_bin = find_binary(src_dir, stem)
+            shutil.copy2(source_bin, dest / name)
             (dest / name).chmod(0o755)
             files.append(dest / name)
+            origins[platform][name] = source_bin
 
         # 素材：assets 里有什么就放什么，缺了不致命（LICENSE 例外，必须齐全）
         for doc in DOCS:
@@ -474,7 +543,7 @@ def collect(targets: list[str], out: Path, assets: Path) -> dict[str, list[Path]
 
         staged[platform] = files
         log(f"已暂存 {platform}：{len(files)} 个文件")
-    return staged
+    return staged, origins
 
 
 def _arcname(f: Path) -> str:
@@ -521,13 +590,51 @@ def make_tar(files: list[Path], out_path: Path) -> None:
     log(f"打包 {out_path.name}")
 
 
+def verify_archive(archive: Path, expected: dict[str, Path]) -> None:
+    """解包，把包内二进制与**源产物**逐个 sha256 比对，不一致直接非零退出。
+
+    这是「打包链路」唯一真正防呆的一步：前面所有环节（找目录、复制、压缩）
+    任何一处读错了文件，这里都会红。比对源产物而不是 staging 副本，
+    是为了不把「复制也错了」这种情况一起放过。
+    """
+    got: dict[str, str] = {}
+    if archive.suffix == ".zip":
+        with zipfile.ZipFile(archive) as z:
+            for name in z.namelist():
+                base = Path(name).name
+                if base in expected:
+                    got[base] = hashlib.sha256(z.read(name)).hexdigest()
+    else:
+        with tarfile.open(archive, "r:*") as t:
+            for m in t.getmembers():
+                base = Path(m.name).name
+                if m.isfile() and base in expected:
+                    fh = t.extractfile(m)
+                    if fh is not None:
+                        got[base] = hashlib.sha256(fh.read()).hexdigest()
+
+    bad: list[str] = []
+    for name, src in expected.items():
+        want = sha256(src)
+        if name not in got:
+            bad.append(f"{name}: 包里没有这个文件（源 {src}）")
+        elif got[name] != want:
+            bad.append(f"{name}: 不符\n    源 {src}\n    源 sha256 {want}\n    包 sha256 {got[name]}")
+    if bad:
+        raise SystemExit(
+            f"打包后自检失败：{archive.name} 里的二进制与源产物不一致，拒绝交付\n  "
+            + "\n  ".join(bad)
+        )
+    log(f"自检通过：{archive.name}（{len(expected)} 个二进制与源产物 sha256 一致）")
+
+
 def cmd_pack(args: argparse.Namespace) -> int:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     assets = find_assets(args.assets)
     log(f"素材目录：{assets}")
     check_toml_assets(assets)
-    staged = collect(args.target, out, assets)
+    staged, origins = collect(args.target, out, assets)
 
     produced: list[Path] = []
     for platform, files in staged.items():
@@ -539,6 +646,8 @@ def cmd_pack(args: argparse.Namespace) -> int:
             p = out / f"{name}.tar.gz"
             make_tar(files, p)
         produced.append(p)
+        if not args.skip_verify:
+            verify_archive(p, origins[platform])
 
     shutil.rmtree(out / ".staging", ignore_errors=True)
     log(f"共 {len(produced)} 个包 -> {out}")
@@ -644,6 +753,8 @@ def cmd_checksum(args: argparse.Namespace) -> int:
         ["gpg", "--batch", "--yes", "--detach-sign", "--armor", "--output", str(sig_file), str(sums)],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if r.returncode == 0:
         log(f"已用 gpg 签名 -> {sig_file.name}")
@@ -757,7 +868,11 @@ def verify_signature(sums: Path, sig_file: Path) -> bool:
         print("  存在签名但本机没有 gpg，跳过验签")
         return True
     r = subprocess.run(
-        ["gpg", "--verify", str(sig_file), str(sums)], capture_output=True, text=True
+        ["gpg", "--verify", str(sig_file), str(sums)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if r.returncode == 0:
         print("  签名有效（gpg）")
@@ -779,10 +894,16 @@ def main() -> int:
         action="append",
         required=True,
         metavar="平台:目录",
-        help="例如 windows-amd64:target/release",
+        help="例如 windows-amd64:@release（@ 开头表示相对 cargo metadata 的 "
+        "target_directory，推荐）或 linux-amd64:/opt/build/amd64",
     )
     p_pack.add_argument("--out", default=str(DEFAULT_OUT), help="输出目录")
     p_pack.add_argument("--assets", help="素材目录（默认自动探测）")
+    p_pack.add_argument(
+        "--skip-verify",
+        action="store_true",
+        help="跳过打包后的 sha256 自检（只在明确知道自己在干什么时用）",
+    )
     p_pack.set_defaults(func=cmd_pack)
 
     p_key = sub.add_parser("keygen", help="生成 Ed25519 签名密钥对")

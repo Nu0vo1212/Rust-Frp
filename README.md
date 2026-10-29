@@ -57,6 +57,13 @@ nfrp-common = "0.6"
 > 例如 Release 为 `v0.6.1` 时，crates.io 上可能是 `0.6.2` ——
 > 因为 crates.io 不允许重发同一版本号（修个 README 也得升版本）。
 > **看代码功能以 Release 为准**；`cargo install` 拿到的始终是该 crate 的最新发布版。
+>
+> ★ **`cargo install` 拿到的二进制与 Release 里的同版本二进制不是同一次构建。**
+> 以 `0.6.6` 为例：crates.io 上的 0.6.6 是在 Release 之前打的，之后又改了几处
+> 才发出 `v0.6.6` 的包（版本号已占用，不能再发一次）。因此
+> **`cargo install nfrp-server@0.6.6` 与 Release 包里的 `frps` 行为可能不同**。
+> 要可复现、可对照 issue 的产物，请用[方式二：下载二进制](#方式二下载二进制)。
+> 后续版本起，发版顺序固定为「先发 crates.io，再用**同一次构建**打包 Release」。
 
 `nfrp-common` 的模块导览：
 
@@ -155,10 +162,16 @@ nfrp-common = "0.6"
 
 ### 工程质量
 
-- 867 个自动化测试，含真实 QUIC 栈握手、端到端集成测试、与官方 frpc/frps 真实抓包密文的解密回归
+- 890 个自动化测试（13 条需真机的设备面测试标 `#[ignore]`），含真实 QUIC 栈握手、端到端集成测试、与官方 frpc/frps 真实抓包密文的解密回归
 - CI 跑 `fmt` / `clippy` / 三系统全量测试 / 两个 musl 目标交叉构建 / 端到端冒烟
 - 第三方 GitHub Action 全部 pin 到 commit SHA；cosign 签名失败即红灯
 - 发布产物附 `SHA256SUMS` + Ed25519 分离签名
+
+> **依赖安全做到哪一步（把措辞说准）**：
+> `cargo audit` 是对**已公开的 RUSTSEC 公告**做比对（当前 0 命中，330 个依赖）；
+> `cargo deny` 管的是许可证、来源与重复依赖；
+> `cargo vet` 目前只有 **184 条 exemption**（即"暂时接受、未经人工审计"），
+> **不等于"依赖经过人工审计"**。本仓库任何地方都不该被读成后者。
 
 ## 快速开始
 
@@ -166,7 +179,9 @@ nfrp-common = "0.6"
 
 ```bash
 cargo build --release
-# 产物：target/release/nfrp-server（frps）、target/release/nfrp-client（frpc）
+# 产物：<target_directory>/release/nfrp-server（frps）、<target_directory>/release/nfrp-client（frpc）
+# target_directory 以 `cargo metadata` 为准：设了 CARGO_TARGET_DIR 或本机
+# `.cargo/config.toml` 时，产物就不在 ./target 下
 ```
 
 需要 Rust 1.75+。Windows 用 MSVC toolchain。
@@ -312,23 +327,25 @@ NFrp 可运行在官方 frp 的任一侧，双向实测通过：
 ```bash
 cargo fmt --all -- --check                # 格式
 cargo clippy --workspace --all-targets    # 静态检查（当前 0 告警）
-cargo test --workspace                    # 732 个测试
+cargo test --workspace                    # 890 个测试
 ```
 
-测试分布：
+测试分布（**v0.6.7 实测值**，`cargo test --workspace -j 1 -- --test-threads=1`）：
 
-| 目标 | 数量 |
-|---|---|
-| `common` 单元测试 | 344 |
-| `server` 单元测试（lib） | 232 |
-| `server` 单元测试（bin） | 17 |
-| `client` 单元测试 | 115 |
-| `server` 端到端集成测试 | 24 |
-| **合计** | **732** |
+| 目标 | 通过 | 忽略 |
+|---|---|---|
+| `nfrp-client` 单元测试 | 127 |  |
+| `nfrp-common` 单元测试（lib） | 432 | 3（需真机网卡） |
+| `nfrp-server` OIDC 端到端 | 9 |  |
+| `nfrp-server` 单元测试（lib） | 277 |  |
+| `nfrp-server` 单元测试（bin） | 17 |  |
+| `nfrp-server` 端到端集成测试 | 26 |  |
+| Wintun 真机（Windows） | 2 | 5 |
+| Linux TUN 真机 | 0 | 5 |
+| **合计** | **890** | **13** |
 
-★ 上表是 **v0.5.9 实测值**（`cargo test --workspace` 逐个 target 数的）。
-v0.5.8 的 725 加本轮 +7（第九轮 9 条修复 + 1 条加固的回归）= 732。
-数字对不上时以 `cargo test` 的输出为准。
+★ 数字对不上时以 `cargo test` 输出为准。`#[ignore]` 的 13 条全是**需要真机 /
+管理员权限**的设备面测试（Windows Wintun、Linux TUN），不是被跳过的问题测试。
 
 CI（`.github/workflows/ci.yml`）在每次 push / PR 上跑 `fmt --check` + `clippy -D warnings`，然后在 Linux / Windows / macOS 上跑全量测试，再做两个 musl 目标的交叉构建与端到端冒烟。
 
@@ -338,20 +355,46 @@ CI（`.github/workflows/ci.yml`）在每次 push / PR 上跑 `fmt --check` + `cl
 
 ```bash
 # 打三平台包（包内统一命名 frps / frpc，附示例配置与 README）
+# `@release` = `cargo metadata` 认定的 target_directory + /release，
+# 不要写死 `target/release`：本机构建目录可能被挪到别的盘（见下方说明）。
 python scripts/release.py pack \
-  --target windows-amd64:target/release \
+  --target windows-amd64:@release \
   --target linux-amd64:/path/to/amd64 \
   --target linux-arm64:/path/to/arm64 \
   --out dist/release
+
+# 安卓包（先把两个 target 编出来，命令见下）：
+#   cargo build --release --target aarch64-linux-android -p nfrp-server -p nfrp-client
+#   cargo build --release --target x86_64-linux-android  -p nfrp-server -p nfrp-client
+python scripts/pack_android.py
+
+# 源码包（可复现：同一个树打两次字节一致，脚本自己验）
+python ../tmp/make_src_tarball.py      # 产物：dist/release/nfrp-src-<ver>.tar.gz
 
 # 生成 SHA256SUMS（--sign 还会产出 Ed25519 分离签名）
 python scripts/release.py checksum --dir dist/release --sign
 
 # 本地验签 + 校验
 python scripts/release.py verify --dir dist/release
+
+# 发版前最后一道闸门：本地 dist/release 与 GitHub Release 资产一一对应
+# （名称 + sha256 都要对上；--check-android 顺带确认只留当前版本安卓包）
+python scripts/verify_dist_matches_release.py --check-android
 ```
 
-Linux 包在云端交叉编译（本机没有 Linux C 工具链，`ring` 需要编译 C）。arm64 走 `+crt-static` 全静态链接，无 glibc 依赖。
+`pack` 打完包会**自动解包自检**：包内 `frps` / `frpc` 与源产物逐个 sha256 比对，
+不一致直接非零退出 —— 防止"脚本读错目录、把上一版二进制打进新包"。
+（历史上踩过两次，见 `memory/PROJECT.md`。）
+
+> **构建目录**：本机把 `CARGO_TARGET_DIR` 从环境变量改成了
+> `nfrp/.cargo/config.toml` 里的 `target-dir = "D:/cargo-target-nfrp"`。
+> 这个文件**不入库**（含 Windows 绝对路径），新机器自己建一份即可。
+> 仓库里的 `nfrp/target/` 已清空归档，不会再出现"直接 `cargo build` 落到旧产物"。
+
+Linux 包用 [`cross`](https://github.com/cross-rs/cross) 在本机（Docker）交叉编译，
+`ring` 需要 C 工具链，cross 的镜像里已经备好。arm64 走 `+crt-static` 全静态链接，
+无 glibc 依赖。**Android 包必须显式指定 NDK 的 clang 作为 linker**（`CC_*` /
+`CARGO_TARGET_*_LINKER` 两组环境变量），完整命令与踩过的坑见 `memory/ANDROID-BUILD.md`。
 
 `release.py` 不依赖任何第三方 Python 包，也不依赖 Rust 工具链。签名缺失或失败会**非零退出**；确实要发未签名制品需显式加 `--allow-unsigned`。
 
@@ -395,8 +438,14 @@ docker run --rm -p 17000:17000 -p 17002:17002/udp \
   mode 0 场景；HardNAT、端口预测、多 STUN 地址与 TTL 探测等完整 NAT 分类
   尚未实现，极端 NAT 组合下可能打洞失败后由客户端回退中继。
 
-  **仍未做**：`webServer.tls.certFile` / `webServer.tls.keyFile`（面板 HTTPS）。
-  配置了这两个字段会在启动日志里明确报"未实现"，不会静默忽略。
+  **仍未做**：真实外部 IdP（Keycloak / Azure AD 等）上的 OIDC 互操作 e2e
+  （目前是对本地 mock IdP 跑 9 条）。SSH 网关的 tcpmux / stcp 只验到注册与清理，
+  **数据面没有 e2e**。
+
+  > ~~`webServer.tls.certFile` / `webServer.tls.keyFile`（面板 HTTPS）未实现~~
+  > —— **这条更正**：面板 HTTPS 自 v0.6.x 起已实现并有真实 HTTPS + HSTS 回归
+  > （`server/src/dashboard.rs::web_server_tls_真实_https_和_hsts`）。原文保留
+  > 是为了不改写历史记录，当前状态以本行为准。
 
   > `udpPacketSize` 的默认值**故意与官方不同**：官方默认 1500，NFRP 一直用
   > 65507（UDP 协议上限）。改成 1500 会**静默截断**现有用户的大 UDP 报文

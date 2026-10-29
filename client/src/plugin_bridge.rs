@@ -219,31 +219,26 @@ impl Bridge {
     /// 访问侧在此期间读到的字节由 `HttpIo::watch_closed` 存入缓冲，不会丢
     /// （管道化的下一条请求照常处理）；被 `select!` 取消的那支是取消安全的。
     ///
-    /// # ★★ v0.6.4：这里有一个**已知的 Linux 竞态，本轮未修好**
+    /// # ★★ v0.6.7：这里修好了 v0.6.4 记录的那个 Linux 竞态
     ///
-    /// 实测：同一测试在 Linux 上 10 次跑出 **5 通过 / 5 次超时**，
-    /// 超时表现为"插件收到连接却从未把请求转给上游"。
+    /// 历史：第十五轮实测同一测试在 Linux 上 10 次跑出 **5 通过 / 5 次超时**，
+    /// 超时表现为"插件收到连接却从未把请求转给上游"。根因是 `watch_closed`
+    /// 用 `read(&mut chunk)` 读进局部数组，被 `select!` 取消时那批字节消失，
+    /// 丢的正是请求体开头。
     ///
-    /// 根因已定位：`watch_closed` 用 `read(&mut chunk)` 读进**局部数组**，
-    /// 被 `select!` 取消时那批字节随局部变量消失，丢掉的可能正是请求体开头。
+    /// 两次失败尝试的共同点：都在"每一次 `select!` 都有一路立刻就绪"上翻车
+    /// ⇒ 100% CPU 忙等（云端 4 进程各烧 20 分钟 CPU）。
     ///
-    /// **两次修复尝试都失败了**，如实记录以免下一任重复踩：
+    /// 现在的写法（两处一起改）：
+    /// 1. `HttpIo::watch_closed` 内部走 `read_buf` 写进 `self.buf`，取消不丢字节；
+    /// 2. **本函数在进 `select!` 之前**先看 `io.available()`：缓冲里已有数据就
+    ///    直接 `fut.await`，根本不再进 `select!`。
     ///
-    /// 1. `watch_closed` 改成 `read_buf` 直接读进 `self.buf` +
-    ///    "缓冲非空就立即 `return Ok(false)`" ⇒ `loop { select! }` 变成
-    ///    100% CPU 的**忙等死循环**（云端 4 个进程各烧掉 20 分钟 CPU，
-    ///    本地单进程烧掉 1288 秒）。
-    /// 2. 再在循环里加 `if io.available() > 0 { return Ok(fut.await) }`
-    ///    ⇒ 仍然空转，因为 `watch_closed` 那份 `read_buf` 已经先把数据
-    ///    吸进缓冲，`available()` 永远 > 0。
-    ///
-    /// 正确方向（留给后续）：把"盯访问侧关闭"改成**单一所有权**的读协程 ——
-    /// 一个任务独占 `stream` 做读取，把字节推进共享队列，`wait_upstream`
-    /// 只等队列信号。那样不存在"两个 future 抢同一个 stream"的问题。
-    /// 这需要改动 `HttpIo` 的所有权结构，属于重构级改动，本轮不动。
+    /// 于是 `select!` 的两路都只会在真正"没事可做"时挂起 —— 没有一路是
+    /// 永远就绪的。回归测试：`wait_upstream_不许忙等`（数 poll 次数，不是看时间）。
     ///
     /// 影响面：仅 Linux 上 `http2*` / `https2*` 插件的端到端用例会间歇失败；
-    /// Windows 上 21/21 稳定通过。产品在 Windows 上不受影响。
+    /// Windows 上 21/21 稳定通过。
     async fn wait_upstream<T, S>(
         io: &mut HttpIo<&mut S>,
         fut: impl std::future::Future<Output = Result<T>>,
@@ -253,13 +248,19 @@ impl Bridge {
     {
         let mut fut = std::pin::pin!(fut);
         loop {
+            // ★ 关键顺序：先看缓冲，再进 select!（见上面 v0.6.7 说明）。
+            //   缓冲里有数据说明对端活着、且那批字节已经安全落在 io.buf 里，
+            //   继续 select! 只会让 watch_closed 立刻返回 ⇒ 忙等。
+            if io.available() > 0 {
+                return Ok(Some(fut.await?));
+            }
             tokio::select! {
                 r = &mut fut => return Ok(Some(r?)),
                 closed = io.watch_closed() => {
                     if closed? {
                         return Ok(None);
                     }
-                    // 访问侧还有数据（例如管道化请求）：已存进缓冲，继续等。
+                    // 读到了数据：已在 io.buf 里，下一轮走上面那个分支。
                 }
             }
         }
@@ -1174,6 +1175,95 @@ mod tests {
             .expect("插件应当立即收尾")
             .expect("插件任务不 panic");
         assert!(r.is_ok(), "访问方撤离应当安静收尾：{r:?}");
+    }
+
+    /// ★★★ v0.6.7 的「关门测试」：`wait_upstream` **不许忙等**。
+    ///
+    /// 前两次修复（第十五 / 十七轮）都栽在这里：改成 `read_buf` 之后，
+    /// `loop { select! }` 里总有一路立刻就绪，于是 100% CPU 空转
+    /// （云端 4 个进程各烧 20 分钟 CPU，本地单进程烧 1288 秒）。
+    ///
+    /// 所以这里**数 poll 次数**，而不是看耗时：一个永不完成的 fut + 一个沉默
+    /// 的对端，等 200ms。正常实现只会被 poll 个位数次；忙等会是几十万次。
+    /// 这条测试是这次重构的验收条件 —— 没有它，同样的错误会第三次发生。
+    #[tokio::test]
+    async fn wait_upstream_不许忙等() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::task::{Context, Poll};
+
+        struct Never(Arc<AtomicUsize>);
+        impl std::future::Future for Never {
+            type Output = Result<()>;
+            fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                let n = self.0.fetch_add(1, Ordering::Relaxed) + 1;
+                // ★ 数到 1 万次就**直接 panic**，而不是靠外面那个 200ms 超时：
+                //   忙等会把单线程 runtime 占死，连定时器都轮不到，测试会**挂住**
+                //   而不是失败（实测：旧写法跑 60s 还没退出）。挂住的测试在 CI 里
+                //   只是一条超时，看不出原因；这里让它在毫秒级给出明确断言。
+                if n > 10_000 {
+                    panic!("wait_upstream 在忙等：已轮询 {n} 次（阈值 10000）");
+                }
+                Poll::Pending
+            }
+        }
+
+        let (mut cli, mut srv) = tokio::io::duplex(64);
+        let mut io = HttpIo::new(&mut srv);
+        // ★ 关键前提：先把**字节灌进缓冲**，模拟"管道化的下一条请求已经到齐"。
+        //   这正是前两次翻车的形状 —— 缓冲非空时 `watch_closed` 立刻返回，
+        //   `loop { select! }` 就转成了死循环。缓冲空时谁也转不起来，
+        //   所以那种测法抓不到忙等（第一版这条测试就写错了）。
+        cli.write_all(b"x").await.unwrap();
+        io.fill().await.unwrap();
+        assert_eq!(io.available(), 1, "前置条件：缓冲里必须有 1 个字节");
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let r = tokio::time::timeout(
+            Duration::from_millis(200),
+            Bridge::wait_upstream(&mut io, Never(polls.clone())),
+        )
+        .await;
+        assert!(
+            r.is_err(),
+            "fut 永不完成、对端沉默 ⇒ 应当一直等（200ms 超时）"
+        );
+        let n = polls.load(Ordering::Relaxed);
+        assert!(
+            n < 50,
+            "wait_upstream 在忙等：200ms 内轮询了 {n} 次（阈值 50）"
+        );
+    }
+
+    /// ★★ v0.6.7 回归：修之前这条路径在 Linux 上 10 次跑出 5 次 5 秒超时
+    /// （"插件收到连接却从未把请求转给上游"）。单跑一次抓不住竞态，
+    /// 所以连跑 20 次 —— 单次失败概率 50% 时，20 次全过的概率是 1e-6。
+    #[tokio::test]
+    async fn 端到端_http2http_连跑20次不许偶发挂住() {
+        for i in 0..20 {
+            let (up, got) = fake_upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+            let b = Bridge::http2http(cfg_to(up)).unwrap();
+            let (out, r) = drive(
+                b,
+                b"POST /a HTTP/1.1\r\nHost: vhost.example.com\r\nContent-Length: 5\r\n\
+                  Connection: close\r\n\r\nhello",
+            )
+            .await;
+            r.unwrap_or_else(|e| panic!("第 {i} 轮插件应当正常收尾：{e:?}"));
+            let up_req = got
+                .await
+                .unwrap_or_else(|e| panic!("第 {i} 轮上游任务：{e:?}"));
+            assert!(
+                up_req.ends_with(b"\r\n\r\nhello"),
+                "第 {i} 轮请求体必须完整到达上游：{:?}",
+                String::from_utf8_lossy(&up_req)
+            );
+            assert!(
+                out.ends_with(b"ok"),
+                "第 {i} 轮响应必须完整搬回：{:?}",
+                String::from_utf8_lossy(&out)
+            );
+        }
     }
 
     /// ★ v0.5.8（第八轮审计 **F8T-1**）回归（上游 TLS 握手悬挂）：`https2https`

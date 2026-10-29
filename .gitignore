@@ -1,6 +1,9 @@
 # 构建产物
 /target
 
+# 本机构建目录固定（含 Windows 绝对路径，不能带到 Linux CI 上）
+/.cargo/config.toml
+
 # 本地草稿配置与日志
 *.log
 /tmp

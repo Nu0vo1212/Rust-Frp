@@ -1300,3 +1300,162 @@ PAGES_ZH['compat'] = `
 </div>
 </div>
 `;
+
+PAGES_ZH['nlink'] = `
+<h1 data-i18n="t-nlink">NLink v1 规划</h1>
+<p class="lead" data-i18n="nlink-lead">NLink 是 NFRp 在标准 frp 协议之外的扩展层。它只承载那些<strong>frp 协议本身没有位置表达</strong>、且<strong>确实有用户被卡住</strong>的能力。</p>
+
+<div class="callout">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+  <div>
+    <strong data-i18n="nlink-status-t">当前状态：规划中</strong>
+    <p data-i18n="nlink-status-d">这份文档是立项评估与设计约束，<strong>尚未实现</strong>。下面每一条都标注了它是否值得做、以及为什么。没有列进这张表的，一律走标准 frp 行为。</p>
+  </div>
+</div>
+
+<h2 data-i18n="nlink-why-h">为什么需要扩展层</h2>
+<p data-i18n="nlink-why-d">frp 的协议是够用的，但它把「传输、会话、鉴权、调度」都固定死了。有些问题不是"实现得不好"，而是<strong>协议里根本没有承载位置</strong>——比如连接迁移需要传输层有独立的连接标识，而 frp 是在 TCP/TLS 之上套 yamux，这个位置不存在。</p>
+
+<h2 data-i18n="nlink-gate-h">准入判断：四个门槛必须同时成立</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th style="width:120px">门槛</th><th>含义</th></tr></thead>
+<tbody>
+<tr><td><strong>① 协议层无解</strong></td><td>不是"frp 实现得差"，而是<strong>协议本身</strong>没有字段、没有流程、没有语义可以承载</td></tr>
+<tr><td><strong>② 有明确需求</strong></td><td>能说清"谁在什么场景被卡住"，而不是"技术上可以做"</td></tr>
+<tr><td><strong>③ 必须双端</strong></td><td>单端升级做不到，或单端做出来是残缺的</td></tr>
+<tr><td><strong>④ 可回退</strong></td><td>对端不支持时必须能<strong>无损退回</strong>标准 frp</td></tr>
+</tbody>
+</table>
+</div>
+<p data-i18n="nlink-gate-note">第 ④ 条是硬门槛。做不到可回退的，不进 NLink。</p>
+
+<h2 data-i18n="nlink-list-h">候选清单</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th style="width:64px">#</th><th style="width:180px">功能</th><th>为什么 frp 协议根本解决不了</th><th style="width:200px">用户需求场景</th></tr></thead>
+<tbody>
+<tr>
+  <td>1</td>
+  <td><strong>原生 QUIC / 多路复用与连接迁移</strong></td>
+  <td>frp 的传输层是「先建 TCP/TLS，再套 yamux」。连接迁移要求<strong>连接标识与四元组解耦</strong>，这是传输层语义，在 yamux 之上做不了。QUIC 的 <code>connection_id</code> 在 frp 里没有承载位置。</td>
+  <td>移动网络切换 Wi-Fi↔4G 时连接全断；弱网下 TCP 队头阻塞导致所有隧道一起卡。</td>
+</tr>
+<tr>
+  <td>2</td>
+  <td><strong>更强的 P2P 打洞信令与 NAT 类型自适应</strong></td>
+  <td>官方 <code>NatHoleVisitor</code> / <code>NatHoleResp</code> 只承载「行为模式 0~4 + 地址列表」，<strong>没有</strong>双向持续探测、没有 TTL 探测结果回传、没有失败原因码。打洞失败只能重试或退回中继。</td>
+  <td>对称 NAT / 双防火墙下的打洞成功率；现在只能"试不成拉倒"。</td>
+</tr>
+<tr>
+  <td>3</td>
+  <td><strong>零信任身份、细粒度流控、端到端可观测性</strong></td>
+  <td>鉴权是<strong>连接级一次性</strong>（token / OIDC 登录），没有每请求身份；流控只有 <code>bandwidthLimit</code> 粗粒度；追踪信息不跨段透传。</td>
+  <td>多租户场景要按代理 / 用户 / 请求维度限流与审计；排障要端到端 trace。</td>
+</tr>
+<tr>
+  <td>4</td>
+  <td><strong>大规模海量连接下的头部开销与调度模型</strong></td>
+  <td>每条工作连接都要走一次 <code>StartWorkConn</code> JSON 握手。协议里没有<strong>「批量申请工作连接」</strong>的语义。</td>
+  <td>单 frps 承载 5 万+ 连接时，连接建立延迟与内存开销明显。</td>
+</tr>
+<tr>
+  <td>5</td>
+  <td><strong>移动端弱网切换、断线续传</strong></td>
+  <td>断线后只能<strong>重连重建代理</strong>，没有「会话恢复」语义（<code>run_id</code> 是登录期生成的，工作连接无法跨断线复用）。续传需要可恢复的流标识 + 服务端保留状态，协议层没有。</td>
+  <td>地铁 / 电梯 / 切网掉线后，所有隧道重建、长连接业务全断。</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<h2 data-i18n="nlink-extra-h">附带补齐</h2>
+<p data-i18n="nlink-extra-d">下面三项性质与上面五条<strong>不同</strong>：它们不是"协议无解"，而是需求或兼容性缺口。列出来是为了完整，但按 ① 号门槛严格说，它们不满足"根本解决不了"。</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th style="width:150px">项</th><th style="width:180px">性质</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td><strong>端口敲门</strong></td><td>需求驱动，<em>非协议无解</em></td><td>frp 的端口一旦开放就对外可见，扫描器能发现。敲门是「先敲门再开放」的访问控制模式，可用扩展帧承载敲门序列，通过后临时放行。</td></tr>
+<tr><td><strong>XTCP 混合版本直连策略</strong></td><td>兼容性缺口</td><td>官方 frpc 与我们并存时，直连能力协商不一致会导致「一方以为能打洞、另一方在等中继」。需要显式的版本 / 能力交集策略。</td></tr>
+<tr><td><strong>与官方双向兼容的边界行为</strong></td><td>兼容性澄清</td><td>明确列出「官方会忽略哪些字段」「官方会报错哪些」「哪些情况我们比官方更严」，形成可测试的边界用例集。</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 data-i18n="nlink-core-h">五条硬性工程约束</h2>
+<p data-i18n="nlink-core-d">这五条是 NLink v1 的设计底线，任何一条不满足就不合入。</p>
+
+<h3 data-i18n="nlink-c1-h">1. 握手期能力协商</h3>
+<p data-i18n="nlink-c1-d">握手阶段交换 capabilities，<strong>双方都支持才启用扩展</strong>，否则自动回退标准 frp 行为。协商在登录 / 握手阶段完成，不额外增加往返；能力用位图 + 版本号表示，<strong>未知位一律忽略</strong>（前向兼容）；协商结果决定本次连接的全部行为，中途不改。</p>
+
+<h3 data-i18n="nlink-c2-h">2. 版本化 TLV / 扩展帧</h3>
+<p data-i18n="nlink-c2-d">扩展帧放在<strong>独立命名空间</strong>（专用消息类型 / 专用 TLV 编号段），<strong>绝不改变标准帧语义</strong>——标准帧的字段、顺序、含义一律不动。TLV 带版本号，对方不认识的 TLV 必须<strong>跳过而非报错</strong>。扩展帧长度必须自描述，便于跳过。</p>
+
+<h3 data-i18n="nlink-c3-h">3. Feature flag</h3>
+<p data-i18n="nlink-c3-d">默认<strong>关闭</strong>，或默认<strong>「仅协商不启用」</strong>（会声明能力、但只在显式开启时才真正使用）。编译期 flag（<code>--features</code>）与运行期开关两层都要有。<strong>关闭时零开销</strong>：不产生额外字段、不改变报文长度。</p>
+
+<h3 data-i18n="nlink-c4-h">4. 双栈共存</h3>
+<p data-i18n="nlink-c4-d"><strong>同一端口</strong>能识别标准 frp 握手与扩展握手；识别依据只能是「标准 frp 不会产生的特征」（首字节 / 魔术字）。扩展握手失败 ⇒ <strong>自动 fallback</strong> 到标准流程，用户无感。</p>
+
+<h3 data-i18n="nlink-c5-h">5. 迁移工具与兼容性矩阵</h3>
+<p data-i18n="nlink-c5-d">提供迁移工具（配置转换、能力检测、兼容性自检），并维护兼容性矩阵，明确标注每个功能的支持情况。矩阵必须<strong>可测试</strong>：每一行都要有对应的 e2e 用例。</p>
+
+<h2 data-i18n="nlink-matrix-h">兼容性矩阵</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>功能</th><th style="width:130px">NFrp × NFrp</th><th style="width:170px">NFrp × 官方 frp</th><th style="width:130px">官方 × 官方</th></tr></thead>
+<tbody>
+<tr><td>原生 QUIC / 连接迁移</td><td>支持</td><td>回退 TCP</td><td>不支持</td></tr>
+<tr><td>增强打洞信令</td><td>支持</td><td>降级为官方 NatHole</td><td>官方行为</td></tr>
+<tr><td>零信任身份 / 细粒度流控</td><td>支持</td><td>仅 metadata 透传</td><td>不支持</td></tr>
+<tr><td>批量工作连接</td><td>支持</td><td>逐条建</td><td>不支持</td></tr>
+<tr><td>断线续传</td><td>支持</td><td>重连重建</td><td>不支持</td></tr>
+<tr><td>端口敲门</td><td>支持</td><td>不支持</td><td>不支持</td></tr>
+<tr><td>XTCP 混合版本直连</td><td>支持</td><td>需显式策略</td><td>官方行为</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 data-i18n="nlink-order-h">建议的实施顺序</h2>
+<p data-i18n="nlink-order-d">按「依赖关系 + 风险从低到高」排：</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th style="width:90px">阶段</th><th style="width:230px">内容</th><th>理由</th></tr></thead>
+<tbody>
+<tr><td><strong>0. 地基</strong></td><td>能力协商 + TLV 框架 + 双栈识别 + feature flag</td><td>后面所有功能都挂在这套地基上，必须先做且做对</td></tr>
+<tr><td><strong>1. 低风险</strong></td><td>XTCP 混合版本策略、兼容性矩阵与边界用例集</td><td>纯策略与测试，不改协议核心，先把兼容性说清楚</td></tr>
+<tr><td><strong>2. 独立</strong></td><td>端口敲门、批量工作连接</td><td>各自独立、互不依赖，可并行</td></tr>
+<tr><td><strong>3. 打洞</strong></td><td>增强信令 + NAT 自适应</td><td>依赖打洞实测环境（多网卡 / 可控 NAT）</td></tr>
+<tr><td><strong>4. 传输层</strong></td><td>原生 QUIC + 连接迁移</td><td>改动最大，地基要稳</td></tr>
+<tr><td><strong>5. 会话</strong></td><td>断线续传</td><td>依赖服务端保留状态，必须最后做</td></tr>
+<tr><td><strong>6. 可观测</strong></td><td>零信任身份 + 细粒度流控 + 端到端 trace</td><td>横切面，等前面稳定后再加</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 data-i18n="nlink-no-h">明确不做</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th style="width:230px">想法</th><th>为什么不做</th></tr></thead>
+<tbody>
+<tr><td>改标准帧的字段含义</td><td>破坏与官方的兼容，违反约束 2</td></tr>
+<tr><td>让扩展成为默认</td><td>风险不可控，违反约束 3</td></tr>
+<tr><td>在 yamux 之上模拟连接迁移</td><td>语义错了——迁移必须在传输层；模拟出来的东西不解决问题</td></tr>
+<tr><td>把鉴权从「连接级」改成「每帧」</td><td>会对不支持的对端产生不兼容；应做成可选扩展</td></tr>
+<tr><td>自定义压缩 / 加密算法</td><td>已有 <code>useCompression</code> / <code>useEncryption</code> 与官方逐字节对齐，改算法只会破坏互通</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 data-i18n="nlink-ask-h">每个功能立项时必须回答的问题</h2>
+<p data-i18n="nlink-ask-d">避免做成「技术上很酷但没人用」：</p>
+<ol>
+<li data-i18n="nlink-a1">现在的 frp 具体卡在哪一步？（要能指到协议字段 / 流程）</li>
+<li data-i18n="nlink-a2">谁在什么规模下遇到？（用户画像 + 量化场景）</li>
+<li data-i18n="nlink-a3">不做会怎样？（绕路方案的成本）</li>
+<li data-i18n="nlink-a4">双端升级的实际成本？（老客户端留存率）</li>
+<li data-i18n="nlink-a5">回退路径是什么？回退后功能残缺到什么程度？</li>
+<li data-i18n="nlink-a6">怎么证明做成了？（可测试的验收标准）</li>
+<li data-i18n="nlink-a7">对官方 frpc 的兼容性影响？（必须是「零影响」或「可协商降级」）</li>
+</ol>
+`;

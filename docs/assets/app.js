@@ -40,6 +40,7 @@
     { slug: 'http-api',               page: 'api',           title: 'api' },
     { slug: 'use-as-library',         page: 'library',       title: 'library' },
     { slug: 'frp-interoperability',   page: 'compat',        title: 'compat' },
+  { slug: 'nlink',                  page: 'nlink',         title: 'nlink' },
   ];
 
   const $ = (s, r) => (r || document).querySelector(s);

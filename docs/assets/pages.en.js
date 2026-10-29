@@ -1302,3 +1302,162 @@ PAGES_EN['compat'] = `
 </div>
 </div>
 `;
+
+PAGES_EN['nlink'] = `
+<h1 data-i18n="t-nlink">NLink v1 Roadmap</h1>
+<p class="lead" data-i18n="nlink-lead">NLink is NFRp's extension layer on top of the standard frp protocol. It carries only those capabilities that the <strong>frp protocol has no place to express</strong> and that <strong>users are genuinely blocked on</strong>.</p>
+
+<div class="callout">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+  <div>
+    <strong data-i18n="nlink-status-t">Status: planned</strong>
+    <p data-i18n="nlink-status-d">This document is a scoping evaluation and design constraint set — <strong>nothing here is implemented yet</strong>. Every item states whether it is worth doing and why. Anything not listed falls back to standard frp behaviour.</p>
+  </div>
+</div>
+
+<h2 data-i18n="nlink-why-h">Why an extension layer</h2>
+<p data-i18n="nlink-why-d">The frp protocol is adequate, but it hard-codes its transport, session, authentication and scheduling model. Some problems are not "implemented badly" — the protocol simply has <strong>no place to carry the information</strong>. Connection migration, for example, needs a transport-level connection identity; frp layers yamux over TCP/TLS, so that slot does not exist.</p>
+
+<h2 data-i18n="nlink-gate-h">Entry criteria: all four must hold</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th style="width:150px">Gate</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><strong>1. Protocol-level gap</strong></td><td>Not "frp does it poorly" — the protocol itself has no field, flow or semantic to carry it</td></tr>
+<tr><td><strong>2. Concrete demand</strong></td><td>You can name who is blocked, in what scenario — not "technically possible"</td></tr>
+<tr><td><strong>3. Both ends required</strong></td><td>One-sided upgrade is impossible or leaves the feature crippled</td></tr>
+<tr><td><strong>4. Reversible</strong></td><td>If the peer does not support it, behaviour must fall back to standard frp <strong>losslessly</strong></td></tr>
+</tbody>
+</table>
+</div>
+<p data-i18n="nlink-gate-note">Gate 4 is a hard requirement. If it cannot be made reversible, it does not enter NLink.</p>
+
+<h2 data-i18n="nlink-list-h">Candidates</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th style="width:56px">#</th><th style="width:190px">Capability</th><th>Why the frp protocol cannot solve it</th><th style="width:200px">Blocked scenario</th></tr></thead>
+<tbody>
+<tr>
+  <td>1</td>
+  <td><strong>Native QUIC / multiplexing and connection migration</strong></td>
+  <td>frp builds TCP/TLS first and layers yamux on top. Migration requires <strong>decoupling the connection identity from the 4-tuple</strong>, which is a transport-layer semantic — impossible above yamux. QUIC's <code>connection_id</code> has nowhere to live in frp.</td>
+  <td>Every connection drops when a mobile device switches Wi-Fi↔cellular; TCP head-of-line blocking stalls all tunnels at once on lossy links.</td>
+</tr>
+<tr>
+  <td>2</td>
+  <td><strong>Stronger P2P signalling and NAT-type adaptation</strong></td>
+  <td>Official <code>NatHoleVisitor</code> / <code>NatHoleResp</code> carry only "behaviour mode 0–4 + address list" — <strong>no</strong> continuous bidirectional probing, no TTL results, no failure reason codes. A failed punch can only be retried or fall back to relay.</td>
+  <td>Punch success rate under symmetric NAT / dual firewalls; today it is "try, and if it fails, give up".</td>
+</tr>
+<tr>
+  <td>3</td>
+  <td><strong>Zero-trust identity, fine-grained flow control, end-to-end observability</strong></td>
+  <td>Authentication is <strong>one-shot per connection</strong> (token / OIDC login) with no per-request identity; flow control is a coarse <code>bandwidthLimit</code>; trace context does not propagate across segments.</td>
+  <td>Multi-tenant setups need per-proxy / per-user / per-request rate limiting and audit; troubleshooting needs end-to-end traces.</td>
+</tr>
+<tr>
+  <td>4</td>
+  <td><strong>Header overhead and scheduling at massive connection counts</strong></td>
+  <td>Every work connection costs a <code>StartWorkConn</code> JSON handshake. There is no <strong>"request work connections in bulk"</strong> semantic.</td>
+  <td>50k+ connections on a single frps: connection setup latency and memory overhead become visible.</td>
+</tr>
+<tr>
+  <td>5</td>
+  <td><strong>Mobile handoff and resumable sessions</strong></td>
+  <td>After a drop the client can only <strong>reconnect and re-register proxies</strong>; there is no session-resume semantic (<code>run_id</code> is minted at login, and work connections cannot be reused across a drop). Resumption needs a resumable stream id plus server-side retained state — neither exists in the protocol.</td>
+  <td>Subway / elevator / network-switch drops tear down every tunnel and kill long-lived connections.</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<h2 data-i18n="nlink-extra-h">Adjacent items</h2>
+<p data-i18n="nlink-extra-d">The three items below are <strong>different in nature</strong> from the five above: they are demand or compatibility gaps, not "protocol dead ends". They are listed for completeness, but strictly by gate 1 they do not qualify as "impossible to solve".</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th style="width:170px">Item</th><th style="width:190px">Nature</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><strong>Port knocking</strong></td><td>Demand-driven, <em>not a protocol gap</em></td><td>An open frp port is visible to scanners. Knocking is a "prove-then-open" access-control model; the knock sequence can ride an extension frame, opening the port temporarily on success.</td></tr>
+<tr><td><strong>XTCP mixed-version direct-connect policy</strong></td><td>Compatibility gap</td><td>When official frpc coexists with ours, mismatched direct-connect capability negotiation leads to "one side thinks it can punch, the other waits for relay". Needs an explicit version/capability intersection policy.</td></tr>
+<tr><td><strong>Bidirectional compatibility boundaries</strong></td><td>Compatibility clarification</td><td>Enumerate exactly which fields the official implementation ignores, which it rejects, and where we are stricter — as a testable boundary case set.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 data-i18n="nlink-core-h">Five hard engineering constraints</h2>
+<p data-i18n="nlink-core-d">These are NLink v1 design red lines. A change that violates any one of them does not merge.</p>
+
+<h3 data-i18n="nlink-c1-h">1. Capability negotiation during handshake</h3>
+<p data-i18n="nlink-c1-d">Capabilities are exchanged during the handshake; the extension is enabled <strong>only when both sides support it</strong>, otherwise behaviour falls back to standard frp. Negotiation happens during login/handshake with no extra round trip. Capabilities are a bitmap plus a version number, and <strong>unknown bits are ignored</strong> (forward compatible). The negotiated result governs the whole connection and never changes mid-session.</p>
+
+<h3 data-i18n="nlink-c2-h">2. Versioned TLV / extension frames</h3>
+<p data-i18n="nlink-c2-d">Extension frames live in a <strong>separate namespace</strong> (dedicated message types / a dedicated TLV number range) and <strong>never change standard frame semantics</strong> — fields, order and meaning of standard frames stay untouched. TLVs are versioned, and an unknown TLV must be <strong>skipped, not rejected</strong>. Extension frame length must be self-describing so it can be skipped.</p>
+
+<h3 data-i18n="nlink-c3-h">3. Feature flags</h3>
+<p data-i18n="nlink-c3-d">Off by default, or <strong>"negotiate only, do not enable"</strong> by default (capability is advertised, but the feature is only used when explicitly turned on). Both a compile-time flag (<code>--features</code>) and a runtime switch are required. When disabled the cost must be <strong>zero</strong>: no extra fields, no change in message size.</p>
+
+<h3 data-i18n="nlink-c4-h">4. Dual-stack coexistence</h3>
+<p data-i18n="nlink-c4-d">The <strong>same port</strong> recognizes both standard frp handshakes and the extended one. Detection may rely only on a marker <strong>standard frp never emits</strong> (first byte / magic value). A failed extended handshake <strong>falls back automatically</strong> to the standard flow, invisibly to the user.</p>
+
+<h3 data-i18n="nlink-c5-h">5. Migration tooling and compatibility matrix</h3>
+<p data-i18n="nlink-c5-d">Provide migration tooling (config conversion, capability detection, self-check) and maintain a compatibility matrix stating support per feature. The matrix must be <strong>testable</strong>: every row needs a corresponding e2e case.</p>
+
+<h2 data-i18n="nlink-matrix-h">Compatibility matrix</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th>Capability</th><th style="width:150px">NFrp × NFRp</th><th style="width:190px">NFrp × official frp</th><th style="width:150px">official × official</th></tr></thead>
+<tbody>
+<tr><td>Native QUIC / connection migration</td><td>Supported</td><td>Falls back to TCP</td><td>Not supported</td></tr>
+<tr><td>Enhanced punch signalling</td><td>Supported</td><td>Degrades to official NatHole</td><td>Official behaviour</td></tr>
+<tr><td>Zero-trust identity / fine-grained flow control</td><td>Supported</td><td>Metadata passthrough only</td><td>Not supported</td></tr>
+<tr><td>Bulk work connections</td><td>Supported</td><td>One at a time</td><td>Not supported</td></tr>
+<tr><td>Resumable sessions</td><td>Supported</td><td>Reconnect and rebuild</td><td>Not supported</td></tr>
+<tr><td>Port knocking</td><td>Supported</td><td>Not supported</td><td>Not supported</td></tr>
+<tr><td>XTCP mixed-version direct connect</td><td>Supported</td><td>Needs explicit policy</td><td>Official behaviour</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 data-i18n="nlink-order-h">Suggested implementation order</h2>
+<p data-i18n="nlink-order-d">Ordered by dependency and ascending risk:</p>
+<div class="table-wrap">
+<table>
+<thead><tr><th style="width:110px">Phase</th><th style="width:250px">Content</th><th>Rationale</th></tr></thead>
+<tbody>
+<tr><td><strong>0. Foundation</strong></td><td>Capability negotiation + TLV framework + dual-stack detection + feature flags</td><td>Everything else hangs off this; must be built first and built right</td></tr>
+<tr><td><strong>1. Low risk</strong></td><td>XTCP mixed-version policy, compatibility matrix and boundary case set</td><td>Policy and tests only, no protocol core changes — define compatibility first</td></tr>
+<tr><td><strong>2. Independent</strong></td><td>Port knocking, bulk work connections</td><td>Independent of each other; can run in parallel</td></tr>
+<tr><td><strong>3. Punching</strong></td><td>Enhanced signalling + NAT adaptation</td><td>Needs a real punching test bed (multi-NIC / controllable NAT)</td></tr>
+<tr><td><strong>4. Transport</strong></td><td>Native QUIC + connection migration</td><td>Largest change; foundation must be solid</td></tr>
+<tr><td><strong>5. Session</strong></td><td>Resumable sessions</td><td>Depends on server-side retained state; must come last</td></tr>
+<tr><td><strong>6. Observability</strong></td><td>Zero-trust identity + fine-grained flow control + end-to-end trace</td><td>Cross-cutting; add once the rest is stable</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 data-i18n="nlink-no-h">Explicitly out of scope</h2>
+<div class="table-wrap">
+<table>
+<thead><tr><th style="width:270px">Idea</th><th>Why not</th></tr></thead>
+<tbody>
+<tr><td>Changing the meaning of standard frame fields</td><td>Breaks compatibility with official frp; violates constraint 2</td></tr>
+<tr><td>Making extensions the default</td><td>Unbounded risk; violates constraint 3</td></tr>
+<tr><td>Emulating connection migration above yamux</td><td>Wrong semantics — migration belongs in the transport; an emulation solves nothing</td></tr>
+<tr><td>Changing authentication from per-connection to per-frame</td><td>Incompatible with peers that do not support it; should be an optional extension</td></tr>
+<tr><td>Custom compression / encryption algorithms</td><td><code>useCompression</code> / <code>useEncryption</code> are already byte-exact with official frp; changing algorithms only breaks interop</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 data-i18n="nlink-ask-h">Questions every proposal must answer</h2>
+<p data-i18n="nlink-ask-d">To avoid building something technically neat that nobody uses:</p>
+<ol>
+<li data-i18n="nlink-a1">Where exactly does frp get stuck today? (Point to the protocol field or flow.)</li>
+<li data-i18n="nlink-a2">Who hits it, at what scale? (User profile plus quantified scenario.)</li>
+<li data-i18n="nlink-a3">What happens if we do not do it? (Cost of the workaround.)</li>
+<li data-i18n="nlink-a4">What does a two-sided upgrade really cost? (Legacy client retention.)</li>
+<li data-i18n="nlink-a5">What is the fallback path, and how crippled is the feature after falling back?</li>
+<li data-i18n="nlink-a6">How do we prove it works? (Testable acceptance criteria.)</li>
+<li data-i18n="nlink-a7">What is the impact on official frpc? (Must be "zero impact" or "negotiated degradation".)</li>
+</ol>
+`;

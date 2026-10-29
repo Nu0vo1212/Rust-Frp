@@ -84,22 +84,31 @@ jobs:
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           targets: ${{ matrix.target }}
+      # ★ 缓存必须按 target 隔离，否则两个矩阵任务会抢同一个 key。
+      # Swatinem/rust-cache 的默认 key 是 `v0-rust-${job}-${os}-...`，
+      # 矩阵里的两个 target 共用 `cross-build` 这个 job 名 ⇒ key 完全相同
+      # ⇒ x86_64 任务存下来的 `target/release/build/*`（宿主 build script 二进制）
+      # 会被 aarch64 任务还原进它那个更老的基础镜像里跑，报
+      # `weak version GLIBC_2.28/2.29/2.30 not found` + `gettid` relocation error。
+      # 报错在 libc 的 build script 上、跟本项目代码无关，且只有 aarch64 红 —— 
+      # 因为 x86_64 的镜像新、aarch64 的镜像老。加 key 后两者互不复用。
+      #
+      # 再把产物目录也分开（`target-cross`）：cross 会把 target 目录挂进容器，
+      # 和宿主 `cargo build` 产出的 build script 混在一起正是上面那个故障的成因。
+      # 这个目录只在容器里写过，跨轮复用是安全的。
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: cross-${{ matrix.target }}
+          workspaces: ". -> target-cross"
       - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: cross
 
       - name: build --release
-        # 用 `edge` 镜像：默认的 `main` 镜像是老基础镜像，它的 glibc 跑不动
-        # 新版 libc crate 编出来的 build script —— 实测报
-        # `weak version GLIBC_2.29 not found` + `symbol gettid` relocation error，
-        # 而报错发生在 build script 阶段，跟本项目代码无关。
-        # 只换容器镜像，不改任何编译参数。
         env:
+          CARGO_TARGET_DIR: target-cross
           CROSS_CONTAINER_OPTS: --platform linux/amd64
-        run: |
-          docker pull ghcr.io/cross-rs/${{ matrix.target }}:edge || true
-          cross build --release --workspace --target ${{ matrix.target }}
+        run: cross build --release --workspace --target ${{ matrix.target }}
         timeout-minutes: 30
 
   # ---------------------------------------------------------------

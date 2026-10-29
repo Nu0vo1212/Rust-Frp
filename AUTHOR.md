@@ -1,3 +1,15 @@
+# 作者
+
+本项目的作者是 **Nu0vo1212**（可以叫他「小诺」）。
+
+- 博客：<https://nu0vo.xyz>
+- 关于我：<https://nu0vo.xyz/about/>
+- GitHub：[@Nu0vo1212](https://github.com/Nu0vo1212)
+
+> 下面这一节内容整理自作者博客的 [「关于我」](https://nu0vo.xyz/about/) 页面，
+> 保留原意与口吻，仅做了排版调整。
+
+---
 
 ## 关于我
 

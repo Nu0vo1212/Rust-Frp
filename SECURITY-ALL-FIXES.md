@@ -6002,7 +6002,7 @@ elease.pub | — | Ed25519 指纹 763896b5…（与 0.6.6 同一把钥匙） |
 | windows-amd64 | 本机 | cargo build --release --workspace |
 | linux-amd64 | 云服务器 | cargo build --release（glibc 动态，形状与 0.6.6 一致） |
 | linux-arm64 | **本机 WSL Ubuntu 24.04** | pt install gcc-aarch64-linux-gnu；RUSTFLAGS="-C target-feature=+crt-static"；CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc |
-| android ×2 | 本机 | NDK 30 的 arch64/x86_64-linux-android26-clang，见 memory/ANDROID-BUILD.md |
+| android ×2 | 本机 | NDK 30 的 arch64/x86_64-linux-android26-clang，见 README「发布与部署 › 打包」一节的安卓编译命令 |
 
 ### 两个真实踩到的坑
 

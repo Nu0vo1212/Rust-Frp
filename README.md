@@ -384,17 +384,37 @@ python scripts/verify_dist_matches_release.py --check-android
 
 `pack` 打完包会**自动解包自检**：包内 `frps` / `frpc` 与源产物逐个 sha256 比对，
 不一致直接非零退出 —— 防止"脚本读错目录、把上一版二进制打进新包"。
-（历史上踩过两次，见 `memory/PROJECT.md`。）
+（历史上真的踩过两次：一次是打进 v0.5.6 的安卓包，一次是 8.0 MB 的异常包。）
 
 > **构建目录**：本机把 `CARGO_TARGET_DIR` 从环境变量改成了
 > `nfrp/.cargo/config.toml` 里的 `target-dir = "D:/cargo-target-nfrp"`。
 > 这个文件**不入库**（含 Windows 绝对路径），新机器自己建一份即可。
 > 仓库里的 `nfrp/target/` 已清空归档，不会再出现"直接 `cargo build` 落到旧产物"。
 
-Linux 包用 [`cross`](https://github.com/cross-rs/cross) 在本机（Docker）交叉编译，
-`ring` 需要 C 工具链，cross 的镜像里已经备好。arm64 走 `+crt-static` 全静态链接，
-无 glibc 依赖。**Android 包必须显式指定 NDK 的 clang 作为 linker**（`CC_*` /
-`CARGO_TARGET_*_LINKER` 两组环境变量），完整命令与踩过的坑见 `memory/ANDROID-BUILD.md`。
+**Linux 产物**：`linux-amd64` 在 Linux 机器上原生 `cargo build --release`（glibc 动态）；
+`linux-arm64` 用 `aarch64-linux-gnu-gcc` 交叉编译，并加
+`RUSTFLAGS="-C target-feature=+crt-static"` 得到全静态、无 glibc 依赖的二进制。
+`ring` 需要 C 工具链，交叉时记得指明 `CC_aarch64_unknown_linux_gnu` 与
+`CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER`。
+
+**Android 包**要先编出两个 target，再交给 `pack_android.py` 打包：
+
+```bash
+NDK=/path/to/android-ndk
+BIN=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin   # Windows 上是 windows-x86_64
+export CC_aarch64_linux_android=$BIN/aarch64-linux-android26-clang
+export AR_aarch64_linux_android=$BIN/llvm-ar
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$CC_aarch64_linux_android
+export CC_x86_64_linux_android=$BIN/x86_64-linux-android26-clang
+export AR_x86_64_linux_android=$BIN/llvm-ar
+export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=$CC_x86_64_linux_android
+
+cargo build --release --target aarch64-linux-android -p nfrp-server -p nfrp-client
+cargo build --release --target x86_64-linux-android  -p nfrp-server -p nfrp-client
+python scripts/pack_android.py      # 打包后自动比对包内二进制与源产物
+```
+
+> 包名里的 `26` 是 `minSdk 26`；用别的 API 级别就把文件名后缀一起改掉。
 
 `release.py` 不依赖任何第三方 Python 包，也不依赖 Rust 工具链。签名缺失或失败会**非零退出**；确实要发未签名制品需显式加 `--allow-unsigned`。
 

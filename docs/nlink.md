@@ -1,4 +1,4 @@
-# NLink v1 规划
+# NLink v1
 
 > 这是 **NLink 文档的唯一内容源**。站点页面（`docs/assets/pages.{zh,en}.js`）
 > 与本地记忆（`memory/NLINK-V1-EVALUATION.md`）都由它生成，**不要直接改生成物**。
@@ -14,9 +14,33 @@
 
 NLink 是 NFRp 在标准 frp 协议之外的扩展层。它只承载那些 **frp 协议本身没有位置表达**、且 **确实有用户被卡住** 的能力。
 
-:::callout 当前状态：规划中
-这份文档是立项评估与设计约束，**尚未实现**。下面每一条都标注了它是否值得做、以及为什么。没有列进这张表的，一律走标准 frp 行为。
+:::callout 当前状态：已实现（v0.6.7 起，默认关闭）
+下面列出的能力**均已实现并通过测试**（`server/tests/nlink_e2e.rs` 的 11 条端到端用例逐项覆盖）。
+但 NLink **默认关闭**：服务端与客户端都要显式写 `[nlink] enable = true` 才生效。
+不开启时，行为与 0.6.x 完全一致。
 :::
+
+## 怎么开启
+
+```toml
+# frps 端
+[nlink]
+enable = true
+# features = ["quic", "resume", "trace"]   # 留空 = 只协商、不启用任何一项
+quic_listen = "0.0.0.0:7000"               # 留空 = 不开 QUIC
+resume_ttl = 30                            # 断线续传保留时长（秒）
+```
+
+```toml
+# frpc 端
+[nlink]
+enable = true
+resume = true      # 断线后用同一个 connection id 续传
+quic = true        # 走 QUIC 连服务端（需服务端开 quic_listen）
+```
+
+官方面（官方 frpc/frps）不认 preamble，会把首字节当成 v1 消息头报错。
+客户端捕获到这种失败后**自动回退标准模式并只重试一次**，日志里留一行 warn，隧道照常工作。
 
 ## 为什么需要扩展层
 

@@ -1307,13 +1307,26 @@ PAGES_ZH['nlink'] = `
 <div class="callout">
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
   <div>
-    <strong>当前状态：规划中</strong>
-    <p>这份文档是立项评估与设计约束，<strong>尚未实现</strong>。下面每一条都标注了它是否值得做、以及为什么。没有列进这张表的，一律走标准 frp 行为。</p>
+    <strong>当前状态：已实现（v0.6.7 起，默认关闭）</strong>
+    <p>下面列出的能力<strong>均已实现并通过测试</strong>（<code>server/tests/nlink_e2e.rs</code> 的 11 条端到端用例逐项覆盖）。 但 NLink <strong>默认关闭</strong>：服务端与客户端都要显式写 <code>[nlink] enable = true</code> 才生效。 不开启时，行为与 0.6.x 完全一致。</p>
   </div>
 </div>
-<h2 data-i18n="nlink-s1-h">为什么需要扩展层</h2>
+<h2 data-i18n="nlink-s1-h">怎么开启</h2>
+<pre class="code-block"><code class="language-toml"># frps 端
+[nlink]
+enable = true
+# features = ["quic", "resume", "trace"]   # 留空 = 只协商、不启用任何一项
+quic_listen = "0.0.0.0:7000"               # 留空 = 不开 QUIC
+resume_ttl = 30                            # 断线续传保留时长（秒）</code></pre>
+<pre class="code-block"><code class="language-toml"># frpc 端
+[nlink]
+enable = true
+resume = true      # 断线后用同一个 connection id 续传
+quic = true        # 走 QUIC 连服务端（需服务端开 quic_listen）</code></pre>
+<p>官方面（官方 frpc/frps）不认 preamble，会把首字节当成 v1 消息头报错。 客户端捕获到这种失败后<strong>自动回退标准模式并只重试一次</strong>，日志里留一行 warn，隧道照常工作。</p>
+<h2 data-i18n="nlink-s2-h">为什么需要扩展层</h2>
 <p>frp 的协议是够用的，但它把「传输、会话、鉴权、调度」都固定死了。有些问题不是"实现得不好"，而是 <strong>协议里根本没有承载位置</strong> —— 比如连接迁移需要传输层有独立的连接标识，而 frp 是在 TCP/TLS 之上套 yamux，这个位置不存在。</p>
-<h2 data-i18n="nlink-s2-h">准入判断：四个门槛必须同时成立</h2>
+<h2 data-i18n="nlink-s3-h">准入判断：四个门槛必须同时成立</h2>
 <div class="table-wrap">
 <table>
 <thead><tr>
@@ -1341,7 +1354,7 @@ PAGES_ZH['nlink'] = `
 </table>
 </div>
 <p>第 ④ 条是硬门槛。做不到可回退的，不进 NLink。</p>
-<h2 data-i18n="nlink-s3-h">候选清单</h2>
+<h2 data-i18n="nlink-s4-h">候选清单</h2>
 <div class="table-wrap">
 <table>
 <thead><tr>
@@ -1384,7 +1397,7 @@ PAGES_ZH['nlink'] = `
 </tbody>
 </table>
 </div>
-<h2 data-i18n="nlink-s4-h">附带补齐</h2>
+<h2 data-i18n="nlink-s5-h">附带补齐</h2>
 <p>下面三项性质与上面五条 <strong>不同</strong>：它们不是"协议无解"，而是需求或兼容性缺口。列出来是为了完整，但按 ① 号门槛严格说，它们不满足"根本解决不了"。</p>
 <div class="table-wrap">
 <table>
@@ -1412,7 +1425,7 @@ PAGES_ZH['nlink'] = `
 </tbody>
 </table>
 </div>
-<h2 data-i18n="nlink-s5-h">五条硬性工程约束</h2>
+<h2 data-i18n="nlink-s6-h">五条硬性工程约束</h2>
 <p>这五条是 NLink v1 的设计底线，任何一条不满足就不合入。</p>
 <h3 data-i18n="nlink-c1-h">1. 握手期能力协商</h3>
 <p>握手阶段交换 capabilities，<strong>双方都支持才启用扩展</strong>，否则自动回退标准 frp 行为。协商在登录 / 握手阶段完成，不额外增加往返；能力用位图 + 版本号表示，<strong>未知位一律忽略</strong>（前向兼容）；协商结果决定本次连接的全部行为，中途不改。</p>
@@ -1424,7 +1437,7 @@ PAGES_ZH['nlink'] = `
 <p><strong>同一端口</strong> 能识别标准 frp 握手与扩展握手；识别依据只能是「标准 frp 不会产生的特征」（首字节 / 魔术字）。扩展握手失败 ⇒ <strong>自动 fallback</strong> 到标准流程，用户无感。</p>
 <h3 data-i18n="nlink-c5-h">5. 迁移工具与兼容性矩阵</h3>
 <p>提供迁移工具（配置转换、能力检测、兼容性自检），并维护兼容性矩阵，明确标注每个功能的支持情况。矩阵必须 <strong>可测试</strong>：每一行都要有对应的 e2e 用例。</p>
-<h2 data-i18n="nlink-s6-h">兼容性矩阵</h2>
+<h2 data-i18n="nlink-s7-h">兼容性矩阵</h2>
 <div class="table-wrap">
 <table>
 <thead><tr>
@@ -1479,7 +1492,7 @@ PAGES_ZH['nlink'] = `
 </tbody>
 </table>
 </div>
-<h2 data-i18n="nlink-s7-h">建议的实施顺序</h2>
+<h2 data-i18n="nlink-s8-h">建议的实施顺序</h2>
 <p>按「依赖关系 + 风险从低到高」排：</p>
 <div class="table-wrap">
 <table>
@@ -1527,7 +1540,7 @@ PAGES_ZH['nlink'] = `
 </tbody>
 </table>
 </div>
-<h2 data-i18n="nlink-s8-h">明确不做</h2>
+<h2 data-i18n="nlink-s9-h">明确不做</h2>
 <div class="table-wrap">
 <table>
 <thead><tr>
@@ -1558,7 +1571,7 @@ PAGES_ZH['nlink'] = `
 </tbody>
 </table>
 </div>
-<h2 data-i18n="nlink-s9-h">每个功能立项时必须回答的问题</h2>
+<h2 data-i18n="nlink-s10-h">每个功能立项时必须回答的问题</h2>
 <p>避免做成「技术上很酷但没人用」：</p>
 <ol>
 <li>现在的 frp 具体卡在哪一步？（要能指到协议字段 / 流程）</li>

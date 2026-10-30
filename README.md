@@ -160,9 +160,52 @@ nfrp-common = "0.6"
   `Ping` / `NewWorkConn` / `NewUserConn` 时回调外部 HTTP 服务，支持拒绝、
   改写登录内容和代理名/metas；每次请求 10 秒超时
 
+### NLink v1（扩展层，默认关闭）
+
+在标准 frp 线协议之上叠的一层**可协商、可回退、零额外往返**的扩展。
+每一部分都遵守两条铁律：**标准帧一个字节都不动**、**没协商成功就当它不存在**。
+
+| 能力 | 说明 |
+|---|---|
+| 能力协商 | 客户端在第一条消息前搭车一个 `NFRPLNK1` preamble，服务端在 `LoginResp._nlink` 里回显。交集非空才启用，全程不增加往返 |
+| QUIC 传输与连接迁移 | 服务端 `[nlink] quic_listen` 开 QUIC 监听；ALPN 用独立的 `nfrp-nlink`，与标准 QUIC 互不串味 |
+| 断线续传 | 进程级 `ConnectionId` 不变；控制连接断开时服务端保留代理名单 `resume_ttl` 秒，重连后原样恢复 |
+| 零信任身份 | 每条工作连接带 `_nlink` 身份令牌（`v1.<exp>.<hmac>`），绑定 `run_id + user + 过期时间`，伪造和过期都会被拒 |
+| 细粒度限流 | 按「用户 × 代理」的令牌桶，支持突发；计费点在桥接层按实际搬运字节扣费 |
+| 端口敲门 | 端口默认对外不可见，敲对 33 字节序列后按 IP 临时放行 |
+| 批量工作连接 | 一条 `BatchReq` 换 N 条工作连接，省掉逐条 `StartWorkConn` 的往返 |
+| 端到端 trace | 控制连接与数据面共享同一个 trace id |
+
+**默认关闭。** 服务端与客户端都需显式写 `[nlink] enable = true` 才生效；
+官方面（官方 frpc/frps）不认 preamble，会把首字节当 v1 消息头报错，
+客户端捕获到这种失败后**自动回退标准模式并只重试一次**，日志里留一行 warn。
+
+```toml
+# frps 端
+[nlink]
+enable = true
+# features = ["quic", "resume", "trace"]   # 留空 = 只协商、不启用任何一项
+quic_listen = "0.0.0.0:7000"               # 留空 = 不开 QUIC
+resume_ttl = 30
+```
+
+```toml
+# frpc 端
+[nlink]
+enable = true
+resume = true
+quic = true
+```
+
+编译期可用 `--no-default-features` 把扩展字段整个摘掉：此时 `LoginResp` /
+`NewWorkConn` 的 `_nlink` 键**不存在**，报文与 0.6.x 逐字节一致。
+
+> 与官方 frp 的双向兼容性、各能力的降级行为，见文档站
+> [NLink v1 规划](https://nu0vo1212.github.io/Rust-Frp/#/nlink) 里的兼容性矩阵。
+
 ### 工程质量
 
-- 890 个自动化测试（13 条需真机的设备面测试标 `#[ignore]`），含真实 QUIC 栈握手、端到端集成测试、与官方 frpc/frps 真实抓包密文的解密回归
+- 956 个自动化测试（13 条需真机的设备面测试标 `#[ignore]`），含真实 QUIC 栈握手、端到端集成测试、与官方 frpc/frps 真实抓包密文的解密回归
 - CI 跑 `fmt` / `clippy` / 三系统全量测试 / 两个 musl 目标交叉构建 / 端到端冒烟
 - 第三方 GitHub Action 全部 pin 到 commit SHA；cosign 签名失败即红灯
 - 发布产物附 `SHA256SUMS` + Ed25519 分离签名

@@ -100,6 +100,29 @@ def md_to_html(md: str) -> str:
             i += 1
             continue
 
+        # 围栏代码块 ```lang ... ```
+        #
+        # 必须在**所有其它规则之前**判断：否则 ``` 会被当成普通段落，
+        # 反引号原样进到 JS 模板字符串里，直接把 pages.*.js 的语法弄坏。
+        m = re.match(r"^\s*```(\w*)\s*$", s)
+        if m:
+            lang = m.group(1)
+            i += 1
+            body: list[str] = []
+            while i < len(lines) and not re.match(r"^\s*```\s*$", lines[i]):
+                body.append(lines[i])
+                i += 1
+            i += 1  # 跳过收尾的 ```
+            code = "\n".join(body)
+            esc = (
+                code.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+            )
+            cls = f' class="language-{lang}"' if lang else ""
+            out.append(f'<pre class="code-block"><code{cls}>{esc}</code></pre>')
+            continue
+
         # 引用块（文件头的元信息，站点不展示）
         if s.lstrip().startswith(">"):
             while i < len(lines) and (lines[i].lstrip().startswith(">") or not lines[i].strip()):

@@ -41,8 +41,9 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     Arc::new(t)
 }
 
-static SERVER_CFG: OnceLock<std::sync::Mutex<std::collections::HashMap<Vec<u8>, quinn::ServerConfig>>> =
-    OnceLock::new();
+static SERVER_CFG: OnceLock<
+    std::sync::Mutex<std::collections::HashMap<Vec<u8>, quinn::ServerConfig>>,
+> = OnceLock::new();
 
 /// 服务端 QUIC 配置（自签证书）。
 ///
@@ -505,8 +506,8 @@ mod tests {
             .expect("NLink ALPN 应当握上手");
 
         // 用错 ALPN 必须失败 —— 这正是分桶要保证的"互不串味"
-        let wrong = connect_with_timeout_alpn(&nlink_addr, None, ALPN, Duration::from_millis(800))
-            .await;
+        let wrong =
+            connect_with_timeout_alpn(&nlink_addr, None, ALPN, Duration::from_millis(800)).await;
         assert!(wrong.is_err(), "ALPN 不一致必须握手失败，而不是静默连上");
 
         // 重复取配置仍然正常（缓存命中路径）

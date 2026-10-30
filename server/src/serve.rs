@@ -332,9 +332,7 @@ pub async fn serve_on_with(
                 "NLink v1 已启用"
             );
         } else {
-            info!(
-                "NLink v1 开关打开但 `features` 为空：只协商、不启用任何扩展能力"
-            );
+            info!("NLink v1 开关打开但 `features` 为空：只协商、不启用任何扩展能力");
         }
     }
     registry.set_nlink(nlink_rt.clone());
@@ -1391,7 +1389,7 @@ async fn handle_control(
                 // NLink 扩展帧与普通消息走同一个 select：扩展帧**立刻**被处理，
                 // 不会因为"等下一条普通消息"而延迟（敲门 / 探测都是时序敏感的）。
                 let msg = match event? {
-                    nfrp_common::frp::conn::ConnEvent::Msg(m) => m,
+                    nfrp_common::frp::conn::ConnEvent::Msg(m) => *m,
                     nfrp_common::frp::conn::ConnEvent::Closed => break,
                     nfrp_common::frp::conn::ConnEvent::NLink(f) => {
                         last_seen = Instant::now();
@@ -2975,22 +2973,18 @@ pub async fn bridge(user: PendingUser, work: WorkItem, registry: &Arc<Registry>)
         (None, true) => {
             let key = user_key;
             debug!(proxy = %proxy, enc, comp, "服务端数据面已启用解密/解压");
-            let mut wrapped = nfrp_common::frp::proxy_stream::ProxyStream::new(work_stream, key, comp);
+            let mut wrapped =
+                nfrp_common::frp::proxy_stream::ProxyStream::new(work_stream, key, comp);
             util::relay_between(&mut user_stream, &mut wrapped).await
         }
         (None, false) => util::relay_between(&mut user_stream, &mut work_stream).await,
         (Some(lim), true) => {
             let key = user_key;
             debug!(proxy = %proxy, enc, comp, "服务端数据面已启用解密/解压（带限流）");
-            let mut wrapped = nfrp_common::frp::proxy_stream::ProxyStream::new(work_stream, key, comp);
-            crate::nlink::relay_throttled(
-                lim,
-                &client_user,
-                &proxy,
-                &mut user_stream,
-                &mut wrapped,
-            )
-            .await
+            let mut wrapped =
+                nfrp_common::frp::proxy_stream::ProxyStream::new(work_stream, key, comp);
+            crate::nlink::relay_throttled(lim, &client_user, &proxy, &mut user_stream, &mut wrapped)
+                .await
         }
         (Some(lim), false) => {
             crate::nlink::relay_throttled(

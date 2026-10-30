@@ -87,9 +87,9 @@ pub struct FrpConn {
     /// v1 下也用二进制 UDP 编码（私有能力协商结果），默认 JSON。
     v1_udp_binary: bool,
     /// NLink 扩展状态：**只有协商成功（服务端在 LoginResp 里回显）才存在**。
-        nlink: Option<NLinkState>,
+    nlink: Option<NLinkState>,
     /// `detect_version` 吃到的 preamble，等握手阶段取走。
-        nlink_pending: Option<nlink::Preamble>,
+    nlink_pending: Option<nlink::Preamble>,
 }
 
 /// 一条连接上的 NLink 状态。
@@ -111,11 +111,7 @@ pub struct NLinkState {
 }
 
 impl NLinkState {
-    pub fn new(
-        caps: nlink::Caps,
-        session: nlink::ConnectionId,
-        trace: nlink::TraceId,
-    ) -> Self {
+    pub fn new(caps: nlink::Caps, session: nlink::ConnectionId, trace: nlink::TraceId) -> Self {
         Self {
             caps,
             session,
@@ -130,8 +126,12 @@ impl NLinkState {
 ///
 /// 为什么不让扩展帧伪装成 `FrpMessage`：那会污染消息枚举，所有 match 都得
 /// 多一条永真分支。分开返回，控制循环只在需要时处理扩展帧。
+///
+/// `Msg` 里的 `FrpMessage` 有 584 字节，而扩展帧只有 32 字节 —— 枚举按最大
+/// 变体开内存，若直接内联，**每一条**扩展帧事件都要按 584 字节搬运。装箱后
+/// 两个变体都只剩一个指针，热路径（每条消息都会走这里）拷贝成本立降。
 pub enum ConnEvent {
-    Msg(FrpMessage),
+    Msg(Box<FrpMessage>),
     NLink(nlink::Frame),
     Closed,
 }
@@ -146,8 +146,8 @@ impl FrpConn {
             crypto: ControlCrypto::None,
             udp_binary: false,
             v1_udp_binary: false,
-                        nlink: None,
-                        nlink_pending: None,
+            nlink: None,
+            nlink_pending: None,
         }
     }
 
@@ -157,21 +157,21 @@ impl FrpConn {
     }
 
     /// 协商成功后的 NLink 状态；未协商时为 `None`。
-        pub fn nlink(&self) -> Option<&NLinkState> {
+    pub fn nlink(&self) -> Option<&NLinkState> {
         self.nlink.as_ref()
     }
 
-        pub fn nlink_mut(&mut self) -> Option<&mut NLinkState> {
+    pub fn nlink_mut(&mut self) -> Option<&mut NLinkState> {
         self.nlink.as_mut()
     }
 
     /// 启用 NLink（**只能在服务端回显 / 客户端收到回显之后调用**）。
-        pub fn enable_nlink(&mut self, state: NLinkState) {
+    pub fn enable_nlink(&mut self, state: NLinkState) {
         self.nlink = Some(state);
     }
 
     /// 服务端在 `detect_version` 里吃到的 preamble（未探测到则为 `None`）。
-        pub fn take_preamble(&mut self) -> Option<nlink::Preamble> {
+    pub fn take_preamble(&mut self) -> Option<nlink::Preamble> {
         self.nlink_pending.take()
     }
 
@@ -186,7 +186,7 @@ impl FrpConn {
     }
 
     /// 解析 preamble 的固定部分 + TLV（魔术字已由调用方消费）。
-        async fn read_nlink_preamble(&mut self) -> Result<nlink::Preamble> {
+    async fn read_nlink_preamble(&mut self) -> Result<nlink::Preamble> {
         // 固定部分去掉魔术字后是 28 字节：version(1)+caps(8)+flags(1)+sid(16)+tlv_len(2)
         let fixed = nlink::frame::PREAMBLE_FIXED - nlink::MAGIC.len();
         self.fill_exact(fixed).await?;
@@ -203,7 +203,7 @@ impl FrpConn {
     /// 在**任何协议字节之前**写入一段原始字节（目前只有 NLink preamble 用）。
     ///
     /// 故意不复用 `write_bytes`：preamble 必须走明文，且必须在 v2 魔术字之前。
-        pub async fn write_preamble(&mut self, pre: &nlink::Preamble) -> Result<()> {
+    pub async fn write_preamble(&mut self, pre: &nlink::Preamble) -> Result<()> {
         let raw = pre.encode();
         self.stream.write_all(&raw).await?;
         self.stream.flush().await?;
@@ -214,7 +214,7 @@ impl FrpConn {
     ///
     /// 未协商成功时**拒绝发送**：宁可报错，也不能让一条没有协商的连接
     /// 凭空出现扩展字节（对端会当成坏帧）。
-        pub async fn send_nlink(&mut self, frame: &nlink::Frame) -> Result<()> {
+    pub async fn send_nlink(&mut self, frame: &nlink::Frame) -> Result<()> {
         if self.nlink.is_none() {
             bail!("NLink 未协商成功，不能发送扩展帧");
         }
@@ -462,7 +462,7 @@ impl FrpConn {
     ///
     /// 未来版本 / 未来类型的扩展帧会被**整帧跳过**（记录 debug 日志），
     /// 继续等下一条 —— 这是前向兼容的落点。
-        pub async fn recv_event(&mut self) -> Result<ConnEvent> {
+    pub async fn recv_event(&mut self) -> Result<ConnEvent> {
         loop {
             match self.version {
                 WireVersion::V2 => {
@@ -498,9 +498,12 @@ impl FrpConn {
                     let type_id = u16::from_be_bytes([payload[0], payload[1]]);
                     if type_id == msg::TYPE_UDP_PACKET_BINARY {
                         let pkt = msg::decode_udp_binary(&payload[2..])?;
-                        return Ok(ConnEvent::Msg(FrpMessage::UdpPacket(pkt)));
+                        return Ok(ConnEvent::Msg(Box::new(FrpMessage::UdpPacket(pkt))));
                     }
-                    return Ok(ConnEvent::Msg(FrpMessage::decode(type_id, &payload[2..])?));
+                    return Ok(ConnEvent::Msg(Box::new(FrpMessage::decode(
+                        type_id,
+                        &payload[2..],
+                    )?)));
                 }
                 WireVersion::V1 => {
                     let taken = {
@@ -527,11 +530,13 @@ impl FrpConn {
                     }
                     let type_id = v1::type_id(byte).expect("take_msg 已校验过类型字节");
                     if self.v1_udp_binary && byte == v1::TYPE_UDP_PACKET {
-                        return Ok(ConnEvent::Msg(FrpMessage::UdpPacket(msg::decode_udp_binary(
-                            &body,
-                        )?)));
+                        return Ok(ConnEvent::Msg(Box::new(FrpMessage::UdpPacket(
+                            msg::decode_udp_binary(&body)?,
+                        ))));
                     }
-                    return Ok(ConnEvent::Msg(FrpMessage::decode(type_id, &body)?));
+                    return Ok(ConnEvent::Msg(Box::new(FrpMessage::decode(
+                        type_id, &body,
+                    )?)));
                 }
             }
         }
@@ -544,7 +549,7 @@ impl FrpConn {
     pub async fn recv_msg(&mut self) -> Result<Option<FrpMessage>> {
         loop {
             match self.recv_event().await? {
-                ConnEvent::Msg(m) => return Ok(Some(m)),
+                ConnEvent::Msg(m) => return Ok(Some(*m)),
                 ConnEvent::NLink(f) => {
                     if let Some(n) = self.nlink.as_mut() {
                         n.inbox.push(f);
@@ -818,6 +823,11 @@ pub async fn client_handshake_with(
 
 /// 服务端对一次 preamble 的协商结果。
 struct NegotiatedNLink {
+    /// 要回显给客户端的协商结果。
+    ///
+    /// 只有打开 `nlink` feature 时 `LoginResp` 才有这个字段可写；
+    /// 关掉时它无处安放，所以单独放行"未读取"。
+    #[cfg_attr(not(feature = "nlink"), allow(dead_code))]
     ack: nlink::LoginAck,
     caps: nlink::Caps,
     session: nlink::ConnectionId,
@@ -832,10 +842,7 @@ struct NegotiatedNLink {
 /// * 运行期没开（`nlink_enabled == None`）；
 /// * 对端 preamble 显式标了"不启用"；
 /// * 交集为空。
-fn negotiate_nlink(
-    pre: Option<nlink::Preamble>,
-    enabled: Option<u64>,
-) -> Option<NegotiatedNLink> {
+fn negotiate_nlink(pre: Option<nlink::Preamble>, enabled: Option<u64>) -> Option<NegotiatedNLink> {
     if !cfg!(feature = "nlink") {
         return None;
     }
@@ -949,7 +956,8 @@ pub async fn server_handshake(
         max_clock_skew_secs,
     )
     .await
-}/// 带授权的服务端握手。
+}
+/// 带授权的服务端握手。
 ///
 /// `authorize` 在**认证通过之后、`LoginResp` 发出之前**被调用 —— 只有它返回
 /// `Ok` 才会回"登录成功"，否则回一条带 `error` 的 `LoginResp`。
@@ -991,6 +999,11 @@ where
 ///
 /// `nlink_enabled` 是**运行期允许启用的能力位**（`None` = 运行期关掉 NLink）。
 /// 协商结果 = 编译期实现 ∩ 对端声明 ∩ 运行期允许，三者缺一不可。
+///
+/// 参数确实多（连接、认证、run_id、授权闭包、时钟容差、插件、对端地址、
+/// NLink 能力位），但每个都是握手必需的独立输入。打包成结构体只会把
+/// 同一组参数搬到另一处定义，所以这里放行。
+#[allow(clippy::too_many_arguments)]
 pub async fn server_handshake_authz_ext<F>(
     stream: BoxStream,
     auth: &crate::security::AuthProvider,
@@ -1321,18 +1334,30 @@ pub async fn client_work_conn_with(
     run_id: &str,
     token: &str,
     ts: i64,
-    nlink_identity: Option<&str>,
+    // 关掉 `nlink` feature 时这个参数用不上（下面整段被 cfg 掉），
+    // 但签名保持一致，免得调用点也要跟着写 `#[cfg]`。
+    #[cfg_attr(not(feature = "nlink"), allow(unused_variables))] nlink_identity: Option<&str>,
 ) -> Result<(BoxStream, Vec<u8>, StartWorkConn)> {
     let mut conn = FrpConn::new(stream, version);
     // v2 要求每条连接都先发魔术字；v1 什么都不发，直接上消息
     conn.write_magic().await?;
-    conn.send_msg(&FrpMessage::NewWorkConn(NewWorkConn {
+    // 两种 feature 配置下字段数不同，所以整个构造函数写两遍。
+    // 用 `#[cfg]` 而不是 `..Default::default()`：后者在默认配置下会被
+    // clippy 判成"所有字段都已指定、这行没作用"（needless_update）。
+    #[cfg(feature = "nlink")]
+    let new_work = NewWorkConn {
         run_id: run_id.to_string(),
         privilege_key: msg::auth_key(token, ts),
         timestamp: ts,
         nlink: nlink_identity.map(str::to_string),
-    }))
-    .await?;
+    };
+    #[cfg(not(feature = "nlink"))]
+    let new_work = NewWorkConn {
+        run_id: run_id.to_string(),
+        privilege_key: msg::auth_key(token, ts),
+        timestamp: ts,
+    };
+    conn.send_msg(&FrpMessage::NewWorkConn(new_work)).await?;
 
     match conn.recv_msg().await? {
         Some(FrpMessage::StartWorkConn(s)) => {
@@ -1466,7 +1491,7 @@ mod tests {
         client.write_all(&wire).await.unwrap();
 
         match conn.recv_event().await.unwrap() {
-            ConnEvent::Msg(FrpMessage::Ping(p)) => assert_eq!(p.timestamp, 7),
+            ConnEvent::Msg(m) => assert!(matches!(*m, FrpMessage::Ping(p) if p.timestamp == 7)),
             _ => panic!("期望跳过未知帧后收到 Ping"),
         }
     }
@@ -1526,7 +1551,10 @@ mod tests {
         match ev {
             ConnEvent::NLink(f) => {
                 assert_eq!(f.kind, crate::nlink::FrameKind::Identity);
-                assert_eq!(f.tlvs.get_str(crate::nlink::frame::TAG_IDENTITY).unwrap(), "v1.tok");
+                assert_eq!(
+                    f.tlvs.get_str(crate::nlink::frame::TAG_IDENTITY).unwrap(),
+                    "v1.tok"
+                );
             }
             _ => panic!("期望拿到已缓冲的 NLink 帧"),
         }
@@ -1675,6 +1703,11 @@ mod tests {
         // ---- v2：首字节是魔术字 ----
         let (mut client, server) = tokio::io::duplex(4096);
         client.write_all(MAGIC_V2).await.unwrap();
+        // ★ 探测要读 max(MAGIC_V2.len(), nlink::MAGIC.len()) = 8 字节，
+        //   而 MAGIC_V2 只有 7 字节 —— 这里必须补足第 8 字节，否则
+        //   `detect_version` 会一直等下一条永远不会来的数据（测试挂死）。
+        //   识别只看前 7 字节，所以补什么都行；真机上这字节是帧头第一个字节。
+        client.write_all(&[0u8]).await.unwrap();
         let mut conn = FrpConn::new(Box::pin(server), WireVersion::V1);
         assert_eq!(conn.detect_version().await.unwrap(), WireVersion::V2);
 

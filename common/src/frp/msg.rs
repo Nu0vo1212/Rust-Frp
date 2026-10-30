@@ -334,8 +334,22 @@ pub struct NewWorkConn {
     ///
     /// 只有会话协商了 `CAP_IDENTITY` 才出现；官方 frps 用 Go 的
     /// `encoding/json` 解析，未知字段直接忽略，所以多挂这个键对它零影响。
+    ///
+    /// 与 [`LoginResp::nlink`] 一样按 feature gating：编译期关掉 `nlink`
+    /// 后这个字段不存在，`NewWorkConn` 的 JSON 与 0.6.x 逐字节一致。
+    #[cfg(feature = "nlink")]
     #[serde(rename = "_nlink", default, skip_serializing_if = "Option::is_none")]
     pub nlink: Option<String>,
+}
+
+#[cfg(not(feature = "nlink"))]
+impl NewWorkConn {
+    /// 关掉 `nlink` feature 时没有 `nlink` 字段，但调用点仍写
+    /// `nlink: Default::default()`。这里提供一个同名的只读访问器，
+    /// 让"取令牌"的代码不必到处写 `#[cfg]`。
+    pub fn nlink(&self) -> Option<&str> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

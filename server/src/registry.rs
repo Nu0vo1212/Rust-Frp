@@ -131,10 +131,7 @@ impl Registry {
 
     /// 取当前 NLink 运行期状态（克隆 Arc，零成本）。
     pub fn nlink(&self) -> Arc<crate::nlink::NLinkRuntime> {
-        self.nlink
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.nlink.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// 整体替换 NLink 运行期状态（启动装载 / 配置热重载）。

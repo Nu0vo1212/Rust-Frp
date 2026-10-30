@@ -114,9 +114,8 @@ impl TlvMap {
 
     pub fn get_u64(&self, tag: u16) -> Option<u64> {
         self.get(tag).and_then(|v| {
-            v.get(..8).map(|v| {
-                u64::from_be_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]])
-            })
+            v.get(..8)
+                .map(|v| u64::from_be_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]]))
         })
     }
 
@@ -155,12 +154,8 @@ impl TlvMap {
                 bail!("TLV 头不完整（剩 {} 字节）", buf.len() - pos);
             }
             let tag = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
-            let len = u32::from_be_bytes([
-                buf[pos + 2],
-                buf[pos + 3],
-                buf[pos + 4],
-                buf[pos + 5],
-            ]) as usize;
+            let len = u32::from_be_bytes([buf[pos + 2], buf[pos + 3], buf[pos + 4], buf[pos + 5]])
+                as usize;
             pos += 6;
             if buf.len() - pos < len {
                 bail!("TLV 长度 {len} 超出剩余缓冲 {}", buf.len() - pos);
@@ -249,7 +244,10 @@ pub struct Frame {
 pub enum Decoded<T> {
     Known(T),
     /// 版本或类型不认识：整帧忽略，连接照常。
-    Unknown { version: u8, kind: u8 },
+    Unknown {
+        version: u8,
+        kind: u8,
+    },
 }
 
 impl Frame {
@@ -343,7 +341,9 @@ impl Preamble {
             bail!("preamble 不完整（{} 字节）", buf.len());
         }
         let version = buf[0];
-        let caps = u64::from_be_bytes([buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8]]);
+        let caps = u64::from_be_bytes([
+            buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8],
+        ]);
         let flags = buf[9];
         let mut sid = [0u8; 16];
         sid.copy_from_slice(&buf[10..26]);
@@ -398,7 +398,12 @@ mod tests {
     #[test]
     fn 不认识的_tlv_被跳过而不是报错() {
         // 手工拼一个含未来 tag 的帧
-        let mut raw = vec![crate::nlink::PROTOCOL_VERSION, FrameKind::Trace.as_u8(), 0, 0];
+        let mut raw = vec![
+            crate::nlink::PROTOCOL_VERSION,
+            FrameKind::Trace.as_u8(),
+            0,
+            0,
+        ];
         raw.extend_from_slice(&0x4EFFu16.to_be_bytes()); // 未来 tag
         raw.extend_from_slice(&5u32.to_be_bytes());
         raw.extend_from_slice(b"hello");
@@ -438,10 +443,18 @@ mod tests {
 
     #[test]
     fn 坏长度必须报错() {
-        let mut raw = vec![crate::nlink::PROTOCOL_VERSION, FrameKind::Trace.as_u8(), 0, 0];
+        let mut raw = vec![
+            crate::nlink::PROTOCOL_VERSION,
+            FrameKind::Trace.as_u8(),
+            0,
+            0,
+        ];
         raw.extend_from_slice(&TAG_TRACE_ID.to_be_bytes());
         raw.extend_from_slice(&999u32.to_be_bytes());
-        assert!(Frame::decode(&raw).is_err(), "长度指到缓冲外是坏帧，不能静默");
+        assert!(
+            Frame::decode(&raw).is_err(),
+            "长度指到缓冲外是坏帧，不能静默"
+        );
     }
 
     #[test]
@@ -472,9 +485,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn 帧大小在_v1_上限内() {
-        // 最大合法帧：8192 字节；v1 的 10240 上限要留得下 9 字节头。
-        assert!(MAX_FRAME + 9 < 10240);
-    }
+    /// v1 的消息长度前缀是 10240，扩展帧必须留得下 9 字节头。
+    ///
+    /// 用 const 断言而不是运行时 ssert!：这是**编译期常量之间的关系**，
+    /// 运行期断言会被 clippy 判成"断言值恒为真"，而且真出问题时也要等到
+    /// 跑测试才发现 —— const 断言让它在编译期就失败。
+    const _: () = assert!(MAX_FRAME + 9 < 10240);
 }

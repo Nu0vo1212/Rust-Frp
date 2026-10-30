@@ -109,7 +109,11 @@ pub async fn try_knock(
     };
     match nfrp_common::nlink::knock::verify_knock(rule, &buf, peer, std::time::SystemTime::now()) {
         Ok(()) => {
-            auth.allow(peer, rule.port, Duration::from_secs(rule.window.clamp(1, 3600)));
+            auth.allow(
+                peer,
+                rule.port,
+                Duration::from_secs(rule.window.clamp(1, 3600)),
+            );
             tracing::info!(%peer, port = rule.port, "端口敲门通过，临时放行");
             true
         }

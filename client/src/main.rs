@@ -839,10 +839,7 @@ impl ServerLink {
 
     /// 本会话协商出来的 NLink 能力位。
     pub(crate) fn nlink_caps(&self) -> nfrp_common::nlink::Caps {
-        nfrp_common::nlink::Caps(
-            self.nlink_caps
-                .load(std::sync::atomic::Ordering::Relaxed),
-        )
+        nfrp_common::nlink::Caps(self.nlink_caps.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// 登录成功后由 `run_session` 写入。
@@ -1352,7 +1349,9 @@ async fn handle_nlink_frame(
     proxies: &registry::ProxyTable,
     health: &Arc<health::Monitor>,
 ) {
-    use nfrp_common::nlink::frame::{FrameKind, TAG_CODE, TAG_COUNT, TAG_DETAIL, TAG_IDENTITY, TAG_OK};
+    use nfrp_common::nlink::frame::{
+        FrameKind, TAG_CODE, TAG_COUNT, TAG_DETAIL, TAG_IDENTITY, TAG_OK,
+    };
 
     match frame.kind {
         FrameKind::Identity => {
@@ -1375,11 +1374,7 @@ async fn handle_nlink_frame(
             }
         }
         FrameKind::BatchReq => {
-            let count = frame
-                .tlvs
-                .get_u32(TAG_COUNT)
-                .unwrap_or(1)
-                .clamp(1, 256) as usize;
+            let count = frame.tlvs.get_u32(TAG_COUNT).unwrap_or(1).clamp(1, 256) as usize;
             debug!(count, "收到批量工作连接请求");
             for _ in 0..count {
                 spawn_work_conn(
@@ -1438,7 +1433,11 @@ async fn handshake_once(
     // 复用上一次的会让"重连"变成"用过期 token 再失败一次"。
     // TokenSource 内部有缓存，没到期时不会真的去打 IdP。
     let cred = current_credential(cfg, token_source).await?;
-    let pre = if with_preamble { nlink.preamble() } else { None };
+    let pre = if with_preamble {
+        nlink.preamble()
+    } else {
+        None
+    };
     conn::client_handshake_with(
         stream,
         link.wire,
@@ -1582,7 +1581,7 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
             .await
             .context("等待 NewProxyResp 超时")??;
         let msg = match event {
-            nfrp_common::frp::conn::ConnEvent::Msg(m) => Some(m),
+            nfrp_common::frp::conn::ConnEvent::Msg(m) => Some(*m),
             nfrp_common::frp::conn::ConnEvent::Closed => None,
             nfrp_common::frp::conn::ConnEvent::NLink(f) => {
                 // 注册窗口期内就可能收到身份令牌 / 续传回执，必须立刻处理：
@@ -1638,7 +1637,7 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
         tokio::select! {
             event = conn.recv_event() => {
                 let msg = match event? {
-                    nfrp_common::frp::conn::ConnEvent::Msg(m) => m,
+                    nfrp_common::frp::conn::ConnEvent::Msg(m) => *m,
                     nfrp_common::frp::conn::ConnEvent::Closed => {
                         info!("服务端关闭了控制连接");
                         // 控制连接没了：还在等的打洞请求必须立刻失败，

@@ -84,12 +84,7 @@ fn knock_mac(secret: &str, ip: IpAddr, port: u16, ts: u64) -> [u8; 16] {
 }
 
 /// 校验一个敲门序列。
-pub fn verify_knock(
-    rule: &KnockRule,
-    seq: &[u8],
-    ip: IpAddr,
-    now: SystemTime,
-) -> Result<()> {
+pub fn verify_knock(rule: &KnockRule, seq: &[u8], ip: IpAddr, now: SystemTime) -> Result<()> {
     if !rule.effective() {
         bail!("敲门规则未启用");
     }

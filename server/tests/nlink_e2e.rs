@@ -24,19 +24,20 @@ use nfrp_common::{
     frp::{
         conn::{self, ConnEvent, FrpConn},
         msg::{FrpMessage, NewProxy, NfrpCaps},
-        quic, stream::BoxStream, WireVersion,
+        quic,
+        stream::BoxStream,
+        WireVersion,
     },
     nlink::{
         frame::{FrameKind, Preamble, TAG_COUNT, TAG_IDENTITY, TAG_OK, TAG_TRACE_ID},
         knock::{build_knock, KnockRule},
+        parse_features,
         policy::{
             classify, decide_direct, matrix_gaps, probe_plan, ttl_ladder, DirectContext,
             DirectDecision, FailureCode, XtcpPolicy, MATRIX,
         },
-        parse_features,
         session::{ConnectionId, IdentityKey, TraceId},
-        Caps, CAP_BATCH_WORK, CAP_IDENTITY, CAP_RESUME, CAP_TRACE, CAP_XTCP_POLICY,
-        FLAG_RESUME,
+        Caps, CAP_BATCH_WORK, CAP_IDENTITY, CAP_RESUME, CAP_TRACE, CAP_XTCP_POLICY, FLAG_RESUME,
     },
     security::Credential,
     util,
@@ -187,7 +188,10 @@ fn preamble(caps: &[&str]) -> Preamble {
     Preamble::new(bits, ConnectionId::random())
 }
 
-async fn register_proxy(conn: &mut FrpConn, proxy: NewProxy) -> nfrp_common::frp::msg::NewProxyResp {
+async fn register_proxy(
+    conn: &mut FrpConn,
+    proxy: NewProxy,
+) -> nfrp_common::frp::msg::NewProxyResp {
     conn.send_msg(&FrpMessage::NewProxy(proxy))
         .await
         .expect("发送 NewProxy");
@@ -227,7 +231,10 @@ fn spawn_provider(
                 Err(_) => break,
             };
             match ev {
-                ConnEvent::Msg(FrpMessage::ReqWorkConn) => {
+                // `ConnEvent::Msg` 里装的是 `Box<FrpMessage>`（枚举按最大变体
+                // 开内存，584 字节的消息装箱后才不会让扩展帧跟着搬运）。
+                // 这里要匹配内层变体，所以先绑定再 `matches!`。
+                ConnEvent::Msg(m) if matches!(*m, FrpMessage::ReqWorkConn) => {
                     let run = run_id.clone();
                     let id = identity.clone();
                     tokio::spawn(async move {
@@ -244,7 +251,8 @@ fn spawn_provider(
                         let run = run_id.clone();
                         let id = identity.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = serve_work_conn(port, &run, local, id.as_deref()).await {
+                            if let Err(e) = serve_work_conn(port, &run, local, id.as_deref()).await
+                            {
                                 eprintln!("批量工作连接出错：{e:#}");
                             }
                         });
@@ -301,7 +309,7 @@ async fn roundtrip(addr: SocketAddr, payload: &[u8]) -> Vec<u8> {
 
 /// 读下一条事件，带超时（超时也算失败，避免用例挂死）。
 async fn next_event(conn: &mut FrpConn, ms: u64) -> anyhow::Result<ConnEvent> {
-    Ok(tokio::time::timeout(Duration::from_millis(ms), conn.recv_event()).await??)
+    tokio::time::timeout(Duration::from_millis(ms), conn.recv_event()).await?
 }
 
 // ---------------------------------------------------------------------------
@@ -326,7 +334,8 @@ async fn nlink_quic_多路复用_同一条连接跑多条流() {
         let (send, recv) = connection.open_bi().await.expect("开双向流");
         let stream: BoxStream = Box::pin(quic::QuicStream::new(send, recv));
         let mut pre = preamble(&["trace"]);
-        pre.tlvs.push(TAG_TRACE_ID, TraceId::random().as_bytes().to_vec());
+        pre.tlvs
+            .push(TAG_TRACE_ID, TraceId::random().as_bytes().to_vec());
         let (conn, run_id, _udp_binary, _caps) = conn::client_handshake_with(
             stream,
             WireVersion::V2,
@@ -343,7 +352,8 @@ async fn nlink_quic_多路复用_同一条连接跑多条流() {
         assert!(
             conn.nlink().is_some(),
             "第 {i} 条流必须协商出 NLink（否则 preamble 被吃掉了）"
-        );        run_ids.push(run_id);
+        );
+        run_ids.push(run_id);
     }
     let unique: HashSet<&String> = run_ids.iter().collect();
     assert_eq!(unique.len(), 3, "三条流必须是三个独立会话：{run_ids:?}");
@@ -435,7 +445,9 @@ async fn nlink_nat_探测阶梯与失败原因码() {
         .await
         .expect("bind udp");
     sock.set_ttl(1).expect("设置 TTL");
-    sock.send_to(b"nfrp-probe", "127.0.0.1:9").await.expect("发送探测");
+    sock.send_to(b"nfrp-probe", "127.0.0.1:9")
+        .await
+        .expect("发送探测");
     let results: Vec<(u8, bool)> = vec![(1, false), (2, false)];
     assert_eq!(classify(&results), FailureCode::PeerUnreachable);
     assert_eq!(classify(&[]), FailureCode::Timeout);
@@ -459,9 +471,10 @@ async fn nlink_身份令牌_伪造与过期都被拒() {
     let cfg = nlink_cfg(&["identity"]);
     let (port, _reg) = start_server(cfg).await;
 
-    let (mut conn, run_id, caps) = login_with_preamble(port, "id-user", Some(preamble(&["identity"])))
-        .await
-        .expect("登录");
+    let (mut conn, run_id, caps) =
+        login_with_preamble(port, "id-user", Some(preamble(&["identity"])))
+            .await
+            .expect("登录");
     assert!(caps.contains(CAP_IDENTITY), "必须协商出身份能力：{caps}");
 
     // 服务端登录后会主动发一张令牌。
@@ -604,9 +617,10 @@ async fn nlink_限流_按代理令牌桶真的限速() {
     }];
     let (port, registry) = start_server(cfg).await;
 
-    let (mut conn, run_id, caps) = login_with_preamble(port, "rl-user", Some(preamble(&["rate-limit"])))
-        .await
-        .expect("登录");
+    let (mut conn, run_id, caps) =
+        login_with_preamble(port, "rl-user", Some(preamble(&["rate-limit"])))
+            .await
+            .expect("登录");
     assert!(caps.any());
     let resp = register_proxy(&mut conn, tcp_proxy("web", remote, echo)).await;
     assert!(resp.error.is_empty(), "注册失败：{}", resp.error);
@@ -648,10 +662,7 @@ async fn nlink_trace_控制连接与数据面共享同一个_id() {
 
     let trace = TraceId::random();
     let session = ConnectionId::random();
-    let mut pre = Preamble::new(
-        parse_features(&["trace".to_string()]).0,
-        session,
-    );
+    let mut pre = Preamble::new(parse_features(&["trace".to_string()]).0, session);
     pre.tlvs.push(TAG_TRACE_ID, trace.as_bytes().to_vec());
 
     let (_conn, run_id, caps) = login_with_preamble(port, "trace-user", Some(pre))
@@ -749,7 +760,7 @@ async fn nlink_断线续传_端口与代理状态保留() {
     let mut saved = false;
     for _ in 0..40 {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        if registry.nlink().resume.len() > 0 {
+        if !registry.nlink().resume.is_empty() {
             saved = true;
             break;
         }
@@ -830,7 +841,14 @@ async fn nlink_端口敲门_不敲门连不上敲门后能连() {
             .expect("登录");
     let resp = register_proxy(&mut conn, tcp_proxy("knock", remote, echo)).await;
     assert!(resp.error.is_empty(), "{}", resp.error);
-    spawn_provider(conn, port, run_id, echo, None, Arc::new(AtomicUsize::new(0)));
+    spawn_provider(
+        conn,
+        port,
+        run_id,
+        echo,
+        None,
+        Arc::new(AtomicUsize::new(0)),
+    );
 
     let target: SocketAddr = format!("127.0.0.1:{remote}").parse().unwrap();
 
@@ -1033,7 +1051,9 @@ async fn nlink_兼容边界_官方忽略的字段与报错的字段() {
         login_with_preamble(port, "compat-user", Some(preamble(&["trace"])))
             .await
             .expect("登录");
-    conn.write_frame(0x4D, b"who-knows").await.expect("写未知帧");
+    conn.write_frame(0x4D, b"who-knows")
+        .await
+        .expect("写未知帧");
     let resp = register_proxy(&mut conn, tcp_proxy("compat", remote, echo)).await;
     assert!(
         resp.error.is_empty(),

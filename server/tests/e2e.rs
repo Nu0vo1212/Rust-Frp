@@ -1820,6 +1820,8 @@ async fn try_work_conn(
         run_id: run_id.to_string(),
         privilege_key: privilege_key.to_string(),
         timestamp: ts,
+        // 这条测试走的是标准 frp 路径（没协商 NLink），令牌留空即可。
+        nlink: Default::default(),
     }))
     .await
     .map_err(|e| e.to_string())?;

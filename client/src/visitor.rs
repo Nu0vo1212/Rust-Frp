@@ -314,7 +314,9 @@ async fn handle_user(
     //   * Relay  —— 一开始就不试（`relay-only`，或明确不可能成功）；
     //   * Fail   —— 策略要求直连但条件不满足：**必须报错**，不能静默降级。
     if cfg.visitor_type == "xtcp" {
-        use nfrp_common::nlink::policy::{decide_direct, DirectContext, DirectDecision, XtcpPolicy};
+        use nfrp_common::nlink::policy::{
+            decide_direct, DirectContext, DirectDecision, XtcpPolicy,
+        };
         let policy = XtcpPolicy::parse(&session.link.cfg.nlink.xtcp_policy).unwrap_or_default();
         let ctx = DirectContext {
             // 保守估计：没协商过 `xtcp-policy` 就当作官方对端（老行为）。
@@ -353,11 +355,9 @@ async fn handle_user(
                     }
                     Err(e) => {
                         if policy == XtcpPolicy::DirectOnly {
-                            return Err(e).with_context(|| {
-                                format!(
-                                    "xtcp 直连策略为 direct-only，打洞失败且不允许回退中继（日志里能看到失败原因）"
-                                )
-                            });
+                            return Err(e).context(
+                                "xtcp 直连策略为 direct-only，打洞失败且不允许回退中继（日志里能看到失败原因）",
+                            );
                         }
                         debug!(visitor = %cfg.name, "P2P 打洞失败，回退中继：{e:#}");
                     }

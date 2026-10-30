@@ -21,8 +21,8 @@ use nfrp_common::config::ClientConfig;
 use nfrp_common::nlink::frame::{Preamble, TAG_TRACE_ID};
 use nfrp_common::nlink::session::{ConnectionId, TraceId};
 use nfrp_common::nlink::{
-    Caps, FeatureSet, CAP_BATCH_WORK, CAP_QUIC, CAP_QUIC_MIGRATION, CAP_RESUME, CAP_TRACE, FLAG_QUIC,
-    FLAG_RESUME,
+    Caps, FeatureSet, CAP_BATCH_WORK, CAP_QUIC, CAP_QUIC_MIGRATION, CAP_RESUME, CAP_TRACE,
+    FLAG_QUIC, FLAG_RESUME,
 };
 
 /// 客户端 NLink 状态。

@@ -142,30 +142,22 @@ impl IdentityKey {
     /// * 换客户端 / 换用户 → 旧令牌立即失效；
     /// * 过期 → 失效（默认 300 秒，够一次重连 + 一批工作连接）。
     pub fn issue(&self, run_id: &str, user: &str, ttl: Duration, now: SystemTime) -> String {
-        let exp = now
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            + ttl.as_secs().max(1);
+        let exp =
+            now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() + ttl.as_secs().max(1);
         let mac = self.mac(&identity_message(run_id, user, exp));
         format!("v1.{exp}.{}", hex(&mac))
     }
 
     /// 校验。
-    pub fn verify(
-        &self,
-        token: &str,
-        run_id: &str,
-        user: &str,
-        now: SystemTime,
-    ) -> Result<()> {
+    pub fn verify(&self, token: &str, run_id: &str, user: &str, now: SystemTime) -> Result<()> {
         let mut it = token.split('.');
-        let (Some("v1"), Some(exp), Some(sig), None) =
-            (it.next(), it.next(), it.next(), it.next())
+        let (Some("v1"), Some(exp), Some(sig), None) = (it.next(), it.next(), it.next(), it.next())
         else {
             bail!("身份令牌格式不对");
         };
-        let exp: u64 = exp.parse().map_err(|_| anyhow::anyhow!("身份令牌过期时间不是数字"))?;
+        let exp: u64 = exp
+            .parse()
+            .map_err(|_| anyhow::anyhow!("身份令牌过期时间不是数字"))?;
         let now_secs = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         // 允许 30 秒时钟回拨，不放宽过期。
         if now_secs > exp + 30 {

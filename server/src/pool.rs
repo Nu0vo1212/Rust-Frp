@@ -430,10 +430,7 @@ impl ClientState {
 
     /// NLink 协商结果（`None` = 本次会话没有启用扩展层）。
     pub fn nlink(&self) -> Option<nfrp_common::frp::conn::NLinkState> {
-        self.nlink
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.nlink.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// 由控制连接在登录成功后写入。

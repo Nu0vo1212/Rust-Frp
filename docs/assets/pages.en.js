@@ -1313,7 +1313,84 @@ PAGES_EN['nlink'] = `
     <p>下面列出的能力<strong>均已实现并通过测试</strong>（<code>server/tests/nlink_e2e.rs</code> 的 11 条端到端用例逐项覆盖）。 但 NLink <strong>默认关闭</strong>：服务端与客户端都要显式写 <code>[nlink] enable = true</code> 才生效。 不开启时，行为与 0.6.x 完全一致。</p>
   </div>
 </div>
-<h2 data-i18n="nlink-s1-h">怎么开启</h2>
+<h2 data-i18n="nlink-s1-h">握手：零额外往返</h2>
+<p>客户端把能力声明<strong>搭车</strong>在第一条协议消息之前，服务端把确认结果<strong>搭车</strong>在本就要发的 <code>LoginResp</code> 上带回。全程不新增任何往返。</p>
+<pre class="code-block"><code class="language-text">frpc                                          frps
+ │                                             │
+ ├─ [8] NFRPLNK1        魔术字                 │   首字节 'N' 是标准 frp
+ ├─ [1] ver = 1         扩展版本               │   永远不产生的值
+ ├─ [8] caps            能力位图（大端 u64）    │   （v1 首字节是 '{'）
+ ├─ [16] session_id     进程级连接标识          │   （v2 是 'F'，TLS 是 0x16）
+ ├─ [8] trace_id        端到端追踪              │
+ ├─ 标准 v1/v2 握手 ────────────────────────▶ │
+ │                                             ├─ 解析 preamble
+ │                                             ├─ 协商结果 = 编译期实现
+ │                             ◀────────────── ┤            ∩ 对端声明
+ │  LoginResp { _nlink: { caps, session, ... } }│            ∩ 运行期允许
+ │                                             │
+ ├─ 后续扩展帧（与标准消息同一条流，同为密文） │</code></pre>
+<p><strong>为什么不会误判</strong>：识别只依赖首字节。<code>MAGIC_V2</code> 是 <code>FRP\0\x02\r\n</code>，NLink 是 <code>NFRPLNK1</code>，v1 的 JSON 以 <code>{</code> 开头 —— 三者互不重叠。</p>
+<p>探测统一读 <code>max(8, 7) = 8</code> 字节。早期实现按 <code>MAGIC_V2.len()</code>（7）去填，紧接着 切片到 8 字节做比较 —— 一个<strong>只发 7 字节就闭嘴</strong>的客户端就能把服务端 panic 掉。 现在这条有专门的回归测试（<code>首帧不足时_detect_version_报错而不是_panic</code>）。</p>
+<h2 data-i18n="nlink-s2-h">扩展帧：版本化 TLV</h2>
+<pre class="code-block"><code class="language-text">u8   version    扩展帧版本（当前 1）
+u8   kind       帧种类
+u16  flags      保留，必须为 0（不认识就忽略）
+TLV*            每个：u16 tag + u32 len + len 字节</code></pre>
+<p><strong>对方不认识的 <code>kind</code> 或 <code>tag</code> 必须跳过，不能报错</strong> —— 这是前向兼容的唯一前提。 帧长度自描述，所以跳过是安全的。</p>
+<p>v2 侧走专用帧类型 <code>0x4E</code>；v1 侧走专用消息类型字节 <code>0x7F</code>。这两个值官方到 v0.71.0 为止都没用过（官方 v1 的类型字节都是可打印 ASCII），所以不会撞号。</p>
+<h2 data-i18n="nlink-s3-h">各能力的承载方式</h2>
+<div class="table-wrap">
+<table>
+<thead><tr>
+<th>能力</th>
+<th>承载</th>
+<th>说明</th>
+</tr></thead>
+<tbody>
+<tr>
+<td>能力协商</td>
+<td>preamble + <code>LoginResp._nlink</code></td>
+<td>双方交集非空才启用</td>
+</tr>
+<tr>
+<td>QUIC 与连接迁移</td>
+<td>独立 ALPN <code>nfrp-nlink</code></td>
+<td>与标准 QUIC 分桶，互不串味</td>
+</tr>
+<tr>
+<td>断线续传</td>
+<td><code>session_id</code> + 服务端保留表</td>
+<td>保留 <code>resume_ttl</code> 秒，重连后原样恢复</td>
+</tr>
+<tr>
+<td>零信任身份</td>
+<td><code>NewWorkConn._nlink</code> 令牌</td>
+<td><code>v1.&lt;exp&gt;.&lt;hmac&gt;</code>，绑定 <code>run_id + user + 过期时间</code></td>
+</tr>
+<tr>
+<td>细粒度限流</td>
+<td>桥接层令牌桶</td>
+<td>按「用户 × 代理」，支持突发</td>
+</tr>
+<tr>
+<td>端口敲门</td>
+<td>数据面 33 字节序列</td>
+<td>敲对了按 IP 临时放行</td>
+</tr>
+<tr>
+<td>批量工作连接</td>
+<td><code>BatchReq</code></td>
+<td>一条帧换 N 条连接</td>
+</tr>
+<tr>
+<td>端到端 trace</td>
+<td><code>trace_id</code></td>
+<td>控制连接与数据面共享</td>
+</tr>
+</tbody>
+</table>
+</div>
+<h2 data-i18n="nlink-s4-h">怎么开启</h2>
 <pre class="code-block"><code class="language-toml"># frps 端
 [nlink]
 enable = true
@@ -1326,9 +1403,9 @@ enable = true
 resume = true      # 断线后用同一个 connection id 续传
 quic = true        # 走 QUIC 连服务端（需服务端开 quic_listen）</code></pre>
 <p>官方面（官方 frpc/frps）不认 preamble，会把首字节当成 v1 消息头报错。 客户端捕获到这种失败后<strong>自动回退标准模式并只重试一次</strong>，日志里留一行 warn，隧道照常工作。</p>
-<h2 data-i18n="nlink-s2-h">为什么需要扩展层</h2>
+<h2 data-i18n="nlink-s5-h">为什么需要扩展层</h2>
 <p>frp 的协议是够用的，但它把「传输、会话、鉴权、调度」都固定死了。有些问题不是"实现得不好"，而是 <strong>协议里根本没有承载位置</strong> —— 比如连接迁移需要传输层有独立的连接标识，而 frp 是在 TCP/TLS 之上套 yamux，这个位置不存在。</p>
-<h2 data-i18n="nlink-s3-h">准入判断：四个门槛必须同时成立</h2>
+<h2 data-i18n="nlink-s6-h">准入判断：四个门槛必须同时成立</h2>
 <div class="table-wrap">
 <table>
 <thead><tr>
@@ -1356,7 +1433,7 @@ quic = true        # 走 QUIC 连服务端（需服务端开 quic_listen）</cod
 </table>
 </div>
 <p>第 ④ 条是硬门槛。做不到可回退的，不进 NLink。</p>
-<h2 data-i18n="nlink-s4-h">候选清单</h2>
+<h2 data-i18n="nlink-s7-h">候选清单</h2>
 <div class="table-wrap">
 <table>
 <thead><tr>
@@ -1399,7 +1476,7 @@ quic = true        # 走 QUIC 连服务端（需服务端开 quic_listen）</cod
 </tbody>
 </table>
 </div>
-<h2 data-i18n="nlink-s5-h">附带补齐</h2>
+<h2 data-i18n="nlink-s8-h">附带补齐</h2>
 <p>下面三项性质与上面五条 <strong>不同</strong>：它们不是"协议无解"，而是需求或兼容性缺口。列出来是为了完整，但按 ① 号门槛严格说，它们不满足"根本解决不了"。</p>
 <div class="table-wrap">
 <table>
@@ -1427,7 +1504,7 @@ quic = true        # 走 QUIC 连服务端（需服务端开 quic_listen）</cod
 </tbody>
 </table>
 </div>
-<h2 data-i18n="nlink-s6-h">五条硬性工程约束</h2>
+<h2 data-i18n="nlink-s9-h">五条硬性工程约束</h2>
 <p>这五条是 NLink v1 的设计底线，任何一条不满足就不合入。</p>
 <h3 data-i18n="nlink-c1-h">1. 握手期能力协商</h3>
 <p>握手阶段交换 capabilities，<strong>双方都支持才启用扩展</strong>，否则自动回退标准 frp 行为。协商在登录 / 握手阶段完成，不额外增加往返；能力用位图 + 版本号表示，<strong>未知位一律忽略</strong>（前向兼容）；协商结果决定本次连接的全部行为，中途不改。</p>
@@ -1439,7 +1516,7 @@ quic = true        # 走 QUIC 连服务端（需服务端开 quic_listen）</cod
 <p><strong>同一端口</strong> 能识别标准 frp 握手与扩展握手；识别依据只能是「标准 frp 不会产生的特征」（首字节 / 魔术字）。扩展握手失败 ⇒ <strong>自动 fallback</strong> 到标准流程，用户无感。</p>
 <h3 data-i18n="nlink-c5-h">5. 迁移工具与兼容性矩阵</h3>
 <p>提供迁移工具（配置转换、能力检测、兼容性自检），并维护兼容性矩阵，明确标注每个功能的支持情况。矩阵必须 <strong>可测试</strong>：每一行都要有对应的 e2e 用例。</p>
-<h2 data-i18n="nlink-s7-h">兼容性矩阵</h2>
+<h2 data-i18n="nlink-s10-h">兼容性矩阵</h2>
 <div class="table-wrap">
 <table>
 <thead><tr>
@@ -1494,7 +1571,7 @@ quic = true        # 走 QUIC 连服务端（需服务端开 quic_listen）</cod
 </tbody>
 </table>
 </div>
-<h2 data-i18n="nlink-s8-h">建议的实施顺序</h2>
+<h2 data-i18n="nlink-s11-h">建议的实施顺序</h2>
 <p>按「依赖关系 + 风险从低到高」排：</p>
 <div class="table-wrap">
 <table>
@@ -1542,7 +1619,7 @@ quic = true        # 走 QUIC 连服务端（需服务端开 quic_listen）</cod
 </tbody>
 </table>
 </div>
-<h2 data-i18n="nlink-s9-h">明确不做</h2>
+<h2 data-i18n="nlink-s12-h">明确不做</h2>
 <div class="table-wrap">
 <table>
 <thead><tr>
@@ -1573,7 +1650,7 @@ quic = true        # 走 QUIC 连服务端（需服务端开 quic_listen）</cod
 </tbody>
 </table>
 </div>
-<h2 data-i18n="nlink-s10-h">每个功能立项时必须回答的问题</h2>
+<h2 data-i18n="nlink-s13-h">每个功能立项时必须回答的问题</h2>
 <p>避免做成「技术上很酷但没人用」：</p>
 <ol>
 <li>现在的 frp 具体卡在哪一步？（要能指到协议字段 / 流程）</li>

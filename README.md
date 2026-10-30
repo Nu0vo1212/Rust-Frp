@@ -26,9 +26,16 @@ NFrp 是 [fatedier/frp](https://github.com/fatedier/frp) 的 Rust 重实现，**
 
 资源占用很小：服务端常驻内存约 3.5 MB（同负载下 Go 版 frps 为 28.8~31.8 MB），单文件部署，无运行时依赖。
 
+另有一层可选的扩展协议 **NLink v1**（QUIC 传输与连接迁移、断线续传、零信任身份、
+细粒度限流、端口敲门等），**默认关闭**，开启后仍是双方可协商、可回退的，
+对官方 frp 零影响。见下方[「NLink v1」](#nlink-v1可协商的扩展层默认关闭)。
+
 > **完整文档**：<https://nu0vo1212.github.io/Rust-Frp/>
 > 涵盖安装、全部配置项、八种代理类型、线协议（v1 / v2）详解、ACL / RBAC、审计日志、HTTP API 与安全修复史。
 > 源文件在 [`docs/`](docs/)，本地预览：`python -m http.server -d docs 8899`
+>
+> **质量与发版**：[QUALITY.md](QUALITY.md) —— 测试分布、CI 矩阵、依赖安全做到哪一步、
+> 发版闸门与人工核对清单。
 
 ## 安装
 
@@ -160,61 +167,69 @@ nfrp-common = "0.6"
   `Ping` / `NewWorkConn` / `NewUserConn` 时回调外部 HTTP 服务，支持拒绝、
   改写登录内容和代理名/metas；每次请求 10 秒超时
 
-### NLink v1（扩展层，默认关闭）
+### NLink v1：可协商的扩展层（默认关闭）
 
-在标准 frp 线协议之上叠的一层**可协商、可回退、零额外往返**的扩展。
-每一部分都遵守两条铁律：**标准帧一个字节都不动**、**没协商成功就当它不存在**。
+标准 frp 协议把传输、会话、鉴权、调度都固定死了。有些需求不是"实现得不好"，
+而是**协议里没有承载位置**——比如连接迁移需要传输层有独立的连接标识，而 frp 是
+在 TCP/TLS 之上套 yamux，这个位置不存在。
+
+NLink 就是在标准 frp 线协议之上叠的一层扩展，两条铁律贯穿始终：
+
+1. **标准帧一个字节都不动** —— 扩展走独立命名空间，官方 frp 永远看不到这些字节；
+2. **没协商成功就当它不存在** —— 任何一端不支持，行为与 0.6.x 完全一致。
+
+**零额外往返。** 客户端把能力声明搭车在第一条消息之前（`NFRPLNK1` preamble），
+服务端把确认结果搭车在本就要发的 `LoginResp._nlink` 上带回。识别只依赖首字节
+——`NFRPLNK1`、`FRP\0\x02\r\n`、`{` 三者互不重叠，不会误判。
 
 | 能力 | 说明 |
 |---|---|
-| 能力协商 | 客户端在第一条消息前搭车一个 `NFRPLNK1` preamble，服务端在 `LoginResp._nlink` 里回显。交集非空才启用，全程不增加往返 |
-| QUIC 传输与连接迁移 | 服务端 `[nlink] quic_listen` 开 QUIC 监听；ALPN 用独立的 `nfrp-nlink`，与标准 QUIC 互不串味 |
-| 断线续传 | 进程级 `ConnectionId` 不变；控制连接断开时服务端保留代理名单 `resume_ttl` 秒，重连后原样恢复 |
-| 零信任身份 | 每条工作连接带 `_nlink` 身份令牌（`v1.<exp>.<hmac>`），绑定 `run_id + user + 过期时间`，伪造和过期都会被拒 |
-| 细粒度限流 | 按「用户 × 代理」的令牌桶，支持突发；计费点在桥接层按实际搬运字节扣费 |
-| 端口敲门 | 端口默认对外不可见，敲对 33 字节序列后按 IP 临时放行 |
-| 批量工作连接 | 一条 `BatchReq` 换 N 条工作连接，省掉逐条 `StartWorkConn` 的往返 |
+| QUIC 传输与连接迁移 | 独立 ALPN `nfrp-nlink`，与标准 QUIC 分桶互不串味 |
+| 断线续传 | 进程级 `ConnectionId` 不变，服务端保留代理名单 `resume_ttl` 秒 |
+| 零信任身份 | 每条工作连接带 `v1.<exp>.<hmac>` 令牌，绑定 `run_id + user + 过期时间` |
+| 细粒度限流 | 按「用户 × 代理」的令牌桶，支持突发 |
+| 端口敲门 | 端口默认不可见，敲对序列后按 IP 临时放行 |
+| 批量工作连接 | 一条 `BatchReq` 换 N 条连接，省掉逐条往返 |
 | 端到端 trace | 控制连接与数据面共享同一个 trace id |
 
-**默认关闭。** 服务端与客户端都需显式写 `[nlink] enable = true` 才生效；
-官方面（官方 frpc/frps）不认 preamble，会把首字节当 v1 消息头报错，
-客户端捕获到这种失败后**自动回退标准模式并只重试一次**，日志里留一行 warn。
+**默认关闭**，两端都要显式开：
 
 ```toml
-# frps 端
+# frps.toml
 [nlink]
 enable = true
-# features = ["quic", "resume", "trace"]   # 留空 = 只协商、不启用任何一项
-quic_listen = "0.0.0.0:7000"               # 留空 = 不开 QUIC
+quic_listen = "0.0.0.0:7000"   # 留空 = 不开 QUIC
 resume_ttl = 30
-```
 
-```toml
-# frpc 端
+# frpc.toml
 [nlink]
 enable = true
 resume = true
 quic = true
 ```
 
-编译期可用 `--no-default-features` 把扩展字段整个摘掉：此时 `LoginResp` /
-`NewWorkConn` 的 `_nlink` 键**不存在**，报文与 0.6.x 逐字节一致。
+**与官方 frp 共存**：官方 frps 不认 preamble，会把它当 v1 消息头报错。客户端捕获
+这种失败后**自动回退标准模式并只重试一次**，日志留一行 warn，隧道照常工作。
 
-> 与官方 frp 的双向兼容性、各能力的降级行为，见文档站
-> [NLink v1 规划](https://nu0vo1212.github.io/Rust-Frp/#/nlink) 里的兼容性矩阵。
+| 组合 | 行为 |
+|---|---|
+| NFrp × NFRp | 按协商结果启用 |
+| NFrp × 官方 frp | 回退标准模式，功能降级但**不影响连通** |
+| 官方 × 官方 | 完全不受影响 |
+
+编译期用 `--no-default-features` 可把扩展字段整个摘掉，此时报文与 0.6.x 逐字节一致。
+
+> 握手时序图、TLV 帧格式、各能力的承载方式、兼容性矩阵与设计约束，见
+> [文档站 NLink 页](https://nu0vo1212.github.io/Rust-Frp/#/nlink)。
+
 
 ### 工程质量
 
-- 956 个自动化测试（13 条需真机的设备面测试标 `#[ignore]`），含真实 QUIC 栈握手、端到端集成测试、与官方 frpc/frps 真实抓包密文的解密回归
-- CI 跑 `fmt` / `clippy` / 三系统全量测试 / 两个 musl 目标交叉构建 / 端到端冒烟
-- 第三方 GitHub Action 全部 pin 到 commit SHA；cosign 签名失败即红灯
-- 发布产物附 `SHA256SUMS` + Ed25519 分离签名
+956 个自动化测试，含真实 QUIC 栈握手、端到端集成、官方抓包密文解密回归；
+`cargo audit` 0 命中；发布产物附 `SHA256SUMS` + Ed25519 签名。
 
-> **依赖安全做到哪一步（把措辞说准）**：
-> `cargo audit` 是对**已公开的 RUSTSEC 公告**做比对（当前 0 命中，330 个依赖）；
-> `cargo deny` 管的是许可证、来源与重复依赖；
-> `cargo vet` 目前只有 **184 条 exemption**（即"暂时接受、未经人工审计"），
-> **不等于"依赖经过人工审计"**。本仓库任何地方都不该被读成后者。
+测试分布、CI 矩阵、依赖安全做到哪一步、发版闸门与人工核对清单，
+统一放在 **[QUALITY.md](QUALITY.md)**。
 
 ## 快速开始
 
@@ -368,98 +383,21 @@ NFrp 可运行在官方 frp 的任一侧，双向实测通过：
 ## 质量保障
 
 ```bash
-cargo fmt --all -- --check                # 格式
-cargo clippy --workspace --all-targets    # 静态检查（当前 0 告警）
-cargo test --workspace                    # 890 个测试
+cargo fmt --all -- --check                              # 格式
+cargo clippy --workspace --all-targets -- -D warnings   # 静态检查，0 告警
+cargo test --workspace                                  # 956 通过 / 0 失败 / 13 ignored
 ```
 
-测试分布（**v0.7.0 实测值**，`cargo test --workspace -j 1 -- --test-threads=1`）：
+那 13 条 `#[ignore]` 全是**需要真机硬件或管理员权限**的设备面测试
+（Windows Wintun 网卡、Linux TUN 设备），不是被跳过的问题测试。
 
-| 目标 | 通过 | 忽略 |
-|---|---|---|
-| `nfrp-client` 单元测试 | 127 |  |
-| `nfrp-common` 单元测试（lib） | 432 | 3（需真机网卡） |
-| `nfrp-server` OIDC 端到端 | 9 |  |
-| `nfrp-server` 单元测试（lib） | 277 |  |
-| `nfrp-server` 单元测试（bin） | 17 |  |
-| `nfrp-server` 端到端集成测试 | 26 |  |
-| Wintun 真机（Windows） | 2 | 5 |
-| Linux TUN 真机 | 0 | 5 |
-| **合计** | **890** | **13** |
+CI 在每次 push / PR 上跑同样的三道门，外加三系统全量测试、两个 musl 目标交叉构建
+与端到端冒烟。
 
-★ 数字对不上时以 `cargo test` 输出为准。`#[ignore]` 的 13 条全是**需要真机 /
-管理员权限**的设备面测试（Windows Wintun、Linux TUN），不是被跳过的问题测试。
-
-CI（`.github/workflows/ci.yml`）在每次 push / PR 上跑 `fmt --check` + `clippy -D warnings`，然后在 Linux / Windows / macOS 上跑全量测试，再做两个 musl 目标的交叉构建与端到端冒烟。
+**完整细节见 [QUALITY.md](QUALITY.md)**：测试分布明细、CI 矩阵、依赖安全做到哪一步
+（`cargo audit` / `deny` / `vet` 各自的真实含义）、发版闸门、人工核对清单。
 
 ## 发布与部署
-
-### 打包
-
-```bash
-# 打三平台包（包内统一命名 frps / frpc，附示例配置与 README）
-# `@release` = `cargo metadata` 认定的 target_directory + /release，
-# 不要写死 `target/release`：本机构建目录可能被挪到别的盘（见下方说明）。
-python scripts/release.py pack \
-  --target windows-amd64:@release \
-  --target linux-amd64:/path/to/amd64 \
-  --target linux-arm64:/path/to/arm64 \
-  --out dist/release
-
-# 安卓包（先把两个 target 编出来，命令见下）：
-#   cargo build --release --target aarch64-linux-android -p nfrp-server -p nfrp-client
-#   cargo build --release --target x86_64-linux-android  -p nfrp-server -p nfrp-client
-python scripts/pack_android.py
-
-# 源码包（可复现：同一个树打两次字节一致，脚本自己验）
-python scripts/make_src_tarball.py     # 产物：dist/release/nfrp-src-<ver>.tar.gz
-
-# 生成 SHA256SUMS（--sign 还会产出 Ed25519 分离签名）
-python scripts/release.py checksum --dir dist/release --sign
-
-# 本地验签 + 校验
-python scripts/release.py verify --dir dist/release
-
-# 发版前最后一道闸门：本地 dist/release 与 GitHub Release 资产一一对应
-# （名称 + sha256 都要对上；--check-android 顺带确认只留当前版本安卓包）
-python scripts/verify_dist_matches_release.py --check-android
-```
-
-`pack` 打完包会**自动解包自检**：包内 `frps` / `frpc` 与源产物逐个 sha256 比对，
-不一致直接非零退出 —— 防止"脚本读错目录、把上一版二进制打进新包"。
-（历史上真的踩过两次：一次是打进 v0.5.6 的安卓包，一次是 8.0 MB 的异常包。）
-
-> **构建目录**：本机把 `CARGO_TARGET_DIR` 从环境变量改成了
-> `nfrp/.cargo/config.toml` 里的 `target-dir = "D:/cargo-target-nfrp"`。
-> 这个文件**不入库**（含 Windows 绝对路径），新机器自己建一份即可。
-> 仓库里的 `nfrp/target/` 已清空归档，不会再出现"直接 `cargo build` 落到旧产物"。
-
-**Linux 产物**：`linux-amd64` 在 Linux 机器上原生 `cargo build --release`（glibc 动态）；
-`linux-arm64` 用 `aarch64-linux-gnu-gcc` 交叉编译，并加
-`RUSTFLAGS="-C target-feature=+crt-static"` 得到全静态、无 glibc 依赖的二进制。
-`ring` 需要 C 工具链，交叉时记得指明 `CC_aarch64_unknown_linux_gnu` 与
-`CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER`。
-
-**Android 包**要先编出两个 target，再交给 `pack_android.py` 打包：
-
-```bash
-NDK=/path/to/android-ndk
-BIN=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin   # Windows 上是 windows-x86_64
-export CC_aarch64_linux_android=$BIN/aarch64-linux-android26-clang
-export AR_aarch64_linux_android=$BIN/llvm-ar
-export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$CC_aarch64_linux_android
-export CC_x86_64_linux_android=$BIN/x86_64-linux-android26-clang
-export AR_x86_64_linux_android=$BIN/llvm-ar
-export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=$CC_x86_64_linux_android
-
-cargo build --release --target aarch64-linux-android -p nfrp-server -p nfrp-client
-cargo build --release --target x86_64-linux-android  -p nfrp-server -p nfrp-client
-python scripts/pack_android.py      # 打包后自动比对包内二进制与源产物
-```
-
-> 包名里的 `26` 是 `minSdk 26`；用别的 API 级别就把文件名后缀一起改掉。
-
-`release.py` 不依赖任何第三方 Python 包，也不依赖 Rust 工具链。签名缺失或失败会**非零退出**；确实要发未签名制品需显式加 `--allow-unsigned`。
 
 ### Docker
 
@@ -470,6 +408,15 @@ docker run --rm -p 17000:17000 -p 17002:17002/udp \
 ```
 
 镜像以非 root 用户运行，多阶段构建（musl 静态），最终镜像只含两个二进制与示例配置。
+
+### 自己打包
+
+打包、签名、跨平台交叉编译（含 Android NDK 环境变量）与发版闸门的完整命令，
+见 **[QUALITY.md](QUALITY.md#六发布产物校验)**。
+
+一句话概括：`release.py pack` 打完包会自动解包，把包内 `frps`/`frpc` 与源产物
+逐个 sha256 比对，不一致直接非零退出。这一步不是可选的——历史上真的出现过
+"包名和版本号都对，但里面的二进制是上一版"。
 
 `Dockerfile` **有意不加 `HEALTHCHECK`**：唯一合适的探针 `- /api/healthz` 挂在面板端口上，而示例配置里 `dashboard_port` 默认是注释掉的，写死探针会让容器一直显示 `unhealthy`。理由已写在文件里。
 

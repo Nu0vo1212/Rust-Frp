@@ -33,6 +33,7 @@
     { slug: 'protocol-v1',            page: 'protocol-v1',   title: 'protocol-v1' },
     { slug: 'protocol-v2',            page: 'protocol-v2',   title: 'protocol-v2' },
     { slug: 'message-types',          page: 'messages',      title: 'messages' },
+  { slug: 'nlink',                  page: 'nlink',         title: 'nlink' },
     { slug: 'security-model',         page: 'security',      title: 'security' },
     { slug: 'acl-and-rbac',           page: 'acl-rbac',      title: 'acl-rbac' },
     { slug: 'audit-log',              page: 'audit',         title: 'audit' },
@@ -40,7 +41,6 @@
     { slug: 'http-api',               page: 'api',           title: 'api' },
     { slug: 'use-as-library',         page: 'library',       title: 'library' },
     { slug: 'frp-interoperability',   page: 'compat',        title: 'compat' },
-  { slug: 'nlink',                  page: 'nlink',         title: 'nlink' },
   ];
 
   const $ = (s, r) => (r || document).querySelector(s);
@@ -472,17 +472,8 @@
   /* ---------- Theme ---------- */
   let themeTimer = 0;
 
-  function applyTheme(th) {
-    /* 先挂上过渡类，让配色平滑换过去（避免亮区突然消失被看成"画面跳了一下"） */
-    if (!REDUCED) {
-      const root = document.documentElement;
-      root.classList.add('theme-switching');
-      clearTimeout(themeTimer);
-      themeTimer = setTimeout(function () {
-        root.classList.remove('theme-switching');
-      }, 300);
-    }
-
+  /* 真正把 --bg 等变量换掉，并同步按钮图标 */
+  function commitTheme(th) {
     document.documentElement.setAttribute('data-theme', th);
     const moon = $('.ico-moon');
     const sun = $('.ico-sun');
@@ -493,10 +484,70 @@
     }
   }
 
+  /* 切换主题。
+
+     ★ 关键顺序（踩过坑）：挂过渡类 → **让出一帧** → 再切变量。
+       浏览器的样式重算是按任务合并的：如果在同一个同步块里又加类又改变量，
+       它只会看到最终状态，没有"旧值作为过渡起点"，结果不产生 transition
+       （实测 Animation 域报告 0 个过渡）。
+       让出一帧后，浏览器先把旧值记为起点，下一帧改变量才有东西可插值。 */
+  function applyTheme(th, animate) {
+    const root = document.documentElement;
+    const doAnim = animate !== false && !REDUCED;
+
+    if (!doAnim) {
+      commitTheme(th);
+      return;
+    }
+
+    /* 已经在过渡中：直接落到目标，避免连续点击堆叠出一堆半途状态 */
+    if (root.classList.contains('theme-switching')) {
+      commitTheme(th);
+      return;
+    }
+
+    root.classList.add('theme-switching');
+    /* 同步读一次计算样式，强制刷新样式缓存（rAF 不可靠时的双保险） */
+    void getComputedStyle(document.body).color;
+
+    const DUR_MS = 320;
+
+    function start() {
+      commitTheme(th);
+
+      let removed = false;
+      function done() {
+        if (removed) return;
+        removed = true;
+        root.classList.remove('theme-switching');
+        root.removeEventListener('transitionend', onEnd);
+        clearTimeout(themeTimer);
+      }
+      function onEnd(e) {
+        if (e.target === root || e.target === document.body) done();
+      }
+      root.addEventListener('transitionend', onEnd);
+      /* 兜底：事件丢失时也要保证类被摘掉，否则页面会一直带着过渡 */
+      clearTimeout(themeTimer);
+      themeTimer = setTimeout(done, DUR_MS + 160);
+    }
+
+    /* 让出一帧再改变量 */
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(function () {
+        /* 有些环境 rAF 回调里紧接着改仍会被合并，再让一帧更稳 */
+        requestAnimationFrame(start);
+      });
+    } else {
+      setTimeout(start, 16);
+    }
+  }
+
   function initTheme() {
     let saved = null;
     try { saved = localStorage.getItem(THEME_KEY); } catch (e) {}
-    applyTheme(saved || 'dark');
+    /* 首次渲染不做过场：页面刚出来应该是稳定的，不该看到颜色渐入 */
+    applyTheme(saved || 'dark', false);
 
     const btn = $('#themeBtn');
     if (btn) {

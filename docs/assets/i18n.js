@@ -40,8 +40,8 @@ const I18N = {
     'nav-api': 'HTTP API',
     'nav-library': '作为库使用',
     'nav-compat': '与官方 frp 互通',
-    'nav-nlink': 'NLink v1 规划',
-    't-nlink': 'NLink v1 规划',
+    'nav-nlink': 'NLink v1 协议',
+    't-nlink': 'NLink v1 协议',
 
     /* ---- home hero ---- */
     'hero-badge': 'v0.7.1 · 与 frp 0.71.0 实测互通',
@@ -181,8 +181,8 @@ const I18N = {
     'nav-api': 'HTTP API',
     'nav-library': 'Use as a library',
     'nav-compat': 'frp interoperability',
-    'nav-nlink': 'NLink v1 Roadmap',
-    't-nlink': 'NLink v1 Roadmap',
+    'nav-nlink': 'NLink v1 Protocol',
+    't-nlink': 'NLink v1 Protocol',
 
     'hero-badge': 'v0.7.1 · verified against frp 0.71.0',
     'hero-title-1': 'Bring internal services ',

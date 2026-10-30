@@ -115,19 +115,25 @@ body {
   font-size: 15px;
   line-height: 1.72;
   color: var(--fg);
-  background: var(--bg);
+  background-color: var(--bg);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
 }
 
 /* ---------- Theme transition ----------
-   切主题时临时挂上，让颜色平滑过去。
+   切主题时临时挂上，让配色平滑过渡。
+
+   ★ 注意：这里**不能**再写 `transition: none !important` 的覆盖段。
+     历史版本为了"防跳一下"在 `*` 上禁用了过渡，结果把元素自己的过渡也抹掉了，
+     切换变成瞬时跳变。现在只声明"该过渡什么"，不强行禁用它。
+
    只过渡颜色类属性：布局/位移属性一律不参与，避免出现任何"跳一下"。
-   由 app.js 在切换后约 300ms 摘掉。 */
+   由 app.js 在过渡结束后摘掉（transitionend + 兜底超时）。 */
 html.theme-switching,
 html.theme-switching body,
 html.theme-switching body::before,
+html.theme-switching body::after,
 html.theme-switching *,
 html.theme-switching *::before,
 html.theme-switching *::after {
@@ -136,10 +142,57 @@ html.theme-switching *::after {
     background-image 260ms var(--ease),
     color 260ms var(--ease),
     border-color 260ms var(--ease),
+    border-top-color 260ms var(--ease),
+    border-bottom-color 260ms var(--ease),
+    border-left-color 260ms var(--ease),
+    border-right-color 260ms var(--ease),
     outline-color 260ms var(--ease),
+    text-decoration-color 260ms var(--ease),
     fill 260ms var(--ease),
     stroke 260ms var(--ease),
-    box-shadow 260ms var(--ease) !important;
+    box-shadow 260ms var(--ease);
+}
+
+/* ★ 入场动画不能被主题过渡吃掉。
+
+   上面 `html.theme-switching *` 的特异性是 (0,1,1)，比 `.reveal` 的
+   (0,1,0) 高，会用 transition 简写把入场动画的 opacity/transform 过渡
+   **整个覆盖掉**。后果：页面刚加载、入场动画还在跑的时候切主题，
+   元素会瞬间跳到终点（观感就是"闪一下"）。
+
+   这里显式把入场动画的过渡补回来 —— 而且必须放在 `*` 规则之后。 */
+html.theme-switching .reveal {
+  transition:
+    opacity 420ms var(--ease),
+    transform 420ms var(--ease),
+    background-color 260ms var(--ease),
+    background-image 260ms var(--ease),
+    color 260ms var(--ease),
+    border-color 260ms var(--ease),
+    fill 260ms var(--ease),
+    stroke 260ms var(--ease),
+    box-shadow 260ms var(--ease);
+}
+
+/* anim-in 用的是 animation（不是 transition），不受 transition 覆盖影响。
+   但 hero 标题的 titleIn 带 filter: blur，切主题时如果 blur 被覆盖会突变，
+   所以一并保证 filter 参与过渡。 */
+html.theme-switching .hero h1.anim-in {
+  transition:
+    filter 260ms var(--ease),
+    opacity 560ms var(--ease),
+    transform 560ms var(--ease),
+    color 260ms var(--ease),
+    background-color 260ms var(--ease);
+}
+    border-bottom-color 260ms var(--ease),
+    border-left-color 260ms var(--ease),
+    border-right-color 260ms var(--ease),
+    outline-color 260ms var(--ease),
+    text-decoration-color 260ms var(--ease),
+    fill 260ms var(--ease),
+    stroke 260ms var(--ease),
+    box-shadow 260ms var(--ease);
 }
 
 /* 尊重"减少动态效果"：直接切，不做过渡 */
@@ -147,6 +200,7 @@ html.theme-switching *::after {
   html.theme-switching,
   html.theme-switching body,
   html.theme-switching body::before,
+  html.theme-switching body::after,
   html.theme-switching *,
   html.theme-switching *::before,
   html.theme-switching *::after {
@@ -1058,7 +1112,7 @@ td code {
 
   .sidebar {
     z-index: 40;
-    background: var(--bg);
+    background-color: var(--bg);
     transform: translateX(-100%);
     transition: transform 260ms var(--ease);
     box-shadow: 0 0 40px rgba(0, 0, 0, 0.4);

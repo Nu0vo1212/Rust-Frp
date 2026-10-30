@@ -12,6 +12,12 @@ readme = "README.md"   # 用本 crate 的 README（根 README 含相对路径，
 keywords = ["frp", "proxy", "tunnel", "protocol", "nat"]
 categories = ["network-programming"]
 
+[features]
+# NLink v1 扩展层。默认开启；`--no-default-features` 关掉后
+# `Login` / `LoginResp` 里不会出现扩展字段，报文与 0.6.x 逐字节一致（零开销）。
+default = ["nlink"]
+nlink = []
+
 [dependencies]
 quinn = { workspace = true }
 yamux = { workspace = true }

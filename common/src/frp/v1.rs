@@ -95,6 +95,12 @@ pub const TYPE_NAT_HOLE_REPORT: u8 = b'6';
 pub const TYPE_SERVER_CMD: u8 = b'Z';
 /// [`TYPE_SERVER_CMD`] 的回执（对应 v2 的 type_id 101）。
 pub const TYPE_SERVER_CMD_RESP: u8 = b'Y';
+/// NLink v1 扩展帧（对应 v2 的专用帧类型 `0x4E`）。
+///
+/// 0x7F 既不是字母也不是数字 —— 官方到 v0.71.0 为止的类型字节都是可打印
+/// ASCII，所以这个值永远不会与官方撞号。只有在双方都协商了 `nlink`
+/// 能力之后才会出现。
+pub const TYPE_NLINK: u8 = crate::nlink::V1_TYPE_BYTE;
 
 /// 单条消息 JSON 体的长度上限（`golib/msg/json` 的 `defaultMaxMsgLength`）。
 ///
@@ -131,6 +137,7 @@ pub fn type_byte(type_id: u16) -> Option<u8> {
         18 => TYPE_NAT_HOLE_REPORT,
         100 => TYPE_SERVER_CMD,
         101 => TYPE_SERVER_CMD_RESP,
+        150 => TYPE_NLINK,
         _ => return None,
     })
 }
@@ -158,6 +165,7 @@ pub fn type_id(byte: u8) -> Option<u16> {
         TYPE_NAT_HOLE_REPORT => 18,
         TYPE_SERVER_CMD => 100,
         TYPE_SERVER_CMD_RESP => 101,
+        TYPE_NLINK => 150,
         _ => return None,
     })
 }

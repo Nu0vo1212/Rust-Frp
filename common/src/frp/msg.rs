@@ -210,6 +210,13 @@ pub struct LoginResp {
     /// 只有这里出现了的能力才算协商成功。官方 frps 不会回这个字段。
     #[serde(rename = "_nfrp", default, skip_serializing_if = "Option::is_none")]
     pub nfrp: Option<NfrpCaps>,
+    /// NLink v1 的协商结果（见 [`crate::nlink::LoginAck`]）。
+    ///
+    /// 编译期关掉 `nlink` feature 时这个字段**不存在**，报文与 0.6.x
+    /// 逐字节一致；运行期没协商成功时是 `None`，同样不写进 JSON。
+    #[cfg(feature = "nlink")]
+    #[serde(rename = "_nlink", default, skip_serializing_if = "Option::is_none")]
+    pub nlink: Option<crate::nlink::LoginAck>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -323,6 +330,12 @@ pub struct NewWorkConn {
     pub privilege_key: String,
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub timestamp: i64,
+    /// NLink 零信任身份令牌（`v1.<exp>.<hmac>`）。
+    ///
+    /// 只有会话协商了 `CAP_IDENTITY` 才出现；官方 frps 用 Go 的
+    /// `encoding/json` 解析，未知字段直接忽略，所以多挂这个键对它零影响。
+    #[serde(rename = "_nlink", default, skip_serializing_if = "Option::is_none")]
+    pub nlink: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -709,6 +709,7 @@ async fn add_live(
                     run_id.clone(),
                     proxies.clone(),
                     health.clone(),
+                    crate::nlink::current(),
                 );
             }
             FrpMessage::Pong(pong) => {

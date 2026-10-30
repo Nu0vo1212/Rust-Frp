@@ -396,6 +396,13 @@ pub struct ServerConfig {
     #[serde(default = "default_bind_addr")]
     pub bind_addr: String,
 
+    /// NLink v1 扩展层（默认关闭）。
+    ///
+    /// 默认关闭时服务端行为与 0.6.x 完全一致：不认 preamble、不处理扩展帧、
+    /// `LoginResp` 里也没有 `_nlink` 字段。
+    #[serde(default)]
+    pub nlink: crate::nlink::ServerNLinkConfig,
+
     /// ★ 用户是否**显式写过** `bind_addr`（v0.5.4，配合 M4 的判定）。
     ///
     /// 为什么需要这个标志：认不出"默认值"和"用户明确写了 0.0.0.0"，
@@ -1340,6 +1347,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind_addr: default_bind_addr(),
+            nlink: crate::nlink::ServerNLinkConfig::default(),
             // 默认（没从文件读过）⇒ 视为"用户没显式写过"
             bind_addr_explicitly_set: false,
             // 空 = 跟随 bind_addr（与官方 proxyBindAddr 的语义一致）
@@ -1952,6 +1960,10 @@ pub struct ClientConfig {
     #[serde(default)]
     pub token: String,
 
+    /// NLink v1 扩展层（默认关闭）。
+    #[serde(default)]
+    pub nlink: crate::nlink::ClientNLinkConfig,
+
     /// 客户端标识，用于服务端日志与多客户端区分。
     #[serde(default = "default_client_id")]
     pub client_id: String,
@@ -2390,6 +2402,7 @@ impl Default for ClientConfig {
             server_port: default_control_port(),
             server_work_port: None,
             token: String::new(),
+            nlink: crate::nlink::ClientNLinkConfig::default(),
             client_id: default_client_id(),
             user: String::new(),
             metas: Default::default(),

@@ -100,6 +100,11 @@ pub struct Registry {
     lb_policy: AtomicU8,
     /// 官方 `[[httpPlugins]]`。热重载时整体换掉，读侧克隆 `Arc`。
     plugins: Mutex<Arc<PluginManager>>,
+    /// NLink v1 的运行期状态（限流器 / 敲门放行表 / 续传表 / 身份密钥）。
+    ///
+    /// 默认是「全关」的实例：未配置 `[nlink]` 时，`enabled_mask()` 返回 `None`，
+    /// 握手阶段连协商都不会发生 —— 行为与 0.6.x 逐字节一致。
+    nlink: Mutex<Arc<crate::nlink::NLinkRuntime>>,
 }
 
 impl Registry {
@@ -120,7 +125,21 @@ impl Registry {
             // 默认轮询：与官方 frp 的 group 行为一致
             lb_policy: AtomicU8::new(LbPolicy::RoundRobin as u8),
             plugins: Mutex::new(Arc::new(PluginManager::default())),
+            nlink: Mutex::new(Arc::new(crate::nlink::NLinkRuntime::disabled())),
         }
+    }
+
+    /// 取当前 NLink 运行期状态（克隆 Arc，零成本）。
+    pub fn nlink(&self) -> Arc<crate::nlink::NLinkRuntime> {
+        self.nlink
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 整体替换 NLink 运行期状态（启动装载 / 配置热重载）。
+    pub fn set_nlink(&self, rt: Arc<crate::nlink::NLinkRuntime>) {
+        *self.nlink.lock().unwrap_or_else(|e| e.into_inner()) = rt;
     }
 
     /// 安装 / 替换 HTTP 插件集合（启动装载与配置热重载共用）。

@@ -41,43 +41,24 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     Arc::new(t)
 }
 
-static SERVER_CFG: OnceLock<quinn::ServerConfig> = OnceLock::new();
-/// 缓存里那份配置当初是用哪个 ALPN 建的。
-///
-/// ★★ v0.5.9（第九轮审计 **C9-2**，预防性加固）：`server_config(alpn)` 收了
-/// `alpn` 参数，但**缓存命中时直接返回**、忽略本次传入值 ——
-/// 也就是说**只有第一次的 ALPN 生效**。
-///
-/// 当前**不构成漏洞**：全仓只有 2 处调用（`quic.rs:143` / `:354`），都传
-/// 同一个 `ALPN = b"nfrp-frp"`；而 xtcp 的 `b"nfrp-xtcp"` 走的是
-/// `client/src/p2p.rs` 里**独立的** `SERVER_CFG`（`p2p.rs:778`），不共用这个缓存。
-///
-/// 但这是"**靠巧合安全**"：如果将来有人加第三个 ALPN 并复用本函数，
-/// 第二次调用会**静默拿到错误 ALPN** 的配置，症状是
-/// "peer doesn't support any known protocol" 这种极难排查的握手失败。
-///
-/// ⇒ 记下首次的 ALPN，缓存命中时**断言一致**（不一致就报错，
-///   让问题在开发期暴露，而不是在用户那里表现为莫名的握手失败）。
-static CACHED_ALPN: OnceLock<Vec<u8>> = OnceLock::new();
+static SERVER_CFG: OnceLock<std::sync::Mutex<std::collections::HashMap<Vec<u8>, quinn::ServerConfig>>> =
+    OnceLock::new();
 
 /// 服务端 QUIC 配置（自签证书）。
+///
+/// ★ v0.7.0：缓存按 **ALPN 分桶**。
+///
+/// 0.6.x 用的是单槽 `OnceLock`，命中时还断言"本次 ALPN 必须与首次一致"。
+/// NLink 需要一个自己的 ALPN（`nfrp-nlink`）与标准 frp 的 `nfrp-frp` 并存，
+/// 单槽缓存就必然撞车。现在每个 ALPN 各存一份，两条路径互不影响。
 pub fn server_config(alpn: &[u8]) -> Result<quinn::ServerConfig> {
-    if let Some(c) = SERVER_CFG.get() {
-        // ★ C9-2：缓存命中时必须确认 ALPN 与首次构造时一致。
-        if let Some(first) = CACHED_ALPN.get() {
-            if first.as_slice() != alpn {
-                anyhow::bail!(
-                    "quic::server_config 的缓存已用 ALPN {:?} 建立，不能再用 {:?} 复用 —— \
-                     不同 ALPN 需要各自独立的缓存（参考 client/src/p2p.rs 的做法）。\
-                     这不是运行时错误，而是调用方用错了这个函数。",
-                    String::from_utf8_lossy(first),
-                    String::from_utf8_lossy(alpn)
-                );
-            }
+    let cache = SERVER_CFG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    {
+        let g = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = g.get(alpn) {
+            return Ok(c.clone());
         }
-        return Ok(c.clone());
     }
-    let _ = CACHED_ALPN.set(alpn.to_vec());
     let key = rcgen::generate_simple_self_signed(vec![SERVER_NAME.to_string()])
         .context("生成 QUIC 自签证书失败")?;
     let cert_der = key.cert.der().clone();
@@ -101,7 +82,10 @@ pub fn server_config(alpn: &[u8]) -> Result<quinn::ServerConfig> {
         .map_err(|e| anyhow!("构造 QUIC 服务端配置失败：{e}"))?;
     let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(quic_cfg));
     cfg.transport_config(transport_config());
-    let _ = SERVER_CFG.set(cfg.clone());
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(alpn.to_vec(), cfg.clone());
     Ok(cfg)
 }
 
@@ -165,16 +149,91 @@ pub fn client_config(alpn: &[u8]) -> Result<quinn::ClientConfig> {
 
 /// 服务端监听一个 UDP 端口。
 pub async fn listen(addr: &SocketAddr) -> Result<quinn::Endpoint> {
+    listen_with_alpn(addr, ALPN).await
+}
+
+/// 同 [`listen`]，但用指定的 ALPN（NLink 走 `b"nfrp-nlink"`）。
+pub async fn listen_with_alpn(addr: &SocketAddr, alpn: &[u8]) -> Result<quinn::Endpoint> {
     let sock = tokio::net::UdpSocket::bind(addr)
         .await
         .with_context(|| format!("监听 QUIC 端口 {addr} 失败"))?;
     quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
-        Some(server_config(ALPN)?),
+        Some(server_config(alpn)?),
         sock.into_std().context("转换 UDP socket 失败")?,
         Arc::new(quinn::TokioRuntime),
     )
     .context("创建 QUIC endpoint 失败")
+}
+
+/// 把 endpoint 的本地 UDP socket 换到 `local`（QUIC 连接迁移）。
+///
+/// quinn 用**连接 ID** 而不是四元组识别连接，所以换源地址后在途连接不会断
+/// —— 这正是 QUIC 能做"网络切换无感"的原因。这里把"建 socket + rebind"
+/// 两件事包起来，调用方只需要关心"我想换到哪个本地地址"。
+pub async fn rebind(endpoint: &quinn::Endpoint, local: SocketAddr) -> Result<()> {
+    let sock = tokio::net::UdpSocket::bind(local)
+        .await
+        .with_context(|| format!("绑定迁移目标地址 {local} 失败"))?;
+    endpoint
+        .rebind(sock.into_std().context("转换 UDP socket 失败")?)
+        .with_context(|| format!("把 QUIC endpoint 迁移到 {local} 失败"))?;
+    Ok(())
+}
+
+/// endpoint 当前绑定的本地地址。
+pub fn local_addr(endpoint: &quinn::Endpoint) -> Option<SocketAddr> {
+    endpoint.local_addr().ok()
+}
+
+/// 在 endpoint 上循环接受连接，每条**双向流**都交给 `handler`。
+///
+/// 用 `Fn` 而不是 `FnMut`：handler 会被多个连接、多条流并发调用，
+/// 需要共享同一份状态（服务端的 `Registry` 就装在它的闭包里）。
+///
+/// 返回的 `JoinHandle` 在 endpoint 被关闭（`endpoint.close()`）后结束。
+/// 单个连接 / 单条流的错误只记日志，不影响其它流 —— QUIC 的多路复用
+/// 本来就是"一条流坏了不该拖垮别的"。
+pub fn spawn_stream_acceptor<F, Fut>(
+    endpoint: quinn::Endpoint,
+    handler: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: Fn(QuicStream, SocketAddr) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let handler = Arc::new(handler);
+    tokio::spawn(async move {
+        while let Some(incoming) = endpoint.accept().await {
+            let handler = handler.clone();
+            tokio::spawn(async move {
+                let conn = match incoming.await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::debug!("QUIC 连接握手失败：{e}");
+                        return;
+                    }
+                };
+                let peer = conn.remote_address();
+                tracing::debug!(%peer, "QUIC 连接建立");
+                loop {
+                    match conn.accept_bi().await {
+                        Ok((send, recv)) => {
+                            let handler = handler.clone();
+                            tokio::spawn(async move {
+                                handler(QuicStream::new(send, recv), peer).await;
+                            });
+                        }
+                        Err(quinn::ConnectionError::ApplicationClosed(_)) => break,
+                        Err(e) => {
+                            tracing::debug!(%peer, "QUIC 连接结束：{e}");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    })
 }
 
 /// 客户端连到服务端。
@@ -188,7 +247,16 @@ pub async fn connect(
     server: &SocketAddr,
     bind: Option<SocketAddr>,
 ) -> Result<(quinn::Endpoint, quinn::Connection)> {
-    connect_with_retry(server, bind, HANDSHAKE_TIMEOUT, HANDSHAKE_ATTEMPTS).await
+    connect_with_alpn(server, bind, ALPN).await
+}
+
+/// 同 [`connect`]，但用指定的 ALPN（NLink 走 `b"nfrp-nlink"`）。
+pub async fn connect_with_alpn(
+    server: &SocketAddr,
+    bind: Option<SocketAddr>,
+    alpn: &[u8],
+) -> Result<(quinn::Endpoint, quinn::Connection)> {
+    connect_with_retry(server, bind, alpn, HANDSHAKE_TIMEOUT, HANDSHAKE_ATTEMPTS).await
 }
 
 /// 单次 QUIC 握手的最长等待。
@@ -238,13 +306,14 @@ const HANDSHAKE_RETRY_DELAY: Duration = Duration::from_millis(250);
 async fn connect_with_retry(
     server: &SocketAddr,
     bind: Option<SocketAddr>,
+    alpn: &[u8],
     attempt_timeout: Duration,
     attempts: u32,
 ) -> Result<(quinn::Endpoint, quinn::Connection)> {
     let attempts = attempts.max(1);
     let mut last: Option<anyhow::Error> = None;
     for attempt in 1..=attempts {
-        match connect_with_timeout(server, bind, attempt_timeout).await {
+        match connect_with_timeout_alpn(server, bind, alpn, attempt_timeout).await {
             Ok(v) => return Ok(v),
             Err(e) => {
                 if attempt < attempts {
@@ -268,6 +337,16 @@ async fn connect_with_retry(
 pub async fn connect_with_timeout(
     server: &SocketAddr,
     bind: Option<SocketAddr>,
+    timeout: Duration,
+) -> Result<(quinn::Endpoint, quinn::Connection)> {
+    connect_with_timeout_alpn(server, bind, ALPN, timeout).await
+}
+
+/// [`connect_with_timeout`] + 自定义 ALPN。
+pub async fn connect_with_timeout_alpn(
+    server: &SocketAddr,
+    bind: Option<SocketAddr>,
+    alpn: &[u8],
     timeout: Duration,
 ) -> Result<(quinn::Endpoint, quinn::Connection)> {
     let sock = match bind {
@@ -297,7 +376,7 @@ pub async fn connect_with_timeout(
     // 这里就把手握完：后续 open_bi 出问题能立刻定位，
     // 而不是等到注册代理超时才报一个含糊的错
     let connecting = endpoint
-        .connect_with(client_config(ALPN)?, *server, SERVER_NAME)
+        .connect_with(client_config(alpn)?, *server, SERVER_NAME)
         .map_err(|e| anyhow!("发起 QUIC 连接失败：{e}"))?;
     // `Connecting` 实现的是 `IntoFuture` 而不是 `Future`，而 `tokio::time::timeout`
     // 要的是 `Future`，所以这里显式转一下（UFCS 写法对两种实现都成立）。
@@ -385,52 +464,54 @@ mod tests {
         let _ = client_config(ALPN).expect("客户端配置");
     }
 
-    /// ★★ v0.5.9 回归（第九轮审计 **C9-2**，预防性加固）：
-    /// **`server_config` 的缓存不能跨 ALPN 复用。**
+    /// ★ v0.7.0：缓存**按 ALPN 分桶**。
     ///
-    /// # 背景
-    ///
-    /// `server_config(alpn)` 收 `alpn` 参数，但**缓存命中时直接返回**、
-    /// 忽略本次传入值 —— 只有第一次的 ALPN 生效。
-    ///
-    /// 当前**不是漏洞**（全仓只有 2 处调用都传 `ALPN`；xtcp 的
-    /// `b"nfrp-xtcp"` 走 `client/src/p2p.rs` 里独立的 `SERVER_CFG`）。
-    /// 但这是「**靠巧合安全**」：加第三个 ALPN 就会静默串。
-    ///
-    /// # 这条测试测什么
-    ///
-    /// 用 ALPN 建好缓存后，再用**另一个 ALPN** 调，必须**报错**而不是
-    /// 静默返回错误配置。
-    ///
-    /// ★ 测试间有全局 `OnceLock` 状态，所以这里只做"同一进程内"的验证：
-    ///   先确保缓存已用 `ALPN` 建好（别的测试多半已经建了），再试别的。
-    #[test]
-    fn 缓存不能跨_alpn_复用() {
-        // 确保缓存已建立（用正式 ALPN）
-        let _ = server_config(ALPN).expect("首次建立缓存");
+    /// 0.6.x 是单槽缓存 + "不同 ALPN 就报错"。NLink 需要 `nfrp-nlink`
+    /// 与标准的 `nfrp-frp` 并存，所以改成每 ALPN 一份配置。
+    #[tokio::test]
+    async fn 不同_alpn_各自独立且能同时服务() {
+        // 两个 endpoint 各自用不同 ALPN
+        let std_ep = listen(&"127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("标准 ALPN 监听");
+        let nlink_ep = listen_with_alpn(&"127.0.0.1:0".parse().unwrap(), b"nfrp-nlink")
+            .await
+            .expect("NLink ALPN 监听");
+        let std_addr = std_ep.local_addr().unwrap();
+        let nlink_addr = nlink_ep.local_addr().unwrap();
 
-        // 再用另一个 ALPN 调用 —— 必须报错，而不是静默返回错误的配置
-        let other = b"nfrp-some-other-alpn";
-        let r = server_config(other);
-        assert!(
-            r.is_err(),
-            "★ 用不同的 ALPN 复用同一个缓存**必须报错** —— \
-             否则调用方会静默拿到错误 ALPN 的配置，\
-             表现为 'peer doesn't support any known protocol' 这种极难排查的握手失败"
-        );
-        if let Err(e) = r {
-            let msg = e.to_string();
-            assert!(
-                msg.contains("ALPN") || msg.contains("alpn"),
-                "错误信息要说明是 ALPN 不一致：{msg}"
-            );
+        // quinn 的入站连接要**被 accept** 才会推进握手并保持存活，所以两边
+        // 各起一个接受循环；endpoint 交给任务持有，连接不会因为提前 drop 而断。
+        for ep in [std_ep, nlink_ep] {
+            tokio::spawn(async move {
+                while let Some(incoming) = ep.accept().await {
+                    tokio::spawn(async move {
+                        if let Ok(connecting) = incoming.accept() {
+                            if let Ok(conn) = connecting.await {
+                                let _ = conn.closed().await;
+                            }
+                        }
+                    });
+                }
+            });
         }
 
-        // 用**相同**的 ALPN 再调一次必须正常（不能把正常路径也给拦了）
-        assert!(
-            server_config(ALPN).is_ok(),
-            "同一个 ALPN 重复调用必须照常成功（不能修得过头）"
-        );
+        // 各自都能连上（ALPN 协商成功才会返回 Ok）
+        let (_e1, _c1) = connect(&std_addr, None)
+            .await
+            .expect("标准 ALPN 应当握上手");
+        let (_e2, _c2) = connect_with_alpn(&nlink_addr, None, b"nfrp-nlink")
+            .await
+            .expect("NLink ALPN 应当握上手");
+
+        // 用错 ALPN 必须失败 —— 这正是分桶要保证的"互不串味"
+        let wrong = connect_with_timeout_alpn(&nlink_addr, None, ALPN, Duration::from_millis(800))
+            .await;
+        assert!(wrong.is_err(), "ALPN 不一致必须握手失败，而不是静默连上");
+
+        // 重复取配置仍然正常（缓存命中路径）
+        assert!(server_config(ALPN).is_ok());
+        assert!(server_config(b"nfrp-nlink").is_ok());
     }
 
     /// 真连一次：验证 listen/connect/QuicStream 这条链路能跑通数据。
@@ -504,7 +585,7 @@ mod tests {
             s.local_addr().unwrap()
         };
         let start = std::time::Instant::now();
-        let err = connect_with_retry(&dead, None, Duration::from_millis(200), 3)
+        let err = connect_with_retry(&dead, None, ALPN, Duration::from_millis(200), 3)
             .await
             .expect_err("没人监听时必须报错");
         let elapsed = start.elapsed();

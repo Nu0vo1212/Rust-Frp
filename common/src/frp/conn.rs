@@ -31,6 +31,9 @@ use super::wire::{
 };
 use super::WireVersion;
 
+// NLink 扩展层（编译期可关：关掉时下面所有 `#[cfg]` 分支都不存在）
+use crate::nlink;
+
 /// 缓冲区上限，避免对端恶意灌数据。
 const MAX_BUFFER: usize = 8 * 1024 * 1024;
 
@@ -83,6 +86,54 @@ pub struct FrpConn {
     udp_binary: bool,
     /// v1 下也用二进制 UDP 编码（私有能力协商结果），默认 JSON。
     v1_udp_binary: bool,
+    /// NLink 扩展状态：**只有协商成功（服务端在 LoginResp 里回显）才存在**。
+        nlink: Option<NLinkState>,
+    /// `detect_version` 吃到的 preamble，等握手阶段取走。
+        nlink_pending: Option<nlink::Preamble>,
+}
+
+/// 一条连接上的 NLink 状态。
+///
+/// 生命周期与连接等长；协商结果**中途不改**（这是约束 1 的要求：
+/// 一次协商决定本次连接的全部行为）。
+#[derive(Debug, Clone)]
+pub struct NLinkState {
+    /// 双方确认启用的能力（交集）。
+    pub caps: nlink::Caps,
+    /// 客户端进程级的 connection id（断线续传 / QUIC 迁移共用）。
+    pub session: nlink::ConnectionId,
+    /// 端到端 trace id。
+    pub trace: nlink::TraceId,
+    /// 客户端在 preamble 里是否要求续传。
+    pub resume: bool,
+    /// 抢占式取走的扩展帧（`recv_msg` 顺手收进来的）。
+    pub inbox: Vec<nlink::Frame>,
+}
+
+impl NLinkState {
+    pub fn new(
+        caps: nlink::Caps,
+        session: nlink::ConnectionId,
+        trace: nlink::TraceId,
+    ) -> Self {
+        Self {
+            caps,
+            session,
+            trace,
+            resume: false,
+            inbox: Vec::new(),
+        }
+    }
+}
+
+/// `recv_event` 的返回：普通消息 / 扩展帧 / 对端关闭。
+///
+/// 为什么不让扩展帧伪装成 `FrpMessage`：那会污染消息枚举，所有 match 都得
+/// 多一条永真分支。分开返回，控制循环只在需要时处理扩展帧。
+pub enum ConnEvent {
+    Msg(FrpMessage),
+    NLink(nlink::Frame),
+    Closed,
 }
 
 impl FrpConn {
@@ -95,12 +146,90 @@ impl FrpConn {
             crypto: ControlCrypto::None,
             udp_binary: false,
             v1_udp_binary: false,
+                        nlink: None,
+                        nlink_pending: None,
         }
     }
 
     /// 本连接的线协议。
     pub fn version(&self) -> WireVersion {
         self.version
+    }
+
+    /// 协商成功后的 NLink 状态；未协商时为 `None`。
+        pub fn nlink(&self) -> Option<&NLinkState> {
+        self.nlink.as_ref()
+    }
+
+        pub fn nlink_mut(&mut self) -> Option<&mut NLinkState> {
+        self.nlink.as_mut()
+    }
+
+    /// 启用 NLink（**只能在服务端回显 / 客户端收到回显之后调用**）。
+        pub fn enable_nlink(&mut self, state: NLinkState) {
+        self.nlink = Some(state);
+    }
+
+    /// 服务端在 `detect_version` 里吃到的 preamble（未探测到则为 `None`）。
+        pub fn take_preamble(&mut self) -> Option<nlink::Preamble> {
+        self.nlink_pending.take()
+    }
+
+    /// 在读满 `n` 字节之前持续从套接字补数据。
+    async fn fill_exact(&mut self, n: usize) -> Result<()> {
+        while self.raw.len() < n {
+            if !self.fill().await? {
+                bail!("对端在读满 {n} 字节前就断开了（已读 {}）", self.raw.len());
+            }
+        }
+        Ok(())
+    }
+
+    /// 解析 preamble 的固定部分 + TLV（魔术字已由调用方消费）。
+        async fn read_nlink_preamble(&mut self) -> Result<nlink::Preamble> {
+        // 固定部分去掉魔术字后是 28 字节：version(1)+caps(8)+flags(1)+sid(16)+tlv_len(2)
+        let fixed = nlink::frame::PREAMBLE_FIXED - nlink::MAGIC.len();
+        self.fill_exact(fixed).await?;
+        let tlv_len = u16::from_be_bytes([self.raw[26], self.raw[27]]) as usize;
+        if tlv_len > nlink::frame::MAX_FRAME {
+            bail!("preamble 的 TLV 部分过长（{tlv_len}）");
+        }
+        self.fill_exact(fixed + tlv_len).await?;
+        let pre = nlink::Preamble::decode_after_magic(&self.raw[..fixed + tlv_len])?;
+        self.raw.drain(..fixed + tlv_len);
+        Ok(pre)
+    }
+
+    /// 在**任何协议字节之前**写入一段原始字节（目前只有 NLink preamble 用）。
+    ///
+    /// 故意不复用 `write_bytes`：preamble 必须走明文，且必须在 v2 魔术字之前。
+        pub async fn write_preamble(&mut self, pre: &nlink::Preamble) -> Result<()> {
+        let raw = pre.encode();
+        self.stream.write_all(&raw).await?;
+        self.stream.flush().await?;
+        Ok(())
+    }
+
+    /// 发送一条扩展帧。
+    ///
+    /// 未协商成功时**拒绝发送**：宁可报错，也不能让一条没有协商的连接
+    /// 凭空出现扩展字节（对端会当成坏帧）。
+        pub async fn send_nlink(&mut self, frame: &nlink::Frame) -> Result<()> {
+        if self.nlink.is_none() {
+            bail!("NLink 未协商成功，不能发送扩展帧");
+        }
+        let payload = frame.encode();
+        if payload.len() > nlink::frame::MAX_FRAME {
+            bail!("扩展帧过大（{} 字节）", payload.len());
+        }
+        match self.version {
+            WireVersion::V2 => self.write_frame(nlink::V2_FRAME_TYPE, &payload).await,
+            WireVersion::V1 => {
+                // 与普通消息走同一条加密路径：登录后扩展帧也是密文。
+                let raw = v1::encode_msg(nlink::V1_TYPE_BYTE, &payload);
+                self.write_bytes(&raw).await
+            }
+        }
     }
 
     /// 探测并锁定线协议（仅服务端用）。
@@ -113,14 +242,23 @@ impl FrpConn {
     /// 官方用 `libnet.NewSharedConnSize` 把已读的字节"塞回去"，这里等价地
     /// 让字节留在 `raw` 缓冲区，后续解析照常从 `raw` 开头继续。
     pub async fn detect_version(&mut self) -> Result<WireVersion> {
-        while self.raw.len() < MAGIC_V2.len() {
-            let need = MAGIC_V2.len() - self.raw.len();
-            let mut chunk = vec![0u8; need];
-            let n = self.stream.read(&mut chunk).await?;
-            if n == 0 {
-                bail!("对端在读满 {} 字节线协议标识前就断开了", MAGIC_V2.len());
-            }
-            self.raw.extend_from_slice(&chunk[..n]);
+        // 一次性读满两者里更长的那个：`MAGIC_V2` 是 7 字节（`FRP\0\x02\r\n`），
+        // NLink 魔术字是 8 字节（`NFRPLNK1`）。只按 `MAGIC_V2.len()` 去填，
+        // 紧接着切 8 字节会**越界 panic** —— 一个只发 7 字节就闭嘴的客户端
+        // 足以打挂服务端，所以这里按较长者取。
+        let probe = MAGIC_V2.len().max(nlink::MAGIC.len());
+        self.fill_exact(probe).await?;
+
+        // ---- NLink preamble（可选，搭车在第一条协议消息之前）----
+        //
+        // 首字节 `N` 是标准 frp 永远不会产生的：v1 首字节是 `{`（JSON），
+        // v2 是 `F`（FRP 魔术字），TLS 是 0x16。所以这里不会误判。
+        if self.raw[..nlink::MAGIC.len()] == nlink::MAGIC {
+            self.raw.drain(..nlink::MAGIC.len());
+            let pre = self.read_nlink_preamble().await?;
+            self.nlink_pending = Some(pre);
+            // preamble 之后才是真正的协议字节，重新读满再判断
+            self.fill_exact(probe).await?;
         }
 
         if self.raw[..MAGIC_V2.len()] == *MAGIC_V2 {
@@ -190,6 +328,49 @@ impl FrpConn {
             writer: AeadWriter::new(&write_key)?,
             reader: AeadReader::new(&read_key)?,
         }));
+        // ★ 已经把**密文**读进 `raw` 的那部分，必须当场解出来。
+        //
+        // 典型场景：服务端回完 LoginResp（明文）后立刻推数据（NLink 的身份令牌、
+        // 续传回执、批量申请）。两次 `write` 经常被合进同一个 TCP 段，于是
+        // `take_frame` 消费掉 LoginResp 之后，`raw` 里剩下的正是加密记录。
+        // 如果等到下一次 `fill()` 才处理，`read_buf()` 已经切到 `plain`，
+        // 这批字节就再也没人解密 —— 症状是"对端日志明明说发了，本端一直阻塞"。
+        self.decrypt_raw_into_plain()
+    }
+
+    /// 把 `raw` 里**已经收到**的密文解进 `plain`（可重复调用，幂等）。
+    ///
+    /// 解密不完整时剩余字节留在 `raw` 里等下一次 `fill()` 补齐。
+    fn decrypt_raw_into_plain(&mut self) -> Result<()> {
+        match &mut self.crypto {
+            ControlCrypto::None => {}
+            ControlCrypto::V1(c) => {
+                // v1 是流密码：把缓冲区里所有能解的字节都解出来
+                let pt = c.decrypt(&mut self.raw);
+                // ★★ v0.5.4 修 M6：`plain` 也必须有自己的硬顶。
+                //
+                // 原先只卡了 `raw`（`fill` 里的 MAX_BUFFER），`plain` 完全没有上限。
+                // 后果：**未认证**的连接就能让对端不断喂数据，把已解密明文堆到
+                // 远大于 8 MiB —— 攻击者只需建约 1000 条连接（受系统 fd 限制）
+                // 就能吃掉接近 8 GB 内存，无需任何凭据。
+                //
+                // 为什么 8 MiB 够：`plain` 里的数据会被上层按消息/帧消费掉，
+                // 正常情况下几乎总是空的。真堆到 8 MiB 说明对端在灌数据而我们
+                // 没消费 —— 那本身就是异常，断开是对的。
+                if self.plain.len() + pt.len() > MAX_PLAIN {
+                    bail!("解密缓冲超限（{MAX_PLAIN} 字节），断开连接");
+                }
+                self.plain.extend_from_slice(&pt);
+            }
+            ControlCrypto::V2(v) => {
+                while let Some(pt) = v.reader.open(&mut self.raw)? {
+                    if self.plain.len() + pt.len() > MAX_PLAIN {
+                        bail!("解密缓冲超限（{MAX_PLAIN} 字节），断开连接");
+                    }
+                    self.plain.extend_from_slice(&pt);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -277,13 +458,39 @@ impl FrpConn {
         Ok(())
     }
 
-    /// 接收一条消息。
-    pub async fn recv_msg(&mut self) -> Result<Option<FrpMessage>> {
-        match self.version {
-            WireVersion::V2 => match self.read_frame().await? {
-                Some((ft, payload)) => {
+    /// 接收一个事件：普通消息 / NLink 扩展帧 / 对端关闭。
+    ///
+    /// 未来版本 / 未来类型的扩展帧会被**整帧跳过**（记录 debug 日志），
+    /// 继续等下一条 —— 这是前向兼容的落点。
+        pub async fn recv_event(&mut self) -> Result<ConnEvent> {
+        loop {
+            match self.version {
+                WireVersion::V2 => {
+                    let Some((ft, payload)) = self.read_frame().await? else {
+                        return Ok(ConnEvent::Closed);
+                    };
+                    if ft == nlink::V2_FRAME_TYPE {
+                        if self.nlink.is_none() {
+                            bail!("未协商 NLink 却收到扩展帧");
+                        }
+                        match nlink::Frame::decode(&payload)? {
+                            nlink::frame::Decoded::Known(f) => return Ok(ConnEvent::NLink(f)),
+                            nlink::frame::Decoded::Unknown { version, kind } => {
+                                tracing::debug!(version, kind, "跳过不认识的 NLink 扩展帧");
+                                continue;
+                            }
+                        }
+                    }
                     if ft != FRAME_MESSAGE {
-                        bail!("期望消息帧({FRAME_MESSAGE})，实际收到帧类型 {ft}");
+                        // 未知**帧类型**整帧跳过：v2 的帧头带长度，跳过是安全的，
+                        // 而且这是"以后加新帧类型不炸老版本"的唯一前提。
+                        // 与 TLV / 未知 NLink 帧种类的处理保持一致。
+                        //
+                        // 注意 v1 没这个待遇：v1 消息类型写在 JSON 的第一字节上，
+                        // 官方 frps 遇到不认识的类型会直接断开，我们也一样
+                        // （见下面 `FrpMessage::decode` 的错误分支）。
+                        tracing::debug!(frame_type = ft, "跳过不认识的 v2 帧类型");
+                        continue;
                     }
                     if payload.len() < 2 {
                         bail!("消息帧负载过短");
@@ -291,27 +498,60 @@ impl FrpConn {
                     let type_id = u16::from_be_bytes([payload[0], payload[1]]);
                     if type_id == msg::TYPE_UDP_PACKET_BINARY {
                         let pkt = msg::decode_udp_binary(&payload[2..])?;
-                        return Ok(Some(FrpMessage::UdpPacket(pkt)));
+                        return Ok(ConnEvent::Msg(FrpMessage::UdpPacket(pkt)));
                     }
-                    Ok(Some(FrpMessage::decode(type_id, &payload[2..])?))
+                    return Ok(ConnEvent::Msg(FrpMessage::decode(type_id, &payload[2..])?));
                 }
-                None => Ok(None),
-            },
-            WireVersion::V1 => loop {
-                {
-                    let buf = self.read_buf();
-                    if let Some((byte, body)) = v1::take_msg(buf)? {
-                        let type_id = v1::type_id(byte).expect("take_msg 已校验过类型字节");
-                        if self.v1_udp_binary && byte == v1::TYPE_UDP_PACKET {
-                            return Ok(Some(FrpMessage::UdpPacket(msg::decode_udp_binary(&body)?)));
+                WireVersion::V1 => {
+                    let taken = {
+                        let buf = self.read_buf();
+                        v1::take_msg(buf)?
+                    };
+                    let Some((byte, body)) = taken else {
+                        if !self.fill().await? {
+                            return Ok(ConnEvent::Closed);
                         }
-                        return Ok(Some(FrpMessage::decode(type_id, &body)?));
+                        continue;
+                    };
+                    if byte == nlink::V1_TYPE_BYTE {
+                        if self.nlink.is_none() {
+                            bail!("未协商 NLink 却收到扩展帧");
+                        }
+                        match nlink::Frame::decode(&body)? {
+                            nlink::frame::Decoded::Known(f) => return Ok(ConnEvent::NLink(f)),
+                            nlink::frame::Decoded::Unknown { version, kind } => {
+                                tracing::debug!(version, kind, "跳过不认识的 NLink 扩展帧");
+                                continue;
+                            }
+                        }
+                    }
+                    let type_id = v1::type_id(byte).expect("take_msg 已校验过类型字节");
+                    if self.v1_udp_binary && byte == v1::TYPE_UDP_PACKET {
+                        return Ok(ConnEvent::Msg(FrpMessage::UdpPacket(msg::decode_udp_binary(
+                            &body,
+                        )?)));
+                    }
+                    return Ok(ConnEvent::Msg(FrpMessage::decode(type_id, &body)?));
+                }
+            }
+        }
+    }
+
+    /// 接收一条消息。
+    ///
+    /// 收到扩展帧时顺手放进 `inbox`（供 [`FrpConn::nlink`] 取用），
+    /// 然后继续等下一条消息 —— 这样**所有老调用点都不用改**。
+    pub async fn recv_msg(&mut self) -> Result<Option<FrpMessage>> {
+        loop {
+            match self.recv_event().await? {
+                ConnEvent::Msg(m) => return Ok(Some(m)),
+                ConnEvent::NLink(f) => {
+                    if let Some(n) = self.nlink.as_mut() {
+                        n.inbox.push(f);
                     }
                 }
-                if !self.fill().await? {
-                    return Ok(None);
-                }
-            },
+                ConnEvent::Closed => return Ok(None),
+            }
         }
     }
 
@@ -354,35 +594,7 @@ impl FrpConn {
             bail!("接收缓冲区超限");
         }
         self.raw.extend_from_slice(&chunk[..n]);
-        match &mut self.crypto {
-            ControlCrypto::None => {}
-            ControlCrypto::V1(c) => {
-                // v1 是流密码：把缓冲区里所有能解的字节都解出来
-                let pt = c.decrypt(&mut self.raw);
-                // ★★ v0.5.4 修 M6：`plain` 也必须有自己的硬顶。
-                //
-                // 原先只卡了 `raw`（上面那条 MAX_BUFFER），`plain` 完全没有上限。
-                // 后果：**未认证**的连接就能让对端不断喂数据，把已解密明文堆到
-                // 远大于 8 MiB —— 攻击者只需建约 1000 条连接（受系统 fd 限制）
-                // 就能吃掉接近 8 GB 内存，无需任何凭据。
-                //
-                // 为什么 8 MiB 够：`plain` 里的数据会被上层按消息/帧消费掉，
-                // 正常情况下几乎总是空的。真堆到 8 MiB 说明对端在灌数据而我们
-                // 没消费 —— 那本身就是异常，断开是对的。
-                if self.plain.len() + pt.len() > MAX_PLAIN {
-                    bail!("解密缓冲超限（{MAX_PLAIN} 字节），断开连接");
-                }
-                self.plain.extend_from_slice(&pt);
-            }
-            ControlCrypto::V2(v) => {
-                while let Some(pt) = v.reader.open(&mut self.raw)? {
-                    if self.plain.len() + pt.len() > MAX_PLAIN {
-                        bail!("解密缓冲超限（{MAX_PLAIN} 字节），断开连接");
-                    }
-                    self.plain.extend_from_slice(&pt);
-                }
-            }
-        }
+        self.decrypt_raw_into_plain()?;
         Ok(true)
     }
 
@@ -491,11 +703,39 @@ pub async fn client_handshake(
     pool_count: i32,
     caps: msg::NfrpCaps,
 ) -> Result<(FrpConn, String, bool, msg::NfrpCaps)> {
+    client_handshake_with(
+        stream, version, cred, client_id, user, metas, pool_count, caps, None,
+    )
+    .await
+}
+
+/// [`client_handshake`] + NLink preamble。
+///
+/// `pre` 为 `Some` 时会在**任何协议字节之前**先把 preamble 写出去（v2 的
+/// 魔术字也在它之后）。服务端的协商结果仍然搭 `LoginResp` 回来，所以
+/// 全程没有新增往返。
+#[allow(clippy::too_many_arguments)]
+pub async fn client_handshake_with(
+    stream: BoxStream,
+    version: WireVersion,
+    cred: &crate::security::Credential,
+    client_id: &str,
+    user: &str,
+    metas: &std::collections::HashMap<String, String>,
+    pool_count: i32,
+    caps: msg::NfrpCaps,
+    pre: Option<nlink::Preamble>,
+) -> Result<(FrpConn, String, bool, msg::NfrpCaps)> {
     let mut conn = FrpConn::new(stream, version);
     let ts = now_unix_secs() as i64;
     let mut login = build_login(cred, client_id, user, metas, pool_count, ts);
     // 只是"声明支持"，真正开不开由服务端在 LoginResp 里回显决定
     login.nfrp = if caps.any() { Some(caps) } else { None };
+
+    // NLink preamble 必须最先写：它要早于 v2 魔术字 / v1 的 Login。
+    if let Some(p) = pre {
+        conn.write_preamble(&p).await?;
+    }
 
     // ---------------------------------------------------------------- v1
     if version == WireVersion::V1 {
@@ -517,6 +757,7 @@ pub async fn client_handshake(
         // 它不会回这个字段，于是这里拿到 default()，行为与以前完全一致。
         let accepted = login_resp.nfrp.clone().unwrap_or_default();
         conn.set_v1_udp_binary(accepted.udp_binary);
+        apply_nlink_ack(&mut conn, &login_resp);
         return Ok((conn, login_resp.run_id, accepted.udp_binary, accepted));
     }
 
@@ -571,7 +812,91 @@ pub async fn client_handshake(
 
     // 5) 私有能力：仍然只认服务端回显的那一份
     let accepted = login_resp.nfrp.clone().unwrap_or_default();
+    apply_nlink_ack(&mut conn, &login_resp);
     Ok((conn, login_resp.run_id, udp_binary, accepted))
+}
+
+/// 服务端对一次 preamble 的协商结果。
+struct NegotiatedNLink {
+    ack: nlink::LoginAck,
+    caps: nlink::Caps,
+    session: nlink::ConnectionId,
+    trace: nlink::TraceId,
+    resume: bool,
+}
+
+/// 计算协商结果：编译期实现 ∩ 对端声明 ∩ 运行期允许。
+///
+/// 返回 `None` 的情况（都等价于"这次连接没有 NLink"）：
+/// * 对端没发 preamble（官方 frpc / 老版 NFrp）；
+/// * 运行期没开（`nlink_enabled == None`）；
+/// * 对端 preamble 显式标了"不启用"；
+/// * 交集为空。
+fn negotiate_nlink(
+    pre: Option<nlink::Preamble>,
+    enabled: Option<u64>,
+) -> Option<NegotiatedNLink> {
+    if !cfg!(feature = "nlink") {
+        return None;
+    }
+    let pre = pre?;
+    let mask = enabled?;
+    if !pre.enabled() {
+        return None;
+    }
+    let caps = nlink::Caps::agree(nlink::compiled_caps(), pre.caps, nlink::Caps::new(mask));
+    if !caps.any() {
+        return None;
+    }
+    let trace = pre
+        .tlvs
+        .get(nlink::frame::TAG_TRACE_ID)
+        .and_then(|v| <[u8; 16]>::try_from(v).ok())
+        .map(nlink::TraceId::from_bytes)
+        .unwrap_or_else(nlink::TraceId::random);
+    Some(NegotiatedNLink {
+        ack: nlink::LoginAck {
+            version: nlink::PROTOCOL_VERSION,
+            caps: caps.bits(),
+            trace_id: trace.to_hex(),
+            session: pre.session.to_hex(),
+        },
+        caps,
+        session: pre.session,
+        trace,
+        resume: pre.wants_resume(),
+    })
+}
+
+/// 把 `LoginResp._nlink` 的协商结果落到连接状态上。
+///
+/// 只有服务端回显了**非空能力**才启用；回显为空 / 没有这个字段（官方 frps）
+/// 一律视为未协商。
+fn apply_nlink_ack(conn: &mut FrpConn, resp: &LoginResp) {
+    #[cfg(feature = "nlink")]
+    {
+        let Some(ack) = resp.nlink.as_ref() else {
+            return;
+        };
+        let caps = nlink::Caps::new(ack.caps);
+        if !caps.any() {
+            return;
+        }
+        let session = nlink::TraceId::parse(&ack.session)
+            .map(|t| nlink::ConnectionId::from_bytes(*t.as_bytes()))
+            .unwrap_or_else(nlink::ConnectionId::random);
+        let trace = nlink::TraceId::parse(&ack.trace_id).unwrap_or_else(nlink::TraceId::random);
+        conn.enable_nlink(NLinkState::new(caps, session, trace));
+        tracing::debug!(
+            caps = %caps,
+            trace = %trace,
+            "NLink 协商成功"
+        );
+    }
+    #[cfg(not(feature = "nlink"))]
+    {
+        let _ = (conn, resp);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -624,9 +949,7 @@ pub async fn server_handshake(
         max_clock_skew_secs,
     )
     .await
-}
-
-/// 带授权的服务端握手。
+}/// 带授权的服务端握手。
 ///
 /// `authorize` 在**认证通过之后、`LoginResp` 发出之前**被调用 —— 只有它返回
 /// `Ok` 才会回"登录成功"，否则回一条带 `error` 的 `LoginResp`。
@@ -653,6 +976,7 @@ where
         max_clock_skew_secs,
         None,
         None,
+        None,
     )
     .await
 }
@@ -664,6 +988,9 @@ where
 /// 的顺序一致 —— 插件先于 token/OIDC 校验。
 ///
 /// `peer` 只用于插件响应的 `client_address` 字段；`None` 时留空。
+///
+/// `nlink_enabled` 是**运行期允许启用的能力位**（`None` = 运行期关掉 NLink）。
+/// 协商结果 = 编译期实现 ∩ 对端声明 ∩ 运行期允许，三者缺一不可。
 pub async fn server_handshake_authz_ext<F>(
     stream: BoxStream,
     auth: &crate::security::AuthProvider,
@@ -672,6 +999,7 @@ pub async fn server_handshake_authz_ext<F>(
     max_clock_skew_secs: u64,
     plugins: Option<&crate::plugin::PluginManager>,
     peer: Option<std::net::SocketAddr>,
+    nlink_enabled: Option<u64>,
 ) -> Result<ServerAccept>
 where
     F: FnOnce(&str) -> std::result::Result<crate::security::Role, String>,
@@ -679,6 +1007,11 @@ where
     // 先用 v1 建连接对象：探测只在 raw 缓冲区上做事，跟协议无关
     let mut conn = FrpConn::new(stream, WireVersion::V1);
     let version = conn.detect_version().await?;
+
+    // NLink：preamble 已经在 detect_version 里吃掉，这里只做"是否同意"。
+    // 注意协商发生在**认证之前**也没问题：它只决定"能不能用扩展"，
+    // 不携带任何身份信息，认证仍然在下面照常做。
+    let negotiated = negotiate_nlink(conn.take_preamble(), nlink_enabled);
 
     // 首帧/首消息的解析：v2 要先处理 ClientHello，v1 直接就是消息
     let (type_id, body, crypto_state) = if version.is_v2() {
@@ -921,6 +1254,8 @@ where
         version: super::FRP_WIRE_VERSION.to_string(),
         run_id: run_id.to_string(),
         nfrp: if caps.any() { Some(caps.clone()) } else { None },
+        #[cfg(feature = "nlink")]
+        nlink: negotiated.as_ref().map(|n| n.ack.clone()),
         ..Default::default()
     }))
     .await?;
@@ -940,6 +1275,14 @@ where
         }
         // v1：套 PBKDF2 + AES-128-CFB
         None => conn.enable_v1_crypto(&control_key)?,
+    }
+
+    // NLink 状态在加密**之后**落到连接上：之后的扩展帧都走密文，
+    // 与标准消息同一条路径。
+    if let Some(n) = negotiated {
+        let mut st = NLinkState::new(n.caps, n.session, n.trace);
+        st.resume = n.resume;
+        conn.enable_nlink(st);
     }
 
     Ok(ServerAccept::Control {
@@ -965,6 +1308,21 @@ pub async fn client_work_conn(
     token: &str,
     ts: i64,
 ) -> Result<(BoxStream, Vec<u8>, StartWorkConn)> {
+    client_work_conn_with(stream, version, run_id, token, ts, None).await
+}
+
+/// [`client_work_conn`] + NLink 身份令牌。
+///
+/// 会话协商了 `CAP_IDENTITY` 时，服务端会**要求**这张令牌；没协商时传 `None`，
+/// 报文与 0.6.x 逐字节一致（`_nlink` 字段不会出现）。
+pub async fn client_work_conn_with(
+    stream: BoxStream,
+    version: WireVersion,
+    run_id: &str,
+    token: &str,
+    ts: i64,
+    nlink_identity: Option<&str>,
+) -> Result<(BoxStream, Vec<u8>, StartWorkConn)> {
     let mut conn = FrpConn::new(stream, version);
     // v2 要求每条连接都先发魔术字；v1 什么都不发，直接上消息
     conn.write_magic().await?;
@@ -972,6 +1330,7 @@ pub async fn client_work_conn(
         run_id: run_id.to_string(),
         privilege_key: msg::auth_key(token, ts),
         timestamp: ts,
+        nlink: nlink_identity.map(str::to_string),
     }))
     .await?;
 
@@ -1077,19 +1436,105 @@ mod tests {
         assert!(take_frame(&mut buf).unwrap().is_none());
     }
 
-    /// 未知帧类型在 `read_frame` 层保留、由 `recv_msg` 明确拒绝。
-    #[test]
-    fn v2_未知帧类型由_recv_拒绝() {
-        let payload = wire::encode_frame(999, b"\x00\x01");
-        // 直接模拟 `recv_msg` 的类型判断，避免为了一个分支再起 socket。
-        let ft = u16::from_be_bytes([payload[0], payload[1]]);
-        assert_ne!(ft, FRAME_MESSAGE);
+    /// 未知帧类型必须**整帧跳过**，而不是断开。
+    ///
+    /// 这条以前叫 `v2_未知帧类型由_recv_拒绝`，而"拒绝"其实是个很强的承诺：
+    /// 一旦 v2 侧以后要加新帧类型（比如 NLink 之外的扩展），老版本服务端会
+    /// 直接把连接踢掉，等于"加一个帧类型就砸一次兼容"。现在改成跳过，
+    /// 与 TLV / 未知 NLink 帧种类的处理一致 —— v2 帧头自带长度，跳过是安全的。
+    ///
+    /// 反过来说：这条测试盯着的是"跳过一个未知帧之后，**下一条正常消息还能收到**"，
+    /// 只断言 `ft != FRAME_MESSAGE` 那种写法证明不了任何东西。
+    #[tokio::test]
+    async fn v2_未知帧类型被跳过_控制连接继续可用() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let mut conn = FrpConn::new(Box::pin(server), WireVersion::V2);
+
+        let mut wire = wire::encode_frame(999, b"future-frame");
+        // 后面跟一条正常消息：必须能被收出来，才说明未知帧只是被跳过、
+        // 而不是把连接搞坏。
+        wire.extend_from_slice(&wire::encode_frame(
+            FRAME_MESSAGE,
+            &FrpMessage::Ping(Ping {
+                timestamp: 7,
+                ..Default::default()
+            })
+            .encode()
+            .unwrap(),
+        ));
+        let mut client = client;
+        client.write_all(&wire).await.unwrap();
+
+        match conn.recv_event().await.unwrap() {
+            ConnEvent::Msg(FrpMessage::Ping(p)) => assert_eq!(p.timestamp, 7),
+            _ => panic!("期望跳过未知帧后收到 Ping"),
+        }
+    }
+
+    /// 回归：`upgrade()` 之前已经读进 `raw` 的**密文**必须当场解出来。
+    ///
+    /// 真实触发场景：服务端回完 `LoginResp`（明文）后立刻推 NLink 身份令牌
+    /// （密文），两段落进同一个 TCP 段。`take_frame` 只消费掉 LoginResp，
+    /// 剩下的密文留在 `raw`；若 `upgrade` 不处理它，`read_buf()` 已切到 `plain`，
+    /// 这批字节就永远没人解密 —— 对端"明明发了"，本端一直阻塞。
+    ///
+    /// 用 `timeout` 包住最后一步：一旦回归，失败是 2 秒后报"超时"，
+    /// 而不是把整个 CI 挂死。
+    #[tokio::test]
+    async fn v2_升级加密时已缓冲的密文不能丢() {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        let mut server = FrpConn::new(Box::pin(a), WireVersion::V2);
+        let mut client = FrpConn::new(Box::pin(b), WireVersion::V2);
+        let (s2c, c2s) = (vec![7u8; 32], vec![9u8; 32]);
+
+        // 1) 明文帧（相当于 LoginResp）
+        server
+            .send_msg(&FrpMessage::LoginResp(LoginResp {
+                run_id: RUN_ID.into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        // 2) 服务端升级加密后立刻推一帧（相当于身份令牌）
+        server.upgrade(s2c.clone(), c2s.clone()).unwrap();
+        let frame = crate::nlink::Frame::new(crate::nlink::FrameKind::Identity)
+            .with(crate::nlink::frame::TAG_IDENTITY, b"v1.tok".to_vec());
+        server
+            .write_frame(crate::nlink::V2_FRAME_TYPE, &frame.encode())
+            .await
+            .unwrap();
+
+        // 客户端此时仍是明文状态：把两段**一起**读进 raw，模拟"同一个 TCP 段"。
+        client.fill().await.unwrap();
+        let (ft, _) = client.read_frame().await.unwrap().unwrap();
+        assert_eq!(ft, FRAME_MESSAGE);
+        assert!(
+            !client.raw.is_empty(),
+            "密文应当已经留在 raw 里（否则这条测试没测到东西）"
+        );
+
+        client.upgrade(c2s, s2c).unwrap();
+        client.enable_nlink(NLinkState::new(
+            crate::nlink::Caps::new(crate::nlink::CAP_TRACE),
+            crate::nlink::ConnectionId::random(),
+            crate::nlink::TraceId::random(),
+        ));
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(2), client.recv_event())
+            .await
+            .expect("升级后必须能立刻解出已缓冲的密文（超时 = 回归）")
+            .unwrap();
+        match ev {
+            ConnEvent::NLink(f) => {
+                assert_eq!(f.kind, crate::nlink::FrameKind::Identity);
+                assert_eq!(f.tlvs.get_str(crate::nlink::frame::TAG_IDENTITY).unwrap(), "v1.tok");
+            }
+            _ => panic!("期望拿到已缓冲的 NLink 帧"),
+        }
     }
 
     fn empty_metas() -> std::collections::HashMap<String, String> {
         Default::default()
     }
-
     /// 从流里读一条 v1 消息（`[类型字节][i64 长度][JSON]`）。
     async fn read_v1_raw<S: AsyncReadExt + Unpin>(s: &mut S) -> (u8, Vec<u8>) {
         let mut head = [0u8; 9];
@@ -1203,6 +1648,21 @@ mod tests {
         let (run_id, udp) = client_task.await.unwrap();
         assert_eq!(run_id, RUN_ID);
         assert!(!udp, "v1 没有 UDP 二进制编码协商，恒为 false");
+    }
+
+    /// 只发 7 字节就断开（或停住）的客户端不能把服务端打挂。
+    ///
+    /// 回归的是一次真实越界：`detect_version` 先用 `MAGIC_V2.len()`（7）去填，
+    /// 紧接着切 `[..8]` 做 NLink 魔术字比较 —— 一个畸形首包就 panic。
+    /// 现在必须变成一条**错误**（连接被拒），而不是进程级崩溃。
+    #[tokio::test]
+    async fn 首帧不足时_detect_version_报错而不是_panic() {
+        let (mut client, server) = tokio::io::duplex(64);
+        client.write_all(b"FRP\x00\x02\r").await.unwrap(); // 7 字节
+        drop(client);
+        let mut conn = FrpConn::new(Box::pin(server), WireVersion::V1);
+        let err = conn.detect_version().await.unwrap_err().to_string();
+        assert!(err.contains("断开"), "应当是明确的错误，实际：{err}");
     }
 
     /// 服务端必须按魔术字自动识别（对应官方 `wire.CheckMagic`）。

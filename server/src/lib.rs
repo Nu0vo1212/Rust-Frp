@@ -17,6 +17,7 @@ pub mod dashboard;
 pub mod guard;
 pub mod limits;
 pub mod nathole_official;
+pub mod nlink;
 pub mod observability;
 pub mod p2p;
 pub mod pool;

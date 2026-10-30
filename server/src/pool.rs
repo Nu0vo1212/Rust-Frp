@@ -352,6 +352,13 @@ pub struct ClientState {
     /// 官方 frpc 天然满足（同一个进程、同一个出口），零兼容代价；
     /// 而攻击者要伪造源 IP 比"知道 run_id"难得多。
     peer_ip: IpAddr,
+    /// NLink 协商结果（`None` = 未协商）。控制连接登录成功后写入，
+    /// 工作连接校验身份令牌、桥接层限流都要读它。
+    nlink: Mutex<Option<nfrp_common::frp::conn::NLinkState>>,
+    /// 批量工作连接条数（0 = 不走批量）。由登录后的协商结果写入。
+    nlink_batch: std::sync::atomic::AtomicUsize,
+    /// 上次批量请求的时间（Unix 毫秒），用于去抖。
+    last_batch_ms: std::sync::atomic::AtomicU64,
 }
 
 impl ClientState {
@@ -410,12 +417,35 @@ impl ClientState {
             // 启用 RBAC 后由控制连接按角色覆盖。
             allow_manage: AtomicBool::new(true),
             peer_ip,
+            nlink: Mutex::new(None),
+            nlink_batch: std::sync::atomic::AtomicUsize::new(0),
+            last_batch_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// 控制连接的源 IP（工作连接的空凭证回退校验要用，见字段注释）。
     pub fn peer_ip(&self) -> IpAddr {
         self.peer_ip
+    }
+
+    /// NLink 协商结果（`None` = 本次会话没有启用扩展层）。
+    pub fn nlink(&self) -> Option<nfrp_common::frp::conn::NLinkState> {
+        self.nlink
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 由控制连接在登录成功后写入。
+    pub fn set_nlink(&self, state: nfrp_common::frp::conn::NLinkState) {
+        *self.nlink.lock().unwrap_or_else(|e| e.into_inner()) = Some(state);
+    }
+
+    /// 本次会话是否协商了某一项 NLink 能力。
+    pub fn nlink_has(&self, bit: u64) -> bool {
+        self.nlink()
+            .map(|st| st.caps.contains(bit))
+            .unwrap_or(false)
     }
 
     /// 按角色写入"面板能不能管理这个客户端"。握手期解析出角色后立刻调用。
@@ -581,6 +611,45 @@ impl ClientState {
     /// 通知控制连接："我需要一条工作连接"。
     pub fn request_work_conn(&self) {
         let _ = self.req_tx.send(CtrlCmd::RequestWork);
+    }
+
+    /// 登录后按协商结果设置批量条数（0 = 关闭）。
+    pub fn set_nlink_batch(&self, n: usize) {
+        self.nlink_batch
+            .store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 这次"要工作连接"能不能合并成一次批量请求。
+    ///
+    /// 三条同时成立才批量：
+    ///
+    /// 1. 会话协商了 `batch-work-conn`（`nlink_batch >= 2`）；
+    /// 2. **当前等待工作连接的用户不止一个** —— 只有一条用户连接时，
+    ///    多要的连接纯属浪费（它们会占着空闲池直到超时）；
+    /// 3. 距上次批量已过 250ms —— 一波突发里的 N 个用户只会触发一次批量，
+    ///    否则每个用户都发一条 `BatchReq`，比逐条要还浪费。
+    ///
+    /// 返回要的条数。`None` 表示"按老办法发一条 `ReqWorkConn`"。
+    pub fn take_batch_request(&self) -> Option<u32> {
+        let cap = self.nlink_batch.load(std::sync::atomic::Ordering::Relaxed);
+        if cap < 2 {
+            return None;
+        }
+        let backlog = self.backlog();
+        if backlog < 2 {
+            return None;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let last = self
+            .last_batch_ms
+            .swap(now, std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(last) < 250 {
+            return None;
+        }
+        Some((cap as u32).min(backlog as u32).clamp(2, 256))
     }
 
     /// 控制连接命令通道的发送端（面板下发管理命令时要用它带上 oneshot 回执）。

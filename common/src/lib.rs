@@ -95,6 +95,12 @@ pub mod http_relay;
 pub mod httpc;
 pub mod logfile;
 pub mod net_proxy;
+/// NLink v1：可协商、可回退、零额外往返的扩展层。
+///
+/// 模块本身始终编译（它只是一组纯函数与结构体）；真正**上线**的部分由
+/// crate feature `nlink` 控制：关掉后 `LoginResp` 里连扩展字段都不存在，
+/// 客户端也不会发 preamble，报文与 0.6.x 逐字节一致。
+pub mod nlink;
 pub mod p2p;
 pub mod plugin;
 pub mod pprof_http;

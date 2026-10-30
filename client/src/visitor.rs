@@ -307,25 +307,69 @@ async fn handle_user(
     let session = wait_session(session_rx).await?;
 
     // xtcp 先试真 P2P：打通了数据就不经过服务端，带宽不再受它限制。
-    // 打洞失败（对称 NAT、UDP 被封等）时静默回退中继 —— xtcp 因此不会比 stcp 更差。
+    //
+    // ★ v0.7.0：能不能直连由 `nlink::policy::decide_direct` **唯一**决定
+    //   （服务端、客户端、测试共用同一份判断）。三种结果：
+    //   * Direct —— 试打洞，失败按策略回退（`direct-only` 不回退，直接报错）；
+    //   * Relay  —— 一开始就不试（`relay-only`，或明确不可能成功）；
+    //   * Fail   —— 策略要求直连但条件不满足：**必须报错**，不能静默降级。
     if cfg.visitor_type == "xtcp" {
-        if let Some(route) = &session.p2p {
-            debug!(visitor = %cfg.name, %peer, "xtcp 尝试 P2P 直连");
-            match p2p::try_punch_as_visitor(route, &session.run_id, &target, &cfg.secret_key).await
-            {
-                Ok(mut stream) => {
-                    match util::relay_between(&mut user, &mut stream).await {
-                        Ok((up, down)) => {
-                            debug!(visitor = %cfg.name, "P2P 转发结束：上行 {up}B / 下行 {down}B")
+        use nfrp_common::nlink::policy::{decide_direct, DirectContext, DirectDecision, XtcpPolicy};
+        let policy = XtcpPolicy::parse(&session.link.cfg.nlink.xtcp_policy).unwrap_or_default();
+        let ctx = DirectContext {
+            // 保守估计：没协商过 `xtcp-policy` 就当作官方对端（老行为）。
+            peer_has_policy: session
+                .link
+                .nlink_caps()
+                .contains(nfrp_common::nlink::CAP_XTCP_POLICY),
+            // 有 P2P hub 才谈得上打洞（否则 xtcp 本来就只能中继）。
+            have_public_addr: session.p2p.is_some(),
+            // 对称 NAT 只有实际探测才知道，这里不预判；真失败会由打洞返回。
+            symmetric: false,
+        };
+        let decision = decide_direct(policy, ctx);
+        if let DirectDecision::Fail { reason } = decision {
+            anyhow::bail!(
+                "xtcp 直连策略为 {}，但当前条件无法直连（{}）——\
+                 这是配置要求的结果，不会静默退回中继。改成 auto 可允许回退。",
+                policy,
+                reason.as_str()
+            );
+        }
+        if decision == DirectDecision::Direct {
+            if let Some(route) = &session.p2p {
+                debug!(visitor = %cfg.name, %peer, "xtcp 尝试 P2P 直连（策略 {policy}）");
+                match p2p::try_punch_as_visitor(route, &session.run_id, &target, &cfg.secret_key)
+                    .await
+                {
+                    Ok(mut stream) => {
+                        match util::relay_between(&mut user, &mut stream).await {
+                            Ok((up, down)) => {
+                                debug!(visitor = %cfg.name, "P2P 转发结束：上行 {up}B / 下行 {down}B")
+                            }
+                            Err(e) => debug!(visitor = %cfg.name, "P2P 转发中断：{e}"),
                         }
-                        Err(e) => debug!(visitor = %cfg.name, "P2P 转发中断：{e}"),
+                        return Ok(());
                     }
-                    return Ok(());
-                }
-                Err(e) => {
-                    debug!(visitor = %cfg.name, "P2P 打洞失败，回退中继：{e:#}");
+                    Err(e) => {
+                        if policy == XtcpPolicy::DirectOnly {
+                            return Err(e).with_context(|| {
+                                format!(
+                                    "xtcp 直连策略为 direct-only，打洞失败且不允许回退中继（日志里能看到失败原因）"
+                                )
+                            });
+                        }
+                        debug!(visitor = %cfg.name, "P2P 打洞失败，回退中继：{e:#}");
+                    }
                 }
             }
+        } else if let DirectDecision::Relay { reason } = decision {
+            debug!(
+                visitor = %cfg.name,
+                policy = %policy,
+                reason = reason.as_str(),
+                "按策略走中继"
+            );
         }
     }
 

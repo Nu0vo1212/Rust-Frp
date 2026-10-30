@@ -317,6 +317,77 @@ pub async fn serve_on_with(
     let security = Arc::new(crate::guard::SecurityContext::from_config(&cfg)?);
     registry.set_security(security.clone());
 
+    // NLink v1：把配置变成运行期对象。即使 `[nlink]` 没写，这里也会装一个
+    // 「全关」的实例，后续所有 `registry.nlink()` 调用都不需要判空。
+    let nlink_rt = Arc::new(crate::nlink::NLinkRuntime::from_config(
+        &cfg,
+        &cfg.effective_auth().token,
+    ));
+    if cfg.nlink.enable {
+        if nlink_rt.enabled() {
+            info!(
+                caps = %nlink_rt.features.active(),
+                resume_ttl = nlink_rt.resume_ttl().as_secs(),
+                quic_listen = %cfg.nlink.quic_listen,
+                "NLink v1 已启用"
+            );
+        } else {
+            info!(
+                "NLink v1 开关打开但 `features` 为空：只协商、不启用任何扩展能力"
+            );
+        }
+    }
+    registry.set_nlink(nlink_rt.clone());
+
+    // ---- NLink QUIC 监听 ----
+    //
+    // 独立 UDP 端口 + 独立 ALPN（`nfrp-nlink`）：与标准 QUIC 传输
+    // （`nfrp-frp`）互不干扰，一条流就是一条 frp 连接。
+    //
+    // 没开 `quic` 能力或 `quic_listen` 留空时这一段完全不执行。
+    if nlink_rt.enabled()
+        && nlink_rt
+            .features
+            .active()
+            .contains(nfrp_common::nlink::CAP_QUIC)
+        && !cfg.nlink.quic_listen.trim().is_empty()
+    {
+        let addr: std::net::SocketAddr = cfg.nlink.quic_listen.parse().with_context(|| {
+            format!(
+                "[nlink] quic_listen 不是合法地址：{:?}（应形如 0.0.0.0:7000）",
+                cfg.nlink.quic_listen
+            )
+        })?;
+        let endpoint = frp::quic::listen_with_alpn(&addr, nfrp_common::nlink::ALPN).await?;
+        info!(
+            addr = %endpoint.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| addr.to_string()),
+            alpn = "nfrp-nlink",
+            "NLink QUIC 监听已启动"
+        );
+        let cfg_q = cfg.clone();
+        let reg_q = registry.clone();
+        frp::quic::spawn_stream_acceptor(endpoint, move |stream, peer| {
+            let cfg = cfg_q.clone();
+            let registry = reg_q.clone();
+            async move {
+                // 复用与 TCP 完全相同的入口：preamble 识别、认证、授权、
+                // 能力协商都在 `handle_frp_stream` 里，两条传输没有分叉逻辑。
+                if let Err(e) = handle_frp_stream(
+                    Box::pin(stream),
+                    peer,
+                    cfg,
+                    registry,
+                    PreauthSlot::Deferred,
+                    None,
+                )
+                .await
+                {
+                    debug!(%peer, "NLink QUIC 流结束：{e:#}");
+                }
+            }
+        });
+    }
+
     // group 负载均衡策略：默认 roundrobin（与官方 frp 的 channel fan-out 行为一致）。
     let lb = crate::registry::LbPolicy::parse(&cfg.lb_policy);
     registry.set_lb_policy(lb);
@@ -1032,6 +1103,7 @@ async fn handle_frp_stream(
     // 对合法用户无任何可感知影响。
     // ★ v0.5.6（M3）：把登录时间戳窗口传进握手（0 = 关闭校验）。
     let plugins = registry.plugins();
+    let nlink_mask = registry.nlink().enabled_mask();
     let handshake = conn::server_handshake_authz_ext(
         stream,
         &auth_snapshot,
@@ -1040,6 +1112,7 @@ async fn handle_frp_stream(
         cfg.max_clock_skew_secs,
         Some(&plugins),
         Some(peer),
+        nlink_mask,
     );
     let hs_result = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await;
     // ★ C9-3：认证阶段到此结束（成功/失败/超时都算），立刻释放未认证名额 ——
@@ -1233,6 +1306,52 @@ async fn handle_control(
     // 行为与老版本完全一致。
     client.set_allow_manage(role.allow_manage);
 
+    // ---- NLink v1：协商结果落地 ----
+    //
+    // 协商本身已经在握手阶段完成（preamble 进、LoginResp._nlink 出），
+    // 这里只做三件必须在 ClientState 建好之后才能做的事：
+    // 落能力位、发身份令牌、处理续传。
+    let nlink_state = conn.nlink().cloned();
+    if let Some(st) = &nlink_state {
+        info!(
+            caps = %st.caps,
+            trace = %st.trace,
+            session = %st.session,
+            "NLink v1 协商成功"
+        );
+        client.set_nlink(st.clone());
+        let rt = registry.nlink();
+        // 批量工作连接：只有客户端也协商了才生效。
+        if st.caps.contains(nfrp_common::nlink::CAP_BATCH_WORK) {
+            client.set_nlink_batch(rt.cfg.batch_work_conn);
+        }
+        // 断线续传：preamble 里要求了、能力也协商了，才去查续传票。
+        if st.caps.contains(nfrp_common::nlink::CAP_RESUME) && st.resume {
+            let resumed = rt.resume.take(st.session).is_some();
+            let resp = nfrp_common::nlink::Frame::new(nfrp_common::nlink::FrameKind::ResumeResp)
+                .with(nfrp_common::nlink::frame::TAG_OK, vec![u8::from(resumed)]);
+            conn.send_nlink(&resp).await?;
+            if resumed {
+                info!(session = %st.session, "断线续传命中：沿用上次的会话状态");
+            } else {
+                info!(session = %st.session, "续传票不存在或已过期，按新会话处理");
+            }
+        }
+        // 零信任身份：每会话一张短时令牌，工作连接必须出示。
+        if st.caps.contains(nfrp_common::nlink::CAP_IDENTITY) {
+            let token = rt.identity.issue(
+                &run_id,
+                &login.user,
+                rt.identity_ttl(),
+                std::time::SystemTime::now(),
+            );
+            let frame = nfrp_common::nlink::Frame::new(nfrp_common::nlink::FrameKind::Identity)
+                .with(nfrp_common::nlink::frame::TAG_IDENTITY, token.into_bytes());
+            tracing::debug!(run_id = %run_id, "下发 NLink 身份令牌");
+            conn.send_nlink(&frame).await?;
+        }
+    }
+
     // 客户端数上限：超出时明确拒绝并带上 reason，方便排查
     let _client_slot = match registry.insert(client.clone()) {
         Some(slot) => slot,
@@ -1268,8 +1387,18 @@ async fn handle_control(
 
     loop {
         tokio::select! {
-            msg = conn.recv_msg() => {
-                let Some(msg) = msg? else { break };
+            event = conn.recv_event() => {
+                // NLink 扩展帧与普通消息走同一个 select：扩展帧**立刻**被处理，
+                // 不会因为"等下一条普通消息"而延迟（敲门 / 探测都是时序敏感的）。
+                let msg = match event? {
+                    nfrp_common::frp::conn::ConnEvent::Msg(m) => m,
+                    nfrp_common::frp::conn::ConnEvent::Closed => break,
+                    nfrp_common::frp::conn::ConnEvent::NLink(f) => {
+                        last_seen = Instant::now();
+                        crate::nlink::handle_control_frame(&mut conn, &f, &run_id).await?;
+                        continue;
+                    }
+                };
                 last_seen = Instant::now();
                 match msg {
                     FrpMessage::NewProxy(mut m) => {
@@ -1568,7 +1697,23 @@ async fn handle_control(
             Some(cmd) = req_rx.recv() => {
                 match cmd {
                     // 有用户连接排队，向客户端索要一条工作连接
-                    CtrlCmd::RequestWork => conn.send_msg(&FrpMessage::ReqWorkConn).await?,
+                    CtrlCmd::RequestWork => {
+                        // NLink 批量：并发用户 >1 且协商了能力时，一条帧换 N 条连接。
+                        // 条件不满足就退回原来的一字节 `ReqWorkConn`。
+                        if let Some(n) = client.take_batch_request() {
+                            let frame = nfrp_common::nlink::Frame::new(
+                                nfrp_common::nlink::FrameKind::BatchReq,
+                            )
+                            .with(
+                                nfrp_common::nlink::frame::TAG_COUNT,
+                                n.to_be_bytes().to_vec(),
+                            );
+                            debug!(count = n, "用一条 BatchReq 向客户端要工作连接");
+                            conn.send_nlink(&frame).await?;
+                        } else {
+                            conn.send_msg(&FrpMessage::ReqWorkConn).await?;
+                        }
+                    }
                     // 其他路径（xtcp 打洞协调）要发给客户端的消息，原样下发
                     CtrlCmd::Send(msg) => conn.send_msg(&msg).await?,
                     // 面板下发的管理命令：发出去并登记等待者
@@ -1604,6 +1749,29 @@ async fn handle_control(
             }
         }
     }
+
+    // ---- 控制连接结束：给续传留一份状态 ----
+    //
+    // 只保留 `resume_ttl`（默认 30 秒）。保留的是"这个 connection id 曾经
+    // 存在过、它的代理叫这些名字"，真正的监听端口随 `ClientState` 一起回收 ——
+    // 所以续传**保住的是会话身份与能力协商**，不是在途 TCP 流（内核状态无法迁移）。
+    if let Some(st) = &nlink_state {
+        if st.caps.contains(nfrp_common::nlink::CAP_RESUME) {
+            let rt = registry.nlink();
+            rt.resume.put(
+                st.session,
+                nfrp_common::nlink::ResumeEntry {
+                    run_id: run_id.clone(),
+                    user: client.user.clone(),
+                    trace: st.trace,
+                    proxies: client.proxy_names(),
+                    expires_at: std::time::Instant::now(),
+                },
+                rt.resume_ttl(),
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -1960,6 +2128,33 @@ async fn proxy_accept_loop(listener: TcpListener, remote_port: u16, registry: Ar
                 // 毫秒级延迟；与 `vhost` / `vnet` 等其它数据面入口的处理一致。
                 // 纯套接字选项，设置失败不影响转发。
                 stream.set_nodelay(true).ok();
+                // ---- NLink 端口敲门 ----
+                //
+                // 配了规则就默认**不信任任何来源**：必须先把敲门序列发上来，
+                // 放行窗口内才允许真正的业务连接。
+                //
+                // 两条路径都关连接：
+                // * 敲门成功 —— 这条连接本身不是业务流量（它只发了 33 字节）；
+                // * 敲门失败/超时 —— 对外表现与"端口没开放"一致，不泄露存在性。
+                //
+                // 没配规则时这一段完全不执行（`knock_rule` 返回 None）。
+                {
+                    let nlink_rt = registry.nlink();
+                    if let Some(rule) = nlink_rt.knock_rule(remote_port) {
+                        if !nlink_rt.knock.is_allowed(peer.ip(), remote_port) {
+                            let mut probe = stream;
+                            let _ = crate::nlink::try_knock(
+                                &mut probe,
+                                rule,
+                                peer.ip(),
+                                &nlink_rt.knock,
+                            )
+                            .await;
+                            debug!(%peer, port = remote_port, "未敲门的连接已关闭");
+                            continue;
+                        }
+                    }
+                }
                 // group 负载均衡：这个端口背后可能挂着多个客户端（同组代理），
                 // 每条新连接轮询挑一个；挑不到说明后端全掉了，直接关掉。
                 // 选**在途连接最少**的后端，并立刻给它记一条 ——
@@ -2059,6 +2254,31 @@ async fn handle_work(
     let mut client = registry
         .get(&msg.run_id)
         .ok_or_else(|| anyhow!("找不到 run_id={} 对应的客户端", msg.run_id))?;
+
+    // ---- NLink 零信任身份 ----
+    //
+    // 会话协商了 `identity` 才要求令牌。令牌绑定 `run_id + user + 过期时间`，
+    // 由服务端 HMAC 签发 —— 比"源 IP 相同"强得多：拿到 run_id 也伪造不出来，
+    // 而且过期就作废。官方 frpc 不会协商这个能力，所以永远走不到这里。
+    if client.nlink_has(nfrp_common::nlink::CAP_IDENTITY) {
+        let rt = registry.nlink();
+        let token = msg.nlink.clone().unwrap_or_default();
+        if let Err(e) = rt.identity.verify(
+            &token,
+            &msg.run_id,
+            &client.user,
+            std::time::SystemTime::now(),
+        ) {
+            tracing::debug!(run_id = %msg.run_id, user = %client.user, "身份令牌校验失败：{e:#}");
+            registry.audit().record(
+                crate::audit::AuditEvent::new(crate::audit::kind::LOGIN_DENIED, false)
+                    .client(msg.run_id.clone())
+                    .ip(peer.ip().to_string())
+                    .detail(format!("工作连接身份令牌校验失败：{e:#}")),
+            );
+            anyhow::bail!("工作连接身份令牌校验失败：{e:#}");
+        }
+    }
 
     // 官方 `[[httpPlugins]]`：NewWorkConn。插件在凭证校验之前执行，
     // 可以拒绝（例如池被盗用）或改写 run_id / privilege_key。
@@ -2683,6 +2903,7 @@ pub async fn bridge(user: PendingUser, work: WorkItem, registry: &Arc<Registry>)
     let PendingUser {
         proxy,
         remote_port,
+        client_user,
         stream: mut user_stream,
         peer,
         use_encryption: user_enc,
@@ -2743,13 +2964,44 @@ pub async fn bridge(user: PendingUser, work: WorkItem, registry: &Arc<Registry>)
     // 标志来自注册时记下的 NewProxy 字段。查不到就当没配（明文透传）——
     // 绝不能“查不到就按密文解”，那会把正常流量解成垃圾。
     let (enc, comp) = (user_enc, user_comp);
-    let relay_result = if enc || comp {
-        let key = user_key;
-        debug!(proxy = %proxy, enc, comp, "服务端数据面已启用解密/解压");
-        let mut wrapped = nfrp_common::frp::proxy_stream::ProxyStream::new(work_stream, key, comp);
-        util::relay_between(&mut user_stream, &mut wrapped).await
+    // NLink 限流：规则表为空时**完全走原来的路径**（零额外开销、零行为差异）。
+    let nlink_rt = registry.nlink();
+    let limiter = if nlink_rt.limiter.is_empty() {
+        None
     } else {
-        util::relay_between(&mut user_stream, &mut work_stream).await
+        Some(&nlink_rt.limiter)
+    };
+    let relay_result = match (limiter, enc || comp) {
+        (None, true) => {
+            let key = user_key;
+            debug!(proxy = %proxy, enc, comp, "服务端数据面已启用解密/解压");
+            let mut wrapped = nfrp_common::frp::proxy_stream::ProxyStream::new(work_stream, key, comp);
+            util::relay_between(&mut user_stream, &mut wrapped).await
+        }
+        (None, false) => util::relay_between(&mut user_stream, &mut work_stream).await,
+        (Some(lim), true) => {
+            let key = user_key;
+            debug!(proxy = %proxy, enc, comp, "服务端数据面已启用解密/解压（带限流）");
+            let mut wrapped = nfrp_common::frp::proxy_stream::ProxyStream::new(work_stream, key, comp);
+            crate::nlink::relay_throttled(
+                lim,
+                &client_user,
+                &proxy,
+                &mut user_stream,
+                &mut wrapped,
+            )
+            .await
+        }
+        (Some(lim), false) => {
+            crate::nlink::relay_throttled(
+                lim,
+                &client_user,
+                &proxy,
+                &mut user_stream,
+                &mut work_stream,
+            )
+            .await
+        }
     };
 
     match relay_result {

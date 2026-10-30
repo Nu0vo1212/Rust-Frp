@@ -7,6 +7,7 @@
 //! （作为接入方）。
 
 mod health;
+mod nlink;
 mod p2p;
 mod plugin;
 mod plugin_bridge;
@@ -776,6 +777,11 @@ struct ServerLink {
     quic: Option<(quinn::Endpoint, quinn::Connection)>,
     /// 本次会话协商出的 UDP 报文编码（true = 二进制），工作连接要跟着用。
     udp_binary: std::sync::atomic::AtomicBool,
+    /// 本会话协商出来的 NLink 能力位（0 = 没协商）。
+    ///
+    /// 放在 `ServerLink` 而不是 `FrpConn` 上，是因为工作连接、visitor、
+    /// web 面板都可能要读它，而它们只拿得到 `Arc<ServerLink>`。
+    nlink_caps: std::sync::atomic::AtomicU64,
 }
 
 impl ServerLink {
@@ -783,8 +789,25 @@ impl ServerLink {
         let wire = cfg.protocol.wire_version().ok_or_else(|| {
             anyhow!("当前版本尚未实现 NFrp 自研协议，请把 protocol 设为 frp-v1 或 frp-v2")
         })?;
-        // QUIC 自带加密与多路复用，所以 tls / tcp_mux 这两层都跳过
-        let quic = if is_quic(&cfg.transport_protocol) {
+        // QUIC 自带加密与多路复用，所以 tls / tcp_mux 这两层都跳过。
+        //
+        // NLink 的 QUIC 用另一个 ALPN（`nfrp-nlink`）与独立端口，
+        // 优先级高于标准 `transport_protocol = "quic"`：两个都配时按 NLink 走
+        // （否则 preamble 会发到只认 `nfrp-frp` 的端点上，握手失败）。
+        let nlink_quic = cfg.nlink.enable
+            && cfg.nlink.quic
+            && cfg
+                .nlink
+                .features()
+                .active()
+                .contains(nfrp_common::nlink::CAP_QUIC);
+        let quic = if nlink_quic {
+            let addr = nlink_quic_server_addr(&cfg).await?;
+            let (endpoint, conn) =
+                frp::quic::connect_with_alpn(&addr, None, nfrp_common::nlink::ALPN).await?;
+            info!(%addr, alpn = "nfrp-nlink", "NLink QUIC 传输已建立");
+            Some((endpoint, conn))
+        } else if is_quic(&cfg.transport_protocol) {
             let addr = quic_server_addr(&cfg).await?;
             let (endpoint, conn) = frp::quic::connect(&addr, None).await?;
             info!(%addr, "QUIC 传输已建立");
@@ -810,7 +833,22 @@ impl ServerLink {
             mux,
             quic,
             udp_binary: std::sync::atomic::AtomicBool::new(false),
+            nlink_caps: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// 本会话协商出来的 NLink 能力位。
+    pub(crate) fn nlink_caps(&self) -> nfrp_common::nlink::Caps {
+        nfrp_common::nlink::Caps(
+            self.nlink_caps
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// 登录成功后由 `run_session` 写入。
+    fn set_nlink_caps(&self, caps: nfrp_common::nlink::Caps) {
+        self.nlink_caps
+            .store(caps.bits(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// 取得一条到服务端的流：QUIC 双向流、yamux stream，或一条新的 TCP（+TLS）。
@@ -824,6 +862,75 @@ impl ServerLink {
             None => raw_connect(&self.cfg).await,
         }
     }
+
+    /// QUIC 连接当前的本地地址（迁移前后对比用）。非 QUIC 时为 None。
+    fn quic_local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.quic
+            .as_ref()
+            .and_then(|(ep, _)| frp::quic::local_addr(ep))
+    }
+
+    /// 把 QUIC 连接的本地出口换到 `local`。
+    ///
+    /// quinn 靠连接 ID 识别连接，换源地址不会断开在途流 —— 这正是
+    /// "从 WiFi 切到 4G 不用重连"的底层机制。
+    async fn rebind_quic(&self, local: std::net::SocketAddr) -> Result<()> {
+        let Some((ep, _)) = &self.quic else {
+            bail!("当前连接不是 QUIC，无法迁移");
+        };
+        frp::quic::rebind(ep, local).await
+    }
+}
+
+/// 网络切换自动迁移：每 5 秒看一次"到服务端的出口 IP 变了没"。
+///
+/// 用一个 `Weak` 持有 `ServerLink`：会话结束、链路被回收后这个任务自己退出，
+/// 不会因为"迁移器还活着"把整条连接（以及它的 QUIC endpoint）留着不放。
+///
+/// 5 秒是"WiFi 切 4G 后用户能忍受的空窗"与"不要无谓唤醒"之间的折中：
+/// 迁移本身是一次 `rebind`，不重建连接，所以快慢只影响切换后的恢复时间。
+fn spawn_quic_migrator(link: std::sync::Weak<ServerLink>, cfg: Arc<ClientConfig>) {
+    tokio::spawn(async move {
+        let Ok(server) = nlink_quic_server_addr(&cfg).await else {
+            return;
+        };
+        let mut ticker = interval(Duration::from_secs(5));
+        loop {
+            ticker.tick().await;
+            let Some(link) = link.upgrade() else {
+                break;
+            };
+            let Some(cur) = link.quic_local_addr() else {
+                break;
+            };
+            let Some(ip) = outbound_ip(server).await else {
+                continue;
+            };
+            if ip == cur.ip() {
+                continue;
+            }
+            let target = std::net::SocketAddr::new(ip, 0);
+            match link.rebind_quic(target).await {
+                Ok(()) => info!(from = %cur, to = %target, "QUIC 连接已迁移到新的本地出口"),
+                Err(e) => warn!("QUIC 连接迁移失败：{e:#}"),
+            }
+        }
+    });
+}
+
+/// 到 `server` 的出口 IP：连一个 UDP socket（不发包）读本地地址。
+///
+/// 这是"取默认路由源地址"的常用办法：`connect` 只设置路由与本地端点，
+/// 不会真的产生流量，也不需要任何外部服务配合。
+async fn outbound_ip(server: std::net::SocketAddr) -> Option<std::net::IpAddr> {
+    let any: std::net::SocketAddr = if server.is_ipv4() {
+        "0.0.0.0:0".parse().ok()?
+    } else {
+        "[::]:0".parse().ok()?
+    };
+    let sock = UdpSocket::bind(any).await.ok()?;
+    sock.connect(server).await.ok()?;
+    Some(sock.local_addr().ok()?.ip())
 }
 
 /// 服务端 QUIC 地址（与 TCP 用同一个端口号，只是走 UDP）。
@@ -832,6 +939,18 @@ async fn quic_server_addr(cfg: &ClientConfig) -> Result<std::net::SocketAddr> {
     util::resolve_addr(&s)
         .await
         .with_context(|| format!("解析服务端 QUIC 地址 {s} 失败"))
+}
+
+/// NLink QUIC 服务端地址：显式 `quic_addr` 优先，否则退回 `server_addr:server_port`。
+async fn nlink_quic_server_addr(cfg: &ClientConfig) -> Result<std::net::SocketAddr> {
+    let s = if cfg.nlink.quic_addr.trim().is_empty() {
+        format!("{}:{}", cfg.server_addr, cfg.server_port)
+    } else {
+        cfg.nlink.quic_addr.trim().to_string()
+    };
+    util::resolve_addr(&s)
+        .await
+        .with_context(|| format!("解析 NLink QUIC 地址 {s} 失败（检查 [nlink] quic_addr）"))
 }
 
 /// 带 `dialServerTimeout` / `connectServerLocalIP` 的拨号（限制①批次1）。
@@ -1222,23 +1341,83 @@ struct SessionDeps {
     hub: Option<Arc<web::Hub>>,
 }
 
-async fn run_session(deps: SessionDeps) -> Result<()> {
-    // 解构出来而不是满篇写 `deps.cfg` —— 下面这段是本文件最长的一段代码，
-    // 到处加前缀只会让它更难读。
-    let SessionDeps {
-        cfg,
-        session_tx,
-        health,
-        logged_in_once,
-        token_source,
-        store,
-        proxies,
-        hub,
-    } = deps;
-    let server = format!("{}:{}", cfg.server_addr, cfg.server_port);
-    let link = Arc::new(ServerLink::open(cfg.clone()).await?);
-    info!(%server, "已连接到服务端，开始握手");
+/// 处理一条来自服务端的 NLink 扩展帧。
+///
+/// 只处理**服务端主动下发**的那几类；不认识的整帧忽略（前向兼容）。
+async fn handle_nlink_frame(
+    frame: &nfrp_common::nlink::Frame,
+    nlink: &nlink::ClientNLink,
+    link: &Arc<ServerLink>,
+    run_id: &Arc<String>,
+    proxies: &registry::ProxyTable,
+    health: &Arc<health::Monitor>,
+) {
+    use nfrp_common::nlink::frame::{FrameKind, TAG_CODE, TAG_COUNT, TAG_DETAIL, TAG_IDENTITY, TAG_OK};
 
+    match frame.kind {
+        FrameKind::Identity => {
+            if let Some(tok) = frame.tlvs.get_str(TAG_IDENTITY) {
+                debug!("收到 NLink 身份令牌，之后的工作连接会出示它");
+                nlink.set_identity(tok);
+            }
+        }
+        FrameKind::ResumeResp => {
+            let ok = frame
+                .tlvs
+                .get(TAG_OK)
+                .and_then(|v| v.first().copied())
+                .map(|b| b != 0)
+                .unwrap_or(false);
+            if ok {
+                info!("NLink 断线续传成功：沿用上次的会话状态");
+            } else {
+                info!("NLink 续传票已过期或不存在，本次按新会话处理");
+            }
+        }
+        FrameKind::BatchReq => {
+            let count = frame
+                .tlvs
+                .get_u32(TAG_COUNT)
+                .unwrap_or(1)
+                .clamp(1, 256) as usize;
+            debug!(count, "收到批量工作连接请求");
+            for _ in 0..count {
+                spawn_work_conn(
+                    link.clone(),
+                    run_id.clone(),
+                    proxies.clone(),
+                    health.clone(),
+                    nlink::current(),
+                );
+            }
+        }
+        FrameKind::CompatResp => {
+            let detail = frame.tlvs.get_str(TAG_DETAIL).unwrap_or_default();
+            info!("服务端兼容性矩阵：{}", detail.trim_end());
+        }
+        FrameKind::Failure => {
+            warn!(
+                code = frame.tlvs.get_u32(TAG_CODE).unwrap_or(0),
+                detail = %frame.tlvs.get_str(TAG_DETAIL).unwrap_or_default(),
+                "服务端回报 NLink 失败"
+            );
+        }
+        other => debug!(kind = ?other, "忽略 NLink 扩展帧"),
+    }
+}
+
+/// 一次控制连接握手的完整尝试。
+///
+/// `with_preamble` 为 `false` 时走**标准模式**（连官方 frps 就是这条路径）。
+/// 拆成独立函数是为了让"带 preamble 失败 → 回退重试"这段逻辑清晰可见，
+/// 而不是在 `run_session` 里堆两层嵌套。
+async fn handshake_once(
+    cfg: &ClientConfig,
+    link: &ServerLink,
+    token_source: &Option<Arc<nfrp_common::auth::oidc::TokenSource>>,
+    nlink: &nlink::ClientNLink,
+    with_preamble: bool,
+) -> Result<(FrpConn, String, bool, msg::NfrpCaps)> {
     let stream = link.connect().await?;
     // 私有能力只是**声明支持**，真正开不开看服务端回显 ——
     // 连官方 frps / 第三方 frps 时对方不会回显，行为与不开完全一致。
@@ -1258,8 +1437,9 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
     // 每次（重）连都重新取一次凭证：OIDC 的 access token 会过期，
     // 复用上一次的会让"重连"变成"用过期 token 再失败一次"。
     // TokenSource 内部有缓存，没到期时不会真的去打 IdP。
-    let cred = current_credential(&cfg, &token_source).await?;
-    let (mut conn, run_id, udp_binary, caps) = conn::client_handshake(
+    let cred = current_credential(cfg, token_source).await?;
+    let pre = if with_preamble { nlink.preamble() } else { None };
+    conn::client_handshake_with(
         stream,
         link.wire,
         &cred,
@@ -1268,8 +1448,47 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
         &cfg.metas,
         cfg.pool_count,
         declared,
+        pre,
     )
-    .await?;
+    .await
+}
+
+async fn run_session(deps: SessionDeps) -> Result<()> {
+    // 解构出来而不是满篇写 `deps.cfg` —— 下面这段是本文件最长的一段代码，
+    // 到处加前缀只会让它更难读。
+    let SessionDeps {
+        cfg,
+        session_tx,
+        health,
+        logged_in_once,
+        token_source,
+        store,
+        proxies,
+        hub,
+    } = deps;
+    let server = format!("{}:{}", cfg.server_addr, cfg.server_port);
+    let link = Arc::new(ServerLink::open(cfg.clone()).await?);
+    // 走 NLink QUIC 且开了迁移时，起一个"出口 IP 变了就 rebind"的看门狗。
+    if cfg.nlink.enable && cfg.nlink.quic && cfg.nlink.quic_migrate {
+        spawn_quic_migrator(Arc::downgrade(&link), cfg.clone());
+    }
+    info!(%server, "已连接到服务端，开始握手");
+
+    // NLink：一个进程一份状态（connection id 跨重连不变，续传要它）。
+    let nlink = nlink::install(&cfg);
+    let (mut conn, run_id, udp_binary, caps) =
+        match handshake_once(&cfg, &link, &token_source, &nlink, true).await {
+            Ok(v) => v,
+            // ★ 自动回退：对端不认 preamble 时（官方 frps 会把 `NFRPLNK1` 当成
+            //   v1 消息头直接报错），立刻用标准模式重连一次。用户只会在日志里
+            //   看到一行 warn，隧道照常工作。
+            Err(e) if nlink.want_preamble() => {
+                warn!("NLink 握手未成功（对端可能不支持扩展层），自动回退标准模式：{e:#}");
+                nlink.mark_fallback();
+                handshake_once(&cfg, &link, &token_source, &nlink, false).await?
+            }
+            Err(e) => return Err(e),
+        };
     link.udp_binary
         .store(udp_binary, std::sync::atomic::Ordering::Relaxed);
     if udp_binary {
@@ -1277,6 +1496,24 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
     }
     if caps.server_cmd {
         debug!("服务端已启用私有管理命令（面板可增删本端代理）");
+    }
+    match conn.nlink() {
+        Some(st) => {
+            link.set_nlink_caps(st.caps);
+            info!(
+                caps = %st.caps,
+                trace = %st.trace,
+                session = %st.session,
+                "NLink v1 协商成功"
+            )
+        }
+        None => {
+            if nlink.want_preamble() {
+                // preamble 发出去了但服务端没回显：按标准模式跑，本次进程不再尝试。
+                warn!("服务端未回显 NLink 能力，按标准模式运行");
+                nlink.mark_fallback();
+            }
+        }
     }
     info!(%run_id, wire = %link.wire, "登录成功（控制通道已加密）");
 
@@ -1341,9 +1578,19 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
     let mut pending: std::collections::HashSet<String> =
         cfg.proxies.iter().map(|p| p.name.clone()).collect();
     while !pending.is_empty() {
-        let msg = tokio::time::timeout(Duration::from_secs(15), conn.recv_msg())
+        let event = tokio::time::timeout(Duration::from_secs(15), conn.recv_event())
             .await
             .context("等待 NewProxyResp 超时")??;
+        let msg = match event {
+            nfrp_common::frp::conn::ConnEvent::Msg(m) => Some(m),
+            nfrp_common::frp::conn::ConnEvent::Closed => None,
+            nfrp_common::frp::conn::ConnEvent::NLink(f) => {
+                // 注册窗口期内就可能收到身份令牌 / 续传回执，必须立刻处理：
+                // 令牌丢了会导致之后每一条工作连接都被服务端拒绝。
+                handle_nlink_frame(&f, &nlink, &link, &run_id, &proxies, &health).await;
+                continue;
+            }
+        };
         match msg {
             Some(FrpMessage::NewProxyResp(r)) => {
                 let raw = util::strip_user_prefix(&cfg.user, &r.proxy_name).to_string();
@@ -1364,6 +1611,7 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
                     run_id.clone(),
                     proxies.clone(),
                     health.clone(),
+                    nlink.clone(),
                 );
             }
             Some(other) => debug!("注册期间收到 {}，忽略", other.name()),
@@ -1378,6 +1626,7 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
             run_id.clone(),
             proxies.clone(),
             health.clone(),
+            nlink.clone(),
         );
     }
 
@@ -1387,15 +1636,22 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
 
     loop {
         tokio::select! {
-            msg = conn.recv_msg() => {
-                let Some(msg) = msg? else {
-                    info!("服务端关闭了控制连接");
-                    // 控制连接没了：还在等的打洞请求必须立刻失败，
-                    // 否则 visitor 会干等到超时才回退中继
-                    if let Some(route) = &p2p_route {
-                        route.bus.clear();
+            event = conn.recv_event() => {
+                let msg = match event? {
+                    nfrp_common::frp::conn::ConnEvent::Msg(m) => m,
+                    nfrp_common::frp::conn::ConnEvent::Closed => {
+                        info!("服务端关闭了控制连接");
+                        // 控制连接没了：还在等的打洞请求必须立刻失败，
+                        // 否则 visitor 会干等到超时才回退中继
+                        if let Some(route) = &p2p_route {
+                            route.bus.clear();
+                        }
+                        break;
                     }
-                    break;
+                    nfrp_common::frp::conn::ConnEvent::NLink(f) => {
+                        handle_nlink_frame(&f, &nlink, &link, &run_id, &proxies, &health).await;
+                        continue;
+                    }
                 };
                 match msg {
                     FrpMessage::ReqWorkConn => {
@@ -1405,6 +1661,7 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
                     run_id.clone(),
                     proxies.clone(),
                     health.clone(),
+                    nlink.clone(),
                 );
                     }
                     FrpMessage::Pong(p) => {
@@ -1654,9 +1911,10 @@ fn spawn_work_conn(
     run_id: Arc<String>,
     proxies: registry::ProxyTable,
     health: Arc<health::Monitor>,
+    nlink: Arc<nlink::ClientNLink>,
 ) {
     tokio::spawn(async move {
-        if let Err(e) = work_conn_flow(link, run_id, proxies, health).await {
+        if let Err(e) = work_conn_flow(link, run_id, proxies, health, nlink).await {
             debug!("工作连接结束：{e:#}");
         }
     });
@@ -1668,12 +1926,22 @@ async fn work_conn_flow(
     run_id: Arc<String>,
     proxies: registry::ProxyTable,
     health: Arc<health::Monitor>,
+    nlink: Arc<nlink::ClientNLink>,
 ) -> Result<()> {
     let stream = link.connect().await?;
 
     let ts = util::now_unix_secs() as i64;
-    let (work, leftover, start) =
-        conn::client_work_conn(stream, link.wire, &run_id, &link.cfg.token, ts).await?;
+    // NLink 身份令牌：协商了才带（`identity()` 为 None 时字段不出现）。
+    let identity = nlink.identity();
+    let (work, leftover, start) = conn::client_work_conn_with(
+        stream,
+        link.wire,
+        &run_id,
+        &link.cfg.token,
+        ts,
+        identity.as_deref(),
+    )
+    .await?;
 
     // 服务端下发的名字是**线上全名**（带 `{user}.` 前缀），本地映射表按配置里的
     // 原始 `name` 建 —— 统一走 `resolve_uploaded_proxy`。

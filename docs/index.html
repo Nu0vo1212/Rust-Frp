@@ -103,7 +103,7 @@
     <span class="hero-badge reveal"><span class="dot"></span><span data-i18n="hero-badge">v0.7.0 · 与 frp 0.71.0 实测互通</span></span>
     <h1 class="reveal"><span data-i18n="hero-title-1">把内网服务</span><span class="grad" data-i18n="hero-title-2">安全地</span><span data-i18n="hero-title-3">带到公网</span></h1>
     <p class="lead reveal" data-i18n="hero-lead">
-      Nfrp 是 fatedier/frp 的 Rust 重实现，完整兼容官方线协议 v1 与 v2。
+      NFrp 是 fatedier/frp 的 Rust 重实现，完整兼容官方线协议 v1 与 v2。
       官方 frpc 与 frps 无需修改任何配置即可连接，而服务端常驻内存只有几兆字节。
     </p>
     <div class="hero-actions reveal">
@@ -139,7 +139,7 @@
     <div class="card reveal">
       <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h8l-1 8 10-12h-8l1-8z"/></svg></div>
       <h4 data-i18n="why2-t">内存占用低一个数量级</h4>
-      <p data-i18n="why2-d">同负载下 Go 版 frps 为 28.8 至 31.8 MB，Nfrp 约 3.5 MB。单文件部署，无运行时依赖。</p>
+      <p data-i18n="why2-d">同负载下 Go 版 frps 为 28.8 至 31.8 MB，NFrp 约 3.5 MB。单文件部署，无运行时依赖。</p>
     </div>
     <div class="card reveal">
       <div class="card-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
@@ -226,7 +226,7 @@ nfrp-client -V     # nfrp-client 0.7.0</code></pre>
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
     <div>
       <strong data-i18n="inst-v-t">-v 为什么输出 0.71.0</strong>
-      <p data-i18n="inst-v-d">这是刻意的。很多管理面板会读 -v 判断对端版本，输出成 0.71.0 才会被当成正常的 frp 对待。要看 Nfrp 自己的版本用 -V。</p>
+      <p data-i18n="inst-v-d">这是刻意的。很多管理面板会读 -v 判断对端版本，输出成 0.71.0 才会被当成正常的 frp 对待。要看 NFrp 自己的版本用 -V。</p>
     </div>
   </div>
 </section>
@@ -278,7 +278,7 @@ nfrp-client -c frpc.toml</code></pre>
   <p data-i18n="qs-p3">流量路径是：你的终端，服务器 6000 端口，加密隧道，内网机器的 22 端口。</p>
 
   <h2 data-i18n="qs-h4">如果用的是官方 frpc</h2>
-  <p data-i18n="qs-p4">什么都不用改。Nfrp 的 frps 默认走 v1，与官方默认值一致，官方 frpc 直接连就行：</p>
+  <p data-i18n="qs-p4">什么都不用改。NFrp 的 frps 默认走 v1，与官方默认值一致，官方 frpc 直接连就行：</p>
   <pre><code># 官方 frpc 直接指向 nfrp-server 的端口即可
 ./frpc -c frpc.toml</code></pre>
 

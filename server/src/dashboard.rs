@@ -790,7 +790,7 @@ fn header_value(req: &str, name: &str) -> Option<String> {
 /// 安全相关头：**必须唯一**。重复即为畸形请求（NFRP-13）。
 ///
 /// 为什么不能“取第一个就算了”：面板前面经常挂 Nginx / WAF / SSO 网关，
-/// 上游与 NFRp 对“哪个 `Authorization` 生效”理解一旦相反，就是鉴权差异，
+/// 上游与 NFrp 对“哪个 `Authorization` 生效”理解一旦相反，就是鉴权差异，
 /// 属于请求走私类问题的经典前置条件。
 ///
 /// 返回 `Err(())` 表示同名头出现两次以上，调用方应直接回 400。
@@ -1622,7 +1622,7 @@ Authorization: Basic ",
         );
     }
 
-    /// 配置里能真正读进来（官方 camelCase 与 Nfrp snake_case 都认）。
+    /// 配置里能真正读进来（官方 camelCase 与 NFrp snake_case 都认）。
     #[test]
     fn enable_prometheus_能读进来() {
         let a =

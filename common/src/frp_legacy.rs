@@ -198,7 +198,7 @@ pub fn parse_ini(text: &str) -> Option<Ini> {
             // 官方 frp 用 `go-ini` 解析，它把段名与键名都做了 `strings.ToLower`
             // （见 `ini.LoadSources` 的 `strings.ToLower(k)`）。而这里原先
             // **严格区分大小写** ⇒ `[Common]`、`[RDP]` 这类写法在官方能用、
-            // 在 NFRp 会"段找不到"。
+            // 在 NFrp 会"段找不到"。
             //
             // 对安全的影响不是"报错"，而是**静默失效**：
             // 段名匹配不上时那条代理**整个不被加载**，用户以为隧道开着。
@@ -1036,7 +1036,7 @@ remote_port = 27064
         // go-ini 对段名做 `strings.ToLower`，`SectionStrings()` 返回的就是
         // 小写名，官方 `Name: name` 于是也得到 `mccc`。
         // ⇒ 改成小写**不是**偏离官方，而是**修正**成一个本就该一致的行为
-        //   （改之前 `[MCCC]` 在官方是 `mccc`、在 NFRp 是 `MCCC`，
+        //   （改之前 `[MCCC]` 在官方是 `mccc`、在 NFrp 是 `MCCC`，
         //     同一份配置在两个实现里产生不同的代理名）。
         assert_eq!(p.name, "mccc", "段名小写化，与官方 go-ini 一致");
         assert_eq!(p.proxy_type, "tcp");
@@ -1046,7 +1046,7 @@ remote_port = 27064
 
     /// ★★ v0.5.6 回归（审计总报告 M4）：INI 的**段名与键名必须大小写不敏感**。
     ///
-    /// 官方 `go-ini` 对两者都做 `strings.ToLower`，而 NFRp 原先严格区分大小写
+    /// 官方 `go-ini` 对两者都做 `strings.ToLower`，而 NFrp 原先严格区分大小写
     /// ⇒ 同一份配置在两个实现里行为不同，而且是**静默失效**
     /// （取不到值就落到默认值，配置看起来"配了"）。
     #[test]
@@ -1088,7 +1088,7 @@ remote_port = 27064
             cfg.proxies.iter().map(|p| &p.name).collect::<Vec<_>>()
         );
 
-        // ★ 大小写不敏感的核心价值：**同一份配置在官方与 NFRp 上行为一致**。
+        // ★ 大小写不敏感的核心价值：**同一份配置在官方与 NFrp 上行为一致**。
         //   下面这份是"大小写混写"的真实样子，必须完整可用。
         let mixed = "[Common]\nServer_Addr = frp.example.com\nServer_Port = 7000\nLogin_Fail_Exit = false\n\n[Web01]\nTYPE = tcp\nLocal_IP = 127.0.0.1\nLocal_Port = 80\nRemote_Port = 8080\n";
         let cfg = parse_client(mixed).expect("混写大小写的配置必须能解析");

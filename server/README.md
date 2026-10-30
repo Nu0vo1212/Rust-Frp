@@ -1,6 +1,6 @@
 # nfrp-server
 
-> Nfrp 服务端可执行文件 —— 等价官方 `frps`。
+> NFrp 服务端可执行文件 —— 等价官方 `frps`。
 > 用 `cargo install nfrp-server` 安装，或从
 > [Releases](https://github.com/Nu0vo1212/Rust-Frp/releases) 下载预编译包。
 
@@ -9,7 +9,7 @@
 
 ## 这是什么
 
-[Nfrp](https://github.com/Nu0vo1212/Rust-Frp) 是 [fatedier/frp](https://github.com/fatedier/frp)
+[NFrp](https://github.com/Nu0vo1212/Rust-Frp) 是 [fatedier/frp](https://github.com/fatedier/frp)
 的 Rust 重实现，**完整兼容官方 wire protocol v1 与 v2**。
 
 本 crate 提供服务端二进制 `nfrp-server`：

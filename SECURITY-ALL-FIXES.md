@@ -1,4 +1,4 @@
-# NFRp 安全修复总文档（全部轮次整合）
+# NFrp 安全修复总文档（全部轮次整合）
 
 **整合日期** 2026-10-25（2026-10-29 增补：总览表重写、发布通道收口）  
 **覆盖轮次** 第一轮 ~ 第十七轮（共 14 份报告 + 第十七轮 + 发布通道）  
@@ -5477,7 +5477,7 @@ future 被 `select!` 取消时那批字节消失。
 
 ## 1. 结论先说
 
-- 官方 Windows `frpc.exe 0.71.0` 已与 NFRp 服务端完成**真实 xtcp / NatHole UDP 打洞**，
+- 官方 Windows `frpc.exe 0.71.0` 已与 NFrp 服务端完成**真实 xtcp / NatHole UDP 打洞**，
   visitor 访问成功；不是只看代码或只测登录。
 - 官方 0.71 的控制连接、代理注册、`sshTunnelGateway`、`httpPlugins`、`pprof`、
   `useEncryption` / `useCompression`、`proxyURL`、`dnsServer`、`natHoleStunServer`
@@ -5708,7 +5708,7 @@ pprof 端点真实 200。
 # 2026-10-26 · 第十七轮（本地复现报告驱动的 5 项修复）
 
 本轮不是安全审计，而是**外部复现报告的闭环**。报告来自
-《NFRp 本地复现与待修清单-2026-10-26》：在 commit `c7214ab`（0.6.6）上
+《NFrp 本地复现与待修清单-2026-10-26》：在 commit `c7214ab`（0.6.6）上
 **实弹复现**了 4 条问题（其中 3 条仓库从未记录、1 条记录过但没修），另指出
 2 条工程项。全部处理完毕。
 
@@ -5744,7 +5744,7 @@ JSON —— 面板 `JSON.parse` 白屏、外部采集器与告警全挂。等效
 **根因**：`header_value()` 命中第一个同名头就 `return`。
 
 **风险**：单独看不构成绕过（仍需密码）。风险在部署形态：面板前置
-Nginx / WAF / SSO 网关时，上游与 NFRp 对"哪个 `Authorization` 生效"的理解
+Nginx / WAF / SSO 网关时，上游与 NFrp 对"哪个 `Authorization` 生效"的理解
 一旦相反，就是鉴权差异 —— 请求走私类问题的经典前置条件。
 
 **修复**：新增 `unique_header()`，同名安全头出现两次及以上一律 400。
@@ -5775,10 +5775,10 @@ OSC 52 剪贴板写入。
 未做百分号解码、未做 dot-segment 归一化，命中后又原样转发。
 
 **复现**：后端会做归一化（nginx / IIS / Apache 默认行为），于是
-`/public/../admin` 在 NFRp 这边命中 `/public`、到后端变成 `/admin`。
+`/public/../admin` 在 NFrp 这边命中 `/public`、到后端变成 `/admin`。
 
 **诚实定性**：上游 `fatedier/frp` 的 `pkg/util/vhost/router.go` 同样是
-`strings.HasPrefix` —— 所以**这不是 NFRp 引入的**，是"对齐上游"的结果。
+`strings.HasPrefix` —— 所以**这不是 NFrp 引入的**，是"对齐上游"的结果。
 但很多用户把 `locations` 当路径级 ACL 用（"只暴露 /public"），实际它不是安全边界。
 
 **修复**：选最保守的方案 —— 请求目标含 dot-segment（`.` / `..`，含 `%2e` /

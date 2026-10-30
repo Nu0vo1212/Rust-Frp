@@ -12,7 +12,7 @@
 > python scripts/sync_nlink_doc.py --check
 > ```
 
-NLink 是 NFRp 在标准 frp 协议之外的扩展层。它只承载那些 **frp 协议本身没有位置表达**、且 **确实有用户被卡住** 的能力。
+NLink 是 NFrp 在标准 frp 协议之外的扩展层。它只承载那些 **frp 协议本身没有位置表达**、且 **确实有用户被卡住** 的能力。
 
 :::callout 当前状态：已实现（v0.7.0 起，默认关闭）
 下面列出的能力**均已实现并通过测试**（`server/tests/nlink_e2e.rs` 的 11 条端到端用例逐项覆盖）。

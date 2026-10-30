@@ -1,7 +1,7 @@
 # nfrp-common
 
-> Nfrp 的公共库：frp 协议（v1 / v2）、配置、加密、ACL/RBAC、日志、传输层抽象。
-> 这是 [Nfrp](https://github.com/Nu0vo1212/Rust-Frp) 三个 crate 里**唯一可以当库用**的那个 ——
+> NFrp 的公共库：frp 协议（v1 / v2）、配置、加密、ACL/RBAC、日志、传输层抽象。
+> 这是 [NFrp](https://github.com/Nu0vo1212/Rust-Frp) 三个 crate 里**唯一可以当库用**的那个 ——
 > 不跑穿透服务也能直接用它的协议与加密实现。
 
 [![crates.io](https://img.shields.io/crates/v/nfrp-common.svg)](https://crates.io/crates/nfrp-common)
@@ -10,7 +10,7 @@
 
 ## 这是什么
 
-[Nfrp](https://github.com/Nu0vo1212/Rust-Frp) 是 [fatedier/frp](https://github.com/fatedier/frp)
+[NFrp](https://github.com/Nu0vo1212/Rust-Frp) 是 [fatedier/frp](https://github.com/fatedier/frp)
 的 Rust 重实现，**完整兼容官方 wire protocol v1 与 v2**
 （与官方 `frps` / `frpc` v0.71.0 实测互通）。
 

@@ -457,7 +457,7 @@ pub async fn handle_nat_hole_visitor(
 
     // 4) 官方 frpc 的正式请求：带 NAT 探测得到的 mapped_addrs。
     //    它走官方控制消息交换，不依赖 `p2p_port`，也不再走下面的
-    //    NFRp 自有 UDP HELLO 牵线。
+    //    NFrp 自有 UDP HELLO 牵线。
     if !m.mapped_addrs.is_empty() {
         return match crate::nathole_official::start_session(visitor_client, &entry, m) {
             Ok(()) => Ok(()),
@@ -468,7 +468,7 @@ pub async fn handle_nat_hole_visitor(
         };
     }
 
-    // 5) NFRp 自有协议：没有 mapped_addrs，靠 `p2p_port` 上的 UDP HELLO。
+    // 5) NFrp 自有协议：没有 mapped_addrs，靠 `p2p_port` 上的 UDP HELLO。
     let Some(hub) = registry.p2p() else {
         refuse(
             visitor_client,
@@ -764,7 +764,7 @@ mod tests {
     ///
     /// 现在服务端实现了官方 `NatHole` 控制器，预检通过后回空错误，
     /// 官方客户端会继续做 STUN 探测并发正式请求；预检本身不建立
-    /// NFRp 自有的 UDP HELLO 会话。
+    /// NFrp 自有的 UDP HELLO 会话。
     #[tokio::test]
     async fn 官方_frpc_预检成功但不建立自有会话() {
         let registry = Arc::new(Registry::unlimited());
@@ -794,7 +794,7 @@ mod tests {
         handle_nat_hole_visitor(&registry, &visitor, &m)
             .await
             .expect("处理过程不应返回 IO 错误");
-        assert_eq!(hub.len(), 0, "官方预检不该建立 NFRp 自有的 UDP HELLO 会话");
+        assert_eq!(hub.len(), 0, "官方预检不该建立 NFrp 自有的 UDP HELLO 会话");
     }
 
     #[tokio::test]

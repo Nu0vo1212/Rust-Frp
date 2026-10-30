@@ -32,7 +32,7 @@ pub enum Protocol {
     #[default]
     FrpV1,
     FrpV2,
-    Nfrp,
+    NFrp,
 }
 
 impl Protocol {
@@ -40,7 +40,7 @@ impl Protocol {
         match self {
             Protocol::FrpV1 => "frp-v1",
             Protocol::FrpV2 => "frp-v2",
-            Protocol::Nfrp => "nfrp",
+            Protocol::NFrp => "nfrp",
         }
     }
 
@@ -49,7 +49,7 @@ impl Protocol {
         match self {
             Protocol::FrpV1 => Some(crate::frp::WireVersion::V1),
             Protocol::FrpV2 => Some(crate::frp::WireVersion::V2),
-            Protocol::Nfrp => None,
+            Protocol::NFrp => None,
         }
     }
 }
@@ -67,7 +67,7 @@ impl std::str::FromStr for Protocol {
             // 照抄 frp 的 `wireProtocol = "v1"` 也认；空值按官方 EmptyOr 的语义落到 v1
             "" | "v1" | "frp-v1" | "frpv1" | "frp" => Ok(Protocol::FrpV1),
             "v2" | "frp-v2" | "frpv2" => Ok(Protocol::FrpV2),
-            "nfrp" | "native" => Ok(Protocol::Nfrp),
+            "nfrp" | "native" => Ok(Protocol::NFrp),
             other => Err(format!(
                 "未知协议 {other}，可选：frp-v1（默认）/ frp-v2 / nfrp"
             )),
@@ -549,7 +549,7 @@ pub struct ServerConfig {
     /// 校验客户端证书的 CA（PEM，对应官方 `transport.tls.trustedCaFile`）。
     ///
     /// 非空时启用 **mTLS**：客户端必须出示由该 CA 签发的证书。
-    /// 官方 frpc 默认不带客户端证书，因此这条路径主要给"NFRP 客户端 + NFRP 服务端"
+    /// 官方 frpc 默认不带客户端证书，因此这条路径主要给"NFrp 客户端 + NFrp 服务端"
     /// 或自建证书的双端使用。
     #[serde(default, rename = "trustedCaFile")]
     pub tls_trusted_ca_file: String,
@@ -640,7 +640,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub max_proxies_per_client: usize,
 
-    /// group 负载均衡策略（**Nfrp 扩展**，官方 frp 没有这个配置项）。
+    /// group 负载均衡策略（**NFrp 扩展**，官方 frp 没有这个配置项）。
     ///
     /// 同 `group` 的多个代理共享一个公网端口，用户连接在它们之间分摊。
     ///
@@ -662,7 +662,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub lb_policy: String,
 
-    /// KCP 会话表条数上限（**Nfrp 扩展**，默认 1024）。
+    /// KCP 会话表条数上限（**NFrp 扩展**，默认 1024）。
     ///
     /// KCP 是"每个 UDP 源端口一个会话"的模型，每个会话约占 15.3 KB。
     /// 上限直接决定内存上界：`值 × 15.3 KB`。
@@ -778,7 +778,7 @@ pub struct ServerConfig {
 
     /// 官方 frps 的 `[webServer]` 段落。
     ///
-    /// NFRp 历史上使用 `dashboard_port` / `dashboard_user` / `dashboard_pwd`。
+    /// NFrp 历史上使用 `dashboard_port` / `dashboard_user` / `dashboard_pwd`。
     /// 现在同时接受官方写法：`[webServer] port` 作为 dashboard 端口的备用值，
     /// `user` / `password` 作为 dashboard 凭据的备用值，`[webServer.tls]`
     /// 用于面板 HTTPS。两者都写时显式的 `dashboard_*` 优先。
@@ -808,7 +808,7 @@ pub struct ServerConfig {
 
     /// UDP 转发的单报文缓冲上限（官方 frps 的 `udpPacketSize`）。
     ///
-    /// ★ v0.6.6：官方默认 **1500**，而 NFRP 一直用 **65507**（UDP 协议上限）。
+    /// ★ v0.6.6：官方默认 **1500**，而 NFrp 一直用 **65507**（UDP 协议上限）。
     ///
     /// 为什么默认**故意与官方不同**：
     /// * 它决定"单个 UDP 报文最多能带多少字节"，超过就被截断；
@@ -857,7 +857,7 @@ pub struct ServerConfig {
 
     /// 官方 `natholeAnalysisDataReserveHours`：NAT 打洞分析记录的保留小时数。
     ///
-    /// 官方默认 168（7 天）。NFRp 目前只实现 mode 0，因此这里的记录用于
+    /// 官方默认 168（7 天）。NFrp 目前只实现 mode 0，因此这里的记录用于
     /// 统计每一对 client/visitor 的反复配对情况，并按此值过期清理；它是
     /// 真实的资源上限，不是只解析不生效的占位字段。
     #[serde(
@@ -4952,7 +4952,7 @@ tcpmuxPassthrough = true
         // ★ 注意：官方 0.71 的 `[transport.tls]` 段包含 `enable` /
         //   `certFile` / `keyFile` / `trustedCaFile` / `serverName` /
         //   `disableCustomTLSFirstByte`（见官方 frpc_full_example.toml）。
-        //   NFRp 的 `verifyServerCert` 仍是顶层键，所以这里分开断言。
+        //   NFrp 的 `verifyServerCert` 仍是顶层键，所以这里分开断言。
         let c3 = parse("[transport.tls]\nenable = true\n");
         assert!(c3.tls_enable, "官方 `[transport.tls] enable` 写法必须有效");
 
@@ -5153,7 +5153,7 @@ tcpmuxPassthrough = true
     // v0.6.6：`udpPacketSize`（两端）
     // ==================================================================
 
-    /// 默认是 65507（NFRP 一直用的值），**不是**官方的 1500。
+    /// 默认是 65507（NFrp 一直用的值），**不是**官方的 1500。
     ///
     /// 这条锁住"默认不被改成 1500" —— 改了会截断现有用户的大 UDP 报文，
     /// 而且是静默截断（收得到包、内容少一截），比报错难查得多。
@@ -5164,7 +5164,7 @@ tcpmuxPassthrough = true
         assert_eq!(MAX_UDP_PACKET_SIZE, 65507);
     }
 
-    /// 两端都能读（官方 camelCase 与 NFRP snake_case 都认）。
+    /// 两端都能读（官方 camelCase 与 NFrp snake_case 都认）。
     #[test]
     fn udp_packet_size_两端都能读() {
         let sv = parse_server_toml("bind_port = 7000\nudpPacketSize = 1500\n").unwrap();

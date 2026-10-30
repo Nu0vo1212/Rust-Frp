@@ -1,6 +1,6 @@
 //! 官方 frp ≥0.52 的 xtcp `NatHole` 控制器（服务端侧）。
 //!
-//! 这里不是 NFRp 自己那套“UDP HELLO + 服务端回 PEER”的牵线协议，而是
+//! 这里不是 NFrp 自己那套“UDP HELLO + 服务端回 PEER”的牵线协议，而是
 //! 官方 frpc 使用的控制连接消息流：
 //!
 //! ```text

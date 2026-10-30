@@ -478,9 +478,9 @@ pub struct NatHoleDetectBehavior {
     pub send_delay_ms: i64,
     /// 官方 frp 的 JSON 字段名是 `read_timeout`（单位毫秒）。
     ///
-    /// 早期 NFRp 自己写成了 `read_timeout_ms`，官方 frpc 收到后只会看到
+    /// 早期 NFrp 自己写成了 `read_timeout_ms`，官方 frpc 收到后只会看到
     /// 未知字段并落到默认值 0 —— 打洞一端会立刻超时。这里以官方字段为准，
-    /// 同时保留旧字段名作为反序列化别名，避免已有 NFRp 测试/客户端配置失效。
+    /// 同时保留旧字段名作为反序列化别名，避免已有 NFrp 测试/客户端配置失效。
     #[serde(
         default,
         rename = "read_timeout",

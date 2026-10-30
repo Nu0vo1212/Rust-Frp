@@ -512,7 +512,7 @@ proxyProtocolVersion = "v2"   # v1 | v2</code></pre>
 /* ======================== 线协议总览 ======================== */
 PAGES_ZH['protocol'] = `
 <h1>线协议总览</h1>
-<p class="lead">Nfrp 与官方 frp 说同一种语言。这一节讲清它在线上到底发什么、怎么识别版本。</p>
+<p class="lead">NFrp 与官方 frp 说同一种语言。这一节讲清它在线上到底发什么、怎么识别版本。</p>
 
 <h2>两条通道</h2>
 <div class="cards">
@@ -597,7 +597,7 @@ PAGES_ZH['protocol'] = `
 /* ======================== v1 ======================== */
 PAGES_ZH['protocol-v1'] = `
 <h1>v1 协议与加密</h1>
-<p class="lead">v1 是官方 frp 的默认协议。Nfrp 完整实现它，包括那套必须逐字节对齐的加密。</p>
+<p class="lead">v1 是官方 frp 的默认协议。NFrp 完整实现它，包括那套必须逐字节对齐的加密。</p>
 
 <h2>登录凭证：MD5(token + timestamp)</h2>
 <p>客户端不发送明文 token，而是发送：</p>
@@ -643,14 +643,14 @@ PAGES_ZH['protocol-v1'] = `
 <li>前 16 字节完全正常（第一个密钥流块来自 IV）</li>
 <li>从第 17 字节起整段乱掉</li>
 </ul>
-<p>症状极像"网络问题"，实际是密码学实现错了。Nfrp 的实现有跨块边界的分段向量测试盯着这一点。</p>
+<p>症状极像"网络问题"，实际是密码学实现错了。NFrp 的实现有跨块边界的分段向量测试盯着这一点。</p>
 
 <h2>IV 的安全性</h2>
 <p>IV 用 <code>OsRng</code> 生成，每次连接独立，<strong>不存在密钥流复用</strong>。</p>
 <p>但 CFB 只提供机密性，<strong>不提供完整性</strong>。所以上层还需要时间戳窗口防重放（见 <a href="#/wire-protocol">线协议总览</a>）。</p>
 
 <h2>什么时候该用 v2</h2>
-<p>如果两端都是 Nfrp（或者都支持 v2），<strong>用 v2</strong>。v1 的存在意义是与官方 frp 互通，不是因为它安全。</p>
+<p>如果两端都是 NFrp（或者都支持 v2），<strong>用 v2</strong>。v1 的存在意义是与官方 frp 互通，不是因为它安全。</p>
 `;
 
 /* ======================== v2 ======================== */
@@ -782,7 +782,7 @@ PAGES_ZH['messages'] = `
 <div class="callout">
 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
 <div>
-<strong>100 / 101 是 Nfrp 私有能力</strong>
+<strong>100 / 101 是 NFrp 私有能力</strong>
 <p>官方 frp 没有这两个类型。连着官方 frpc 时这个能力不开启，面板会直接回一句人话错误，而不是干等到超时。</p>
 </div>
 </div>
@@ -1243,19 +1243,19 @@ PAGES_ZH['compat'] = `
 <table>
 <thead><tr><th>组合</th><th>状态</th><th>说明</th></tr></thead>
 <tbody>
-<tr><td>官方 frpc 连 Nfrp frps</td><td>可用</td><td>默认走 v1，无需改配置</td></tr>
-<tr><td>Nfrp frpc 连官方 frps</td><td>可用</td><td>配置键名镜像 frp</td></tr>
-<tr><td>Nfrp 两端</td><td>可用</td><td>可选 v2 强加密</td></tr>
+<tr><td>官方 frpc 连 NFrp frps</td><td>可用</td><td>默认走 v1，无需改配置</td></tr>
+<tr><td>NFrp frpc 连官方 frps</td><td>可用</td><td>配置键名镜像 frp</td></tr>
+<tr><td>NFrp 两端</td><td>可用</td><td>可选 v2 强加密</td></tr>
 </tbody>
 </table>
 </div>
 <p>测试基准：官方 frp <strong>0.71.0</strong>。</p>
 
 <h2>键名映射</h2>
-<p>Nfrp 的 <code>ServerConfig</code> / <code>ClientConfig</code> 用 snake_case，官方用 camelCase。兼容层负责桥接：</p>
+<p>NFrp 的 <code>ServerConfig</code> / <code>ClientConfig</code> 用 snake_case，官方用 camelCase。兼容层负责桥接：</p>
 <div class="table-wrap">
 <table>
-<thead><tr><th>官方 frp</th><th>Nfrp 原生</th></tr></thead>
+<thead><tr><th>官方 frp</th><th>NFrp 原生</th></tr></thead>
 <tbody>
 <tr><td><code>bindPort</code></td><td><code>bind_port</code></td></tr>
 <tr><td><code>serverAddr</code></td><td><code>server_addr</code></td></tr>
@@ -1293,7 +1293,7 @@ PAGES_ZH['compat'] = `
 <div>
 <strong>几处诚实的差异</strong>
 <ul>
-<li><strong>未实现端口敲门</strong>：官方有 knock 特性，Nfrp 没有。</li>
+<li><strong>未实现端口敲门</strong>：官方有 knock 特性，NFrp 没有。</li>
 <li><strong>xtcp 混合版本</strong>：两端版本不一致时自动回退成 stcp 中继（功能正常，只是不经直连）。</li>
 <li><strong><code>TYPE_SERVER_CMD</code>（100 / 101）是私有扩展</strong>：连着官方 frpc 时该能力不开启，面板会直接报错而不是卡到超时。</li>
 </ul>
@@ -1303,7 +1303,7 @@ PAGES_ZH['compat'] = `
 
 <!-- BEGIN nlink (generated from docs/nlink.md, do not edit) -->
 PAGES_ZH['nlink'] = `
-<p class="lead" data-i18n="nlink-lead">NLink 是 NFRp 在标准 frp 协议之外的扩展层。它只承载那些 <strong>frp 协议本身没有位置表达</strong>、且 <strong>确实有用户被卡住</strong> 的能力。</p>
+<p class="lead" data-i18n="nlink-lead">NLink 是 NFrp 在标准 frp 协议之外的扩展层。它只承载那些 <strong>frp 协议本身没有位置表达</strong>、且 <strong>确实有用户被卡住</strong> 的能力。</p>
 <div class="callout">
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
   <div>

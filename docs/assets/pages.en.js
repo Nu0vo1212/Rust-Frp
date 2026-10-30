@@ -514,7 +514,7 @@ proxyProtocolVersion = "v2"   # v1 | v2</code></pre>
 /* ======================== Wire protocol ======================== */
 PAGES_EN['protocol'] = `
 <h1>Wire protocol</h1>
-<p class="lead">Nfrp speaks the same language as the official frp. This section covers exactly what goes on the wire and how versions are detected.</p>
+<p class="lead">NFrp speaks the same language as the official frp. This section covers exactly what goes on the wire and how versions are detected.</p>
 
 <h2>Two kinds of connection</h2>
 <div class="cards">
@@ -599,7 +599,7 @@ PAGES_EN['protocol'] = `
 /* ======================== v1 ======================== */
 PAGES_EN['protocol-v1'] = `
 <h1>v1 protocol and crypto</h1>
-<p class="lead">v1 is the official frp default. Nfrp implements it completely, including the crypto that must match byte for byte.</p>
+<p class="lead">v1 is the official frp default. NFrp implements it completely, including the crypto that must match byte for byte.</p>
 
 <h2>Login credential: MD5(token + timestamp)</h2>
 <p>The client never sends the raw token. It sends:</p>
@@ -652,7 +652,7 @@ PAGES_EN['protocol-v1'] = `
 <p>CFB provides confidentiality only, <strong>not integrity</strong>. Anti-replay therefore relies on the timestamp window at the layer above, see <a href="#/wire-protocol">Wire protocol</a>.</p>
 
 <h2>When to prefer v2</h2>
-<p>If both ends are Nfrp, or both support v2, <strong>use v2</strong>. v1 exists for interoperability with the official frp, not because it is secure.</p>
+<p>If both ends are NFrp, or both support v2, <strong>use v2</strong>. v1 exists for interoperability with the official frp, not because it is secure.</p>
 `;
 
 /* ======================== v2 ======================== */
@@ -784,7 +784,7 @@ PAGES_EN['messages'] = `
 <div class="callout">
 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
 <div>
-<strong>100 and 101 are Nfrp-private</strong>
+<strong>100 and 101 are NFrp-private</strong>
 <p>The official frp has no such types. When connected to an official frpc the capability stays off, and the dashboard returns a plain error instead of hanging until timeout.</p>
 </div>
 </div>
@@ -1245,19 +1245,19 @@ PAGES_EN['compat'] = `
 <table>
 <thead><tr><th>Combination</th><th>Status</th><th>Notes</th></tr></thead>
 <tbody>
-<tr><td>Official frpc to Nfrp frps</td><td>works</td><td>v1 by default, no config change needed</td></tr>
-<tr><td>Nfrp frpc to official frps</td><td>works</td><td>Key names mirror frp</td></tr>
-<tr><td>Nfrp on both ends</td><td>works</td><td>Optionally v2 with strong encryption</td></tr>
+<tr><td>Official frpc to NFrp frps</td><td>works</td><td>v1 by default, no config change needed</td></tr>
+<tr><td>NFrp frpc to official frps</td><td>works</td><td>Key names mirror frp</td></tr>
+<tr><td>NFrp on both ends</td><td>works</td><td>Optionally v2 with strong encryption</td></tr>
 </tbody>
 </table>
 </div>
 <p>Baseline: official frp <strong>0.71.0</strong>.</p>
 
 <h2>Key name mapping</h2>
-<p>Nfrp's <code>ServerConfig</code> and <code>ClientConfig</code> use snake_case while the official configs use camelCase. A compatibility layer bridges the two:</p>
+<p>NFrp's <code>ServerConfig</code> and <code>ClientConfig</code> use snake_case while the official configs use camelCase. A compatibility layer bridges the two:</p>
 <div class="table-wrap">
 <table>
-<thead><tr><th>Official frp</th><th>Nfrp native</th></tr></thead>
+<thead><tr><th>Official frp</th><th>NFrp native</th></tr></thead>
 <tbody>
 <tr><td><code>bindPort</code></td><td><code>bind_port</code></td></tr>
 <tr><td><code>serverAddr</code></td><td><code>server_addr</code></td></tr>
@@ -1295,7 +1295,7 @@ PAGES_EN['compat'] = `
 <div>
 <strong>Honest differences</strong>
 <ul>
-<li><strong>Port knocking is not implemented.</strong> The official frp has a knock feature; Nfrp does not.</li>
+<li><strong>Port knocking is not implemented.</strong> The official frp has a knock feature; NFrp does not.</li>
 <li><strong>Mixed xtcp versions</strong> fall back to stcp relay automatically. It works, it just never goes direct.</li>
 <li><strong><code>TYPE_SERVER_CMD</code> (100 and 101) is a private extension.</strong> With an official frpc the capability stays off, and the dashboard reports an error rather than hanging until timeout.</li>
 </ul>
@@ -1305,7 +1305,7 @@ PAGES_EN['compat'] = `
 
 <!-- BEGIN nlink (generated from docs/nlink.md, do not edit) -->
 PAGES_EN['nlink'] = `
-<p class="lead" data-i18n="nlink-lead">NLink 是 NFRp 在标准 frp 协议之外的扩展层。它只承载那些 <strong>frp 协议本身没有位置表达</strong>、且 <strong>确实有用户被卡住</strong> 的能力。</p>
+<p class="lead" data-i18n="nlink-lead">NLink 是 NFrp 在标准 frp 协议之外的扩展层。它只承载那些 <strong>frp 协议本身没有位置表达</strong>、且 <strong>确实有用户被卡住</strong> 的能力。</p>
 <div class="callout">
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
   <div>

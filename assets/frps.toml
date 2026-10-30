@@ -158,7 +158,7 @@ hot_reload = false
 # 不是一回事：http / https / tcpmux / stcp 这些不占公网端口的只算代理数。
 # max_ports_per_client = 20
 
-# ---- group 负载均衡策略（v0.6.3 新增，Nfrp 扩展项）----
+# ---- group 负载均衡策略（v0.6.3 新增，NFrp 扩展项）----
 # 同 group 的多个代理共享一个公网端口，用户连接在它们之间分摊。
 #
 #   roundrobin（默认）  严格 1/N 轮询。**与官方 frp 的行为一致**
@@ -174,7 +174,7 @@ hot_reload = false
 # 客户端 / 服务端的互通。
 # lb_policy = "leastconn"
 
-# ---- KCP 会话表上限（v0.6.3 新增，Nfrp 扩展项）----
+# ---- KCP 会话表上限（v0.6.3 新增，NFrp 扩展项）----
 # KCP 是"每个 UDP 源端口一个会话"的模型，每会话约占 15.3 KB。
 # 这个值直接决定内存上界：值 × 15.3 KB。
 #

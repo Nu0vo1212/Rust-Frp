@@ -3474,7 +3474,7 @@ mod tests {
         cfg.protocol = Protocol::FrpV2;
         assert!(ensure_protocol(&cfg).is_ok(), "v2 也必须被接受");
 
-        cfg.protocol = Protocol::Nfrp;
+        cfg.protocol = Protocol::NFrp;
         assert!(ensure_protocol(&cfg).is_err());
     }
 

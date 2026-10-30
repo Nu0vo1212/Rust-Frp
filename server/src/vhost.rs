@@ -51,10 +51,10 @@ use crate::{pool::ClientState, registry::Registry};
 ///
 /// `locations` 是**前缀匹配**，而很多后端（nginx / IIS / Apache）
 /// 会把路径做 dot-segment 归一化。于是
-/// `/public/../admin` 在 NFRp 这边命中 `/public`、到后端变成 `/admin`，
+/// `/public/../admin` 在 NFrp 这边命中 `/public`、到后端变成 `/admin`，
 /// “只暴露 /public”的设想直接被绕过。
 ///
-/// 官方 frp 也是前缀匹配（`strings.HasPrefix`），所以这不是 NFRp 引入的问题；
+/// 官方 frp 也是前缀匹配（`strings.HasPrefix`），所以这不是 NFrp 引入的问题；
 /// 但我们选择比上游更严：直接拒绝，而不是猜客户端意图。
 ///
 /// 只解码一层且只处理 `%2e`（`.` 的唯一合法编码）：

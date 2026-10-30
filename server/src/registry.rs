@@ -7,6 +7,7 @@ use std::{
     collections::{hash_map::Entry, HashMap},
     sync::atomic::{AtomicU8, AtomicUsize, Ordering},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use crate::{
@@ -18,8 +19,9 @@ use crate::{
     vhost::VhostTable,
     visitor::VisitorTable,
 };
+use nfrp_common::nlink::session::ConnectionId;
 use nfrp_common::plugin::PluginManager;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// 由配置折算出来的服务端资源上限（`0` 表示不限）。
 #[derive(Debug, Clone, Default)]
@@ -105,6 +107,25 @@ pub struct Registry {
     /// 默认是「全关」的实例：未配置 `[nlink]` 时，`enabled_mask()` 返回 `None`，
     /// 握手阶段连协商都不会发生 —— 行为与 0.6.x 逐字节一致。
     nlink: Mutex<Arc<crate::nlink::NLinkRuntime>>,
+    /// 控制连接断开后、等待续传的会话。
+    ///
+    /// 与 `nlink` 分开放：`nlink` 会在配置热重载时整体替换，而这里挂的是
+    /// **活的监听器与端口** —— 被热重载顺手丢掉就会永久泄漏。
+    suspended: Mutex<HashMap<ConnectionId, SuspendedSession>>,
+}
+
+/// 一个暂停中、等待客户端续传的会话。
+pub struct SuspendedSession {
+    /// 仍然是同一份 `ClientState`：代理表、监听器、端口都挂在它上面。
+    pub client: Arc<ClientState>,
+    /// 保留客户端名额；过期回收时 drop 即归还。
+    pub slot: Option<LimitGuard>,
+    /// 暂停前的 run_id（日志与清理用）。
+    pub run_id: String,
+    /// 绑定校验：续传必须来自同一 user + client_id。
+    pub user: String,
+    pub client_id: String,
+    pub expires_at: Instant,
 }
 
 impl Registry {
@@ -126,6 +147,7 @@ impl Registry {
             lb_policy: AtomicU8::new(LbPolicy::RoundRobin as u8),
             plugins: Mutex::new(Arc::new(PluginManager::default())),
             nlink: Mutex::new(Arc::new(crate::nlink::NLinkRuntime::disabled())),
+            suspended: Mutex::new(HashMap::new()),
         }
     }
 
@@ -220,7 +242,7 @@ impl Registry {
         self.clients
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(client.run_id.clone(), client);
+            .insert(client.run_id(), client);
         self.metrics().clients_total.inc();
         self.metrics().clients_active.inc();
         Some(LimitGuard(Some(permit)))
@@ -250,28 +272,144 @@ impl Registry {
             .unwrap_or_else(|e| e.into_inner())
             .remove(run_id);
         if let Some(c) = &c {
-            // 这个客户端被回收时还挂着几个代理，`proxies_active` 就得减几个。
-            //
-            // 客户端**主动**关代理走的是 `CloseProxy`，那条路径自己已经减过了；
-            // 但被 kill / 断网时它根本发不出这条消息，只有这里能兜底 ——
-            // 否则面板上的"生效代理"只增不减，跑几天全是水分。
-            // 必须趁 `stop()` 清空名册**之前**取数，之后再取永远是 0。
-            let outstanding = c.proxy_names().len() as i64;
-            c.stop();
-            if outstanding > 0 {
-                self.metrics().proxies_active.add(-outstanding);
-            }
-            // 客户端的 http/https 域名要一并回收，否则域名会一直被占着
-            if let Some(t) = self.vhosts() {
-                t.unregister_client(c);
-            }
-            // stcp / xtcp 的代理名同理
-            self.visitors.unregister_client(c);
-            // 它占的公网端口（含 group 成员身份）也要收回
-            self.release_ports_of(c);
             self.metrics().clients_active.dec();
+            self.cleanup_client(c);
         }
         c
+    }
+
+    /// 回收一个客户端的全部外部资源（代理 / 域名 / visitor / 端口）。
+    ///
+    /// **不**负责从 `clients` 表里摘除，也**不**动 `clients_active`：
+    /// 这两件事由调用方按语义处理 —— 正常下线要在摘表后减一次；
+    /// 续传过期回收时它早就不在表里了，不能再减。
+    fn cleanup_client(&self, c: &Arc<ClientState>) {
+        // 这个客户端被回收时还挂着几个代理，`proxies_active` 就得减几个。
+        //
+        // 客户端**主动**关代理走的是 `CloseProxy`，那条路径自己已经减过了；
+        // 但被 kill / 断网时它根本发不出这条消息，只有这里能兜底 ——
+        // 否则面板上的"生效代理"只增不减，跑几天全是水分。
+        // 必须趁 `stop()` 清空名册**之前**取数，之后再取永远是 0。
+        let outstanding = c.proxy_names().len() as i64;
+        c.stop();
+        if outstanding > 0 {
+            self.metrics().proxies_active.add(-outstanding);
+        }
+        // 客户端的 http/https 域名要一并回收，否则域名会一直被占着
+        if let Some(t) = self.vhosts() {
+            t.unregister_client(c);
+        }
+        // stcp / xtcp 的代理名同理
+        self.visitors.unregister_client(c);
+        // 它占的公网端口（含 group 成员身份）也要收回
+        self.release_ports_of(c);
+    }
+
+    /// 控制连接断开、进入续传等待：从在线表摘掉，但**保留全部资源**。
+    ///
+    /// 返回的 `Arc<ClientState>` 由调用方放进 [`Self::suspend`]；
+    /// 监听器仍然持有同一份 Arc，所以公网端口在续传窗口内继续可连接。
+    pub fn detach(&self, run_id: &str) -> Option<Arc<ClientState>> {
+        let c = self
+            .clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(run_id)?;
+        self.metrics().clients_active.dec();
+        Some(c)
+    }
+
+    /// 把暂停的会话放进等待表。
+    ///
+    /// 同名 key 已经挂着**另一个** `ClientState` 时拒绝覆盖：否则后登录的
+    /// 一条（可能只是复用了同一个 session id 的新会话）会把真正的暂停会话
+    /// 顶掉，合法客户端再回来时拿到的是空壳。冲突时新条目就地回收。
+    /// 返回 `true` 表示已登记。
+    pub fn suspend(&self, id: ConnectionId, entry: SuspendedSession) -> bool {
+        self.sweep_suspended();
+        let mut g = self.suspended.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(old) = g.get(&id) {
+            if !Arc::ptr_eq(&old.client, &entry.client) {
+                drop(g);
+                warn!(
+                    session = %id,
+                    "同一 session id 已有暂停会话，拒绝覆盖（后到的会话按普通断开回收）"
+                );
+                self.reclaim_suspended(entry);
+                return false;
+            }
+        }
+        g.insert(id, entry);
+        true
+    }
+
+    /// 取一个仍有效的暂停会话（一次性：续传成功后从表里移除）。
+    ///
+    /// **先校验身份再摘除**：只认 connection id 的话，任何拿到（或猜到）
+    /// 该 id 的登录都能把别人的暂停会话取走并 `reclaim` —— 一条合法的
+    /// 重连就会被降级成"新会话"，监听器 / 端口全被回收。身份不匹配时
+    /// 原样留在表里，等真正的客户端回来。
+    ///
+    /// 过期条目会在这里就地回收，不会把端口留给下一位续传者。
+    pub fn take_suspended_if(
+        &self,
+        id: ConnectionId,
+        user: &str,
+        client_id: &str,
+    ) -> Option<SuspendedSession> {
+        let now = Instant::now();
+        let mut g = self.suspended.lock().unwrap_or_else(|e| e.into_inner());
+        let e = g.get(&id)?;
+        if e.expires_at <= now {
+            let expired = g.remove(&id)?;
+            drop(g);
+            self.reclaim_suspended(expired);
+            return None;
+        }
+        if e.user != user || e.client_id != client_id {
+            return None;
+        }
+        g.remove(&id)
+    }
+
+    /// 清掉过期会话并回收其端口 / 监听器，返回清理数量。
+    pub fn sweep_suspended(&self) -> usize {
+        let now = Instant::now();
+        let expired: Vec<SuspendedSession> = {
+            let mut g = self.suspended.lock().unwrap_or_else(|e| e.into_inner());
+            let ids: Vec<ConnectionId> = g
+                .iter()
+                .filter(|(_, v)| v.expires_at <= now)
+                .map(|(k, _)| *k)
+                .collect();
+            ids.into_iter().filter_map(|k| g.remove(&k)).collect()
+        };
+        let n = expired.len();
+        for e in expired {
+            self.reclaim_suspended(e);
+        }
+        n
+    }
+
+    /// 续传过期 / 被拒绝时回收资源。
+    pub fn reclaim_suspended(&self, entry: SuspendedSession) {
+        let SuspendedSession { client, slot, .. } = entry;
+        self.cleanup_client(&client);
+        drop(slot);
+    }
+
+    /// 续传命中：把同一个 `ClientState` 重新挂回在线表（新 run_id）。
+    ///
+    /// 名额沿用暂停时保留的 [`LimitGuard`]，不重新申请 —— 否则
+    /// `max_clients` 会在续传瞬间被自己占两次。
+    pub fn reattach(&self, client: Arc<ClientState>) {
+        let run_id = client.run_id();
+        self.clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(run_id, client);
+        self.metrics().clients_total.inc();
+        self.metrics().clients_active.inc();
     }
 
     pub fn client_count(&self) -> usize {
@@ -497,7 +635,7 @@ impl Registry {
             .unwrap_or_else(|e| e.into_inner())
             .values()
             .map(|c| ClientInfo {
-                run_id: c.run_id.clone(),
+                run_id: c.run_id(),
                 client_id: c.client_id.clone(),
                 user: c.user.clone(),
                 proxies: c.proxy_names(),
@@ -520,7 +658,7 @@ impl Registry {
             .get(&port)?
             .members
             .iter()
-            .find(|b| b.client.run_id == run_id)
+            .find(|b| b.client.run_id() == run_id)
             .cloned()
     }
 
@@ -606,7 +744,7 @@ impl Drop for LoadGuard {
 /// ★ 注意这是"客户端级"的判据，**不能**用来判断"同一个代理" ——
 /// 一个客户端可以注册多个代理，判代理要再加上 `proxy_name`。
 fn same_client(a: &Arc<ClientState>, b: &Arc<ClientState>) -> bool {
-    Arc::ptr_eq(a, b) || a.run_id == b.run_id
+    Arc::ptr_eq(a, b) || a.run_id() == b.run_id()
 }
 
 /// 端口申领的结果。
@@ -864,18 +1002,34 @@ pub struct LimitGuard(#[allow(dead_code)] Option<crate::limits::Permit>);
 /// 控制连接退出时自动清理该客户端的全部资源。
 pub struct ClientGuard {
     registry: Arc<Registry>,
-    run_id: String,
+    run_id: Option<String>,
 }
 
 impl ClientGuard {
     pub fn new(registry: Arc<Registry>, run_id: String) -> Self {
-        Self { registry, run_id }
+        Self {
+            registry,
+            run_id: Some(run_id),
+        }
+    }
+
+    /// 续传：会话不结束，别在 drop 时把监听器 / 端口一起带走。
+    pub fn disarm(&mut self) {
+        self.run_id = None;
+    }
+
+    /// 续传命中后换成新 run_id（正常退出时仍要清理新条目）。
+    pub fn rekey(&mut self, run_id: String) {
+        self.run_id = Some(run_id);
     }
 }
 
 impl Drop for ClientGuard {
     fn drop(&mut self) {
-        self.registry.remove(&self.run_id);
+        let Some(run_id) = self.run_id.take() else {
+            return;
+        };
+        self.registry.remove(&run_id);
         // ★★ v0.6.1 修（Shannon 审计，低危）：**会话结束时清掉 OIDC 的 subject 绑定**。
         //
         // `forget_session` 早就写好（`security.rs` / `guard.rs` / `oidc.rs`），
@@ -889,7 +1043,7 @@ impl Drop for ClientGuard {
         //
         // 放在 `Drop` 里是为了**覆盖所有退出路径**（正常断开、被踢、panic 展开），
         // 与上面 `remove` 同一个位置，不会漏。
-        self.registry.security().forget_session(&self.run_id);
+        self.registry.security().forget_session(&run_id);
     }
 }
 
@@ -1379,13 +1533,13 @@ mod tests {
         // 一轮 3 次，每个后端各一次
         let mut seen = std::collections::HashSet::new();
         for _ in 0..3 {
-            seen.insert(r.pick(6000).expect("应有后端").client.run_id.clone());
+            seen.insert(r.pick(6000).expect("应有后端").client.run_id());
         }
         assert_eq!(seen.len(), 3, "三轮必须轮到三个不同的后端：{seen:?}");
 
         // 再走一轮，同样要覆盖全部后端
         let second: Vec<String> = (0..3)
-            .map(|_| r.pick(6000).unwrap().client.run_id.clone())
+            .map(|_| r.pick(6000).unwrap().client.run_id())
             .collect();
         assert_eq!(
             second
@@ -1420,7 +1574,7 @@ mod tests {
         // 之后的每一次挑选都应当落在 b 上
         for _ in 0..6 {
             let b = r.pick(6100).expect("应有后端");
-            assert_eq!(b.client.run_id, "b", "a 压着 5 条，新流量必须全给 b");
+            assert_eq!(b.client.run_id(), "b", "a 压着 5 条，新流量必须全给 b");
             drop(b.hold()); // 立刻还回去，b 的计数始终是 0
         }
         drop(held);
@@ -1458,7 +1612,7 @@ mod tests {
         let mut counts = std::collections::HashMap::new();
         for _ in 0..10 {
             let b = r.pick(6200).expect("应有后端");
-            *counts.entry(b.client.run_id.clone()).or_insert(0) += 1;
+            *counts.entry(b.client.run_id()).or_insert(0) += 1;
             drop(b.hold());
         }
         drop(held);
@@ -1521,7 +1675,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..6 {
             let (b, g) = r.pick_and_hold(6300).expect("应有后端");
-            seen.insert(b.client.run_id.clone());
+            seen.insert(b.client.run_id());
             drop(g);
         }
         assert_eq!(seen.len(), 3, "一直平局时必须轮流坐庄，实际只轮到 {seen:?}");
@@ -1553,7 +1707,7 @@ mod tests {
             let b = r.pick(6000).expect("应有后端");
             assert_eq!(
                 b.proxy_name,
-                expect(&b.client.run_id),
+                expect(&b.client.run_id()),
                 "轮询到的后端必须带着它**自己**的代理名"
             );
             seen.insert(b.proxy_name);
@@ -1611,7 +1765,7 @@ mod tests {
         r.release_ports_of(&a);
         assert!(!r.reserved_ports().contains(&6001), "独占端口应被释放");
         assert_eq!(r.backend_count(6000), 1, "组里只剩另一个后端");
-        assert_eq!(r.pick(6000).unwrap().client.run_id, b.run_id);
+        assert_eq!(r.pick(6000).unwrap().client.run_id(), b.run_id());
     }
 
     /// 同一个客户端重连时重复注册，不该把成员表越撑越大。

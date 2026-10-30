@@ -9,8 +9,8 @@ use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, SocketAddr},
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex, RwLock,
     },
     time::{Duration, Instant},
 };
@@ -177,6 +177,16 @@ struct ProxyEntry {
     use_compression: bool,
     /// 代理类型（`tcp` / `http` / `stcp` ...）。给 `NewUserConn` 插件用。
     proxy_type: String,
+    /// 注册时回给客户端的 `remote_addr` 文案。
+    ///
+    /// 续传命中时客户端会把同样的 `NewProxy` 再发一遍；服务端据此原样回
+    /// 成功，而不是重复 bind（那会直接 `Address already in use`）。
+    remote_addr: String,
+    /// `NewProxy` 的规范化指纹。同名但配置变了（换端口 / 换域名 / 换密钥）
+    /// 必须重新注册，不能盲目复用旧监听器。
+    signature: String,
+    /// 最后一次被"续传后重新注册 / 复用"确认时的代次（见 `resume_epoch`）。
+    seen_epoch: u64,
 }
 
 /// 一对已经配对成功的（用户连接，工作连接）。
@@ -243,12 +253,20 @@ impl PoolState {
 
 /// 一个已登录客户端的全部状态。
 pub struct ClientState {
-    pub run_id: String,
+    /// 本次控制连接的 run_id。
+    ///
+    /// **可写**：断线续传命中时服务端会给新控制连接签发新的 run_id，
+    /// 但代理 / 监听器都挂在同一个 `ClientState` 上 —— 只换身份、不重建资源。
+    /// 面板「踢出」、工作连接查找都用这个值，所以必须跟着新会话走。
+    run_id: RwLock<String>,
     pub client_id: String,
     /// 客户端在 Login 里声明的用户名，用于 stcp/xtcp 的 `allow_users` 白名单匹配。
     pub user: String,
     /// 代理监听器用它通知控制连接"需要一条工作连接"，或者转发一条下行消息。
-    req_tx: mpsc::UnboundedSender<CtrlCmd>,
+    ///
+    /// 续传命中时整体换成新控制连接的发送端；旧连接已经关闭，留着只会
+    /// 让 `request_work_conn` 静默失败。
+    req_tx: Mutex<mpsc::UnboundedSender<CtrlCmd>>,
     pool: Mutex<PoolState>,
     /// 已登记的代理（占住的名额 + 占用的端口）。
     ///
@@ -351,7 +369,7 @@ pub struct ClientState {
     /// 折中方案：**凭证为空时，要求工作连接的源 IP 与控制连接一致**。
     /// 官方 frpc 天然满足（同一个进程、同一个出口），零兼容代价；
     /// 而攻击者要伪造源 IP 比"知道 run_id"难得多。
-    peer_ip: IpAddr,
+    peer_ip: Mutex<IpAddr>,
     /// NLink 协商结果（`None` = 未协商）。控制连接登录成功后写入，
     /// 工作连接校验身份令牌、桥接层限流都要读它。
     nlink: Mutex<Option<nfrp_common::frp::conn::NLinkState>>,
@@ -359,6 +377,25 @@ pub struct ClientState {
     nlink_batch: std::sync::atomic::AtomicUsize,
     /// 上次批量请求的时间（Unix 毫秒），用于去抖。
     last_batch_ms: std::sync::atomic::AtomicU64,
+    /// 控制连接已断开、正在等续传（`resume_ttl` 窗口内）。
+    ///
+    /// 暂停期间监听器**仍然持有端口**，但不再向客户端要工作连接 ——
+    /// 用户连接会被立刻拒绝，而不是傻等 `userConnTimeout`。
+    suspended: AtomicBool,
+    /// 本次控制连接是不是由续传恢复出来的。
+    ///
+    /// 只有它为真时，`NewProxy` 才走"同名同配置直接复用"的幂等路径；
+    /// 普通新会话必须重新绑定，不能因为注册表里还残留同名条目就跳过。
+    resumed_session: AtomicBool,
+    /// 续传代次：每次 `rebind_control` 自增。代理条目记下自己最后一次
+    /// 被"本次续传"确认过的代次，用来回收老客户端不认识的 `ResumeCommit`。
+    ///
+    /// 老客户端（0.7.0 及以前）只重发 `NewProxy`、不发 `ResumeCommit`；
+    /// 配置里删掉的代理就永远不会被点名。超过宽限期后把"这一代没被碰过"
+    /// 的代理回收掉，等价于用实际注册行为反推最终清单。
+    resume_epoch: AtomicU64,
+    /// 本次续传的起点；超过宽限期由心跳 tick 触发对账。
+    resumed_at: Mutex<Option<Instant>>,
 }
 
 impl ClientState {
@@ -396,10 +433,10 @@ impl ClientState {
         };
         let idle_work_limit = Limit::new(idle_cap);
         Self {
-            run_id,
+            run_id: RwLock::new(run_id),
             client_id,
             user,
-            req_tx,
+            req_tx: Mutex::new(req_tx),
             pool: Mutex::new(PoolState::default()),
             proxies: Mutex::new(HashMap::new()),
             caps,
@@ -416,16 +453,93 @@ impl ClientState {
             // 默认**允许**：未启用 RBAC 时行为必须与老版本完全一致。
             // 启用 RBAC 后由控制连接按角色覆盖。
             allow_manage: AtomicBool::new(true),
-            peer_ip,
+            peer_ip: Mutex::new(peer_ip),
             nlink: Mutex::new(None),
             nlink_batch: std::sync::atomic::AtomicUsize::new(0),
             last_batch_ms: std::sync::atomic::AtomicU64::new(0),
+            suspended: AtomicBool::new(false),
+            resumed_session: AtomicBool::new(false),
+            resume_epoch: AtomicU64::new(0),
+            resumed_at: Mutex::new(None),
         }
+    }
+
+    /// 当前会话的 run_id（续传后会被换新）。
+    pub fn run_id(&self) -> String {
+        self.run_id
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 续传命中：把同一个 `ClientState` 挂到新的控制连接上。
+    ///
+    /// 只换"身份 + 通知通道 + 源 IP"三样东西；代理表、监听器、端口、
+    /// 配额令牌全部原地保留 —— 这正是续传相对重连的全部价值。
+    pub fn rebind_control(
+        &self,
+        run_id: &str,
+        req_tx: mpsc::UnboundedSender<CtrlCmd>,
+        peer_ip: IpAddr,
+    ) {
+        *self.run_id.write().unwrap_or_else(|e| e.into_inner()) = run_id.to_string();
+        *self.req_tx.lock().unwrap_or_else(|e| e.into_inner()) = req_tx;
+        *self.peer_ip.lock().unwrap_or_else(|e| e.into_inner()) = peer_ip;
+        self.suspended.store(false, Ordering::Relaxed);
+        self.resumed_session.store(true, Ordering::Relaxed);
+        self.resume_epoch.fetch_add(1, Ordering::Relaxed);
+        *self.resumed_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    }
+
+    /// 控制连接断开、进入续传等待窗口。
+    pub fn set_suspended(&self, suspended: bool) {
+        self.suspended.store(suspended, Ordering::Relaxed);
+    }
+
+    pub fn is_suspended(&self) -> bool {
+        self.suspended.load(Ordering::Relaxed)
+    }
+
+    /// 本次控制连接是否由续传恢复（决定 `NewProxy` 能否幂等复用）。
+    pub fn is_resumed_session(&self) -> bool {
+        self.resumed_session.load(Ordering::Relaxed)
+    }
+
+    /// 客户端发来 `ResumeCommit` 后调用：本会话只剩普通语义。
+    pub fn finish_resume(&self) {
+        self.resumed_session.store(false, Ordering::Relaxed);
+        *self.resumed_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// 本次续传是否已经超过宽限期（老客户端不会发 `ResumeCommit`）。
+    pub fn resume_grace_expired(&self, grace: Duration) -> bool {
+        self.resumed_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|t| t.elapsed() >= grace)
+    }
+
+    /// 本次续传宽限期内**没有被重新注册 / 复用**的代理名。
+    ///
+    /// 用代次而不是"是否发过 commit"：老客户端会重发全部 `NewProxy`，
+    /// 被重发的条目会刷新代次；配置里删掉的没人碰，代次停留在上一代。
+    pub fn stale_proxies(&self) -> Vec<String> {
+        let epoch = self.resume_epoch.load(Ordering::Relaxed);
+        let mut v: Vec<String> = self
+            .proxies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(_, e)| e.seen_epoch != epoch)
+            .map(|(k, _)| k.clone())
+            .collect();
+        v.sort();
+        v
     }
 
     /// 控制连接的源 IP（工作连接的空凭证回退校验要用，见字段注释）。
     pub fn peer_ip(&self) -> IpAddr {
-        self.peer_ip
+        *self.peer_ip.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// NLink 协商结果（`None` = 本次会话没有启用扩展层）。
@@ -514,6 +628,10 @@ impl ClientState {
                     use_encryption: false,
                     use_compression: false,
                     proxy_type: String::new(),
+                    remote_addr: String::new(),
+                    signature: String::new(),
+                    // `set_proxy_registration` 紧接着会刷成本次续传代次。
+                    seen_epoch: 0,
                 },
             );
     }
@@ -546,6 +664,34 @@ impl ClientState {
             e.use_encryption = enc;
             e.use_compression = comp;
         }
+    }
+
+    /// 记录注册结果（回给客户端的地址 + `NewProxy` 指纹），续传复用要用。
+    pub fn set_proxy_registration(&self, name: &str, remote_addr: String, signature: String) {
+        let epoch = self.resume_epoch.load(Ordering::Relaxed);
+        let mut g = self.proxies.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = g.get_mut(name) {
+            e.remote_addr = remote_addr;
+            e.signature = signature;
+            e.seen_epoch = epoch;
+        }
+    }
+
+    /// 续传复用判据：同名代理仍在册，且本次 `NewProxy` 与上次逐字段一致。
+    ///
+    /// 返回上次回给客户端的 `remote_addr`。`None` 表示必须重新注册
+    /// （新代理，或端口 / 域名 / 密钥被改过）。
+    pub fn reusable_proxy(&self, name: &str, signature: &str) -> Option<String> {
+        let g = self.proxies.lock().unwrap_or_else(|e| e.into_inner());
+        let e = g.get(name)?;
+        (e.signature == signature).then(|| e.remote_addr.clone())
+    }
+
+    pub fn has_proxy(&self, name: &str) -> bool {
+        self.proxies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(name)
     }
 
     /// 查某条代理的数据面标志：`(加密, 压缩)`。
@@ -607,7 +753,14 @@ impl ClientState {
 
     /// 通知控制连接："我需要一条工作连接"。
     pub fn request_work_conn(&self) {
-        let _ = self.req_tx.send(CtrlCmd::RequestWork);
+        if self.is_suspended() {
+            return;
+        }
+        let _ = self
+            .req_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send(CtrlCmd::RequestWork);
     }
 
     /// 登录后按协商结果设置批量条数（0 = 关闭）。
@@ -650,13 +803,23 @@ impl ClientState {
     }
 
     /// 控制连接命令通道的发送端（面板下发管理命令时要用它带上 oneshot 回执）。
-    pub fn req_tx(&self) -> &mpsc::UnboundedSender<CtrlCmd> {
-        &self.req_tx
+    pub fn req_tx(&self) -> mpsc::UnboundedSender<CtrlCmd> {
+        self.req_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// 让控制连接把这条消息原样发给客户端（xtcp 打洞协调用）。
     pub fn forward_to_client(&self, msg: FrpMessage) {
-        let _ = self.req_tx.send(CtrlCmd::Send(Box::new(msg)));
+        if self.is_suspended() {
+            return;
+        }
+        let _ = self
+            .req_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send(CtrlCmd::Send(Box::new(msg)));
     }
 
     /// 主动取一条工作连接：池里没有就向客户端要，并等待 `user_conn_timeout`
@@ -671,6 +834,11 @@ impl ClientState {
 
     /// 同 [`Self::acquire_work_conn`]，但**显式指定**等待时长（测试 / 特殊路径用）。
     pub async fn acquire_work_conn_within(self: &Arc<Self>, wait: Duration) -> Option<WorkItem> {
+        // 控制连接断了、正在等续传：立刻失败。监听器还开着，但此刻
+        // 没有任何客户端能接这条连接，排队只会白占 `userConnTimeout`。
+        if self.is_suspended() || self.is_stopped() {
+            return None;
+        }
         if let Some(w) = self
             .pool
             .lock()
@@ -710,6 +878,9 @@ impl ClientState {
     /// 队列达到上限时返回 [`Submit::Full`]，由调用方给访客回一个失败，
     /// 而不是让它无限排队（那是另一种形式的资源耗尽）。
     pub fn submit_user(&self, mut user: PendingUser) -> Submit {
+        if self.is_suspended() || self.is_stopped() {
+            return Submit::Full(Box::new(user));
+        }
         let mut g = self.pool.lock().unwrap_or_else(|e| e.into_inner());
         g.reap(self.idle_timeout, self.user_conn_timeout);
         if let Some(w) = g.work.pop_front() {
@@ -930,6 +1101,39 @@ mod tests {
         c.add_proxy("tcp-c".into(), Some(6001), s3);
         assert_eq!(c.ports_used(), 2);
         assert_eq!(c.proxy_count(), 3);
+    }
+
+    /// 老客户端（0.7.0 及以前）续传后只重发 `NewProxy`、不发 `ResumeCommit`：
+    /// 必须能靠"代次没刷新"识别出配置里已删除的代理。
+    #[test]
+    fn 续传代次能识别没被重新注册的代理() {
+        let c = dummy_client("resume-epoch");
+        let slot = c.reserve_proxy().expect("名额充足");
+        c.add_proxy("web".into(), Some(26000), slot);
+        c.set_proxy_registration("web", "127.0.0.1:26000".into(), "sig".into());
+        assert!(c.stale_proxies().is_empty(), "新会话里不该有陈旧代理");
+
+        let (tx, _rx) = mpsc::unbounded_channel::<CtrlCmd>();
+        c.rebind_control(
+            "run-2",
+            tx,
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap(),
+        );
+        assert!(c.is_resumed_session());
+        assert_eq!(
+            c.stale_proxies(),
+            vec!["web".to_string()],
+            "续传后还没重发 NewProxy，必须先视为陈旧"
+        );
+        assert!(!c.resume_grace_expired(Duration::from_secs(10)));
+
+        // 客户端重发了同名同配置：刷新代次，不再陈旧。
+        c.set_proxy_registration("web", "127.0.0.1:26000".into(), "sig".into());
+        assert!(c.stale_proxies().is_empty());
+
+        c.finish_resume();
+        assert!(!c.is_resumed_session());
+        assert!(c.stale_proxies().is_empty(), "代次相同，收尾后也不该误报");
     }
 
     #[test]

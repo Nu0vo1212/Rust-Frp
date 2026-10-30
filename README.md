@@ -5,7 +5,7 @@
 </div>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.7.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.7.1-blue" alt="Version">
   <img src="https://img.shields.io/badge/protocol-frp%20v1%20%2F%20v2-orange" alt="Protocol">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey" alt="Platform">
   <img src="https://img.shields.io/badge/license-Apache--2.0-green" alt="License">
@@ -185,7 +185,7 @@ NLink 就是在标准 frp 线协议之上叠的一层扩展，两条铁律贯穿
 | 能力 | 说明 |
 |---|---|
 | QUIC 传输与连接迁移 | 独立 ALPN `nfrp-nlink`，与标准 QUIC 分桶互不串味 |
-| 断线续传 | 进程级 `ConnectionId` 不变，服务端保留代理名单 `resume_ttl` 秒 |
+| 断线续传 | 进程级 `ConnectionId` 不变，服务端把代理监听器 / 端口 / vhost 路由原样保留 `resume_ttl` 秒 |
 | 零信任身份 | 每条工作连接带 `v1.<exp>.<hmac>` 令牌，绑定 `run_id + user + 过期时间` |
 | 细粒度限流 | 按「用户 × 代理」的令牌桶，支持突发 |
 | 端口敲门 | 端口默认不可见，敲对序列后按 IP 临时放行 |
@@ -225,7 +225,7 @@ quic = true
 
 ### 工程质量
 
-956 个自动化测试，含真实 QUIC 栈握手、端到端集成、官方抓包密文解密回归；
+965 个自动化测试，含真实 QUIC 栈握手、端到端集成、官方抓包密文解密回归；
 `cargo audit` 0 命中；发布产物附 `SHA256SUMS` + Ed25519 签名。
 
 测试分布、CI 矩阵、依赖安全做到哪一步、发版闸门与人工核对清单，
@@ -385,7 +385,7 @@ NFrp 可运行在官方 frp 的任一侧，双向实测通过：
 ```bash
 cargo fmt --all -- --check                              # 格式
 cargo clippy --workspace --all-targets -- -D warnings   # 静态检查，0 告警
-cargo test --workspace                                  # 956 通过 / 0 失败 / 13 ignored
+cargo test --workspace                                  # 965 通过 / 0 失败 / 13 ignored
 ```
 
 那 13 条 `#[ignore]` 全是**需要真机硬件或管理员权限**的设备面测试

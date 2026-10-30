@@ -14,8 +14,8 @@
 
 NLink 是 NFrp 在标准 frp 协议之外的扩展层。它只承载那些 **frp 协议本身没有位置表达**、且 **确实有用户被卡住** 的能力。
 
-:::callout 当前状态：已实现（v0.7.0 起，默认关闭）
-下面列出的能力**均已实现并通过测试**（`server/tests/nlink_e2e.rs` 的 11 条端到端用例逐项覆盖）。
+:::callout 当前状态：已实现（v0.7.1 起，默认关闭）
+下面列出的能力**均已实现并通过测试**（`server/tests/nlink_e2e.rs` 的 14 条端到端用例逐项覆盖）。
 但 NLink **默认关闭**：服务端与客户端都要显式写 `[nlink] enable = true` 才生效。
 不开启时，行为与 0.6.x 完全一致。
 :::
@@ -76,6 +76,15 @@ v0.71.0 为止都没用过（官方 v1 的类型字节都是可打印 ASCII）�
 | 端口敲门 | 数据面 33 字节序列 | 敲对了按 IP 临时放行 |
 | 批量工作连接 | `BatchReq` | 一条帧换 N 条连接 |
 | 端到端 trace | `trace_id` | 控制连接与数据面共享 |
+
+:::callout 续传的认证边界
+续传只校验 `user + client_id + wire/caps/UDP codec`，`session_id` 本身是
+bearer 凭证。开 TLS 时 preamble 在加密通道里；`transport.tls.force = false`
+时 preamble 是明文，链路上的观察者配合任意有效 token 可以抢在客户端之前续传。
+这不是提权（仍然要先通过 token/OIDC 登录），但**生产环境应开 TLS**。
+后续版本会加服务端签发的一次性 resume token，把续传从"知道 session_id 就能用"
+收紧成"必须持有上一次连接下发的不可重放凭证"。
+:::
 
 ## 怎么开启
 

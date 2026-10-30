@@ -79,20 +79,26 @@ impl TokenBucket {
 
     /// 申请 `n` 字节的额度。
     ///
-    /// 返回需要等待的时间（`ZERO` = 立即放行）。欠账上限压在一个 burst 内，
-    /// 避免一个 8 MB 的响应把后续所有流量卡住十几秒。
+    /// 返回需要等待的时间（`ZERO` = 立即放行）。
+    ///
+    /// 等待时间严格等于"补齐这 `n` 字节还差多少额度 / 速率"：慢速链路
+    /// （比如 1 KiB/s）不会因为一次读 16 KiB 就被允许按 16 KiB/s 跑。
+    /// 调用方负责把单次 `n` 限制在合理范围内（见 `copy_throttled` 的缓冲大小）——
+    /// 限流器本身**不**替调用方截断额度，否则等于偷偷放大速率。
     pub fn take(&mut self, n: u64, now: Instant) -> Duration {
         let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
         self.last = now;
         self.tokens = (self.tokens + elapsed * self.rate).min(self.burst);
-        self.tokens -= n as f64;
-        if self.tokens >= 0.0 {
+        if self.tokens >= n as f64 {
+            self.tokens -= n as f64;
             return Duration::ZERO;
         }
-        let wait = (-self.tokens) / self.rate;
-        // 欠账不无限累积
-        self.tokens = self.tokens.max(-self.burst);
-        Duration::from_secs_f64(wait.min(self.burst / self.rate))
+        let deficit = n as f64 - self.tokens;
+        // 先记账（负额度），再让调用方睡够 deficit/rate 秒 —— 醒来时
+        // 桶恰好回到 0，不多不少。绝不把欠账截断到 burst：那会让
+        // "一次大读"绕过速率上限。
+        self.tokens = -deficit;
+        Duration::from_secs_f64(deficit / self.rate)
     }
 
     pub fn tokens(&self) -> f64 {
@@ -132,6 +138,12 @@ impl RateLimiter {
     /// 命中该用户 + 代理的第一条规则。
     pub fn rule_for(&self, user: &str, proxy: &str) -> Option<&RateLimitRule> {
         self.rules.iter().find(|r| r.matches(user, proxy))
+    }
+
+    /// 命中规则的有效速率（字节/秒）。转发层用它决定单次读多大 ——
+    /// 块越小，低速率下的"一次性透支"越少。
+    pub fn rate_for(&self, user: &str, proxy: &str) -> Option<u64> {
+        self.rule_for(user, proxy).map(|r| r.rate)
     }
 
     /// 申请额度，返回需要等待的时间。
@@ -265,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn 欠账不会无限累积() {
+    fn 大额度按真实速率等待_不截断欠账() {
         let lim = RateLimiter::new(vec![RateLimitRule {
             proxy: "*".into(),
             user: "*".into(),
@@ -273,8 +285,28 @@ mod tests {
             burst: 1000,
         }]);
         let now = t0();
-        // 一次要 10 MB：等待时间必须被 burst/rate 钳住（= 1 秒），不是 10000 秒
+        // 一次要 10 MB：必须等 10000 秒。0.7.0 把它硬截到 1 秒，
+        // 等于允许低速率链路按 burst 透支，实际速率被放大 1000 倍。
         let wait = lim.acquire_at("u", "p", 10_000_000, now);
-        assert!(wait <= Duration::from_secs(1), "实际 {wait:?}");
+        assert!(
+            wait >= Duration::from_secs(9_999),
+            "等待时间不能被 burst 截断，实际 {wait:?}"
+        );
+    }
+
+    #[test]
+    fn 低速率下每块按一秒的量切分就不会超速() {
+        let lim = RateLimiter::new(vec![RateLimitRule {
+            proxy: "*".into(),
+            user: "*".into(),
+            rate: 1024,
+            burst: 1024,
+        }]);
+        assert_eq!(lim.rate_for("u", "u.web"), Some(1024));
+        // 转发层用 rate_for 把单次读切成 ≤1024 字节，因此每次最多欠 1 秒。
+        let now = t0();
+        assert!(lim.acquire_at("u", "u.web", 1024, now).is_zero());
+        let wait = lim.acquire_at("u", "u.web", 1024, now);
+        assert!(wait >= Duration::from_millis(999), "实际 {wait:?}");
     }
 }

@@ -536,7 +536,9 @@ mod tests {
             buf
         });
 
-        let (_cli, conn) = connect(&addr, None).await.expect("连接");
+        let (_cli, conn) = connect_with_timeout(&addr, None, Duration::from_secs(10))
+            .await
+            .expect("连接");
         let (mut send, mut recv) = conn.open_bi().await.expect("开流");
         send.write_all(b"ping").await.unwrap();
 
@@ -555,10 +557,13 @@ mod tests {
     /// 不管平台是把"端口不可达"报成 ICMP 错误还是干脆静默，都不该让调用方无限等。
     #[tokio::test]
     async fn connect_fails_fast_when_nobody_listens() {
-        // 拿一个刚释放的 UDP 端口：基本可以确定没人监听
-        let dead = {
+        // 拿一个刚释放的 UDP 端口：基本可以确定没人监听。
+        // 一定要**保持 socket 存活**：如果 drop 掉，并行跑的其他 QUIC 用例
+        // 可能立刻复用这个端口并真的监听，测试就会误判成"连接成功"。
+        let (_held, dead) = {
             let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            s.local_addr().unwrap()
+            let addr = s.local_addr().unwrap();
+            (s, addr)
         };
         let start = std::time::Instant::now();
         let err = connect_with_timeout(&dead, None, Duration::from_millis(400))
@@ -581,9 +586,11 @@ mod tests {
     /// 错误里必须写明试了几次（那正是循环跑满的证据）。
     #[tokio::test]
     async fn connect_retries_before_giving_up() {
-        let dead = {
+        // 同样保持 socket 存活，避免并行用例复用端口后"假连接成功"。
+        let (_held, dead) = {
             let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            s.local_addr().unwrap()
+            let addr = s.local_addr().unwrap();
+            (s, addr)
         };
         let start = std::time::Instant::now();
         let err = connect_with_retry(&dead, None, ALPN, Duration::from_millis(200), 3)

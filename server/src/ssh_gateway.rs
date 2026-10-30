@@ -464,13 +464,16 @@ async fn run_tunnel(
         client.proxy_count(),
     )?;
 
-    let remote_addr = register_proxy(&cfg, &registry, &client, &m).await?;
+    let outcome = register_proxy(&cfg, &registry, &client, &m).await?;
     // 普通 frpc 的 NewProxy 分支在 `register_proxy` 成功后自己加这两个指标；
     // SSH 网关走的是同一套 `register_proxy`，但绕过了那段分支。漏加会让
     // `proxies_active` 只在客户端断开时被 `Registry::remove()` 减一次，
     // 实际 e2e 表现是 3 条 SSH 代理全部断开后面板显示 **-3**。
-    registry.metrics().proxies_total.inc();
-    registry.metrics().proxies_active.inc();
+    if !outcome.adopted {
+        registry.metrics().proxies_total.inc();
+        registry.metrics().proxies_active.inc();
+    }
+    let remote_addr = outcome.remote_addr;
     info!(
         run_id = %run_id,
         user = %user,

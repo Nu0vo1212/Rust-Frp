@@ -203,6 +203,12 @@ pub enum FrameKind {
     CompatProbe = 13,
     /// 兼容性边界探测回执。
     CompatResp = 14,
+    /// 续传完成后的代理清单（客户端 -> 服务端）。
+    ///
+    /// 客户端在续传会话里把**最终**代理名列表发上来，服务端据此回收
+    /// "上次会话有、这次配置里已经删掉"的监听器。没有这一帧时服务端
+    /// 只能保守保留旧监听器到 TTL 过期。
+    ResumeCommit = 15,
 }
 
 impl FrameKind {
@@ -222,6 +228,7 @@ impl FrameKind {
             12 => Self::Failure,
             13 => Self::CompatProbe,
             14 => Self::CompatResp,
+            15 => Self::ResumeCommit,
             _ => return None,
         })
     }

@@ -29,7 +29,7 @@ use nfrp_common::{
         WireVersion,
     },
     nlink::{
-        frame::{FrameKind, Preamble, TAG_COUNT, TAG_IDENTITY, TAG_OK, TAG_TRACE_ID},
+        frame::{FrameKind, Preamble, TAG_COUNT, TAG_DETAIL, TAG_IDENTITY, TAG_OK, TAG_TRACE_ID},
         knock::{build_knock, KnockRule},
         parse_features,
         policy::{
@@ -738,24 +738,19 @@ async fn nlink_断线续传_端口与代理状态保留() {
     let (port, registry) = start_server(cfg).await;
 
     let session = ConnectionId::random();
-    let mut pre = Preamble::new(parse_features(&["resume".to_string()]).0, session);
-    pre.flags |= FLAG_RESUME;
+    let pre = pre2(session);
 
     let (mut conn, run_id, caps) = login_with_preamble(port, "resume-user", Some(pre.clone()))
         .await
         .expect("第一次登录");
     assert!(caps.contains(CAP_RESUME));
-    let resp = register_proxy(&mut conn, tcp_proxy("resume", remote, echo)).await;
-    assert!(resp.error.is_empty(), "{}", resp.error);
-    assert!(
-        registry
-            .get(&run_id)
-            .is_some_and(|c| c.proxy_names().iter().any(|n| n.ends_with("resume"))),
-        "断开前代理必须在册：{:?}",
-        registry.get(&run_id).map(|c| c.proxy_names())
-    );
+    let first = register_proxy(&mut conn, tcp_proxy("resume", remote, echo)).await;
+    assert!(first.error.is_empty(), "{}", first.error);
+    let old_addr = first.remote_addr.clone();
+    assert_eq!(old_addr, format!("127.0.0.1:{remote}"));
+    assert!(registry.reserved_ports().contains(&remote));
 
-    // 断开控制连接：服务端应当把会话状态写进续传表。
+    // 断开控制连接：会话应当进入"暂停"而不是被清掉。
     drop(conn);
     let mut saved = false;
     for _ in 0..40 {
@@ -767,48 +762,300 @@ async fn nlink_断线续传_端口与代理状态保留() {
     }
     assert!(saved, "断开后应当写入续传状态");
 
-    // 同一个 connection id + FLAG_RESUME 重连：必须命中。
-    let (mut conn2, _run_id2, caps2) = login_with_preamble(port, "resume-user", Some(pre))
+    // 关键断言①：暂停期间在线表里已经没有它，但**公网端口还在监听**。
+    assert!(
+        registry.get(&run_id).is_none(),
+        "暂停期间不应继续挂在在线表（避免工作连接 / 面板误用旧 run_id）"
+    );
+    assert!(
+        registry.reserved_ports().contains(&remote),
+        "暂停期间监听器与端口必须保留，否则续传就等于重连"
+    );
+    // 真连一下：端口能 accept 才说明监听器活着（此刻没有工作连接，连上即断）。
+    let probe = TcpStream::connect(("127.0.0.1", remote))
+        .await
+        .expect("暂停期间监听器必须仍然绑定在公网端口上");
+    drop(probe);
+
+    // 同一个 connection id + FLAG_RESUME 重连：必须命中，并换发新 run_id。
+    let (mut conn2, run_id2, caps2) = login_with_preamble(port, "resume-user", Some(pre))
         .await
         .expect("续传登录");
     assert!(caps2.contains(CAP_RESUME));
-    let resumed = loop {
+    let resp = loop {
         match next_event(&mut conn2, 2000).await.expect("读事件") {
-            ConnEvent::NLink(f) if f.kind == FrameKind::ResumeResp => {
-                break f
-                    .tlvs
-                    .get(TAG_OK)
-                    .and_then(|v| v.first().copied())
-                    .map(|b| b != 0)
-                    .unwrap_or(false);
-            }
-            ConnEvent::NLink(_) => continue,
-            _ => panic!("等 ResumeResp 时收到别的消息"),
-        }
-    };
-    assert!(resumed, "续传票存在时服务端必须回 ok=1");
-
-    // 二次使用同一张票必须失败（一次性）。
-    drop(conn2);
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let (mut conn3, _, _) = login_with_preamble(port, "resume-user", Some(pre2(session)))
-        .await
-        .expect("第三次登录");
-    let again = loop {
-        match next_event(&mut conn3, 2000).await.expect("读事件") {
             ConnEvent::NLink(f) if f.kind == FrameKind::ResumeResp => break f,
             ConnEvent::NLink(_) => continue,
             _ => panic!("等 ResumeResp 时收到别的消息"),
         }
     };
-    let ok_again = again
+    let resumed = resp
         .tlvs
         .get(TAG_OK)
         .and_then(|v| v.first().copied())
         .map(|b| b != 0)
         .unwrap_or(false);
-    // 第二次断开会重新写入一张新票，所以这里允许 true；关键是**不能崩**。
-    let _ = ok_again;
+    assert!(resumed, "续传票存在时服务端必须回 ok=1");
+    let detail = resp.tlvs.get_str(TAG_DETAIL).unwrap_or_default();
+    assert!(
+        detail.lines().any(|n| n.ends_with(".resume")),
+        "续传回执必须列出恢复的代理，实际：{detail:?}"
+    );
+    assert_ne!(run_id2, run_id, "续传必须换发新 run_id");
+
+    // 关键断言②：新 run_id 在册、旧 run_id 已消失、代理与端口原样恢复。
+    let restored = registry.get(&run_id2).expect("续传后必须重新上线");
+    assert!(
+        restored
+            .proxy_names()
+            .iter()
+            .any(|n| n.ends_with(".resume")),
+        "续传后代理表必须包含原代理：{:?}",
+        restored.proxy_names()
+    );
+    assert!(registry.get(&run_id).is_none(), "旧 run_id 必须已摘除");
+    assert!(
+        registry.reserved_ports().contains(&remote),
+        "续传后端口必须仍是原来那一个"
+    );
+
+    // 关键断言③：客户端照常重发 NewProxy 时，同名同配置必须复用原监听器，
+    // 而不是重新 bind（否则这里会直接 Address already in use）。
+    let again = register_proxy(&mut conn2, tcp_proxy("resume", remote, echo)).await;
+    assert!(again.error.is_empty(), "{}", again.error);
+    assert_eq!(
+        again.remote_addr, old_addr,
+        "续传后同名同配置 NewProxy 必须返回原 remote_addr"
+    );
+    assert!(registry.reserved_ports().contains(&remote));
+
+    // 关键断言④：数据面走的确实是**新控制连接** ——
+    // 让 conn2 扮演 frpc 建立工作连接，再从原公网端口回环一次。
+    spawn_provider(
+        conn2,
+        port,
+        run_id2,
+        echo,
+        None,
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let payload = b"resume-state-restored";
+    let got = roundtrip(SocketAddr::from(([127, 0, 0, 1], remote)), payload).await;
+    assert_eq!(&got, payload, "续传后的原端口必须能正常转发");
+}
+
+#[tokio::test]
+async fn nlink_断线续传_身份不匹配不能抢会话_删除的代理会释放端口() {
+    let echo = echo_service().await;
+    let remote = free_port();
+    let cfg = nlink_cfg(&["resume"]);
+    let (port, registry) = start_server(cfg).await;
+
+    let session = ConnectionId::random();
+    let pre = pre2(session);
+    let (mut conn, _run_id, _caps) = login_with_preamble(port, "resume-user", Some(pre.clone()))
+        .await
+        .expect("第一次登录");
+    let resp = register_proxy(&mut conn, tcp_proxy("victim", remote, echo)).await;
+    assert!(resp.error.is_empty(), "{}", resp.error);
+    drop(conn);
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if !registry.nlink().resume.is_empty() {
+            break;
+        }
+    }
+
+    // 攻击者拿到同一个 connection id（例如从日志 / 侧信道），用自己的
+    // 合法登录来抢：身份不同必须 ok=0，并且**不能**把受害者的暂停会话
+    // 取走或回收 —— 否则这就是一个"知道了 id 就能打断别人隧道"的 DoS。
+    let (mut attacker, _arun, _acaps) = login_with_preamble(port, "attacker", Some(pre.clone()))
+        .await
+        .expect("攻击者登录");
+    let aresp = loop {
+        match next_event(&mut attacker, 2000).await.expect("读事件") {
+            ConnEvent::NLink(f) if f.kind == FrameKind::ResumeResp => break f,
+            ConnEvent::NLink(_) => continue,
+            _ => panic!("等 ResumeResp 时收到别的消息"),
+        }
+    };
+    let aok = aresp
+        .tlvs
+        .get(TAG_OK)
+        .and_then(|v| v.first().copied())
+        .map(|b| b != 0)
+        .unwrap_or(false);
+    assert!(!aok, "身份不匹配的续传必须被拒绝");
+    assert!(
+        registry.reserved_ports().contains(&remote),
+        "被拒绝的续传不得回收受害者的监听器"
+    );
+    drop(attacker);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // 受害者带正确 user/client_id 回来：仍然能续上（说明会话没被抢走）。
+    let (mut victim, vrun, _vcaps) = login_with_preamble(port, "resume-user", Some(pre))
+        .await
+        .expect("受害者续传登录");
+    let vresp = loop {
+        match next_event(&mut victim, 2000).await.expect("读事件") {
+            ConnEvent::NLink(f) if f.kind == FrameKind::ResumeResp => break f,
+            ConnEvent::NLink(_) => continue,
+            _ => panic!("等 ResumeResp 时收到别的消息"),
+        }
+    };
+    let vok = vresp
+        .tlvs
+        .get(TAG_OK)
+        .and_then(|v| v.first().copied())
+        .map(|b| b != 0)
+        .unwrap_or(false);
+    assert!(vok, "被攻击者尝试过之后，合法客户端仍必须能续传");
+    assert!(
+        vresp
+            .tlvs
+            .get_str(TAG_DETAIL)
+            .unwrap_or_default()
+            .lines()
+            .any(|n| n.ends_with(".victim")),
+        "合法续传必须拿回原代理"
+    );
+
+    // 票是一次性的：同一个 session 已经消费掉了，不能再被第二个登录复用。
+    assert!(
+        registry
+            .take_suspended_if(session, "resume-user", "nlink-e2e-client")
+            .is_none(),
+        "续传成功后的暂停条目必须已被消费"
+    );
+
+    // 续传对账：客户端只报告"最终还在的代理"。这里报空清单，
+    // 服务端必须把上次遗留下来、这次配置里已删除的代理回收掉。
+    let commit =
+        nfrp_common::nlink::Frame::new(FrameKind::ResumeCommit).with(TAG_DETAIL, Vec::new());
+    victim.send_nlink(&commit).await.expect("发送 ResumeCommit");
+
+    let mut freed = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if !registry.reserved_ports().contains(&remote) {
+            freed = true;
+            break;
+        }
+    }
+    assert!(freed, "续传对账后，配置里删掉的代理端口必须释放");
+    assert!(
+        registry
+            .get(&vrun)
+            .is_some_and(|c| c.proxy_names().is_empty()),
+        "续传对账后代理表必须为空：{:?}",
+        registry.get(&vrun).map(|c| c.proxy_names())
+    );
+    // 端口真的回到了内核手里：能重新 bind 才算释放，不只是从表里删掉。
+    std::net::TcpListener::bind(("127.0.0.1", remote)).expect("端口释放后必须能重新绑定");
+}
+
+/// 0.7.0 及更早的客户端不认识 `ResumeCommit`。它们续传后只重发**还在配置里的**
+/// 代理；被删掉的没人提。服务端必须在宽限期后用"代次没刷新"把这类代理回收，
+/// 否则旧端口会一直占着，直到进程重启。
+#[tokio::test]
+async fn nlink_旧客户端续传_宽限期后回收已删除的代理() {
+    let echo = echo_service().await;
+    let remote = free_port();
+    let cfg = nlink_cfg(&["resume"]);
+    let (port, registry) = start_server(cfg).await;
+
+    let session = ConnectionId::random();
+    let pre = pre2(session);
+    let (mut conn, _run, _caps) = login_with_preamble(port, "old-client", Some(pre.clone()))
+        .await
+        .expect("第一次登录");
+    let resp = register_proxy(&mut conn, tcp_proxy("gone", remote, echo)).await;
+    assert!(resp.error.is_empty(), "{}", resp.error);
+    drop(conn);
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if !registry.nlink().resume.is_empty() {
+            break;
+        }
+    }
+
+    let (mut conn2, run2, _caps2) = login_with_preamble(port, "old-client", Some(pre))
+        .await
+        .expect("续传登录");
+    let resumed = loop {
+        match next_event(&mut conn2, 2000).await.expect("读事件") {
+            ConnEvent::NLink(f) if f.kind == FrameKind::ResumeResp => break f,
+            ConnEvent::NLink(_) => continue,
+            _ => panic!("等 ResumeResp 时收到别的消息"),
+        }
+    };
+    assert_eq!(
+        resumed.tlvs.get(TAG_OK).and_then(|v| v.first().copied()),
+        Some(1),
+        "续传必须成功"
+    );
+
+    // 模拟老客户端：**不重发** NewProxy、也**不发** ResumeCommit。
+    let mut freed = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if !registry.reserved_ports().contains(&remote) {
+            freed = true;
+            break;
+        }
+    }
+    assert!(
+        freed,
+        "宽限期结束后必须回收没被重新注册的代理端口（run={run2}）"
+    );
+    assert!(
+        registry
+            .get(&run2)
+            .is_some_and(|c| c.proxy_names().is_empty()),
+        "代理表必须被清空"
+    );
+    std::net::TcpListener::bind(("127.0.0.1", remote)).expect("端口释放后必须能重新绑定");
+}
+
+/// 同一会话用同一个代理名重新注册（改端口 / 改配置）：旧监听器必须先回收。
+///
+/// 否则 `add_proxy` 只是覆盖 map 条目，旧 `TcpListener` 的 task 没人 abort，
+/// 客户端可以用一个名字反复注册，把 allowPorts 里的端口一个个占住且永不释放。
+#[tokio::test]
+async fn 同名代理改端口_旧监听器必须释放() {
+    let p1 = free_port();
+    let p2 = free_port();
+    assert_ne!(p1, p2, "需要两个不同端口");
+    let echo = echo_service().await;
+    let (port, _reg) = start_server(base_cfg()).await;
+    let (mut conn, _run, _caps) = login_with_preamble(port, "rebind-user", None)
+        .await
+        .expect("登录");
+
+    let r1 = register_proxy(&mut conn, tcp_proxy("dup", p1, echo)).await;
+    assert!(r1.error.is_empty(), "第一次注册失败：{}", r1.error);
+    let r2 = register_proxy(&mut conn, tcp_proxy("dup", p2, echo)).await;
+    assert!(r2.error.is_empty(), "改端口后注册失败：{}", r2.error);
+
+    // abort 是异步的，给旧 task 一点时间 drop listener；CI 上可能慢于 200ms，
+    // 所以轮询而不是只 sleep 一次，避免把调度抖动误判成泄漏。
+    let mut freed = false;
+    for _ in 0..20 {
+        if std::net::TcpListener::bind(("127.0.0.1", p1)).is_ok() {
+            freed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        freed,
+        "旧端口必须已释放（否则每次换端口都会泄漏一个监听器）"
+    );
+    assert!(
+        std::net::TcpListener::bind(("127.0.0.1", p2)).is_err(),
+        "新端口必须仍在监听"
+    );
 }
 
 fn pre2(session: ConnectionId) -> Preamble {

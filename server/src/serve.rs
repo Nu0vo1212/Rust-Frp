@@ -331,6 +331,24 @@ pub async fn serve_on_with(
                 quic_listen = %cfg.nlink.quic_listen,
                 "NLink v1 已启用"
             );
+            // 续传的会话 ID / client_id 在 preamble 里，TLS 没强制时是明文。
+            // 这本身不是提权：攻击者仍然需要一把能登录服务端的有效 token；
+            // 但同一把共享 token 的持有者 / 链路上的观察者可以抢在客户端之前
+            // 用同一个 session_id 续传。把边界显式写进启动日志，避免"以为
+            // 续传自带认证"的误判。
+            if nlink_rt
+                .features
+                .active()
+                .contains(nfrp_common::nlink::CAP_RESUME)
+                && !cfg.tls_force
+            {
+                warn!(
+                    "NLink 断线续传已启用，但 transport.tls.force = false：\
+                     续传会话 ID 与 client_id 走明文 preamble，\
+                     拿到有效 token 的链路观察者可以抢先续传。\
+                     生产环境请开 TLS；一次性 resume token 在后续版本补上。"
+                );
+            }
         } else {
             info!("NLink v1 开关打开但 `features` 为空：只协商、不启用任何扩展能力");
         }
@@ -381,6 +399,30 @@ pub async fn serve_on_with(
                 .await
                 {
                     debug!(%peer, "NLink QUIC 流结束：{e:#}");
+                }
+            }
+        });
+    }
+
+    // ---- NLink 续传过期回收 ----
+    //
+    // 续传窗口内监听器 / 端口是被“故意留着”的；如果客户端再也不回来，
+    // 必须有人到点把它们收掉。放在这里而不是 `suspend` 里边，是因为
+    // “断开后没人再登录”正是最需要回收的场景 —— 只靠下一次登录顺带清理
+    // 等于永远不清。
+    //
+    // 无条件启动（空表时几乎零成本）：配置热重载可能在运行中才打开
+    // resume，回收任务不能依赖启动那一刻的开关。
+    {
+        let reg = registry.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(5));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let n = reg.sweep_suspended();
+                if n > 0 {
+                    debug!(reclaimed = n, "回收过期的 NLink 续传会话");
                 }
             }
         });
@@ -1279,14 +1321,14 @@ async fn handle_control(
     // "等不到工作连接就放弃这条用户连接"，默认 10 秒；配 0 折算默认
     // （官方 `EmptyOr` 口径），不会变成"无限等"。
     let user_conn_timeout = cfg.user_conn_timeout();
-    let client = Arc::new(ClientState::new(
+    let fresh_client = Arc::new(ClientState::new(
         run_id.clone(),
         client_id.clone(),
         login.user.clone(),
-        req_tx,
+        req_tx.clone(),
         idle_timeout,
         user_conn_timeout,
-        caps,
+        caps.clone(),
         udp_binary,
         wire_version,
         conn_limit,
@@ -1302,14 +1344,22 @@ async fn handle_control(
     // 角色是在握手函数内部解析出来的，`ClientState::new` 时还拿不到，
     // 所以补写一次。未启用 RBAC 时 role 是 unrestricted（allow_manage = true），
     // 行为与老版本完全一致。
-    client.set_allow_manage(role.allow_manage);
+    fresh_client.set_allow_manage(role.allow_manage);
 
     // ---- NLink v1：协商结果落地 ----
     //
     // 协商本身已经在握手阶段完成（preamble 进、LoginResp._nlink 出），
-    // 这里只做三件必须在 ClientState 建好之后才能做的事：
+    // 这里只做三件必须已经拿到 `ClientState` 才能做的事：
     // 落能力位、发身份令牌、处理续传。
     let nlink_state = conn.nlink().cloned();
+    let rt = registry.nlink();
+
+    // 断线续传：preamble 里要求了、能力也协商了，才去查续传票。
+    //
+    // 真正的恢复发生在这一小段：把**暂停中的同一个 `ClientState`**
+    // （连同它的代理表、监听器、端口、配额）挂到新控制连接上，
+    // 而不是像 0.7.0 那样只回一个 ok=1 然后一切照旧重来。
+    let mut resumed_session: Option<crate::registry::SuspendedSession> = None;
     if let Some(st) = &nlink_state {
         info!(
             caps = %st.caps,
@@ -1317,25 +1367,64 @@ async fn handle_control(
             session = %st.session,
             "NLink v1 协商成功"
         );
-        client.set_nlink(st.clone());
-        let rt = registry.nlink();
-        // 批量工作连接：只有客户端也协商了才生效。
-        if st.caps.contains(nfrp_common::nlink::CAP_BATCH_WORK) {
-            client.set_nlink_batch(rt.cfg.batch_work_conn);
-        }
-        // 断线续传：preamble 里要求了、能力也协商了，才去查续传票。
         if st.caps.contains(nfrp_common::nlink::CAP_RESUME) && st.resume {
-            let resumed = rt.resume.take(st.session).is_some();
-            let resp = nfrp_common::nlink::Frame::new(nfrp_common::nlink::FrameKind::ResumeResp)
-                .with(nfrp_common::nlink::frame::TAG_OK, vec![u8::from(resumed)]);
+            let mut restored: Vec<String> = Vec::new();
+            // 注意顺序：**先校验身份再取走**。身份不符时条目原样留在表里，
+            // 真正的客户端回来仍然能续上；否则任何人都能用同一个 session id
+            // 把别人的暂停会话"取走并回收"，等于一个 DoS。
+            if let Some(sess) = registry.take_suspended_if(st.session, &login.user, &client_id) {
+                // 传输参数（wire / caps / UDP 编码）必须与暂停前一致：
+                // 换了这些还复用旧监听器，后续工作连接会按错误的协议解析。
+                let same_transport = sess.client.wire_version() == wire_version
+                    && sess.client.udp_codec_is_binary() == udp_binary
+                    && sess.client.caps() == caps;
+                if same_transport && !sess.client.is_stopped() {
+                    // 到这里才消费元数据票（它只是可观测性 / 日志用的副本）。
+                    let _ = rt.resume.take(st.session);
+                    restored = sess.client.proxy_names();
+                    // 新 run_id 必须落到 ClientState 上：工作连接查找、
+                    // 面板踢出、审计都靠它。
+                    sess.client
+                        .rebind_control(&run_id, req_tx.clone(), peer.ip());
+                    registry.reattach(sess.client.clone());
+                    info!(
+                        session = %st.session,
+                        restored = restored.len(),
+                        "断线续传命中：沿用上次的代理与监听端口"
+                    );
+                    resumed_session = Some(sess);
+                } else {
+                    // 传输参数不符（例如客户端换了 wire 版本）：把会话放回，
+                    // 既不复用也不销毁 —— 监听器继续等下一次合法续传。
+                    warn!(
+                        session = %st.session,
+                        "续传会话的传输参数与暂停前不一致，保留旧会话并拒绝本次复用"
+                    );
+                    registry.suspend(st.session, sess);
+                }
+            }
+            let mut resp =
+                nfrp_common::nlink::Frame::new(nfrp_common::nlink::FrameKind::ResumeResp).with(
+                    nfrp_common::nlink::frame::TAG_OK,
+                    vec![u8::from(resumed_session.is_some())],
+                );
+            if resumed_session.is_some() {
+                resp = resp.with(
+                    nfrp_common::nlink::frame::TAG_DETAIL,
+                    restored.join("\n").into_bytes(),
+                );
+            }
             conn.send_nlink(&resp).await?;
-            if resumed {
-                info!(session = %st.session, "断线续传命中：沿用上次的会话状态");
-            } else {
-                info!(session = %st.session, "续传票不存在或已过期，按新会话处理");
+            if resumed_session.is_none() {
+                info!(
+                    session = %st.session,
+                    "没有可用的续传会话（不存在 / 已过期 / 身份不匹配），按新会话处理"
+                );
             }
         }
         // 零信任身份：每会话一张短时令牌，工作连接必须出示。
+        //
+        // 必须在续传判定之后：令牌绑定的是**新** run_id，先发会把旧 id 签进去。
         if st.caps.contains(nfrp_common::nlink::CAP_IDENTITY) {
             let token = rt.identity.issue(
                 &run_id,
@@ -1350,30 +1439,47 @@ async fn handle_control(
         }
     }
 
-    // 客户端数上限：超出时明确拒绝并带上 reason，方便排查
-    let _client_slot = match registry.insert(client.clone()) {
-        Some(slot) => slot,
+    // 续传命中 → 复用同一份 ClientState（名额沿用暂停时保留的那个）；
+    // 否则照常登记新客户端，并受 `max_clients` 约束。
+    let (client, mut client_slot) = match resumed_session {
+        Some(sess) => (sess.client, sess.slot),
         None => {
-            registry.metrics().clients_rejected.inc();
-            warn!(
-                client_id = %nfrp_common::util::LogSafe(&client_id),
-                "客户端数量已达上限 {}，拒绝本次登录", limits.max_clients
-            );
-            let _ = conn
-                .send_msg(&FrpMessage::NewProxyResp(NewProxyResp {
-                    proxy_name: String::new(),
-                    error: format!(
-                        "too many clients (limit = {}), login rejected",
-                        limits.max_clients
-                    ),
-                    ..Default::default()
-                }))
-                .await;
-            let _ = conn.shutdown().await;
-            anyhow::bail!("客户端数量达到上限 {}", limits.max_clients);
+            let slot = match registry.insert(fresh_client.clone()) {
+                Some(slot) => slot,
+                None => {
+                    registry.metrics().clients_rejected.inc();
+                    warn!(
+                        client_id = %nfrp_common::util::LogSafe(&client_id),
+                        "客户端数量已达上限 {}，拒绝本次登录", limits.max_clients
+                    );
+                    let _ = conn
+                        .send_msg(&FrpMessage::NewProxyResp(NewProxyResp {
+                            proxy_name: String::new(),
+                            error: format!(
+                                "too many clients (limit = {}), login rejected",
+                                limits.max_clients
+                            ),
+                            ..Default::default()
+                        }))
+                        .await;
+                    let _ = conn.shutdown().await;
+                    anyhow::bail!("客户端数量达到上限 {}", limits.max_clients);
+                }
+            };
+            (fresh_client, Some(slot))
         }
     };
-    let _guard = ClientGuard::new(registry.clone(), run_id.clone());
+    if let Some(st) = &nlink_state {
+        client.set_nlink(st.clone());
+        // 批量工作连接：只有客户端也协商了才生效。
+        if st.caps.contains(nfrp_common::nlink::CAP_BATCH_WORK) {
+            client.set_nlink_batch(rt.cfg.batch_work_conn);
+        }
+    }
+    // 续传命中后，本次控制连接从"暂停"恢复为在线。
+    client.set_suspended(false);
+
+    let mut _guard = ClientGuard::new(registry.clone(), run_id.clone());
 
     let mut hb_ticker = tokio::time::interval(Duration::from_secs(5));
     let mut last_seen = Instant::now();
@@ -1382,6 +1488,10 @@ async fn handle_control(
         String,
         tokio::sync::oneshot::Sender<Result<(), String>>,
     > = std::collections::HashMap::new();
+    // 只有"网络断开 / 心跳超时"这类**被动**结束才允许续传。
+    // 被插件拒绝、心跳凭证复核失败等**主动**策略断开必须彻底清理，
+    // 不能留一个可续传的壳。
+    let mut allow_resume = true;
 
     loop {
         tokio::select! {
@@ -1393,7 +1503,36 @@ async fn handle_control(
                     nfrp_common::frp::conn::ConnEvent::Closed => break,
                     nfrp_common::frp::conn::ConnEvent::NLink(f) => {
                         last_seen = Instant::now();
-                        crate::nlink::handle_control_frame(&mut conn, &f, &run_id).await?;
+                        if f.kind == nfrp_common::nlink::FrameKind::ResumeCommit
+                            && client.is_resumed_session()
+                        {
+                            // 续传后客户端把"最终还在的代理"报上来；没报的一律回收，
+                            // 否则配置里删掉的代理会一直占着域名 / 端口。
+                            let wanted: Vec<String> = f
+                                .tlvs
+                                .get_str(nfrp_common::nlink::frame::TAG_DETAIL)
+                                .unwrap_or_default()
+                                .lines()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string)
+                                .collect();
+                            let mut closed = 0usize;
+                            for name in client.proxy_names() {
+                                if !wanted.iter().any(|w| w == &name)
+                                    && close_proxy_by_name(&registry, &client, &name)
+                                {
+                                    closed += 1;
+                                }
+                            }
+                            client.finish_resume();
+                            debug!(
+                                kept = wanted.len(),
+                                closed, "续传代理清单已对账，配置里删掉的代理已回收"
+                            );
+                        } else {
+                            crate::nlink::handle_control_frame(&mut conn, &f, &run_id).await?;
+                        }
                         continue;
                     }
                 };
@@ -1493,9 +1632,12 @@ async fn handle_control(
                             continue;
                         }
                         let resp = match register_proxy(&cfg, &registry, &client, &m).await {
-                            Ok(remote_addr) => {
-                                registry.metrics().proxies_total.inc();
-                                registry.metrics().proxies_active.inc();
+                            Ok(outcome) => {
+                                if !outcome.adopted {
+                                    registry.metrics().proxies_total.inc();
+                                    registry.metrics().proxies_active.inc();
+                                }
+                                let remote_addr = outcome.remote_addr;
                                 info!(proxy = %name, port, remote = %remote_addr, "代理注册成功");
                                 registry.audit().record(
                                     crate::audit::AuditEvent::new(
@@ -1550,6 +1692,7 @@ async fn handle_control(
                                 }
                                 Err(e) => {
                                     warn!("HTTP 插件拒绝心跳，断开控制连接：{e:#}");
+                                    allow_resume = false;
                                     let _ = conn
                                         .send_msg(&FrpMessage::Pong(Pong {
                                             error: cfg.error_to_client(
@@ -1580,6 +1723,7 @@ async fn handle_control(
                                     .detail(format!("心跳凭证复核失败：{e:#}")),
                                 );
                                 warn!("心跳凭证复核失败，断开控制连接：{e:#}");
+                                allow_resume = false;
                                 // 先回一条带错误的 Pong 再断，客户端才拿得到原因；
                                 // 短句与官方 `handlePing` 的 summary 逐字一致
                                 // （官方那边同样受 detailedErrorsToClient 控制）。
@@ -1733,6 +1877,20 @@ async fn handle_control(
                 }
             }
             _ = hb_ticker.tick() => {
+                // 续传兜底对账：0.7.0 及更早的客户端只重发 `NewProxy`，
+                // 不认识 `ResumeCommit`。给 10 秒宽限期，还没被重发 / 复用的
+                // 代理（配置里已删除）在这里回收 —— 否则旧端口会一直被占着。
+                if client.is_resumed_session()
+                    && client.resume_grace_expired(Duration::from_secs(10))
+                {
+                    let stale = client.stale_proxies();
+                    for name in &stale {
+                        if close_proxy_by_name(&registry, &client, name) {
+                            debug!(proxy = %name, "续传兜底：回收未被重新注册的代理");
+                        }
+                    }
+                    client.finish_resume();
+                }
                 // 被面板踢出：`stop()` 之后必须主动断开，
                 // 否则这条控制连接会一直活到心跳超时，
                 // 期间还能继续建立工作连接 —— "踢了但没完全踢"。
@@ -1748,29 +1906,122 @@ async fn handle_control(
         }
     }
 
-    // ---- 控制连接结束：给续传留一份状态 ----
+    // ---- 控制连接结束：暂停会话，等续传 ----
     //
-    // 只保留 `resume_ttl`（默认 30 秒）。保留的是"这个 connection id 曾经
-    // 存在过、它的代理叫这些名字"，真正的监听端口随 `ClientState` 一起回收 ——
-    // 所以续传**保住的是会话身份与能力协商**，不是在途 TCP 流（内核状态无法迁移）。
+    // 与 0.7.0 的区别：这里**不再**只写一份元数据就顺手 `registry.remove()`。
+    // 监听器、端口、vhost 路由、visitor 记录全部原地保留 `resume_ttl` 秒；
+    // 续传命中时新控制连接直接接管这份状态，公网端口在切换窗口里不需要
+    // 重新 bind，也不会被别人抢走。
     if let Some(st) = &nlink_state {
-        if st.caps.contains(nfrp_common::nlink::CAP_RESUME) {
+        if allow_resume
+            && st.caps.contains(nfrp_common::nlink::CAP_RESUME)
+            && st.resume
+            && !client.is_stopped()
+        {
             let rt = registry.nlink();
-            rt.resume.put(
-                st.session,
-                nfrp_common::nlink::ResumeEntry {
+            let ttl = rt.resume_ttl();
+            if let Some(c) = registry.detach(&run_id) {
+                c.set_suspended(true);
+                let entry = crate::registry::SuspendedSession {
+                    client: c,
+                    slot: client_slot.take(),
                     run_id: run_id.clone(),
                     user: client.user.clone(),
-                    trace: st.trace,
-                    proxies: client.proxy_names(),
-                    expires_at: std::time::Instant::now(),
-                },
-                rt.resume_ttl(),
-            );
+                    client_id: client.client_id.clone(),
+                    expires_at: std::time::Instant::now() + ttl,
+                };
+                if registry.suspend(st.session, entry) {
+                    rt.resume.put(
+                        st.session,
+                        nfrp_common::nlink::ResumeEntry {
+                            run_id: run_id.clone(),
+                            user: client.user.clone(),
+                            trace: st.trace,
+                            proxies: client.proxy_names(),
+                            expires_at: std::time::Instant::now(),
+                        },
+                        ttl,
+                    );
+                    // 会话没结束：别让 `ClientGuard` 把刚保住的资源清掉。
+                    _guard.disarm();
+                    // 旧 run_id 的 OIDC 绑定随旧会话一起作废；新会话会重新绑定。
+                    registry.security().forget_session(&run_id);
+                    info!(
+                        session = %st.session,
+                        ttl = ttl.as_secs(),
+                        "控制连接断开：会话已暂停，等待续传"
+                    );
+                    return Ok(());
+                }
+                warn!(
+                    session = %st.session,
+                    "暂停会话登记冲突：本次连接按普通断开回收"
+                );
+            }
         }
     }
 
     Ok(())
+}
+
+/// `NewProxy` 的确定性指纹（续传复用判据）。
+///
+/// **不能用 `serde_json::to_string(m)`**：`metas` / `headers` 等是
+/// `HashMap`，每次构造的随机种子不同，序列化顺序会变 —— 同一份配置两次
+/// 算出的字符串不同，续传就永远复用不了，随后重新 bind 直接 `EADDRINUSE`。
+/// 这里把所有集合排序后再拼接，保证跨进程、跨重启稳定。
+fn proxy_signature(m: &nfrp_common::frp::msg::NewProxy) -> String {
+    fn sorted_map(m: &std::collections::HashMap<String, String>) -> String {
+        let mut kv: Vec<(&String, &String)> = m.iter().collect();
+        kv.sort();
+        kv.into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("&")
+    }
+    fn sorted_vec(v: &[String]) -> String {
+        let mut v = v.to_vec();
+        v.sort();
+        v.join(",")
+    }
+    format!(
+        "name={}\0type={}\0enc={}\0comp={}\0bw={}\0bwmode={}\0group={}\0gkey={}\0metas={}\0ann={}\0port={}\0domains={}\0sub={}\0locations={}\0http_user={}\0http_pwd={}\0host={}\0headers={}\0resp_headers={}\0route_user={}\0mux={}\0sk={}\0allow={}",
+        m.proxy_name,
+        m.proxy_type,
+        m.use_encryption,
+        m.use_compression,
+        m.bandwidth_limit,
+        m.bandwidth_limit_mode,
+        m.group,
+        m.group_key,
+        sorted_map(&m.metas),
+        sorted_map(&m.annotations),
+        m.remote_port,
+        sorted_vec(&m.custom_domains),
+        m.subdomain,
+        sorted_vec(&m.locations),
+        m.http_user,
+        m.http_pwd,
+        m.host_header_rewrite,
+        sorted_map(&m.headers),
+        sorted_map(&m.response_headers),
+        m.route_by_http_user,
+        m.multiplexer,
+        m.sk,
+        sorted_vec(&m.allow_users),
+    )
+}
+
+/// `register_proxy` 的结果。
+#[derive(Debug)]
+pub(crate) struct RegisterOutcome {
+    /// 回给客户端的 `remote_addr` 文案。
+    pub remote_addr: String,
+    /// `true` = 续传时复用了原监听器，**没有**新建资源。
+    ///
+    /// 调用方据此决定要不要 `proxies_total/active.inc()`：复用的条目在
+    /// 暂停期间从未减过，再 inc 一次会让面板统计永久偏高。
+    pub adopted: bool,
 }
 
 /// 按代理类型注册：tcp / udp 绑端口，http / https 注册虚拟主机域名。
@@ -1781,9 +2032,38 @@ pub(crate) async fn register_proxy(
     registry: &Arc<Registry>,
     client: &Arc<ClientState>,
     m: &nfrp_common::frp::msg::NewProxy,
-) -> Result<String> {
+) -> Result<RegisterOutcome> {
     if m.proxy_name.is_empty() {
         anyhow::bail!("代理名为空");
+    }
+    // 续传复用：只有"本次控制连接是续传出来的"才允许跳过重新绑定。
+    // 指纹覆盖端口 / 域名 / 密钥等全部字段 —— 同名但配置改过时必须重新注册，
+    // 否则用户改了端口却仍指向旧监听器，且不会有任何报错。
+    let signature = proxy_signature(m);
+    if client.is_resumed_session() {
+        if let Some(addr) = client.reusable_proxy(&m.proxy_name, &signature) {
+            debug!(
+                proxy = %m.proxy_name,
+                remote = %addr,
+                "续传：同名同配置代理直接复用原监听器"
+            );
+            // 刷新代次：本次续传确实"碰过"它，宽限期对账时不能当成陈旧条目。
+            client.set_proxy_registration(&m.proxy_name, addr.clone(), signature.clone());
+            return Ok(RegisterOutcome {
+                remote_addr: addr,
+                adopted: true,
+            });
+        }
+    }
+    // 同名但配置变了（或普通会话重复注册同名代理）：先把旧监听器 / 域名 /
+    // visitor 记录彻底摘掉，再走新注册。
+    //
+    // 这一步不能只在续传路径做：普通会话只要重复发同一个 `NewProxy`，旧条目
+    // 就会被 `add_proxy` 覆盖，而旧监听器没人 abort —— 客户端可以用一个代理名
+    // 反复换端口，把 allowPorts 白名单里的端口一个个占住且永不释放。
+    if client.has_proxy(&m.proxy_name) {
+        debug!(proxy = %m.proxy_name, "同名代理重新注册，先回收旧注册");
+        close_proxy_by_name(registry, client, &m.proxy_name);
     }
     // 代理数必须在分配端口/域名之前拦住，否则失败路径还要回头回收资源。
     // 名额由 add_proxy 接管，随代理一起存活。
@@ -1821,7 +2101,7 @@ pub(crate) async fn register_proxy(
             }
         }
     }
-    match m.proxy_type.as_str() {
+    let result = match m.proxy_type.as_str() {
         "tcp" => register_tcp(cfg, registry, client, m, slot).await,
         "udp" => register_udp(cfg, registry, client, m, slot).await,
         "http" => register_vhost(cfg, registry, client, m, VhostKind::Http, slot).await,
@@ -1837,7 +2117,35 @@ pub(crate) async fn register_proxy(
             "暂不支持的代理类型：{other}\
              （支持 tcp / udp / http / https / tcpmux / stcp / xtcp / sudp）"
         ),
+    };
+    // 记下回给客户端的地址 + 指纹：续传时据此判断"同名同配置，直接复用"。
+    if let Ok(addr) = &result {
+        client.set_proxy_registration(&m.proxy_name, addr.clone(), signature);
     }
+    result.map(|remote_addr| RegisterOutcome {
+        remote_addr,
+        adopted: false,
+    })
+}
+
+/// 按名字摘掉一条代理并回收它占用的域名 / visitor 记录 / 公网端口。
+///
+/// 与 `CloseProxy` 走同一套清理语义，但**不**触发 HTTP 插件（这是服务端
+/// 自己的对账动作，不是客户端发起的关闭）。返回 `true` 表示确实摘掉了。
+fn close_proxy_by_name(registry: &Arc<Registry>, client: &Arc<ClientState>, name: &str) -> bool {
+    registry.visitors.remove(client, name);
+    if let Some(t) = registry.vhosts() {
+        t.remove_proxy(client, name);
+    }
+    if !client.has_proxy(name) {
+        return false;
+    }
+    let port = client.stop_proxy(name);
+    registry.metrics().proxies_active.dec();
+    if let Some(port) = port {
+        registry.release_port(port, client, name);
+    }
+    true
 }
 
 /// stcp / xtcp：**不需要公网端口**，只在 visitor 表里登记一条记录。
@@ -2170,7 +2478,7 @@ async fn proxy_accept_loop(listener: TcpListener, remote_port: u16, registry: Ar
                     proxy: backend.proxy_name.clone(),
                     proxy_type: client.proxy_type(&backend.proxy_name),
                     client_user: client.user.clone(),
-                    client_run_id: client.run_id.clone(),
+                    client_run_id: client.run_id(),
                     // ★ v0.6.6：数据面标志随用户连接带下去
                     use_encryption: {
                         let (e, _) = client.proxy_flags(&backend.proxy_name);
@@ -2287,7 +2595,7 @@ async fn handle_work(
                 user: client.user.clone(),
                 ..Default::default()
             },
-            &client.run_id,
+            &client.run_id(),
         );
         let content = nfrp_common::plugin::content_with_user(&msg, user)?;
         let new_content = plugins
@@ -2783,7 +3091,7 @@ async fn handle_visitor(
         proxy: proxy_name.clone(),
         proxy_type: entry.proxy_type.clone(),
         client_user: entry.client.user.clone(),
-        client_run_id: entry.client.run_id.clone(),
+        client_run_id: entry.client.run_id(),
         // visitor 走的是 visitor 自己那条通道，加密/压缩由它自己协商
         use_encryption: false,
         use_compression: false,
@@ -2964,10 +3272,10 @@ pub async fn bridge(user: PendingUser, work: WorkItem, registry: &Arc<Registry>)
     let (enc, comp) = (user_enc, user_comp);
     // NLink 限流：规则表为空时**完全走原来的路径**（零额外开销、零行为差异）。
     let nlink_rt = registry.nlink();
-    let limiter = if nlink_rt.limiter.is_empty() {
-        None
-    } else {
+    let limiter = if nlink_rt.rate_limit_enabled() {
         Some(&nlink_rt.limiter)
+    } else {
+        None
     };
     let relay_result = match (limiter, enc || comp) {
         (None, true) => {
@@ -3476,6 +3784,45 @@ mod tests {
 
         cfg.protocol = Protocol::NFrp;
         assert!(ensure_protocol(&cfg).is_err());
+    }
+
+    /// 续传复用指纹必须**跨 HashMap 插入顺序**稳定。
+    ///
+    /// 这是真机上会踩的坑：`metas` / `headers` 是 `HashMap`，直接
+    /// `serde_json::to_string` 两次可能得到不同顺序 —— 指纹一变就不复用，
+    /// 下一步重新 bind 报 `Address already in use`，而用户配置根本没改。
+    #[test]
+    fn 续传指纹跨_map_插入顺序稳定() {
+        use std::collections::HashMap;
+        let mut a = tcp_proxy("web", 28080);
+        let mut m1 = HashMap::new();
+        m1.insert("b".to_string(), "2".to_string());
+        m1.insert("a".to_string(), "1".to_string());
+        a.metas = m1;
+        let mut h1 = HashMap::new();
+        h1.insert("X-B".to_string(), "2".to_string());
+        h1.insert("X-A".to_string(), "1".to_string());
+        a.headers = h1;
+
+        let mut b = tcp_proxy("web", 28080);
+        let mut m2 = HashMap::new();
+        m2.insert("a".to_string(), "1".to_string());
+        m2.insert("b".to_string(), "2".to_string());
+        b.metas = m2;
+        let mut h2 = HashMap::new();
+        h2.insert("X-A".to_string(), "1".to_string());
+        h2.insert("X-B".to_string(), "2".to_string());
+        b.headers = h2;
+
+        assert_eq!(proxy_signature(&a), proxy_signature(&b));
+
+        // 改端口 / 改密钥必须变，不能误复用旧监听器。
+        let mut c = b.clone();
+        c.remote_port = 28081;
+        assert_ne!(proxy_signature(&a), proxy_signature(&c));
+        let mut d = b.clone();
+        d.sk = "other-secret".into();
+        assert_ne!(proxy_signature(&a), proxy_signature(&d));
     }
 
     // ==================================================================

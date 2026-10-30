@@ -784,6 +784,18 @@ struct ServerLink {
     nlink_caps: std::sync::atomic::AtomicU64,
 }
 
+/// NLink QUIC 是否应在本会话尝试。
+///
+/// 判据是「运行期开关 + 编译期实现」，**不是**裸的 `features` 列表：
+/// `quic = true` 是便利开关，`ClientNLink::from_config` 会隐式补上
+/// `CAP_QUIC`。0.7.0 在 `ServerLink::open` 里查裸列表，导致只写
+/// `quic = true` 时静默走 TCP（服务端那边却以为客户端支持 QUIC）。
+fn nlink_quic_requested(cfg: &ClientConfig) -> bool {
+    cfg.nlink.enable
+        && cfg.nlink.quic
+        && nfrp_common::nlink::compiled_caps().contains(nfrp_common::nlink::CAP_QUIC)
+}
+
 impl ServerLink {
     async fn open(cfg: Arc<ClientConfig>) -> Result<Self> {
         let wire = cfg.protocol.wire_version().ok_or_else(|| {
@@ -794,19 +806,34 @@ impl ServerLink {
         // NLink 的 QUIC 用另一个 ALPN（`nfrp-nlink`）与独立端口，
         // 优先级高于标准 `transport_protocol = "quic"`：两个都配时按 NLink 走
         // （否则 preamble 会发到只认 `nfrp-frp` 的端点上，握手失败）。
-        let nlink_quic = cfg.nlink.enable
-            && cfg.nlink.quic
-            && cfg
-                .nlink
-                .features()
-                .active()
-                .contains(nfrp_common::nlink::CAP_QUIC);
+        //
+        // ★ 判据必须看**编译期能力 ∩ 便利开关**，而不是裸 `features()`：
+        //   `quic = true` 会由 `ClientNLink::from_config` 隐式补上 CAP_QUIC，
+        //   0.7.0 这里查裸列表，导致只写 `quic = true` 时静默走 TCP。
+        let nlink_quic = nlink_quic_requested(&cfg);
         let quic = if nlink_quic {
-            let addr = nlink_quic_server_addr(&cfg).await?;
-            let (endpoint, conn) =
-                frp::quic::connect_with_alpn(&addr, None, nfrp_common::nlink::ALPN).await?;
-            info!(%addr, alpn = "nfrp-nlink", "NLink QUIC 传输已建立");
-            Some((endpoint, conn))
+            // NLink QUIC 是**增强路径**：失败必须回退到 TCP，而不是让整个
+            // 会话失败。用户配了 quic=true 但 UDP 被防火墙挡住时，TCP
+            // 仍然能用；只是失去多路复用与连接迁移。
+            let attempt = async {
+                let addr = nlink_quic_server_addr(&cfg).await?;
+                let (endpoint, conn) =
+                    frp::quic::connect_with_alpn(&addr, None, nfrp_common::nlink::ALPN).await?;
+                Ok::<_, anyhow::Error>((addr, endpoint, conn))
+            }
+            .await;
+            match attempt {
+                Ok((addr, endpoint, conn)) => {
+                    info!(%addr, alpn = "nfrp-nlink", "NLink QUIC 传输已建立");
+                    Some((endpoint, conn))
+                }
+                Err(e) => {
+                    warn!(
+                        "NLink QUIC 连接失败，回退到 TCP：{e:#}（本次会话没有 QUIC 多路复用 / 迁移）"
+                    );
+                    None
+                }
+            }
         } else if is_quic(&cfg.transport_protocol) {
             let addr = quic_server_addr(&cfg).await?;
             let (endpoint, conn) = frp::quic::connect(&addr, None).await?;
@@ -1618,6 +1645,31 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
         }
     }
 
+    // 续传对账：把**最终**代理清单交给服务端，让它回收"上次会话有、
+    // 这次配置里已经删掉"的监听器 / 域名 / 端口。
+    //
+    // 无条件发送：服务端只有在本次控制连接确实是续传出来的时候才处理它
+    // （普通新会话 `is_resumed_session()` 为假，收到也只当未知帧忽略）。
+    // 这样即使 0 个代理、注册循环一次都没跑，也不会漏掉对账。
+    if nlink.resume
+        && nlink
+            .features
+            .active()
+            .contains(nfrp_common::nlink::CAP_RESUME)
+    {
+        let names: Vec<String> = cfg
+            .proxies
+            .iter()
+            .map(|p| NewProxy::from_config(p, &cfg.user).proxy_name)
+            .collect();
+        let frame = nfrp_common::nlink::Frame::new(nfrp_common::nlink::FrameKind::ResumeCommit)
+            .with(
+                nfrp_common::nlink::frame::TAG_DETAIL,
+                names.join("\n").into_bytes(),
+            );
+        conn.send_nlink(&frame).await?;
+    }
+
     // 预建工作连接（与官方 frpc 的 pool_count 行为一致）
     for _ in 0..cfg.pool_count.max(0) {
         spawn_work_conn(
@@ -2144,6 +2196,30 @@ mod tests {
     //! 谁没被搬过去，断言就会指名道姓地失败。
 
     use super::*;
+
+    #[test]
+    fn nlink_quic_门控看运行期开关与编译期能力() {
+        let mut cfg = ClientConfig::default();
+        cfg.nlink.quic = true;
+        // 总开关关着：无论怎么配都不尝试。
+        cfg.nlink.enable = false;
+        assert!(!nlink_quic_requested(&cfg));
+
+        cfg.nlink.enable = true;
+        // 只写 quic = true、features 留空：便利开关必须生效，
+        // 不能被"裸 features 列表里没有 quic"挡成 TCP。
+        assert_eq!(
+            nlink_quic_requested(&cfg),
+            nfrp_common::nlink::compiled_caps().contains(nfrp_common::nlink::CAP_QUIC),
+            "quic = true 应由便利开关隐式启用"
+        );
+
+        cfg.nlink.quic = false;
+        assert!(
+            !nlink_quic_requested(&cfg),
+            "显式关掉 quic 时即使 features 里写了也不应尝试"
+        );
+    }
 
     /// 限制①批次2：`dialServerKeepalive > 0` 时拨号成功返回的 socket 必须真的
     /// 开上 TCP keepalive；`0` 时保持内核默认（不开）。

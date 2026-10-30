@@ -5964,9 +5964,9 @@ aarch64 任务把它还原出来、放进**自己那个基础镜像更老的容�
 
 ---
 
-## v0.7.0 发布记录（2026-10-29）
+## v0.7.1 发布记录（2026-10-29）
 
-Release id 427869196，tag 0.7.0，指向 2fb1ffa9。
+Release id 427869196，tag 0.7.1，指向 2fb1ffa9。
 
 ### CI：连续 3 次全绿
 
@@ -5987,7 +5987,7 @@ frp-linux-amd64.tar.gz | 5.03 MB | 8dcd68f8070ada45 |
 | 
 frp-linux-arm64.tar.gz | 5.64 MB | 701279545115c8a6 |
 | 
-frp-android-v0.7.0.zip | 9.28 MB | 6247308907774dce |
+frp-android-v0.7.1.zip | 9.28 MB | 6247308907774dce |
 | 
 frp-src-067.tar.gz | 1.19 MB | 5818d8e4d7259e1 |
 | SHA256SUMS.txt / .sig / 

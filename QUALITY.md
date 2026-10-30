@@ -2,7 +2,7 @@
 
 > 这份文件收纳 README 里放不下的质量细节。README 只留一句话概述 + 指向这里。
 >
-> 对应版本：**v0.7.0** · 最后核对：2026-10-30
+> 对应版本：**v0.7.1** · 最后核对：2026-10-31
 
 ---
 
@@ -13,30 +13,30 @@
 ```bash
 cargo fmt --all -- --check                 # 格式
 cargo clippy --workspace --all-targets -- -D warnings   # 静态检查，当前 0 告警
-cargo test --workspace                     # 956 个测试
+cargo test --workspace                     # 965 个测试通过
 ```
 
 三项全绿才算过。CI 上跑的是同一组命令，参数一致，不存在"本地过了 CI 不过"。
 
 ---
 
-## 二、测试分布（v0.7.0 实测）
+## 二、测试分布（v0.7.1 实测）
 
 `cargo test --workspace` 实测输出：
 
 | 目标 | 通过 | 忽略 |
 |---|---|---|
-| `nfrp-client` 单元测试 | 133 |  |
+| `nfrp-client` 单元测试 | 134 |  |
 | `nfrp-common` 单元测试（lib） | 478 | 3（需真机网卡） |
 | `nfrp-common` 集成测试 | 9 |  |
-| `nfrp-server` 单元测试（lib） | 281 |  |
+| `nfrp-server` 单元测试（lib） | 285 |  |
 | `nfrp-server` 单元测试（bin） | 17 |  |
 | `nfrp-server` 端到端集成测试 | 26 |  |
-| `nfrp-server` NLink 端到端 | 11 |  |
+| `nfrp-server` NLink 端到端 | 14 |  |
 | `nfrp-server` OIDC 端到端 | 2 |  |
 | Wintun 真机（Windows） | 0 | 5 |
 | Linux TUN 真机 | 0 | 5 |
-| **合计** | **956** | **13** |
+| **合计** | **965** | **13** |
 
 **关于 13 条 `#[ignore]`**：全部是**需要真机硬件或管理员权限**的设备面测试
 （Windows Wintun 网卡、Linux TUN 设备），不是被跳过的问题测试。它们在有权限的
@@ -55,7 +55,7 @@ cargo test --workspace                     # 956 个测试
 | 真实 QUIC 栈握手 | 起真 `quinn` endpoint，不是 mock |
 | 端到端集成 | 真 frps + 真 frpc + 真内网回显服务 |
 | 官方密文解密回归 | 用官方 frpc/frps 真实抓下来的密文做解密断言 |
-| NLink 逐项覆盖 | `server/tests/nlink_e2e.rs` 的 11 条用例一一对应 8 项能力 |
+| NLink 逐项覆盖 | `server/tests/nlink_e2e.rs` 的 14 条用例一一对应 8 项能力 |
 | 打包产物核对 | 包内二进制与源产物逐个 sha256 比对 |
 
 ---

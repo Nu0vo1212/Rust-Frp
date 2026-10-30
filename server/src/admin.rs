@@ -114,9 +114,12 @@ pub async fn add_proxy(
     // 2) 服务端开端口 / 注册域名
     let wire = NewProxy::from_config(&proxy, &client.user);
     match crate::serve::register_proxy(cfg, registry, &client, &wire).await {
-        Ok(remote) => {
-            registry.metrics().proxies_total.inc();
-            registry.metrics().proxies_active.inc();
+        Ok(outcome) => {
+            if !outcome.adopted {
+                registry.metrics().proxies_total.inc();
+                registry.metrics().proxies_active.inc();
+            }
+            let remote = outcome.remote_addr;
             tracing::info!(%run_id, proxy = %name, remote = %remote, "面板新增代理成功");
             // ★★ v0.6.1 修（Shannon 审计）：**面板下发的增删也要进审计链**。
             // 原先只有 `serve.rs` 里"客户端自己注册"那条记 `PROXY_ADD`，

@@ -1307,8 +1307,8 @@ PAGES_ZH['nlink'] = `
 <div class="callout">
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
   <div>
-    <strong>当前状态：已实现（v0.7.0 起，默认关闭）</strong>
-    <p>下面列出的能力<strong>均已实现并通过测试</strong>（<code>server/tests/nlink_e2e.rs</code> 的 11 条端到端用例逐项覆盖）。 但 NLink <strong>默认关闭</strong>：服务端与客户端都要显式写 <code>[nlink] enable = true</code> 才生效。 不开启时，行为与 0.6.x 完全一致。</p>
+    <strong>当前状态：已实现（v0.7.1 起，默认关闭）</strong>
+    <p>下面列出的能力<strong>均已实现并通过测试</strong>（<code>server/tests/nlink_e2e.rs</code> 的 14 条端到端用例逐项覆盖）。 但 NLink <strong>默认关闭</strong>：服务端与客户端都要显式写 <code>[nlink] enable = true</code> 才生效。 不开启时，行为与 0.6.x 完全一致。</p>
   </div>
 </div>
 <h2 data-i18n="nlink-s1-h">握手：零额外往返</h2>
@@ -1387,6 +1387,13 @@ TLV*            每个：u16 tag + u32 len + len 字节</code></pre>
 </tr>
 </tbody>
 </table>
+</div>
+<div class="callout">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+  <div>
+    <strong>续传的认证边界</strong>
+    <p>续传只校验 <code>user + client_id + wire/caps/UDP codec</code>，<code>session_id</code> 本身是 bearer 凭证。开 TLS 时 preamble 在加密通道里；<code>transport.tls.force = false</code> 时 preamble 是明文，链路上的观察者配合任意有效 token 可以抢在客户端之前续传。 这不是提权（仍然要先通过 token/OIDC 登录），但<strong>生产环境应开 TLS</strong>。 后续版本会加服务端签发的一次性 resume token，把续传从"知道 session_id 就能用" 收紧成"必须持有上一次连接下发的不可重放凭证"。</p>
+  </div>
 </div>
 <h2 data-i18n="nlink-s4-h">怎么开启</h2>
 <pre class="code-block"><code class="language-toml"># frps 端

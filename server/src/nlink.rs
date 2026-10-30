@@ -69,10 +69,31 @@ impl NLinkRuntime {
     }
 
     pub fn knock_rule(&self, port: u16) -> Option<&KnockRule> {
+        // 运行期总开关 / 能力协商都没过时，配置里写了规则也不生效。
+        // 否则 `enable = false` 会变成一句空话：端口仍然被敲门表拦截，
+        // 运维以为关掉了 NLink，实际数据面还在按它的规则跑。
+        if !self.enabled()
+            || !self
+                .features
+                .active()
+                .contains(nfrp_common::nlink::CAP_PORT_KNOCK)
+        {
+            return None;
+        }
         self.cfg
             .knock
             .iter()
             .find(|r| r.port == port && r.effective())
+    }
+
+    /// 数据面限流是否生效（同样受总开关 + 能力位门控）。
+    pub fn rate_limit_enabled(&self) -> bool {
+        self.enabled()
+            && self
+                .features
+                .active()
+                .contains(nfrp_common::nlink::CAP_RATE_LIMIT)
+            && !self.limiter.is_empty()
     }
 
     pub fn resume_ttl(&self) -> Duration {
@@ -195,9 +216,14 @@ where
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // 16 KiB 是"够大不至于 syscall 太密、够小不至于让限流粒度变得很粗"的折中。
-    // 不用 `util::RELAY_BUF`：那个是给无限速路径调大的，套上限流只会
-    // 让令牌桶一次扣掉一大块，突发感更明显。
-    let mut buf = vec![0u8; 16 * 1024];
+    // 但**低速率**下 16 KiB 一块会让令牌桶一次欠 16 秒的量：老实现把等待
+    // 截断到 burst/rate（=1 秒），于是 1 KiB/s 实际跑成 ~16 KiB/s。
+    // 现在按速率切块：最慢每秒读一块，等待时间自然 ≈ 1 秒，速率准确。
+    let budget = limiter
+        .rate_for(user, proxy)
+        .unwrap_or(16 * 1024)
+        .clamp(1, 16 * 1024) as usize;
+    let mut buf = vec![0u8; budget];
     let mut total = 0u64;
     loop {
         let n = match r.read(&mut buf).await {
@@ -276,5 +302,61 @@ mod tests {
         cfg.nlink.features = vec!["resume".into()];
         let rt = NLinkRuntime::from_config(&cfg, "t");
         assert_eq!(rt.resume_ttl(), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn 总开关关闭时敲门与限流都不生效() {
+        use nfrp_common::nlink::knock::KnockRule;
+        use nfrp_common::nlink::ratelimit::RateLimitRule;
+
+        let mut cfg = ServerConfig::default();
+        // 故意把规则都配上，只把 enable 留 false：配置里有不等于会执行。
+        cfg.nlink.enable = false;
+        cfg.nlink.features = vec!["port-knock".into(), "rate-limit".into()];
+        cfg.nlink.knock = vec![KnockRule {
+            port: 7000,
+            secret: "s".into(),
+            window: 10,
+        }];
+        cfg.nlink.limits = vec![RateLimitRule {
+            user: "*".into(),
+            proxy: "*".into(),
+            rate: 1024,
+            burst: 1024,
+        }];
+        let rt = NLinkRuntime::from_config(&cfg, "t");
+        assert!(rt.knock_rule(7000).is_none(), "enable=false 时敲门不得拦截");
+        assert!(!rt.rate_limit_enabled(), "enable=false 时限流不得生效");
+    }
+
+    #[test]
+    fn 能力没协商时对应数据面也不生效() {
+        use nfrp_common::nlink::knock::KnockRule;
+        use nfrp_common::nlink::ratelimit::RateLimitRule;
+
+        let mut cfg = ServerConfig::default();
+        cfg.nlink.enable = true;
+        // 只协商 trace：knock / rate-limit 的配置都在，但能力位没开。
+        cfg.nlink.features = vec!["trace".into()];
+        cfg.nlink.knock = vec![KnockRule {
+            port: 7001,
+            secret: "s".into(),
+            window: 10,
+        }];
+        cfg.nlink.limits = vec![RateLimitRule {
+            user: "*".into(),
+            proxy: "*".into(),
+            rate: 2048,
+            burst: 2048,
+        }];
+        let rt = NLinkRuntime::from_config(&cfg, "t");
+        assert!(rt.knock_rule(7001).is_none());
+        assert!(!rt.rate_limit_enabled());
+
+        // 显式协商后同一份配置才生效。
+        cfg.nlink.features = vec!["port-knock".into(), "rate-limit".into()];
+        let rt = NLinkRuntime::from_config(&cfg, "t");
+        assert!(rt.knock_rule(7001).is_some());
+        assert!(rt.rate_limit_enabled());
     }
 }

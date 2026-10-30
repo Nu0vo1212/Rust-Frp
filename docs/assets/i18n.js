@@ -44,7 +44,7 @@ const I18N = {
     't-nlink': 'NLink v1 规划',
 
     /* ---- home hero ---- */
-    'hero-badge': 'v0.6.7 · 与 frp 0.71.0 实测互通',
+    'hero-badge': 'v0.7.0 · 与 frp 0.71.0 实测互通',
     'hero-title-1': '把内网服务',
     'hero-title-2': '安全地',
     'hero-title-3': '带到公网',
@@ -103,7 +103,7 @@ const I18N = {
     'inst-h2': '方式二：通过 crates.io',
     'inst-p2': '已装 Rust 工具链的话最省事：',
     'inst-ver-t': '版本号是分开的',
-    'inst-ver-d': 'crates.io 上的版本与本页 Release 的版本相互独立。比如 Release 是 v0.6.7 而 crates.io 上的构建可能更早，因为 crates.io 不允许重发同一版本号，连修个 README 也得升版本。功能以 Release 为准。',
+    'inst-ver-d': 'crates.io 上的版本与本页 Release 的版本相互独立。比如 Release 是 v0.7.0 而 crates.io 上的构建可能更早，因为 crates.io 不允许重发同一版本号，连修个 README 也得升版本。功能以 Release 为准。',
     'inst-h3': '方式三：从源码构建',
     'inst-h4': '验证安装',
     'inst-v-t': '-v 为什么输出 0.71.0',
@@ -184,7 +184,7 @@ const I18N = {
     'nav-nlink': 'NLink v1 Roadmap',
     't-nlink': 'NLink v1 Roadmap',
 
-    'hero-badge': 'v0.6.7 · verified against frp 0.71.0',
+    'hero-badge': 'v0.7.0 · verified against frp 0.71.0',
     'hero-title-1': 'Bring internal services ',
     'hero-title-2': 'to the public',
     'hero-title-3': ' safely',
@@ -239,7 +239,7 @@ const I18N = {
     'inst-h2': 'Option 2: crates.io',
     'inst-p2': 'Simplest if you already have a Rust toolchain:',
     'inst-ver-t': 'Version numbers are independent',
-    'inst-ver-d': 'The crates.io version and the Release version on this page are separate. A Release may be v0.6.7 while the crates.io build is older, because crates.io never allows republishing a version number, not even to fix a README. Functionality follows the Release.',
+    'inst-ver-d': 'The crates.io version and the Release version on this page are separate. A Release may be v0.7.0 while the crates.io build is older, because crates.io never allows republishing a version number, not even to fix a README. Functionality follows the Release.',
     'inst-h3': 'Option 3: build from source',
     'inst-h4': 'Verify the install',
     'inst-v-t': 'Why -v prints 0.71.0',

@@ -373,7 +373,7 @@ cargo clippy --workspace --all-targets    # 静态检查（当前 0 告警）
 cargo test --workspace                    # 890 个测试
 ```
 
-测试分布（**v0.6.7 实测值**，`cargo test --workspace -j 1 -- --test-threads=1`）：
+测试分布（**v0.7.0 实测值**，`cargo test --workspace -j 1 -- --test-threads=1`）：
 
 | 目标 | 通过 | 忽略 |
 |---|---|---|

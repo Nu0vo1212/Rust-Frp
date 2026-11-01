@@ -1309,7 +1309,7 @@ PAGES_EN['nlink'] = `
 <div class="callout">
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
   <div>
-    <strong>当前状态：已实现（v0.7.1 起，默认关闭）</strong>
+    <strong>当前状态：已实现（v0.7.2 起，默认关闭）</strong>
     <p>下面列出的能力<strong>均已实现并通过测试</strong>（<code>server/tests/nlink_e2e.rs</code> 的 14 条端到端用例逐项覆盖）。 但 NLink <strong>默认关闭</strong>：服务端与客户端都要显式写 <code>[nlink] enable = true</code> 才生效。 不开启时，行为与 0.6.x 完全一致。</p>
   </div>
 </div>
@@ -1394,7 +1394,7 @@ TLV*            每个：u16 tag + u32 len + len 字节</code></pre>
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
   <div>
     <strong>续传的认证边界</strong>
-    <p>续传只校验 <code>user + client_id + wire/caps/UDP codec</code>，<code>session_id</code> 本身是 bearer 凭证。开 TLS 时 preamble 在加密通道里；<code>transport.tls.force = false</code> 时 preamble 是明文，链路上的观察者配合任意有效 token 可以抢在客户端之前续传。 这不是提权（仍然要先通过 token/OIDC 登录），但<strong>生产环境应开 TLS</strong>。 后续版本会加服务端签发的一次性 resume token，把续传从"知道 session_id 就能用" 收紧成"必须持有上一次连接下发的不可重放凭证"。</p>
+    <p>从 0.7.2 起，续传需要出示<strong>服务端签发的一次性令牌</strong>，光知道 <code>session_id</code> 不再够用。 令牌用 HMAC 绑定 <code>session + user + client_id + 过期时间 + 随机 nonce</code>， 登记在待用表里，<strong>用一次就作废</strong>。它在登录成功时通过 <code>ResumeResp</code> 下发 （断线时连接已经断了，发不出去，所以必须提前给）。 这样"抄走 preamble 就能冒充"这条路堵上了：伪造不出签名，重放上一轮的令牌 也会因为已被消费而失败。 <strong>但仍有一处需要你自己判断</strong>：<code>transport.tls.force = false</code>（默认值）时， 链路上的观察者可以<strong>直接抄走令牌并抢先消费</strong>。这时真客户端会续传失败并告警—— 可检测，但拦不住。<strong>生产环境请开 <code>transport.tls.force = true</code></strong>， 让令牌本身也在加密通道里。</p>
   </div>
 </div>
 <h2 data-i18n="nlink-s4-h">怎么开启</h2>
@@ -1435,8 +1435,8 @@ quic = true        # 走 QUIC 连服务端（需服务端开 quic_listen）</cod
 </tr>
 <tr>
 <td>断线续传</td>
-<td><code>session_id</code> + 服务端保留表</td>
-<td>保留 <code>resume_ttl</code> 秒（默认 30），<strong>恢复的是监听器/端口/vhost/visitor 本体</strong>，不只是名单</td>
+<td><code>session_id</code> + 一次性令牌 + 服务端保留表</td>
+<td>保留 <code>resume_ttl</code> 秒（默认 30），<strong>恢复的是监听器/端口/vhost/visitor 本体</strong>，不只是名单。令牌单次有效，见下方认证边界</td>
 </tr>
 <tr>
 <td>零信任身份</td>

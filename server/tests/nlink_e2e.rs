@@ -1018,6 +1018,174 @@ async fn nlink_旧客户端续传_宽限期后回收已删除的代理() {
     std::net::TcpListener::bind(("127.0.0.1", remote)).expect("端口释放后必须能重新绑定");
 }
 
+/// 一次性续传令牌：同一张令牌不能续传两次。
+///
+/// # 这条测试盯着什么
+///
+/// 0.7.1 的续传身份是 `user + client_id + session_id` 三元组 —— 都是**标识**
+/// 而不是凭证。明文链路上抄走 preamble 的观察者可以冒充。
+/// 0.7.2 引入一次性令牌：登记在待用表里，**用一次就作废**。
+///
+/// 所以这里验证两件事：
+/// 1. 首次续传成功（带正确令牌）；
+/// 2. 同一个 session + 同一张令牌再来一次 —— 必须失败，
+///    因为令牌已被消费，而不是"签名对了就放行"。
+#[tokio::test]
+async fn nlink_续传令牌只能用一次() {
+    let echo = echo_service().await;
+    let remote = free_port();
+    let cfg = nlink_cfg(&["resume"]);
+    let (port, registry) = start_server(cfg).await;
+
+    let session = ConnectionId::random();
+    let pre = pre2(session);
+
+    // ---- 第一次登录：服务端应当在 ResumeResp 里下发令牌 ----
+    //
+    // ★ 必须**先读令牌再去注册代理**。`register_proxy` 内部会等待
+    //   `NewProxyResp`，而 `ResumeResp` 是先到的 —— 顺带在那一轮里被读走后
+    //   这里就再也等不到了（测试会卡到超时）。
+    let (mut conn, _run_id, _caps) = login_with_preamble(port, "tok-user", Some(pre.clone()))
+        .await
+        .expect("首次登录");
+
+    let resp = loop {
+        match next_event(&mut conn, 2000).await.expect("读事件") {
+            ConnEvent::NLink(f) if f.kind == FrameKind::ResumeResp => break f,
+            ConnEvent::NLink(_) => continue,
+            _ => panic!("等 ResumeResp 时收到别的消息"),
+        }
+    };
+    let token = resp
+        .tlvs
+        .get_str(nfrp_common::nlink::frame::TAG_RESUME_TOKEN)
+        .expect("服务端必须下发一次性续传令牌");
+
+    let _ = register_proxy(&mut conn, tcp_proxy("tok", remote, echo)).await;
+
+    // 断开，等它进入暂停
+    drop(conn);
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if !registry.nlink().resume.is_empty() {
+            break;
+        }
+    }
+    assert!(!registry.nlink().resume.is_empty(), "应当写入续传状态");
+
+    // ---- 带令牌续传：应当成功 ----
+    let mut pre_2nd = pre.clone();
+    pre_2nd.tlvs.push(
+        nfrp_common::nlink::frame::TAG_RESUME_TOKEN,
+        token.clone().into_bytes(),
+    );
+    let (mut conn2, _run2, _c2) = login_with_preamble(port, "tok-user", Some(pre_2nd.clone()))
+        .await
+        .expect("带令牌续传登录");
+    let resp2 = loop {
+        match next_event(&mut conn2, 2000).await.expect("读事件") {
+            ConnEvent::NLink(f) if f.kind == FrameKind::ResumeResp => break f,
+            ConnEvent::NLink(_) => continue,
+            _ => panic!("等 ResumeResp 时收到别的消息"),
+        }
+    };
+    assert!(
+        resp2
+            .tlvs
+            .get(TAG_OK)
+            .and_then(|v| v.first().copied())
+            .map(|b| b != 0)
+            .unwrap_or(false),
+        "带正确令牌首次续传必须成功"
+    );
+    drop(conn2);
+
+    // ---- 用**同一张**令牌再来一次：必须失败 ----
+    //
+    // 这是防重放的核心断言。失败原因可能是"令牌已被消费"或"没有暂停会话"，
+    // 两种都算通过，但令牌**绝不能被再次接受**。
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        if !registry.nlink().resume.is_empty() {
+            break;
+        }
+    }
+    let (mut conn3, _run3, _c3) = login_with_preamble(port, "tok-user", Some(pre_2nd))
+        .await
+        .expect("第三次登录");
+    let resp3 = loop {
+        match next_event(&mut conn3, 2000).await.expect("读事件") {
+            ConnEvent::NLink(f) if f.kind == FrameKind::ResumeResp => break f,
+            ConnEvent::NLink(_) => continue,
+            _ => panic!("等 ResumeResp 时收到别的消息"),
+        }
+    };
+    let ok3 = resp3
+        .tlvs
+        .get(TAG_OK)
+        .and_then(|v| v.first().copied())
+        .map(|b| b != 0)
+        .unwrap_or(false);
+    assert!(!ok3, "同一张一次性令牌不能被用来续传第二次（防重放）");
+}
+
+/// `ResumeCommit` 分片：代理名多到超过单帧上限时，仍然能完成对账。
+///
+/// # 这条测试盯着什么
+///
+/// 0.7.1 把整份名单塞进一帧。超过 8192 字节客户端只能**拒绝发送**，
+/// 于是"已删除的代理立即可回收"静默降级成 10 秒宽限期。
+/// 0.7.2 分片后不再有名单长度限制。
+#[test]
+fn nlink_resume_commit_超长名单能分片重组() {
+    use nfrp_common::nlink::frame::{
+        encode_resume_commit, CommitAssembler, MAX_FRAME, TAG_CHUNK, TAG_CHUNKS, TAG_DETAIL,
+        TAG_RESUME_TOKEN,
+    };
+
+    // 造一份必然超过单帧上限的名单
+    let names: Vec<String> = (0..3000)
+        .map(|i| format!("user{}.a-long-enough-proxy-name-{i:05}", i % 7))
+        .collect();
+    let total_bytes: usize = names.iter().map(|n| n.len() + 1).sum();
+    assert!(
+        total_bytes > MAX_FRAME,
+        "前提：这份名单必须超过单帧上限（{total_bytes} 字节）"
+    );
+
+    let frames = encode_resume_commit(&names);
+    assert!(frames.len() > 1, "超长名单必须被拆成多帧");
+
+    let mut asm = CommitAssembler::new();
+    let mut got: Option<Vec<String>> = None;
+    for f in &frames {
+        let (idx, total) = f
+            .tlvs
+            .commit_chunk_info()
+            .expect("多帧时每一帧都该带分片标记");
+        let part: Vec<String> = f
+            .tlvs
+            .get_str(TAG_DETAIL)
+            .unwrap_or_default()
+            .lines()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        if let Some(all) = asm.push(idx, total, part).expect("分片合法") {
+            got = Some(all);
+        }
+    }
+    assert_eq!(
+        got.expect("必须收齐"),
+        names,
+        "分片重组后的名单必须与原始完全一致"
+    );
+
+    // 令牌 TLV 与分片 TLV 不能撞号（两者都在 0x4E00 段里）
+    assert_ne!(TAG_RESUME_TOKEN, TAG_CHUNK);
+    assert_ne!(TAG_RESUME_TOKEN, TAG_CHUNKS);
+}
+
 /// 同一会话用同一个代理名重新注册（改端口 / 改配置）：旧监听器必须先回收。
 ///
 /// 否则 `add_proxy` 只是覆盖 map 条目，旧 `TcpListener` 的 task 没人 abort，

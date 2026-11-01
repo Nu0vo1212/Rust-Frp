@@ -55,6 +55,24 @@ pub const TAG_ADDR: u16 = TAG_BASE + 15;
 pub const TAG_POLICY: u16 = TAG_BASE + 16;
 pub const TAG_DETAIL: u16 = TAG_BASE + 17;
 pub const TAG_VERSION: u16 = TAG_BASE + 18;
+/// `ResumeCommit` 分片：本片序号（从 0 开始，u16 大端）。
+///
+/// 代理名列表超过单帧上限时拆成多帧，每帧带这个 tag。
+/// 只有一片时不带（兼容 0.7.1 的行为）。
+pub const TAG_CHUNK: u16 = TAG_BASE + 19;
+/// `ResumeCommit` 分片：总片数（u16 大端）。
+pub const TAG_CHUNKS: u16 = TAG_BASE + 20;
+/// 续传令牌（一次性）。登录成功时由服务端下发，重连时客户端带回。
+pub const TAG_RESUME_TOKEN: u16 = TAG_BASE + 21;
+
+/// `ResumeCommit` 最多允许拆成多少片。
+///
+/// 这是**防 DoS 的硬上限**：没有它，恶意客户端可以声称 `chunks = 65535`
+/// 让服务端一直攒内存等一个永远不会到的"最后一片"。
+///
+/// 8192 字节 × 64 片 ≈ 512 KiB 的名单空间，按每个代理名平均 40 字节算，
+/// 够放下约 1.3 万个代理 —— 远超单 frps 实际能承载的代理数。
+pub const MAX_COMMIT_CHUNKS: u16 = 64;
 
 /// 一个 TLV 项。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,6 +185,163 @@ impl TlvMap {
             pos += len;
         }
         Ok(map)
+    }
+
+    /// `ResumeCommit` 分片：本片序号 / 总片数。返回 `None` 表示这是单帧（不分片）。
+    pub fn commit_chunk_info(&self) -> Option<(u16, u16)> {
+        let idx = self
+            .get(TAG_CHUNK)
+            .and_then(|v| v.get(..2))
+            .map(|v| u16::from_be_bytes([v[0], v[1]]))?;
+        let total = self
+            .get(TAG_CHUNKS)
+            .and_then(|v| v.get(..2))
+            .map(|v| u16::from_be_bytes([v[0], v[1]]))?;
+        Some((idx, total))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ResumeCommit 分片
+// ---------------------------------------------------------------------------
+
+/// 一片 `ResumeCommit` 实际能装多少字节。
+///
+/// 帧总上限 [`MAX_FRAME`] 减掉帧头（version+kind+flags = 4）、
+/// `TAG_CHUNK` / `TAG_CHUNKS` 两个 TLV 各 6+2 字节、以及 `TAG_DETAIL`
+/// 自己的 6 字节头，再留一点余量。
+pub const COMMIT_CHUNK_BUDGET: usize = MAX_FRAME - 4 - (6 + 2) * 2 - 6 - 16;
+
+/// 把代理名列表切成若干段，每段长度不超过 `budget` 字节（含换行分隔）。
+///
+/// # 为什么需要分片
+///
+/// 0.7.1 把整份名单塞进一帧的 `TAG_DETAIL`。代理名多的会话会超过
+/// [`MAX_FRAME`]，客户端只能**拒绝发送**并记日志 —— 续传照样成功，但
+/// "已删除的代理立即可回收"这个对账能力就静默降级成 10 秒宽限期。
+///
+/// 分片后不再有名单长度上限（只受 [`MAX_COMMIT_CHUNKS`] 约束）。
+///
+/// # 切分规则
+///
+/// 按**代理名边界**切，不切断单个名字。
+pub fn split_commit_names(names: &[String], budget: usize) -> Vec<Vec<String>> {
+    let budget = budget.max(1);
+    let mut out: Vec<Vec<String>> = Vec::new();
+    let mut cur: Vec<String> = Vec::new();
+    let mut cur_len = 0usize;
+
+    for name in names {
+        let add = name.len() + if cur.is_empty() { 0 } else { 1 };
+        if !cur.is_empty() && cur_len + add > budget {
+            out.push(std::mem::take(&mut cur));
+            cur_len = name.len();
+            cur.push(name.clone());
+        } else {
+            cur_len += add;
+            cur.push(name.clone());
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// 把一份名单编码成一条或多条 `ResumeCommit` 帧。
+///
+/// 只有一片时**不带** `TAG_CHUNK` / `TAG_CHUNKS`，与 0.7.1 的线上格式一致
+/// （老服务端仍能照常解析）。
+pub fn encode_resume_commit(names: &[String]) -> Vec<Frame> {
+    let chunks = split_commit_names(names, COMMIT_CHUNK_BUDGET);
+    if chunks.is_empty() {
+        // 空名单也要发一条，表示"一个都不剩"，否则服务端不会对账
+        return vec![Frame::new(FrameKind::ResumeCommit).with(TAG_DETAIL, Vec::new())];
+    }
+    if chunks.len() == 1 {
+        return vec![
+            Frame::new(FrameKind::ResumeCommit).with(TAG_DETAIL, chunks[0].join("\n").into_bytes())
+        ];
+    }
+    let total = chunks.len() as u16;
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(i, part)| {
+            Frame::new(FrameKind::ResumeCommit)
+                .with(TAG_DETAIL, part.join("\n").into_bytes())
+                .with(TAG_CHUNK, (i as u16).to_be_bytes().to_vec())
+                .with(TAG_CHUNKS, total.to_be_bytes().to_vec())
+        })
+        .collect()
+}
+
+/// 组装 `ResumeCommit` 分片。
+///
+/// 调用方每收到一片调用一次；返回 `Ok(Some(names))` 表示**已收齐**。
+///
+/// # 防护
+///
+/// * `total == 0` 或 `total > MAX_COMMIT_CHUNKS` 直接判错 —— 前者是坏帧，
+///   后者是 DoS 尝试（否则恶意客户端可以声称 65535 片让服务端一直攒内存）；
+/// * `idx >= total` 判错，防止用越界序号把表撑大；
+/// * 收不到的片永远不完成，但表是按会话保存的，会话断开即释放。
+#[derive(Debug, Default)]
+pub struct CommitAssembler {
+    total: u16,
+    parts: Vec<Option<Vec<String>>>,
+    received: u16,
+}
+
+impl CommitAssembler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 喂一片。返回 `Ok(Some(names))` = 收齐；`Ok(None)` = 还差。
+    pub fn push(
+        &mut self,
+        idx: u16,
+        total: u16,
+        names: Vec<String>,
+    ) -> Result<Option<Vec<String>>> {
+        if total == 0 {
+            bail!("ResumeCommit 分片总数为 0");
+        }
+        if total > MAX_COMMIT_CHUNKS {
+            bail!("ResumeCommit 分片数 {total} 超过上限 {MAX_COMMIT_CHUNKS}");
+        }
+        if idx >= total {
+            bail!("ResumeCommit 分片序号 {idx} 越界（总数 {total}）");
+        }
+        // 总片数变了说明是两轮分片混在一起，重置：只认最新一轮
+        if self.total != total {
+            self.total = total;
+            self.parts = vec![None; total as usize];
+            self.received = 0;
+        }
+        let slot = &mut self.parts[idx as usize];
+        if slot.is_none() {
+            self.received += 1;
+        }
+        *slot = Some(names);
+
+        if self.received == self.total {
+            let mut all: Vec<String> = Vec::new();
+            // 用 flatten 而不是 `if let Some(..)` + append：
+            // clippy 把后者判成"只用到 Some 变体"的多余写法。
+            for v in self.parts.drain(..).flatten() {
+                all.extend(v);
+            }
+            self.total = 0;
+            self.received = 0;
+            return Ok(Some(all));
+        }
+        Ok(None)
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.total == 0
     }
 }
 
@@ -498,4 +673,152 @@ mod tests {
     /// 运行期断言会被 clippy 判成"断言值恒为真"，而且真出问题时也要等到
     /// 跑测试才发现 —— const 断言让它在编译期就失败。
     const _: () = assert!(MAX_FRAME + 9 < 10240);
+
+    // ---- ResumeCommit 分片 ----
+
+    #[test]
+    fn 单帧能装下时不分片且不带分片标记() {
+        let names = vec!["alice.tcp1".to_string(), "alice.tcp2".to_string()];
+        let frames = encode_resume_commit(&names);
+        assert_eq!(frames.len(), 1, "小名单应当只发一帧");
+        assert!(
+            frames[0].tlvs.commit_chunk_info().is_none(),
+            "单帧不应带分片标记（保持与 0.7.1 线上格式一致）"
+        );
+        let body = frames[0].tlvs.get_str(TAG_DETAIL).unwrap();
+        assert_eq!(body, "alice.tcp1\nalice.tcp2");
+    }
+
+    #[test]
+    fn 空名单也会发一条空帧() {
+        let frames = encode_resume_commit(&[]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].tlvs.get_str(TAG_DETAIL).unwrap(), "");
+    }
+
+    #[test]
+    fn 超长名单会分片且每片都不超上限() {
+        // 造 2000 个名字，每个 40 字节 → 约 80 KB，必然超过单帧
+        let names: Vec<String> = (0..2000)
+            .map(|i| format!("user{i:04}.proxy-name-padding-xxxx"))
+            .collect();
+        let frames = encode_resume_commit(&names);
+        assert!(frames.len() > 1, "应当被拆成多帧（实际 {}）", frames.len());
+        assert!(
+            frames.len() <= MAX_COMMIT_CHUNKS as usize,
+            "片数不能超过上限"
+        );
+        for f in &frames {
+            let detail_len = f.tlvs.get(TAG_DETAIL).map(|v| v.len()).unwrap_or(0);
+            assert!(
+                detail_len <= COMMIT_CHUNK_BUDGET,
+                "单片 {detail_len} 字节超过预算 {COMMIT_CHUNK_BUDGET}"
+            );
+        }
+    }
+
+    #[test]
+    fn 分片按名字边界切不切断单个名字() {
+        let names: Vec<String> = (0..300)
+            .map(|i| format!("u{i}.a-fairly-long-proxy-name-for-testing"))
+            .collect();
+        let chunks = split_commit_names(&names, COMMIT_CHUNK_BUDGET);
+        let mut flat: Vec<String> = Vec::new();
+        for c in &chunks {
+            for n in c {
+                // 每个名字都必须是完整的
+                assert!(names.contains(n), "分片里出现了被截断的名字：{n}");
+                flat.push(n.clone());
+            }
+        }
+        assert_eq!(flat, names, "重组后必须与原始顺序完全一致");
+    }
+
+    #[test]
+    fn 组装器收齐后返回完整名单() {
+        let names: Vec<String> = (0..1500)
+            .map(|i| format!("user.proxy-{i:05}-padding-xxxxxxxx"))
+            .collect();
+        let frames = encode_resume_commit(&names);
+        assert!(frames.len() > 1);
+
+        let mut asm = CommitAssembler::new();
+        let mut got: Option<Vec<String>> = None;
+        for f in &frames {
+            let (idx, total) = f.tlvs.commit_chunk_info().expect("应当是分片帧");
+            let part: Vec<String> = f
+                .tlvs
+                .get_str(TAG_DETAIL)
+                .unwrap_or_default()
+                .split('\n')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+            if let Some(all) = asm.push(idx, total, part).unwrap() {
+                got = Some(all);
+            }
+        }
+        let got = got.expect("应当收齐");
+        assert_eq!(got, names, "重组的名单必须与原始一致");
+        assert!(asm.is_idle(), "收齐后组装器应复位");
+    }
+
+    #[test]
+    fn 分片数超上限被拒() {
+        let mut asm = CommitAssembler::new();
+        let e = asm
+            .push(0, MAX_COMMIT_CHUNKS + 1, vec!["x".into()])
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("超过上限"), "应当报超限：{e:#}");
+    }
+
+    #[test]
+    fn 分片序号越界被拒() {
+        let mut asm = CommitAssembler::new();
+        let e = asm.push(3, 3, vec!["x".into()]).unwrap_err();
+        assert!(format!("{e:#}").contains("越界"), "应当报越界：{e:#}");
+    }
+
+    #[test]
+    fn 分片总数为零被拒() {
+        let mut asm = CommitAssembler::new();
+        let e = asm.push(0, 0, vec!["x".into()]).unwrap_err();
+        assert!(format!("{e:#}").contains("总数为 0"), "应当报错：{e:#}");
+    }
+
+    #[test]
+    fn 分片乱序到达也能正确重组() {
+        let mut asm = CommitAssembler::new();
+        // 先喂第 2 片，再喂第 1 片，最后第 0 片
+        assert!(asm.push(2, 3, vec!["c".into()]).unwrap().is_none());
+        assert!(asm.push(1, 3, vec!["b".into()]).unwrap().is_none());
+        let all = asm.push(0, 3, vec!["a".into()]).unwrap().expect("收齐");
+        // 结果必须按片序号排序，不是按到达顺序
+        assert_eq!(all, vec!["a".to_string(), "b".into(), "c".into()]);
+    }
+
+    #[test]
+    fn 重复到达的分片不会重复计入() {
+        let mut asm = CommitAssembler::new();
+        assert!(asm.push(0, 2, vec!["a".into()]).unwrap().is_none());
+        // 同一片再来一次：不应把 received 加两次
+        assert!(asm.push(0, 2, vec!["a".into()]).unwrap().is_none());
+        let all = asm.push(1, 2, vec!["b".into()]).unwrap().expect("收齐");
+        assert_eq!(all, vec!["a".to_string(), "b".into()]);
+    }
+
+    #[test]
+    fn 新一轮分片会重置旧状态() {
+        let mut asm = CommitAssembler::new();
+        // 上一轮只到了一片就断了
+        assert!(asm.push(0, 3, vec!["old".into()]).unwrap().is_none());
+        // 新一轮：总数变成 2
+        assert!(asm.push(0, 2, vec!["new1".into()]).unwrap().is_none());
+        let all = asm.push(1, 2, vec!["new2".into()]).unwrap().expect("收齐");
+        assert_eq!(
+            all,
+            vec!["new1".to_string(), "new2".into()],
+            "不能混进上一轮的数据"
+        );
+    }
 }

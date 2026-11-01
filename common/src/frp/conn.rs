@@ -106,6 +106,11 @@ pub struct NLinkState {
     pub trace: nlink::TraceId,
     /// 客户端在 preamble 里是否要求续传。
     pub resume: bool,
+    /// 客户端在 preamble 里出示的一次性续传令牌。
+    ///
+    /// 服务端专用：握手时从 preamble TLV 取出，交给续传校验。
+    /// 客户端侧恒为 `None`（它持有的是**服务端下发**的令牌，不是自己带的）。
+    pub resume_token: Option<String>,
     /// 抢占式取走的扩展帧（`recv_msg` 顺手收进来的）。
     pub inbox: Vec<nlink::Frame>,
 }
@@ -117,6 +122,7 @@ impl NLinkState {
             session,
             trace,
             resume: false,
+            resume_token: None,
             inbox: Vec::new(),
         }
     }
@@ -833,6 +839,11 @@ struct NegotiatedNLink {
     session: nlink::ConnectionId,
     trace: nlink::TraceId,
     resume: bool,
+    /// 客户端出示的一次性续传令牌（preamble TLV 带上来）。
+    ///
+    /// `None` 有两种可能：普通首连（本来就没有令牌），或 0.7.1 及更早的
+    /// 客户端（那时还没有这个机制）。服务端看到 `None` 会走旧式校验并记 warn。
+    resume_token: Option<String>,
 }
 
 /// 计算协商结果：编译期实现 ∩ 对端声明 ∩ 运行期允许。
@@ -872,6 +883,10 @@ fn negotiate_nlink(pre: Option<nlink::Preamble>, enabled: Option<u64>) -> Option
         session: pre.session,
         trace,
         resume: pre.wants_resume(),
+        resume_token: pre
+            .tlvs
+            .get_str(nlink::frame::TAG_RESUME_TOKEN)
+            .filter(|s| !s.is_empty()),
     })
 }
 
@@ -1295,6 +1310,8 @@ where
     if let Some(n) = negotiated {
         let mut st = NLinkState::new(n.caps, n.session, n.trace);
         st.resume = n.resume;
+        // 客户端出示的一次性续传令牌，服务端在续传判定时要校验并消费它
+        st.resume_token = n.resume_token;
         conn.enable_nlink(st);
     }
 

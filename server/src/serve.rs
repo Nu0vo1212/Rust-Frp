@@ -1369,38 +1369,87 @@ async fn handle_control(
         );
         if st.caps.contains(nfrp_common::nlink::CAP_RESUME) && st.resume {
             let mut restored: Vec<String> = Vec::new();
+
+            // 客户端在 preamble TLV 里出示的一次性令牌（0.7.1 及更早没有这个）。
+            let preamble_token: Option<String> = st.resume_token.clone();
+
+            // ★ 第一步：校验一次性续传令牌（0.7.2 起）。
+            //
+            // 只靠 user + client_id + session_id 是不够的：那三个值都是**标识**
+            // 而不是凭证，明文链路上的观察者抄走 preamble 就能冒充。
+            // 令牌用 HMAC 绑定四项且登记在待用表里，**用一次就作废**。
+            //
+            // 顺序很关键：令牌校验必须**先于** take_suspended_if。反过来的话，
+            // 一个带错令牌的请求已经把会话取走了，合法客户端回来时就续不上了。
+            let presented = preamble_token.as_deref();
+            let token_ok = match presented {
+                Some(tok) => rt
+                    .resume_tokens
+                    .consume(
+                        st.session,
+                        tok,
+                        &login.user,
+                        &client_id,
+                        &rt.resume_key,
+                        std::time::SystemTime::now(),
+                    )
+                    .map_err(|e| {
+                        warn!(
+                            session = %st.session,
+                            client_id = %nfrp_common::util::LogSafe(&client_id),
+                            "续传令牌校验失败：{e:#}"
+                        );
+                        e
+                    })
+                    .is_ok(),
+                None => {
+                    // 老客户端（0.7.1 及以前）不会带令牌。为了不把它们的续传
+                    // 直接废掉，这里仍然放行，但明确记一条 warn —— 运维能看到
+                    // 自己正在用弱凭证形式，也知道升级后会更强。
+                    warn!(
+                        session = %st.session,
+                        client_id = %nfrp_common::util::LogSafe(&client_id),
+                        "续传请求没有携带一次性令牌（客户端可能是 0.7.1 或更早），按旧式会话标识校验"
+                    );
+                    true
+                }
+            };
+
             // 注意顺序：**先校验身份再取走**。身份不符时条目原样留在表里，
             // 真正的客户端回来仍然能续上；否则任何人都能用同一个 session id
             // 把别人的暂停会话"取走并回收"，等于一个 DoS。
-            if let Some(sess) = registry.take_suspended_if(st.session, &login.user, &client_id) {
-                // 传输参数（wire / caps / UDP 编码）必须与暂停前一致：
-                // 换了这些还复用旧监听器，后续工作连接会按错误的协议解析。
-                let same_transport = sess.client.wire_version() == wire_version
-                    && sess.client.udp_codec_is_binary() == udp_binary
-                    && sess.client.caps() == caps;
-                if same_transport && !sess.client.is_stopped() {
-                    // 到这里才消费元数据票（它只是可观测性 / 日志用的副本）。
-                    let _ = rt.resume.take(st.session);
-                    restored = sess.client.proxy_names();
-                    // 新 run_id 必须落到 ClientState 上：工作连接查找、
-                    // 面板踢出、审计都靠它。
-                    sess.client
-                        .rebind_control(&run_id, req_tx.clone(), peer.ip());
-                    registry.reattach(sess.client.clone());
-                    info!(
-                        session = %st.session,
-                        restored = restored.len(),
-                        "断线续传命中：沿用上次的代理与监听端口"
-                    );
-                    resumed_session = Some(sess);
-                } else {
-                    // 传输参数不符（例如客户端换了 wire 版本）：把会话放回，
-                    // 既不复用也不销毁 —— 监听器继续等下一次合法续传。
-                    warn!(
-                        session = %st.session,
-                        "续传会话的传输参数与暂停前不一致，保留旧会话并拒绝本次复用"
-                    );
-                    registry.suspend(st.session, sess);
+            if token_ok {
+                if let Some(sess) = registry.take_suspended_if(st.session, &login.user, &client_id)
+                {
+                    // 传输参数（wire / caps / UDP 编码）必须与暂停前一致：
+                    // 换了这些还复用旧监听器，后续工作连接会按错误的协议解析。
+                    let same_transport = sess.client.wire_version() == wire_version
+                        && sess.client.udp_codec_is_binary() == udp_binary
+                        && sess.client.caps() == caps;
+                    if same_transport && !sess.client.is_stopped() {
+                        // 到这里才消费元数据票（它只是可观测性 / 日志用的副本）。
+                        let _ = rt.resume.take(st.session);
+                        restored = sess.client.proxy_names();
+                        // 新 run_id 必须落到 ClientState 上：工作连接查找、
+                        // 面板踢出、审计都靠它。
+                        sess.client
+                            .rebind_control(&run_id, req_tx.clone(), peer.ip());
+                        registry.reattach(sess.client.clone());
+                        info!(
+                            session = %st.session,
+                            restored = restored.len(),
+                            "断线续传命中：沿用上次的代理与监听端口"
+                        );
+                        resumed_session = Some(sess);
+                    } else {
+                        // 传输参数不符（例如客户端换了 wire 版本）：把会话放回，
+                        // 既不复用也不销毁 —— 监听器继续等下一次合法续传。
+                        warn!(
+                            session = %st.session,
+                            "续传会话的传输参数与暂停前不一致，保留旧会话并拒绝本次复用"
+                        );
+                        registry.suspend(st.session, sess);
+                    }
                 }
             }
             let mut resp =
@@ -1412,6 +1461,26 @@ async fn handle_control(
                 resp = resp.with(
                     nfrp_common::nlink::frame::TAG_DETAIL,
                     restored.join("\n").into_bytes(),
+                );
+            }
+            // ★ 无论本次是否续传成功，都签发**下一轮**用的一次性令牌。
+            //
+            // 续传成功 ⇒ 客户端拿新令牌，下次断线用；旧令牌已在 consume 时作废。
+            // 续传失败 ⇒ 仍给一个新令牌，让客户端这次建立的会话也能在未来续传
+            //            （否则第一次连上就没凭证，等于续传永远用不了）。
+            //
+            // 令牌通过这条帧下发，因为此刻控制连接还在 —— 断了就发不出去了，
+            // 所以必须"提前给"而不是"断线时给"。
+            if let Some(tok) = crate::nlink::issue_resume_token(
+                &rt,
+                st.session,
+                &login.user,
+                &client_id,
+                cfg.nlink.resume_ttl.max(30),
+            ) {
+                resp = resp.with(
+                    nfrp_common::nlink::frame::TAG_RESUME_TOKEN,
+                    tok.into_bytes(),
                 );
             }
             conn.send_nlink(&resp).await?;
@@ -1436,6 +1505,34 @@ async fn handle_control(
                 .with(nfrp_common::nlink::frame::TAG_IDENTITY, token.into_bytes());
             tracing::debug!(run_id = %run_id, "下发 NLink 身份令牌");
             conn.send_nlink(&frame).await?;
+        }
+
+        // ★ 一次性续传令牌：**首连也要下发**。
+        //
+        // 续传判定那一支里已经发过一次（覆盖"带着令牌回来"的路径）；
+        // 但首次连接根本不带 FLAG_RESUME，压根不会走进那一支 ——
+        // 如果这里不补，客户端第一次连上就永远拿不到令牌，续传等于白做。
+        //
+        // 两条路径不会重复发：`st.resume` 为真时走上面那一支，为假时走这里。
+        if !st.resume {
+            if let Some(tok) = crate::nlink::issue_resume_token(
+                &rt,
+                st.session,
+                &login.user,
+                &client_id,
+                rt.cfg.resume_ttl.max(30),
+            ) {
+                let frame =
+                    nfrp_common::nlink::Frame::new(nfrp_common::nlink::FrameKind::ResumeResp)
+                        // ok=0：这不是"续传成功"，只是一张预授令牌
+                        .with(nfrp_common::nlink::frame::TAG_OK, vec![0u8])
+                        .with(
+                            nfrp_common::nlink::frame::TAG_RESUME_TOKEN,
+                            tok.into_bytes(),
+                        );
+                tracing::debug!(run_id = %run_id, "下发一次性续传令牌（首连预授）");
+                conn.send_nlink(&frame).await?;
+            }
         }
     }
 
@@ -1483,6 +1580,9 @@ async fn handle_control(
 
     let mut hb_ticker = tokio::time::interval(Duration::from_secs(5));
     let mut last_seen = Instant::now();
+    // 续传对账名单的分片组装器。名单可能超过单帧上限被拆成多帧，
+    // 收齐一片才算一轮结算。只有续传会话才会用到，其它会话保持 idle。
+    let mut commit_asm = nfrp_common::nlink::frame::CommitAssembler::new();
     // 已下发、还在等回执的管理命令：key 是命令 id
     let mut pending_cmds: std::collections::HashMap<
         String,
@@ -1508,15 +1608,43 @@ async fn handle_control(
                         {
                             // 续传后客户端把"最终还在的代理"报上来；没报的一律回收，
                             // 否则配置里删掉的代理会一直占着域名 / 端口。
-                            let wanted: Vec<String> = f
+                            //
+                            // 名单可能被拆成多帧（0.7.2 起）：单帧上限 8192 字节，
+                            // 代理多的会话一份名单装不下。这里按片组装，收齐才结算。
+                            let body = f
                                 .tlvs
                                 .get_str(nfrp_common::nlink::frame::TAG_DETAIL)
-                                .unwrap_or_default()
+                                .unwrap_or_default();
+                            let part: Vec<String> = body
                                 .lines()
                                 .map(str::trim)
                                 .filter(|s| !s.is_empty())
                                 .map(str::to_string)
                                 .collect();
+
+                            let maybe_wanted = if let Some((idx, total)) =
+                                f.tlvs.commit_chunk_info()
+                            {
+                                match commit_asm.push(idx, total, part) {
+                                    Ok(done) => done,
+                                    Err(e) => {
+                                        // 畸形分片不能让整条会话崩掉，记 warn 后继续
+                                        warn!(
+                                            client_id = %nfrp_common::util::LogSafe(&client_id),
+                                            "ResumeCommit 分片被拒：{e:#}"
+                                        );
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                // 没带分片标记 = 单帧（0.7.1 的格式），直接结算
+                                Some(part)
+                            };
+
+                            let Some(wanted) = maybe_wanted else {
+                                // 还差几片，等下一帧
+                                continue;
+                            };
                             let mut closed = 0usize;
                             for name in client.proxy_names() {
                                 if !wanted.iter().any(|w| w == &name)

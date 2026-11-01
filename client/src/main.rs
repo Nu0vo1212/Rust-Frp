@@ -1377,7 +1377,7 @@ async fn handle_nlink_frame(
     health: &Arc<health::Monitor>,
 ) {
     use nfrp_common::nlink::frame::{
-        FrameKind, TAG_CODE, TAG_COUNT, TAG_DETAIL, TAG_IDENTITY, TAG_OK,
+        FrameKind, TAG_CODE, TAG_COUNT, TAG_DETAIL, TAG_IDENTITY, TAG_OK, TAG_RESUME_TOKEN,
     };
 
     match frame.kind {
@@ -1394,6 +1394,14 @@ async fn handle_nlink_frame(
                 .and_then(|v| v.first().copied())
                 .map(|b| b != 0)
                 .unwrap_or(false);
+            // 服务端在这条帧里同时下发了**下一轮**用的一次性令牌，无论本次
+            // 续传成功与否都有。存下来，下次断线重连时带回去。
+            if let Some(tok) = frame.tlvs.get_str(TAG_RESUME_TOKEN) {
+                if !tok.is_empty() {
+                    nlink.set_resume_token(tok);
+                    debug!("已保存服务端下发的一次性续传令牌");
+                }
+            }
             if ok {
                 info!("NLink 断线续传成功：沿用上次的会话状态");
             } else {
@@ -1662,12 +1670,19 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
             .iter()
             .map(|p| NewProxy::from_config(p, &cfg.user).proxy_name)
             .collect();
-        let frame = nfrp_common::nlink::Frame::new(nfrp_common::nlink::FrameKind::ResumeCommit)
-            .with(
-                nfrp_common::nlink::frame::TAG_DETAIL,
-                names.join("\n").into_bytes(),
+        // 名单超过单帧上限时自动分片（0.7.2 起）。
+        // 只有一片时线上格式与 0.7.1 完全相同，老服务端照常解析。
+        let frames = nfrp_common::nlink::frame::encode_resume_commit(&names);
+        if frames.len() > 1 {
+            debug!(
+                chunks = frames.len(),
+                proxies = names.len(),
+                "代理名单较大，ResumeCommit 拆成多帧发送"
             );
-        conn.send_nlink(&frame).await?;
+        }
+        for frame in frames {
+            conn.send_nlink(&frame).await?;
+        }
     }
 
     // 预建工作连接（与官方 frpc 的 pool_count 行为一致）

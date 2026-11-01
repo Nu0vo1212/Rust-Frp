@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use nfrp_common::config::ClientConfig;
-use nfrp_common::nlink::frame::{Preamble, TAG_TRACE_ID};
+use nfrp_common::nlink::frame::{Preamble, TAG_RESUME_TOKEN, TAG_TRACE_ID};
 use nfrp_common::nlink::session::{ConnectionId, TraceId};
 use nfrp_common::nlink::{
     Caps, FeatureSet, CAP_BATCH_WORK, CAP_QUIC, CAP_QUIC_MIGRATION, CAP_RESUME, CAP_TRACE,
@@ -42,6 +42,12 @@ pub struct ClientNLink {
     pub quic: bool,
     /// 服务端下发的身份令牌（工作连接建立时出示）。
     identity: Mutex<Option<String>>,
+    /// 服务端下发的一次性续传令牌。
+    ///
+    /// 登录成功后由服务端通过 `ResumeResp` 下发，本次连接一直持有；
+    /// 断线重连时放进 preamble TLV 交回去，服务端验证后**立即作废**。
+    /// 每成功续传一次会拿到一张新的，如此滚动。
+    resume_token: Mutex<Option<String>>,
     /// 是否已经因为对端不支持而回退到标准模式。
     fallback: AtomicBool,
 }
@@ -74,6 +80,7 @@ impl ClientNLink {
             resume: n.resume,
             quic: n.quic,
             identity: Mutex::new(None),
+            resume_token: Mutex::new(None),
             fallback: AtomicBool::new(false),
         }
     }
@@ -88,6 +95,7 @@ impl ClientNLink {
             resume: false,
             quic: false,
             identity: Mutex::new(None),
+            resume_token: Mutex::new(None),
             fallback: AtomicBool::new(true),
         }
     }
@@ -109,6 +117,11 @@ impl ClientNLink {
             pre.flags |= FLAG_QUIC;
         }
         pre.tlvs.push(TAG_TRACE_ID, self.trace.as_bytes().to_vec());
+        // 有令牌就带上：服务端用它做一次性校验。没有（首连 / 升级后第一次）
+        // 就不带，服务端走旧式校验并记 warn。
+        if let Some(tok) = self.resume_token() {
+            pre.tlvs.push(TAG_RESUME_TOKEN, tok.into_bytes());
+        }
         Some(pre)
     }
 
@@ -128,6 +141,19 @@ impl ClientNLink {
 
     pub fn identity(&self) -> Option<String> {
         self.identity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 保存服务端新下发的续传令牌（覆盖旧值 —— 旧令牌已在上一次重连时作废）。
+    pub fn set_resume_token(&self, token: String) {
+        *self.resume_token.lock().unwrap_or_else(|e| e.into_inner()) = Some(token);
+    }
+
+    /// 取当前持有的续传令牌（重连时放进 preamble）。
+    pub fn resume_token(&self) -> Option<String> {
+        self.resume_token
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()

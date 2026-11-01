@@ -27,6 +27,13 @@ pub struct NLinkRuntime {
     pub knock: KnockAuthorizer,
     pub resume: ResumeRegistry,
     pub identity: IdentityKey,
+    /// 一次性续传令牌的签名密钥。
+    ///
+    /// 与 `identity` 分开派生（`nlink-resume|` 前缀不同），
+    /// 这样身份令牌和续传令牌互不通用。
+    pub resume_key: nfrp_common::nlink::session::ResumeKey,
+    /// 已签发、待消费的续传令牌。消费与校验在同一把锁里完成，防重放。
+    pub resume_tokens: nfrp_common::nlink::session::PendingTokens,
 }
 
 impl NLinkRuntime {
@@ -38,6 +45,8 @@ impl NLinkRuntime {
             knock: KnockAuthorizer::new(),
             resume: ResumeRegistry::new(),
             identity: IdentityKey::derive(identity_secret),
+            resume_key: nfrp_common::nlink::session::ResumeKey::derive(identity_secret),
+            resume_tokens: nfrp_common::nlink::session::PendingTokens::new(),
             features,
             cfg: nlink,
         }
@@ -52,6 +61,8 @@ impl NLinkRuntime {
             knock: KnockAuthorizer::new(),
             resume: ResumeRegistry::new(),
             identity: IdentityKey::derive(""),
+            resume_key: nfrp_common::nlink::session::ResumeKey::derive(""),
+            resume_tokens: nfrp_common::nlink::session::PendingTokens::new(),
         }
     }
 
@@ -143,6 +154,35 @@ pub async fn try_knock(
             false
         }
     }
+}
+
+/// 签发并登记一张一次性续传令牌，返回令牌原文。
+///
+/// 返回 `None` 表示当前配置没开续传能力，不需要令牌。
+///
+/// # 为什么在登录成功时就签发
+///
+/// 断线那一刻控制连接已经没了，发不出任何东西。所以令牌必须**提前下发**，
+/// 由客户端保存到下一次重连。
+pub fn issue_resume_token(
+    rt: &NLinkRuntime,
+    session: nfrp_common::nlink::ConnectionId,
+    user: &str,
+    client_id: &str,
+    ttl_secs: u64,
+) -> Option<String> {
+    if !rt
+        .features
+        .active()
+        .contains(nfrp_common::nlink::CAP_RESUME)
+    {
+        return None;
+    }
+    let ttl = std::time::Duration::from_secs(ttl_secs.max(1));
+    let now = std::time::SystemTime::now();
+    let tok = rt.resume_key.issue(session, user, client_id, ttl, now);
+    rt.resume_tokens.issue(session, tok.clone(), ttl);
+    Some(tok)
 }
 
 /// 处理一条来自客户端的扩展帧（控制连接上）。

@@ -1173,6 +1173,93 @@ mod tests {
         assert_eq!(behavior.read_timeout_ms, 5_000);
     }
 
+    /// 六个 mode 选择分支必须与官方 `analysis.go` 一一对应。
+    ///
+    /// # 为什么需要这条
+    ///
+    /// 官方 `newMakeHoleRecordsWithClock` 按 `(easyCount, hardCount,
+    /// portsChangedRegularCount)` 选不同的 mode 组合，共 6 个分支。
+    /// 只测其中一个（比如只测 easy==2 的 mode0）时，剩下的分支哪怕写错
+    /// 也不会被发现 —— 而这几个分支正好决定**对称 NAT / 双防火墙**下
+    /// 能不能打洞成功。
+    ///
+    /// 这里把 6 个分支的**首个 mode**都钉死，任何一条被改坏都会红。
+    #[test]
+    fn mode_选择的六个分支与官方一致() {
+        // 不用 clear()：全局表被别的测试共用，清了会让它们拿不到自己的条目
+        // （`nat_report_成功会回写分数` 就是这么被搞挂的）。
+        // 这里每个用例都用唯一的 session 名，天然隔离。
+        // 构造 NAT 特征：ports 决定 easy/hard 与"规律端口变化"
+        //   easy：两个端口相同（NoChange / 映射稳定）
+        //   hard + regular：端口差 1~5（可预测）
+        //   easy2：端口差 >5 且不规律（不可预测）
+        let easy = |name: &str| {
+            classify_nat_feature(&[format!("{name}:2000"), format!("{name}:2000")], &[]).unwrap()
+        };
+        let hard_regular = |name: &str| {
+            classify_nat_feature(&[format!("{name}:2000"), format!("{name}:2002")], &[]).unwrap()
+        };
+        let hard_random = |name: &str| {
+            classify_nat_feature(&[format!("{name}:2000"), format!("{name}:9000")], &[]).unwrap()
+        };
+
+        // 前置确认：三个构造器真的造出了预期的类别
+        assert_eq!(easy("11.0.0.1").nat_type, "EasyNAT");
+        assert!(hard_regular("12.0.0.1").nat_type != "EasyNAT");
+        assert!(hard_regular("12.0.0.1").regular_ports_change);
+        assert!(hard_random("13.0.0.1").nat_type != "EasyNAT");
+        assert!(!hard_random("13.0.0.1").regular_ports_change);
+
+        // ---- 官方 6 个分支 ----
+        // 1) easy==2                    → mode0
+        // 2) hard==1 && regular==1      → mode1 打头
+        // 3) hard==1 && regular==0      → mode2 打头
+        // 4) hard==2 && regular==2      → mode3 打头
+        // 5) hard==2 && regular==1      → mode4 打头
+        // 6) default（hard==2 && regular==0）→ mode0 打头（分数 1，"硬试"）
+        let cases: [(&str, NatFeature, NatFeature, i64); 6] = [
+            ("easy-easy", easy("21.0.0.1"), easy("21.0.0.2"), 0),
+            ("hard1-reg1", hard_regular("22.0.0.1"), easy("22.0.0.2"), 1),
+            ("hard1-reg0", hard_random("23.0.0.1"), easy("23.0.0.2"), 2),
+            (
+                "hard2-reg2",
+                hard_regular("24.0.0.1"),
+                hard_regular("24.0.0.2"),
+                3,
+            ),
+            (
+                "hard2-reg1",
+                hard_regular("25.0.0.1"),
+                hard_random("25.0.0.2"),
+                4,
+            ),
+            (
+                "hard2-reg0",
+                hard_random("26.0.0.1"),
+                hard_random("26.0.0.2"),
+                0,
+            ),
+        ];
+
+        for (label, c, v, want_mode) in cases {
+            let (mode, _index, cb, vb) = get_recommand_behaviors(label, &c, &v);
+            assert_eq!(
+                mode, want_mode,
+                "分支 {label} 的首选 mode 应为 {want_mode}，实际 {mode}"
+            );
+            // 角色必须**一 sender 一 receiver**，否则双方都在等对方发包。
+            // 具体谁做 sender 由 mode 行为表决定（不同 mode 不同），
+            // 所以这里只钉"不重合"，不钉具体方向。
+            assert_ne!(
+                cb.role,
+                vb.role,
+                "分支 {label}: 两侧角色不能相同（{cb_role} vs {vb_role}）",
+                cb_role = cb.role,
+                vb_role = vb.role
+            );
+        }
+    }
+
     #[test]
     fn 公网一侧永远做_receiver() {
         hole_records()
@@ -1194,28 +1281,34 @@ mod tests {
 
     #[test]
     fn nat_report_成功会回写分数() {
-        hole_records()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        // ★ 这张表是**全局共享**的，多个测试并发跑时会互相 `clear()`。
+        //   原先的写法是「clear → 写入 → 之后再去表里读」，中间被别的测试
+        //   清一次就 `unwrap()` 到 None（实测确实偶发失败）。
+        //   现在改用唯一的 session 名避免撞车，且不再 clear 别人的数据。
+        let sid = format!("t-report-{}", std::process::id());
         let c = classify_nat_feature(&["1.1.1.1:1000".into(), "1.1.1.1:1002".into()], &[]).unwrap();
         let v = classify_nat_feature(&["2.2.2.2:2000".into(), "2.2.2.2:2000".into()], &[]).unwrap();
-        let (mode, index, _, _) = get_recommand_behaviors("t-report", &c, &v);
+        let (mode, index, _, _) = get_recommand_behaviors(&sid, &c, &v);
         let score = |m, i| {
             hole_records()
                 .lock()
-                .unwrap()
-                .get("t-report")
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&sid)
+                .expect("刚写入的 session 必须还在表里")
                 .scores
                 .iter()
                 .find(|s| s.mode == m && s.index == i)
-                .unwrap()
+                .expect("该 mode/index 必须有分数条目")
                 .score
         };
         let before = score(mode, index);
-        report_success("t-report", mode, index);
+        report_success(&sid, mode, index);
         assert_eq!(score(mode, index), (before + 2).min(10));
+        // 用完即清，别给后面的测试留垃圾
+        hole_records()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&sid);
     }
 
     fn take_nat_hole_resp(rx: &mut mpsc::UnboundedReceiver<CtrlCmd>) -> NatHoleResp {

@@ -14,7 +14,7 @@
 
 NLink 是 NFrp 在标准 frp 协议之外的扩展层。它只承载那些 **frp 协议本身没有位置表达**、且 **确实有用户被卡住** 的能力。
 
-:::callout 当前状态：已实现（v0.7.2 起，默认关闭）
+:::callout 当前状态：已实现（v0.7.3 起，默认关闭）
 下面列出的能力**均已实现并通过测试**（`server/tests/nlink_e2e.rs` 的 14 条端到端用例逐项覆盖）。
 但 NLink **默认关闭**：服务端与客户端都要显式写 `[nlink] enable = true` 才生效。
 不开启时，行为与 0.6.x 完全一致。
@@ -78,7 +78,7 @@ v0.71.0 为止都没用过（官方 v1 的类型字节都是可打印 ASCII）�
 | 端到端 trace | `trace_id` | 控制连接与数据面共享 |
 
 :::callout 续传的认证边界
-从 0.7.2 起，续传需要出示**服务端签发的一次性令牌**，光知道 `session_id` 不再够用。
+从 0.7.3 起，续传需要出示**服务端签发的一次性令牌**，光知道 `session_id` 不再够用。
 
 令牌用 HMAC 绑定 `session + user + client_id + 过期时间 + 随机 nonce`，
 登记在待用表里，**用一次就作废**。它在登录成功时通过 `ResumeResp` 下发
@@ -139,6 +139,34 @@ NLink 就是在不改标准帧的前提下，补上这些位置。
 
 **设计上的补充**：XTCP 混合版本直连策略、与官方双向兼容的边界用例集，
 也一并落地（见下方兼容性矩阵）。
+
+## P2P 打洞：NatHole 的五种 mode
+
+服务端按官方 `pkg/nathole/{classify,analysis}.go` 实现了完整的行为选择，
+**mode 0~4 全都在用**，不是只有 EasyNAT 的 mode 0。
+
+判定依据是双方 NAT 特征的三个计数：`easyCount` / `hardCount` /
+`portsChangedRegularCount`。
+
+| 条件 | 首选 mode | 含义 |
+|---|---|---|
+| 双方都 EasyNAT | **mode 0** | 映射稳定，直接对发即可 |
+| 一方 HardNAT + 端口规律变化 | **mode 1** | 预测端口范围扫描 |
+| 一方 HardNAT + 端口不规律 | **mode 2** | TTL 控制 + 多轮重试 |
+| 双方 HardNAT + 都规律 | **mode 3** | 双向预测 + 随机监听端口 |
+| 双方 HardNAT + 一方规律 | **mode 4** | 单侧预测 + 随机监听端口 |
+| 双方 HardNAT + 都不规律 | mode 0（分数 1） | 极难，硬着头皮试 |
+
+每张行为表都还按「历史成功率」打分：续传/重试时优先选之前成功过的
+mode + index，成功后分数 +2（上限 10），由客户端通过 `NatHoleReport` 回报。
+
+配套参数也一并下发：`portsRangeNumber` / `portsRandomNumber`（端口预测范围）、
+`listenRandomPorts`（随机监听端口数）、`ttl`、`sendDelayMs`、`readTimeoutMs`、
+以及全部 STUN 候选地址 `candidateAddrs`。
+
+**仍然存在的限制**：这些是**协议层的能力**，最终能不能打洞成功还取决于
+两端 NAT 设备的实际行为。HardNAT 场景下失败仍会按 `fallbackTo` 退回中继——
+这是设计好的降级路径，不是缺陷。
 
 ## 设计约束
 

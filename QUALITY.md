@@ -2,7 +2,7 @@
 
 > 这份文件收纳 README 里放不下的质量细节。README 只留一句话概述 + 指向这里。
 >
-> 对应版本：**v0.7.2** · 最后核对：2026-10-31
+> 对应版本：**v0.7.3** · 最后核对：2026-10-31
 
 ---
 
@@ -20,7 +20,7 @@ cargo test --workspace                     # 965 个测试通过
 
 ---
 
-## 二、测试分布（v0.7.2 实测）
+## 二、测试分布（v0.7.3 实测）
 
 `cargo test --workspace` 实测输出：
 
@@ -29,14 +29,14 @@ cargo test --workspace                     # 965 个测试通过
 | `nfrp-client` 单元测试 | 134 |  |
 | `nfrp-common` 单元测试（lib） | 499 | 3（需真机网卡） |
 | `nfrp-common` 集成测试 | 9 |  |
-| `nfrp-server` 单元测试（lib） | 285 |  |
+| `nfrp-server` 单元测试（lib） | 286 |  |
 | `nfrp-server` 单元测试（bin） | 17 |  |
 | `nfrp-server` 端到端集成测试 | 26 |  |
 | `nfrp-server` NLink 端到端 | 16 |  |
 | `nfrp-server` OIDC 端到端 | 2 |  |
 | Wintun 真机（Windows） | 0 | 5 |
 | Linux TUN 真机 | 0 | 5 |
-| **合计** | **988** | **13** |
+| **合计** | **989** | **13** |
 
 **关于 13 条 `#[ignore]`**：全部是**需要真机硬件或管理员权限**的设备面测试
 （Windows Wintun 网卡、Linux TUN 设备），不是被跳过的问题测试。它们在有权限的

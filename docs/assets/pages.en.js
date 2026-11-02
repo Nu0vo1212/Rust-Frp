@@ -1309,7 +1309,7 @@ PAGES_EN['nlink'] = `
 <div class="callout">
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
   <div>
-    <strong>当前状态：已实现（v0.7.2 起，默认关闭）</strong>
+    <strong>当前状态：已实现（v0.7.3 起，默认关闭）</strong>
     <p>下面列出的能力<strong>均已实现并通过测试</strong>（<code>server/tests/nlink_e2e.rs</code> 的 14 条端到端用例逐项覆盖）。 但 NLink <strong>默认关闭</strong>：服务端与客户端都要显式写 <code>[nlink] enable = true</code> 才生效。 不开启时，行为与 0.6.x 完全一致。</p>
   </div>
 </div>
@@ -1394,7 +1394,7 @@ TLV*            每个：u16 tag + u32 len + len 字节</code></pre>
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
   <div>
     <strong>续传的认证边界</strong>
-    <p>从 0.7.2 起，续传需要出示<strong>服务端签发的一次性令牌</strong>，光知道 <code>session_id</code> 不再够用。 令牌用 HMAC 绑定 <code>session + user + client_id + 过期时间 + 随机 nonce</code>， 登记在待用表里，<strong>用一次就作废</strong>。它在登录成功时通过 <code>ResumeResp</code> 下发 （断线时连接已经断了，发不出去，所以必须提前给）。 这样"抄走 preamble 就能冒充"这条路堵上了：伪造不出签名，重放上一轮的令牌 也会因为已被消费而失败。 <strong>但仍有一处需要你自己判断</strong>：<code>transport.tls.force = false</code>（默认值）时， 链路上的观察者可以<strong>直接抄走令牌并抢先消费</strong>。这时真客户端会续传失败并告警—— 可检测，但拦不住。<strong>生产环境请开 <code>transport.tls.force = true</code></strong>， 让令牌本身也在加密通道里。</p>
+    <p>从 0.7.3 起，续传需要出示<strong>服务端签发的一次性令牌</strong>，光知道 <code>session_id</code> 不再够用。 令牌用 HMAC 绑定 <code>session + user + client_id + 过期时间 + 随机 nonce</code>， 登记在待用表里，<strong>用一次就作废</strong>。它在登录成功时通过 <code>ResumeResp</code> 下发 （断线时连接已经断了，发不出去，所以必须提前给）。 这样"抄走 preamble 就能冒充"这条路堵上了：伪造不出签名，重放上一轮的令牌 也会因为已被消费而失败。 <strong>但仍有一处需要你自己判断</strong>：<code>transport.tls.force = false</code>（默认值）时， 链路上的观察者可以<strong>直接抄走令牌并抢先消费</strong>。这时真客户端会续传失败并告警—— 可检测，但拦不住。<strong>生产环境请开 <code>transport.tls.force = true</code></strong>， 让令牌本身也在加密通道里。</p>
   </div>
 </div>
 <h2 data-i18n="nlink-s4-h">怎么开启</h2>
@@ -1467,7 +1467,54 @@ quic = true        # 走 QUIC 连服务端（需服务端开 quic_listen）</cod
 </table>
 </div>
 <p><strong>设计上的补充</strong>：XTCP 混合版本直连策略、与官方双向兼容的边界用例集， 也一并落地（见下方兼容性矩阵）。</p>
-<h2 data-i18n="nlink-s7-h">设计约束</h2>
+<h2 data-i18n="nlink-s7-h">P2P 打洞：NatHole 的五种 mode</h2>
+<p>服务端按官方 <code>pkg/nathole/{classify,analysis}.go</code> 实现了完整的行为选择， <strong>mode 0~4 全都在用</strong>，不是只有 EasyNAT 的 mode 0。</p>
+<p>判定依据是双方 NAT 特征的三个计数：<code>easyCount</code> / <code>hardCount</code> / <code>portsChangedRegularCount</code>。</p>
+<div class="table-wrap">
+<table>
+<thead><tr>
+<th>条件</th>
+<th>首选 mode</th>
+<th>含义</th>
+</tr></thead>
+<tbody>
+<tr>
+<td>双方都 EasyNAT</td>
+<td><strong>mode 0</strong></td>
+<td>映射稳定，直接对发即可</td>
+</tr>
+<tr>
+<td>一方 HardNAT + 端口规律变化</td>
+<td><strong>mode 1</strong></td>
+<td>预测端口范围扫描</td>
+</tr>
+<tr>
+<td>一方 HardNAT + 端口不规律</td>
+<td><strong>mode 2</strong></td>
+<td>TTL 控制 + 多轮重试</td>
+</tr>
+<tr>
+<td>双方 HardNAT + 都规律</td>
+<td><strong>mode 3</strong></td>
+<td>双向预测 + 随机监听端口</td>
+</tr>
+<tr>
+<td>双方 HardNAT + 一方规律</td>
+<td><strong>mode 4</strong></td>
+<td>单侧预测 + 随机监听端口</td>
+</tr>
+<tr>
+<td>双方 HardNAT + 都不规律</td>
+<td>mode 0（分数 1）</td>
+<td>极难，硬着头皮试</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>每张行为表都还按「历史成功率」打分：续传/重试时优先选之前成功过的 mode + index，成功后分数 +2（上限 10），由客户端通过 <code>NatHoleReport</code> 回报。</p>
+<p>配套参数也一并下发：<code>portsRangeNumber</code> / <code>portsRandomNumber</code>（端口预测范围）、 <code>listenRandomPorts</code>（随机监听端口数）、<code>ttl</code>、<code>sendDelayMs</code>、<code>readTimeoutMs</code>、 以及全部 STUN 候选地址 <code>candidateAddrs</code>。</p>
+<p><strong>仍然存在的限制</strong>：这些是<strong>协议层的能力</strong>，最终能不能打洞成功还取决于 两端 NAT 设备的实际行为。HardNAT 场景下失败仍会按 <code>fallbackTo</code> 退回中继—— 这是设计好的降级路径，不是缺陷。</p>
+<h2 data-i18n="nlink-s8-h">设计约束</h2>
 <p>这五条是 NLink 的硬约束。不满足就不合入——它们是这份协议能被安全启用的前提。</p>
 <h3 data-i18n="nlink-c1-h">1. 握手期能力协商</h3>
 <p>双方都声明才启用，否则自动回退标准 frp 行为；协商结果决定本次连接的全部行为， 中途不改。能力用位图 + 版本号表示，<strong>未知位一律忽略</strong>（前向兼容）。</p>
@@ -1480,7 +1527,7 @@ quic = true        # 走 QUIC 连服务端（需服务端开 quic_listen）</cod
 <p><strong>同一端口</strong>识别两种握手，只依赖首字节——<code>NFRPLNK1</code>、<code>FRP\0\x02\r\n</code>、<code>{</code> 三者互不重叠。扩展握手失败自动 fallback，用户无感。</p>
 <h3 data-i18n="nlink-c5-h">5. 可测试性</h3>
 <p>兼容性矩阵的每一行都有对应的 e2e 用例。NLink 相关的 e2e 共 14 条， 覆盖续传、身份、敲门、限流、QUIC、门控与旧客户端回退。</p>
-<h2 data-i18n="nlink-s8-h">兼容性矩阵</h2>
+<h2 data-i18n="nlink-s9-h">兼容性矩阵</h2>
 <div class="table-wrap">
 <table>
 <thead><tr>
@@ -1542,7 +1589,7 @@ quic = true        # 走 QUIC 连服务端（需服务端开 quic_listen）</cod
 </table>
 </div>
 <p><strong>与官方 frp 的全部交互都是"不启用"，不影响连通性。</strong> 唯一需要特殊处理的是 preamble：官方 frps 会把它当 v1 消息头报错，客户端捕获后回退标准模式重试一次。</p>
-<h2 data-i18n="nlink-s9-h">续传的认证边界（重要）</h2>
+<h2 data-i18n="nlink-s10-h">续传的认证边界（重要）</h2>
 <p>续传身份是 <strong><code>user</code> + <code>client_id</code> + <code>session_id</code></strong> 的 bearer 会话，不是一次性凭证。</p>
 <p><strong>当 <code>transport.tls.force = false</code>（默认值）时</strong>，preamble 与登录凭据在链路上是明文。 能观察到有效 token 的人，可以抢在原客户端之前完成续传，占住原会话的代理与端口。</p>
 <p>本版的处置：</p>
@@ -1552,7 +1599,7 @@ quic = true        # 走 QUIC 连服务端（需服务端开 quic_listen）</cod
 <li>明确建议：<strong>生产环境开 <code>transport.tls.force = true</code></strong>。</li>
 </ul>
 <p>彻底修复需要一次性 resume token（签发 + 消费语义），不在当前版本范围内。</p>
-<h2 data-i18n="nlink-s10-h">明确不做</h2>
+<h2 data-i18n="nlink-s11-h">明确不做</h2>
 <div class="table-wrap">
 <table>
 <thead><tr>

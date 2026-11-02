@@ -6,7 +6,7 @@
 
 <!-- lang-switch -->
 <p align="center">
-  **English** &nbsp;·&nbsp; [简体中文](README.zh-CN.md) &nbsp;·&nbsp; [日本語](README.ja.md) &nbsp;·&nbsp; [Русский](README.ru.md)
+  <strong>English</strong> &nbsp;·&nbsp; <a href="README.zh-CN.md">简体中文</a> &nbsp;·&nbsp; <a href="README.ja.md">日本語</a> &nbsp;·&nbsp; <a href="README.ru.md">Русский</a>
 </p>
 <!-- /lang-switch -->
 
@@ -180,13 +180,20 @@ round together with reproduction, fix, and regression test.
 
 ### Observability and management
 
-- Built-in web dashboard, Prometheus `/metrics` (opt-in via `enablePrometheus = true`), and an unauthenticated health endpoint; Basic Auth supported
-- Add or remove proxies and kick clients from the dashboard, no config edit or restart needed
-- Dashboard API v2 (`/api/v2/*`): uniform error envelope, pagination, stable ordering; v1 endpoints are unchanged
-- Client local web UI / API (`[webServer] port = 7400`): inspect tunnels, connections, and traffic, and add or remove proxies
-- CPU profiling: with `pprofEnable = true`, exposed by both the server dashboard and the client web UI as `GET /debug/pprof/profile?seconds=N` (default 10 s, max 60 s). Returns protobuf on Unix; explicitly 501 on Windows (Rust's `pprof` needs perf signals / `ucontext_t`)
-- SSH tunnel gateway (`sshTunnelGateway`): an SSH server embedded in frps, so OpenSSH's `ssh -R` can register `tcp` / `http` / `https` / `tcpmux` / `stcp` proxies; the data plane reuses ordinary work connections. When `authorizedKeysFile` is non-empty only keys from that file are accepted, and the key comment is the frp user name
-- HTTP plugins (`httpPlugins`): the server calls out to an external HTTP service on `Login` / `NewProxy` / `CloseProxy` / `Ping` / `NewWorkConn` / `NewUserConn`, and can reject or rewrite the login content and proxy name/metas; 10 s timeout per request
+- Built-in web dashboard plus Prometheus `/metrics` (opt-in via `enablePrometheus = true`, off by default) plus an unauthenticated health endpoint; Basic Auth supported
+- Add or remove proxies and kick clients from the dashboard, with no config edit or restart
+- Dashboard API v2 (`/api/v2/*`): uniform error envelope, pagination, stable ordering; v1 endpoints behave exactly as before
+- Client local web UI / API (`[webServer] port = 7400`): inspect tunnels, connections and traffic, and add or remove proxies
+- CPU profiling: with `pprofEnable = true`, both the server dashboard and the client's local web UI expose
+  `GET /debug/pprof/profile?seconds=N` (default 10 s, max 60 s); returns
+  protobuf on Unix and an explicit 501 on Windows (Rust's `pprof` needs perf signals / `ucontext_t`)
+- SSH tunnel gateway (`sshTunnelGateway`): an SSH server embedded in the server, so OpenSSH's
+  `ssh -R` can register `tcp` / `http` / `https` / `tcpmux` / `stcp` proxies directly, with the
+  data plane reusing ordinary work connections; when `authorizedKeysFile` is non-empty only keys from
+  that file are accepted, and the key comment is the frp user name
+- HTTP plugins (`httpPlugins`): the server calls out to an external HTTP service on
+  `Login` / `NewProxy` / `CloseProxy` / `Ping` / `NewWorkConn` / `NewUserConn`, and can reject or
+  rewrite the login content and the proxy name/metas; 10 s timeout per request
 
 ### NLink v1: negotiated extension layer (disabled by default)
 
@@ -498,26 +505,74 @@ version".
 
 ## Current limitations
 
-See **[QUALITY.md](QUALITY.md)** and the
-[docs site](https://nu0vo1212.github.io/Rust-Frp/) for the up-to-date list.
-Things that are **not** done, stated plainly rather than checked off for
-appearance:
+- **VirtualNet TUN devices**: Linux uses `/dev/net/tun` (requires root or `CAP_NET_ADMIN`);
+  **Windows uses Wintun** (supported since v0.6.6, requires administrator privileges and a
+  `wintun.dll` you supply yourself; the repo contains `#[ignore]`d real-adapter and bidirectional
+  ping data-plane tests that must be run manually with administrator rights; the error paths for a
+  missing DLL and for access denied have been verified in a non-elevated session, but the real
+  data plane was not re-run this round);
+  macOS is not implemented and reports a clear error instead of failing silently
+- Alignment with official 0.71 configuration fields:
 
-- `tcpmux` proxy type is not implemented (upstream has it)
-- Some upstream plugins and fields are parsed only to keep configs from failing,
-  and are explicitly reported as unsupported at startup
-- **NLink v1 session resumption is a bearer-session design**; with
-  `transport.tls.force = false` (the default) the token travels in clear text.
-  Use TLS in production — see the [NLink page](https://nu0vo1212.github.io/Rust-Frp/#/nlink)
-- NatHole implements upstream's modes 0–4, but whether a hole is actually
-  punched still depends on the NAT devices on both ends; HardNAT failures fall
-  back to relay by design
-- The SSH gateway data plane and the Windows Wintun / Linux TUN data planes have
-  no real-hardware end-to-end tests in CI (they require administrator
-  privileges or specific hardware)
+  **Implemented**: the TLS certificate group (`transport.tls.certFile` / `keyFile` / `trustedCaFile`,
+  including server-side mTLS and client certificates), `auth.tokenSource` (file / external command,
+  client and server), `includes` (client config includes), `quicBindPort`, `enablePrometheus`,
+  `udpPacketSize` (both ends; default 65507 rather than upstream's 1500 — see below),
+  client `useEncryption` / `useCompression` (implemented against the official golib's AES-128-CFB +
+  snappy stream, passing unit tests and in-memory round trips on both ends; no combined e2e against
+  official frpc yet), `proxyURL` (HTTP CONNECT / SOCKS5 outbound proxy),
+  `dnsServer` (A/AAAA lookups over a custom UDP DNS resolver), `natHoleStunServer` (RFC 5389
+  public mapping discovery), `pprofEnable` (Unix CPU profile, explicit 501 on Windows),
+  `assetsDir` (dashboard static asset directory), `natholeAnalysisDataReserveHours`
+  (NatHole analysis retention, 0 = keep nothing), `httpPlugins` (server-side login / proxy /
+  work-connection callbacks), `sshTunnelGateway` (OpenSSH `ssh -R` tunnel gateway).
+
+  **Official NatHole / xtcp**: the official controller protocol is implemented and was verified with a
+  real end-to-end run against official `frpc 0.71.0` (provider and visitor completed UDP hole punching
+  through the `NatHoleSid` work connection, `NatHoleClient`, and `NatHoleResp`, and the connection
+  succeeded).
+
+  Following official `pkg/nathole/{classify,analysis}.go`, the **complete NAT classification and mode
+  0–4 behaviour selection** is implemented: both sides EasyNAT → mode 0; one side HardNAT → mode 1 or 2
+  depending on whether ports change regularly; both sides HardNAT → mode 3 or 4; neither regular → back
+  to mode 0 as a best effort. Port prediction (`portsRangeNumber` / `portsRandomNumber`), random
+  listening ports (`listenRandomPorts`), TTL, `sendDelayMs` / `readTimeoutMs`, and all STUN candidate
+  addresses are all sent down to the client.
+
+  > Earlier versions of this file said "only mode 0 is covered". That conclusion predates 0.7.2 and is
+  > void. 0.7.3 pins the gap shut with the `mode_选择的六个分支与官方一致` test: breaking any of the
+  > six branches turns it red.
+
+  A real limitation remains: whether a hole actually opens depends on the **actual behaviour of the NAT
+  devices at both ends**. In HardNAT scenarios a failure makes the client fall back to relay according
+  to `fallbackTo` — that is the designed degradation path.
+
+  **Still not done**: end-to-end OIDC interoperability against a real external IdP (Keycloak / Azure AD
+  and so on) — currently nine cases run against a local mock IdP. The SSH gateway's tcpmux / stcp only
+  have registration and cleanup verified; **the data plane has no e2e**.
+
+  > ~~`webServer.tls.certFile` / `webServer.tls.keyFile` (dashboard HTTPS) is not implemented~~
+  > — **correction**: dashboard HTTPS has been implemented since v0.6.x, with a real HTTPS + HSTS
+  > regression (`server/src/dashboard.rs::web_server_tls_真实_https_和_hsts`). The original line is kept
+  > so history is not rewritten; this line is the current state.
+
+  > The `udpPacketSize` default **deliberately differs** from upstream: upstream defaults to 1500 while
+  > NFrp has always used 65507 (the UDP protocol ceiling). Switching to 1500 would **silently truncate**
+  > large UDP datagrams for existing users (the packet arrives, with content missing) — far harder to
+  > diagnose than an error. Deployments that want upstream behaviour can set `udpPacketSize = 1500`
+  > explicitly.
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+This project is released under the [Apache License 2.0](LICENSE).
 
+```
 Copyright 2026 nfrp contributors
+```
+
+---
+
+<p align="center">
+  Made by <a href="AUTHOR.md">Nu0vo1212</a> ·
+  <a href="https://nu0vo.xyz">nu0vo.xyz</a>
+</p>

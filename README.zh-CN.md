@@ -6,7 +6,7 @@
 
 <!-- lang-switch -->
 <p align="center">
-  [English](README.md) &nbsp;·&nbsp; **简体中文** &nbsp;·&nbsp; [日本語](README.ja.md) &nbsp;·&nbsp; [Русский](README.ru.md)
+  <a href="README.md">English</a> &nbsp;·&nbsp; <strong>简体中文</strong> &nbsp;·&nbsp; <a href="README.ja.md">日本語</a> &nbsp;·&nbsp; <a href="README.ru.md">Русский</a>
 </p>
 <!-- /lang-switch -->
 
@@ -450,9 +450,21 @@ docker run --rm -p 17000:17000 -p 17002:17002/udp \
 
   **官方 NatHole / xtcp**：已实现官方控制器协议，并用官方 `frpc 0.71.0`
   做过真实 e2e（provider/visitor 经 `NatHoleSid` 工作连接、`NatHoleClient`、
-  `NatHoleResp` 完成 UDP 打洞，访问成功）。当前覆盖 EasyNAT / 公网直连的
-  mode 0 场景；HardNAT、端口预测、多 STUN 地址与 TTL 探测等完整 NAT 分类
-  尚未实现，极端 NAT 组合下可能打洞失败后由客户端回退中继。
+  `NatHoleResp` 完成 UDP 打洞，访问成功）。
+
+  按官方 `pkg/nathole/{classify,analysis}.go` 实现了**完整的 NAT 分类与
+  mode 0~4 行为选择**：双方 EasyNAT 走 mode 0；一方 HardNAT 时按端口是否
+  规律变化走 mode 1 / 2；双方 HardNAT 时走 mode 3 / 4；都不规律则退到
+  mode 0 "硬试"。端口预测（`portsRangeNumber` / `portsRandomNumber`）、
+  随机监听端口（`listenRandomPorts`）、TTL、`sendDelayMs` / `readTimeoutMs`
+  与全部 STUN 候选地址也都会下发给客户端。
+
+  > 早期版本这里曾写"只覆盖 mode 0"，那是 0.7.2 之前的旧结论，已作废。
+  > 这个能力缺口在 0.7.3 里通过 `mode_选择的六个分支与官方一致` 这条测试
+  > 钉死，六个分支任何一个被改坏都会红。
+
+  仍有现实限制：能不能真的打通取决于**两端 NAT 设备的实际行为**，
+  HardNAT 场景失败时客户端会按 `fallbackTo` 回退中继——这是设计好的降级路径。
 
   **仍未做**：真实外部 IdP（Keycloak / Azure AD 等）上的 OIDC 互操作 e2e
   （目前是对本地 mock IdP 跑 9 条）。SSH 网关的 tcpmux / stcp 只验到注册与清理，

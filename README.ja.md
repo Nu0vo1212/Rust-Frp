@@ -6,7 +6,7 @@
 
 <!-- lang-switch -->
 <p align="center">
-  [English](README.md) &nbsp;·&nbsp; [简体中文](README.zh-CN.md) &nbsp;·&nbsp; **日本語** &nbsp;·&nbsp; [Русский](README.ru.md)
+  <a href="README.md">English</a> &nbsp;·&nbsp; <a href="README.zh-CN.md">简体中文</a> &nbsp;·&nbsp; <strong>日本語</strong> &nbsp;·&nbsp; <a href="README.ru.md">Русский</a>
 </p>
 <!-- /lang-switch -->
 
@@ -179,13 +179,20 @@ nfrp-common = "0.7"
 
 ### 可観測性と管理
 
-- 内蔵 Web ダッシュボード、Prometheus `/metrics`（`enablePrometheus = true` で有効化）、認証不要のヘルスエンドポイント。Basic 認証に対応
+- 内蔵 Web ダッシュボード + Prometheus `/metrics`（`enablePrometheus = true` で有効、既定は無効）+ 認証不要のヘルスエンドポイント。Basic 認証に対応
 - ダッシュボードからプロキシの追加 / 削除、クライアントの切断が可能。設定編集や再起動は不要
 - Dashboard API v2（`/api/v2/*`）: 統一されたエラーエンベロープ、ページネーション、安定した並び順。v1 エンドポイントの挙動は不変
-- クライアントのローカル Web UI / API（`[webServer] port = 7400`）: トンネル、接続、トラフィックの確認とプロキシの追加 / 削除
-- CPU プロファイル: `pprofEnable = true` で、サーバーのダッシュボードとクライアントのローカル Web の両方が `GET /debug/pprof/profile?seconds=N` を提供（既定 10 秒、上限 60 秒）。Unix では protobuf を返し、Windows では明示的に 501（Rust の `pprof` は perf シグナル / `ucontext_t` を必要とするため）
-- SSH トンネルゲートウェイ（`sshTunnelGateway`）: frps に SSH サーバーを内蔵し、OpenSSH の `ssh -R` で `tcp` / `http` / `https` / `tcpmux` / `stcp` プロキシを登録できる。データプレーンは通常の作業接続を再利用。`authorizedKeysFile` が空でなければそのファイル内の公開鍵のみ受け付け、鍵のコメントが frp のユーザー名になる
-- HTTP プラグイン（`httpPlugins`）: `Login` / `NewProxy` / `CloseProxy` / `Ping` / `NewWorkConn` / `NewUserConn` のタイミングで外部 HTTP サービスを呼び出し、拒否やログイン内容・プロキシ名 / metas の書き換えが可能。1 リクエストあたり 10 秒でタイムアウト
+- クライアントのローカル Web UI / API（`[webServer] port = 7400`）: トンネル / 接続 / トラフィックの確認と、プロキシの追加 / 削除
+- CPU プロファイル: `pprofEnable = true` にすると、サーバーのダッシュボードとクライアントのローカル Web の両方が
+  `GET /debug/pprof/profile?seconds=N` を提供（既定 10 秒、上限 60 秒）。Unix では
+  protobuf を返し、Windows では明示的に 501（Rust の `pprof` は perf シグナル / `ucontext_t` を必要とする）
+- SSH トンネルゲートウェイ（`sshTunnelGateway`）: サーバーに SSH サーバーを内蔵し、OpenSSH の
+  `ssh -R` で `tcp` / `http` / `https` / `tcpmux` / `stcp` プロキシを直接登録できる。データプレーンは
+  通常の作業接続を再利用。`authorizedKeysFile` が空でなければそのファイル内の公開鍵のみを受け付け、
+  鍵のコメントが frp のユーザー名になる
+- HTTP プラグイン（`httpPlugins`）: サーバーが `Login` / `NewProxy` / `CloseProxy` /
+  `Ping` / `NewWorkConn` / `NewUserConn` のタイミングで外部 HTTP サービスを呼び出し、拒否や
+  ログイン内容・プロキシ名 / metas の書き換えが可能。1 リクエストあたり 10 秒でタイムアウト
 
 ### NLink v1: ネゴシエーションで有効化する拡張レイヤー（デフォルトは無効）
 
@@ -493,24 +500,71 @@ docker run --rm -p 17000:17000 -p 17002:17002/udp \
 
 ## 現在の制限
 
-最新の一覧は **[QUALITY.md](QUALITY.md)** と
-[ドキュメントサイト](https://nu0vo1212.github.io/Rust-Frp/) を参照してください。
-見栄えのためにチェックを付けず、**やっていないこと**をそのまま書きます。
+- **VirtualNet の TUN デバイス**: Linux は `/dev/net/tun`（root または `CAP_NET_ADMIN` が必要）。
+  **Windows は Wintun**（v0.6.6 以降で対応。管理者権限と、自分で用意した `wintun.dll` が必要。
+  リポジトリには `#[ignore]` 付きの実機アダプター / 双方向 ping のデータプレーンテストがあり、
+  管理者権限で手動実行する必要がある。DLL 不在とアクセス拒否のエラー経路は非管理者セッションで
+  検証済みだが、今回は実機データプレーンを再実行していない）。
+  macOS は未実装で、黙って失敗せず明確なエラーを返す
+- 公式 0.71 の設定フィールドとの整合状況:
 
-- `tcpmux` プロキシ種別は未実装（公式にはあります）
-- 一部の公式プラグインとフィールドは、設定が失敗しないようにパースするだけで、
-  起動時に明示的に未対応と報告します
-- **NLink v1 のセッション再開はベアラーセッション方式**です。
-  `transport.tls.force = false`（既定）ではトークンが平文で流れます。
-  本番では TLS を使ってください — [NLink ページ](https://nu0vo1212.github.io/Rust-Frp/#/nlink)を参照
-- NatHole は公式の mode 0〜4 を実装していますが、実際に穴が開くかは両端の
-  NAT 機器の挙動に依存します。HardNAT での失敗は設計どおりリレーへ戻ります
-- SSH ゲートウェイのデータプレーン、および Windows Wintun / Linux TUN の
-  データプレーンには、CI での実機エンドツーエンドテストがありません
-  （管理者権限や特定のハードウェアが必要なため）
+  **実装済み**: TLS 証明書グループ（`transport.tls.certFile` / `keyFile` / `trustedCaFile`、
+  サーバー側 mTLS とクライアント証明書を含む）、`auth.tokenSource`（ファイル / 外部コマンド、
+  クライアントとサーバー）、`includes`（クライアント設定の取り込み）、`quicBindPort`、
+  `enablePrometheus`、`udpPacketSize`（両端。既定は公式の 1500 ではなく 65507 —— 下記参照）、
+  クライアントの `useEncryption` / `useCompression`（公式 golib の AES-128-CFB + snappy
+  ストリームに合わせて実装。単体テストとメモリ上の双方向は通過。公式 frpc との組み合わせ
+  e2e は未実施）、`proxyURL`（HTTP CONNECT / SOCKS5 の外向きプロキシ）、
+  `dnsServer`（A/AAAA 問い合わせを独自の UDP DNS で解決）、`natHoleStunServer`（RFC 5389
+  によるパブリックマッピング検出）、`pprofEnable`（Unix の CPU プロファイル、Windows は明示的に 501）、
+  `assetsDir`（ダッシュボードの静的リソースディレクトリ）、`natholeAnalysisDataReserveHours`
+  （NatHole 分析記録の保持期間、0 で保持しない）、`httpPlugins`（サーバー側のログイン / プロキシ /
+  作業接続コールバック）、`sshTunnelGateway`（OpenSSH `ssh -R` トンネルゲートウェイ）。
+
+  **公式 NatHole / xtcp**: 公式コントローラープロトコルを実装し、公式 `frpc 0.71.0` との
+  実 e2e も行った（provider / visitor が `NatHoleSid` 作業接続、`NatHoleClient`、
+  `NatHoleResp` を経て UDP ホールパンチングを完了し、アクセスに成功）。
+
+  公式 `pkg/nathole/{classify,analysis}.go` に従い、**NAT 分類と mode 0〜4 の挙動選択を
+  完全に実装**している: 双方 EasyNAT なら mode 0、片側 HardNAT ならポートが規則的に変化するかで
+  mode 1 / 2、双方 HardNAT なら mode 3 / 4、どちらも不規則なら mode 0 の「とりあえず試す」に
+  戻る。ポート予測（`portsRangeNumber` / `portsRandomNumber`）、ランダム待ち受けポート
+  （`listenRandomPorts`）、TTL、`sendDelayMs` / `readTimeoutMs`、および全 STUN 候補アドレスも
+  クライアントへ送信される。
+
+  > 以前の版ではここに「mode 0 のみ対応」と書いていたが、それは 0.7.2 より前の古い結論で
+  > あり、無効である。この能力の欠落は 0.7.3 で `mode_选择的六个分支与官方一致` というテストに
+  > よって固定され、6 つの分岐のどれかが壊れれば赤になる。
+
+  現実的な制限は残る: 実際に穴が開くかどうかは**両端の NAT 機器の実際の挙動**に依存する。
+  HardNAT で失敗した場合、クライアントは `fallbackTo` に従ってリレーへ戻る —— これは
+  設計された縮退経路である。
+
+  **まだ未実施**: 実際の外部 IdP（Keycloak / Azure AD など）に対する OIDC 相互運用の
+  e2e（現在はローカルのモック IdP に対して 9 件）。SSH ゲートウェイの tcpmux / stcp は
+  登録と後始末までしか検証しておらず、**データプレーンの e2e はない**。
+
+  > ~~`webServer.tls.certFile` / `webServer.tls.keyFile`（ダッシュボード HTTPS）は未実装~~
+  > —— **訂正**: ダッシュボード HTTPS は v0.6.x 以降で実装済みで、実際の HTTPS + HSTS
+  > 回帰テスト（`server/src/dashboard.rs::web_server_tls_真实_https_和_hsts`）もある。
+  > 元の記述は履歴を書き換えないために残しており、現在の状態はこの行による。
+
+  > `udpPacketSize` の既定値は**意図的に公式と異なる**: 公式の既定は 1500 だが、NFrp は
+  > 一貫して 65507（UDP の上限）を使ってきた。1500 に変えると既存利用者の大きな UDP データグラムが
+  > **黙って切り捨てられる**（パケットは届くが内容が欠ける）—— エラーより遥かに原因究明が難しい。
+  > 公式の挙動に合わせたい配備では `udpPacketSize = 1500` を明示的に設定すればよい。
 
 ## ライセンス
 
-Apache-2.0。[LICENSE](LICENSE) と [NOTICE](NOTICE) を参照してください。
+本プロジェクトは [Apache License 2.0](LICENSE) で公開されています。
 
+```
 Copyright 2026 nfrp contributors
+```
+
+---
+
+<p align="center">
+  Made by <a href="AUTHOR.md">Nu0vo1212</a> ·
+  <a href="https://nu0vo.xyz">nu0vo.xyz</a>
+</p>

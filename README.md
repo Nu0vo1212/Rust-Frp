@@ -1,8 +1,14 @@
 <div align="center">
   <img src="assets/icons/nfrp-icon-256.png" alt="NFrp Logo" width="120">
   <h1>NFrp</h1>
-  <p><b>Rust 实现的内网穿透工具，兼容官方 frp 协议</b></p>
+  <p><b>A Rust reimplementation of frp, wire-compatible with upstream</b></p>
 </div>
+
+<!-- lang-switch -->
+<p align="center">
+  **English** &nbsp;·&nbsp; [简体中文](README.zh-CN.md) &nbsp;·&nbsp; [日本語](README.ja.md) &nbsp;·&nbsp; [Русский](README.ru.md)
+</p>
+<!-- /lang-switch -->
 
 <p align="center">
   <img src="https://img.shields.io/badge/version-0.7.3-blue" alt="Version">
@@ -20,185 +26,207 @@
 
 ---
 
-NFrp 是 [fatedier/frp](https://github.com/fatedier/frp) 的 Rust 重实现，**完整兼容官方 wire protocol v1 与 v2**，可与官方 `frps` / `frpc`（v0.71.0 实测）直接互通，第三方 frp 平台下发的配置也能直接用。
+NFrp is a Rust reimplementation of [fatedier/frp](https://github.com/fatedier/frp).
+It is **fully compatible with the upstream wire protocol, both v1 and v2**, and
+interoperates directly with official `frps` / `frpc` (verified against v0.71.0).
+Configurations pushed by third-party frp providers work as-is.
 
-默认走 **v1**，与官方 frp 的默认值一致 —— 所以官方客户端 / 服务端**不需要改任何配置**就能连上。
+The default is **v1**, matching upstream's default — so official clients and
+servers **need no configuration changes** to connect.
 
-资源占用很小：服务端常驻内存约 3.5 MB（同负载下 Go 版 frps 为 28.8~31.8 MB），单文件部署，无运行时依赖。
+Memory footprint is small: about 3.5 MB resident for the server, versus
+28.8–31.8 MB for the Go frps under the same load. Single binary, no runtime
+dependencies.
 
-另有一层可选的扩展协议 **NLink v1**（QUIC 传输与连接迁移、断线续传、零信任身份、
-细粒度限流、端口敲门等），**默认关闭**，开启后仍是双方可协商、可回退的，
-对官方 frp 零影响。见下方[「NLink v1」](#nlink-v1可协商的扩展层默认关闭)。
+There is also an optional extension layer, **NLink v1** (QUIC transport and
+connection migration, session resumption, zero-trust identity, fine-grained
+rate limiting, port knocking). It is **disabled by default**, negotiated
+bilaterally, and fully reversible — zero impact on official frp. See
+[NLink v1](#nlink-v1-negotiated-extension-layer-disabled-by-default).
 
-> **完整文档**：<https://nu0vo1212.github.io/Rust-Frp/>
-> 涵盖安装、全部配置项、八种代理类型、线协议（v1 / v2）详解、ACL / RBAC、审计日志、HTTP API 与安全修复史。
-> 源文件在 [`docs/`](docs/)，本地预览：`python -m http.server -d docs 8899`
+> **Full documentation**: <https://nu0vo1212.github.io/Rust-Frp/>
+> Covers installation, every configuration key, the eight proxy types, the
+> v1/v2 wire protocols, ACL / RBAC, audit logging, the HTTP API, and the
+> security fix history. Sources live in [`docs/`](docs/); preview locally with
+> `python -m http.server -d docs 8899`
 >
-> **质量与发版**：[QUALITY.md](QUALITY.md) —— 测试分布、CI 矩阵、依赖安全做到哪一步、
-> 发版闸门与人工核对清单。
+> **Quality and releases**: [QUALITY.md](QUALITY.md) — test distribution,
+> CI matrix, what dependency security actually covers, release gates, and the
+> manual checklist.
 
-## 安装
+## Installation
 
-### 方式一：crates.io（推荐 Rust 用户）
+### Option 1: crates.io (recommended for Rust users)
 
-三个 crate 都已发布，也可以直接依赖协议库而**不跑穿透服务**：
+All three crates are published. You can also depend on the protocol library
+alone and **skip the tunnel server entirely**:
 
 ```bash
-# 装两个可执行文件
+# Install both executables
 cargo install nfrp-server nfrp-client
 ```
 
 ```toml
-# 或者：只把协议 / 配置 / 加密当库用
+# Or: use protocol / config / crypto as a library
 [dependencies]
-nfrp-common = "0.6"
+nfrp-common = "0.7"
 ```
 
-| crate | 用途 | 链接 |
+| crate | Purpose | Links |
 |---|---|---|
-| **nfrp-common** | 协议、配置、加密、ACL/RBAC、日志、传输层抽象 | [crates.io](https://crates.io/crates/nfrp-common) · [docs.rs](https://docs.rs/nfrp-common) |
-| **nfrp-server** | 服务端可执行文件（等价官方 `frps`） | [crates.io](https://crates.io/crates/nfrp-server) |
-| **nfrp-client** | 客户端可执行文件（等价官方 `frpc`） | [crates.io](https://crates.io/crates/nfrp-client) |
+| **nfrp-common** | Protocol, config, crypto, ACL/RBAC, logging, transport abstractions | [crates.io](https://crates.io/crates/nfrp-common) · [docs.rs](https://docs.rs/nfrp-common) |
+| **nfrp-server** | Server executable (equivalent to official `frps`) | [crates.io](https://crates.io/crates/nfrp-server) |
+| **nfrp-client** | Client executable (equivalent to official `frpc`) | [crates.io](https://crates.io/crates/nfrp-client) |
 
-> **关于版本号**：crates.io 上的版本与本页 Release 的版本**相互独立**。
-> 例如 Release 为 `v0.6.1` 时，crates.io 上可能是 `0.6.2` ——
-> 因为 crates.io 不允许重发同一版本号（修个 README 也得升版本）。
-> **看代码功能以 Release 为准**；`cargo install` 拿到的始终是该 crate 的最新发布版。
+> **About version numbers**: crates.io versions and the Release versions on
+> this page are **independent**. For example, a Release might be `v0.7.1`
+> while crates.io is already `0.7.2` — crates.io does not allow republishing
+> the same version number, so even a README fix forces a version bump.
+> **Use the Release as the reference for code behaviour**; `cargo install`
+> always gives you the latest published version of that crate.
 >
-> ★ **`cargo install` 拿到的二进制与 Release 里的同版本二进制不是同一次构建。**
-> 以 `0.6.6` 为例：crates.io 上的 0.6.6 是在 Release 之前打的，之后又改了几处
-> 才发出 `v0.6.6` 的包（版本号已占用，不能再发一次）。因此
-> **`cargo install nfrp-server@0.6.6` 与 Release 包里的 `frps` 行为可能不同**。
-> 要可复现、可对照 issue 的产物，请用[方式二：下载二进制](#方式二下载二进制)。
-> 后续版本起，发版顺序固定为「先发 crates.io，再用**同一次构建**打包 Release」。
+> ★ **A binary from `cargo install` is not the same build as the same version
+> in a Release.** Take `0.6.6`: the crates.io build was cut before the Release,
+> and a few more changes landed before `v0.6.6` was tagged (the version number
+> was already taken, so it could not be re-published). So
+> **`cargo install nfrp-server@0.6.6` and the `frps` in the Release package may
+> behave differently**. For reproducible artifacts you can cite in an issue,
+> use [Option 2: download binaries](#option-2-download-binaries).
+> From later versions on, the release order is fixed: **publish to crates.io
+> first, then package the Release from that same build**.
 
-`nfrp-common` 的模块导览：
+Module map for `nfrp-common`:
 
-| 需求 | 从哪里入手 |
+| You want to | Start from |
 |---|---|
-| 读/写 frp 的 TOML 配置（含字段名兼容） | `config` · `frp_config` |
-| 读老式 `frpc.ini` / `frps.ini` | `frp_legacy` |
-| 自己实现 frp 客户端或服务端 | `frp` · `frp::msg` |
-| 只做加密（AEAD / v1 CFB） | `frp::crypto` · `frp::v1` · `frp::tls` |
-| HTTP 请求解析 / 转发（无 Web 框架） | `http1` · `http_relay` |
-| IP 白黑名单 / RBAC / 审计 | `security` |
-| 日志按天轮转 | `logfile` |
+| Read/write frp TOML config (with key-name compatibility) | `config` · `frp_config` |
+| Parse legacy `frpc.ini` / `frps.ini` | `frp_legacy` |
+| Implement your own frp client or server | `frp` · `frp::msg` |
+| Only the crypto (AEAD / v1 CFB) | `frp::crypto` · `frp::v1` · `frp::tls` |
+| HTTP request parsing / relay (no web framework) | `http1` · `http_relay` |
+| IP allow/deny, RBAC, audit | `security` |
+| Daily log rotation | `logfile` |
 | PROXY protocol v1/v2 | `proxy_protocol` |
-| KCP / QUIC / WebSocket 传输 | `frp::kcp` · `frp::quic` · `ws` |
+| KCP / QUIC / WebSocket transports | `frp::kcp` · `frp::quic` · `ws` |
 
-### 方式二：下载二进制
+### Option 2: download binaries
 
-从 [Releases](https://github.com/Nu0vo1212/Rust-Frp/releases) 取对应平台的包
-（Windows / Linux amd64 / Linux arm64 / Android，另附源码包）。
+Grab the package for your platform from
+[Releases](https://github.com/Nu0vo1212/Rust-Frp/releases)
+(Windows / Linux amd64 / Linux arm64 / Android, plus a source tarball).
 
-## 功能特性
+## Features
 
-### 代理类型
+### Proxy types
 
-八种，与官方 frp 的类型清单完全一致：
+Eight, exactly matching upstream frp's list:
 
-| 类型 | 说明 |
+| Type | Description |
 |---|---|
-| `tcp` | 最常用的端口转发 |
-| `udp` | UDP 转发，每个代理只占一条工作连接，靠访客地址区分会话 |
-| `http` | 按域名路由，支持 `locations` 前缀、Basic Auth、Host 改写、自定义请求/响应头 |
-| `https` | 只嗅探 ClientHello 的 SNI 做路由，不终止 TLS，证书仍由内网服务提供 |
-| `tcpmux` | HTTP CONNECT 复用，多条代理共用一个服务端端口，支持 `routeByHTTPUser` 二级路由 |
-| `stcp` | 私密隧道，服务端不开公网端口，`secret_key` 校验 + `allow_users` 白名单 |
-| `sudp` | 与 stcp 同一套鉴权，数据面为 UDP，同样不占公网端口 |
-| `xtcp` | UDP 打洞 + QUIC / KCP 直连，数据不经服务端；打不通自动回退中继。v0.5.8 起 P2P 握手加两层校验（provider 回**派生应答口令** + 服务端把牵线 HELLO 绑定到控制连接来源 IP） |
+| `tcp` | The most common port forwarding |
+| `udp` | UDP forwarding; each proxy uses a single work connection, sessions are distinguished by visitor address |
+| `http` | Domain-based routing with `locations` prefixes, Basic Auth, Host rewriting, custom request/response headers |
+| `https` | Routes by sniffing only the SNI in ClientHello; TLS is not terminated, certificates stay on the internal service |
+| `tcpmux` | HTTP CONNECT multiplexing; several proxies share one server port, with `routeByHTTPUser` for second-level routing |
+| `stcp` | Private tunnel; the server opens no public port, `secret_key` plus an `allow_users` allowlist |
+| `sudp` | Same auth model as stcp with a UDP data plane, also no public port |
+| `xtcp` | UDP hole punching with QUIC / KCP direct connections; data bypasses the server. Falls back to relay automatically. Since v0.5.8 the P2P handshake has two extra checks: the provider returns a **derived response secret**, and the server binds the rendezvous HELLO to the control connection's source IP |
 
-### 传输层
+### Transports
 
-- frp v1 / v2 双线协议，默认 v1，可用 `transport.wireProtocol = "v2"` 显式启用
-- QUIC 传输（`transport_protocol = "quic"`）：1-RTT 握手、流级多路复用
-- KCP 弱网通道：既可作为 xtcp 直连通道，也可作为独立传输协议（`kcp_bind_port`）
-- yamux 多路复用（`transport.tcpMux`），控制连接与工作连接复用一条 TCP
-- TLS 加密（`transport.tls`），含官方自定义首字节伪装；服务端默认自动生成自签名证书，也支持 `certFile` / `keyFile` 自定义证书，以及 `trustedCaFile` 开启客户端证书（mTLS）；客户端可配 `certFile` / `keyFile` 出示身份
-- WebSocket / WSS（`websocket = true`），同一端口按路径自动识别，可穿透只放行 HTTP 的防火墙
-- Proxy Protocol v1 / v2，把真实客户端 IP 透传给 Nginx / HAProxy / 后端应用
+- frp v1 / v2 dual wire protocol; v1 by default, opt into v2 with `transport.wireProtocol = "v2"`
+- QUIC transport (`transport_protocol = "quic"`): 1-RTT handshake, per-stream multiplexing
+- KCP for lossy networks: usable as an xtcp direct-connect channel or as a standalone transport (`kcp_bind_port`)
+- yamux multiplexing (`transport.tcpMux`); control and work connections share one TCP connection
+- TLS (`transport.tls`) with upstream's custom-first-byte disguise. The server auto-generates a self-signed certificate, or you can supply `certFile` / `keyFile`; `trustedCaFile` enables client certificates (mTLS). The client can present its own identity via `certFile` / `keyFile`
+- WebSocket / WSS (`websocket = true`), auto-detected by path on the same port — gets through firewalls that only allow HTTP
+- Proxy Protocol v1 / v2 to pass the real client IP to Nginx / HAProxy / backend apps
 
-### 客户端插件
+### Client plugins
 
-官方 9 种全部实现：`http_proxy` / `socks5` / `static_file` / `unix_domain_socket` / `http2http` / `http2https` / `https2http` / `https2https` / `tls2raw`。frpc 本身即可作为正向代理、静态站点或 TLS 终结器。
+All nine upstream plugins are implemented: `http_proxy` / `socks5` /
+`static_file` / `unix_domain_socket` / `http2http` / `http2https` /
+`https2http` / `https2https` / `tls2raw`. frpc alone can act as a forward
+proxy, a static site, or a TLS terminator.
 
-### 安全与访问控制
+### Security and access control
 
-- OIDC 认证（`auth.method = "oidc"`），对接 Keycloak / Google / Azure AD 等任意标准 IdP；客户端走 Client Credentials Grant，服务端验签 JWKS（RS256 / PS256 / ES256）
-- RBAC 角色权限表（`[[roles]]`），按序匹配 + `deny_unknown` / `default_role` 兜底
-- IP 白 / 黑名单（`[acl]`），CIDR 语法，`deny` 优先；**v0.5.9 起铺满全部数据面入口**（TCP / UDP 代理、vhost、VNet、xtcp 牵线、管理面板）
-- 审计日志（`[audit]`），JSONL 追加写 + 内存环形缓冲；关闭时零开销。**v0.5.9 起支持 `maxFileMB` 轮转**（默认 64，单份 `.1` 备份）
-- 凭据比较统一走常量时间；HTTP 转发做逐跳头剥离、`Host` 规范化、CL+TE 走私拒绝
-- 面板与客户端本地界面**绑非回环地址却没有凭据时拒绝启动**（逃生开关 `allow_insecure_dashboard` / `allowInsecureRemote`）
+- OIDC authentication (`auth.method = "oidc"`) against any standards-compliant IdP (Keycloak, Google, Azure AD, …). The client uses the Client Credentials grant; the server verifies JWKS signatures (RS256 / PS256 / ES256)
+- RBAC role table (`[[roles]]`) matched in order, with `deny_unknown` / `default_role` fallbacks
+- IP allow/deny lists (`[acl]`) with CIDR syntax, `deny` wins. **Since v0.5.9 they cover every data-plane entry point** (TCP / UDP proxies, vhost, VNet, xtcp rendezvous, dashboard)
+- Audit log (`[audit]`): append-only JSONL plus an in-memory ring buffer; zero overhead when disabled. **Since v0.5.9, `maxFileMB` rotation** (default 64, one `.1` backup)
+- Credential comparison is always constant-time; HTTP relay strips hop-by-hop headers, normalizes `Host`, and rejects CL+TE smuggling
+- The dashboard and the client's local UI **refuse to start if bound to a non-loopback address without credentials** (escape hatches: `allow_insecure_dashboard` / `allowInsecureRemote`)
 
-所有安全修复已整合为一份文档（按日期编排、各轮原文完整收录）：
+All security fixes are consolidated into one document (chronological, with each
+round's original text preserved):
 
-**[SECURITY-ALL-FIXES.md](SECURITY-ALL-FIXES.md)** —— 第一 ~ 第十六轮，2026-10-04 至 2026-10-25
+**[SECURITY-ALL-FIXES.md](SECURITY-ALL-FIXES.md)** — rounds 1 through 16, 2026-10-04 to 2026-10-25
 
-各轮原始报告仍保留（SECURITY-FIXES-ROUND4..16.md），作为证据链引用；
-总文档里每一轮都标了日期与结论，并保留「实测复现 / 修复方式 / 回归测试」。
-。
+The per-round originals (SECURITY-FIXES-ROUND4..16.md) are kept as a chain of
+evidence; the consolidated document records the date and conclusion of each
+round together with reproduction, fix, and regression test.
 
-### 运维与调度
+### Operations and scheduling
 
-- group 负载均衡：同 `group` 的多个代理共享一个 `remote_port`，按最小连接数分摊
-- 健康检查：`tcp` / `http` 探测，连续失败自动摘除后端，恢复后自动回归
-- 带宽限流：每个代理可配 `bandwidth_limit`（如 `1MB`），令牌桶精确限速
-- 资源上限：客户端数 / 代理数 / 转发连接数 / 待处理队列，五个维度全部可限并计入指标
-- 端口白名单：`allowPorts` + `maxPortsPerClient`
-- 日志落盘与轮转：`log.to` + `log.maxDays`，按天切分与清理
-- 客户端 Store 持久化：动态添加的代理落盘，重启自动恢复
-- 配置热重载：改 `log_level` / 面板密码无需重启
+- Group load balancing: several proxies sharing a `group` and a `remote_port`, distributed by least-connections
+- Health checks: `tcp` / `http` probes; failing backends are removed and re-added automatically once healthy
+- Bandwidth limiting: per-proxy `bandwidth_limit` (e.g. `1MB`) enforced by a token bucket
+- Resource caps on five dimensions (clients / proxies / relayed connections / pending queues), all exported as metrics
+- Port allowlist: `allowPorts` + `maxPortsPerClient`
+- Log rotation: `log.to` + `log.maxDays`, split and cleaned daily
+- Client store persistence: dynamically added proxies survive restarts
+- Config hot reload: change `log_level` or the dashboard password without a restart
 
-### 可观测性与管理
+### Observability and management
 
-- 内置 Web 面板 + Prometheus `/metrics`（需配 `enablePrometheus = true`，默认关闭）+ 免鉴权健康检查端点，支持 Basic Auth
-- 面板可直接增删代理、踢掉客户端，无需改配置重启
-- Dashboard API v2（`/api/v2/*`）：统一错误信封 + 分页 + 稳定排序；v1 接口行为不变
-- 客户端本地 Web UI / API（`[webServer] port = 7400`）：查看隧道 / 连接 / 流量，并可增删代理
-- CPU profile：`pprofEnable = true` 后，服务端面板与客户端本地 Web 都提供
-  `GET /debug/pprof/profile?seconds=N`（默认 10 秒、上限 60 秒）；Unix 返回
-  protobuf，Windows 明确 501（Rust `pprof` 依赖 perf signal / `ucontext_t`）
-- SSH 隧道网关（`sshTunnelGateway`）：服务端内嵌 SSH 服务器，OpenSSH 的
-  `ssh -R` 可直接注册 `tcp` / `http` / `https` / `tcpmux` / `stcp` 代理，
-  数据面复用普通工作连接；`authorizedKeysFile` 非空时只接受文件内公钥，
-  公钥注释就是 frp 用户名
-- HTTP 插件（`httpPlugins`）：服务端在 `Login` / `NewProxy` / `CloseProxy` /
-  `Ping` / `NewWorkConn` / `NewUserConn` 时回调外部 HTTP 服务，支持拒绝、
-  改写登录内容和代理名/metas；每次请求 10 秒超时
+- Built-in web dashboard, Prometheus `/metrics` (opt-in via `enablePrometheus = true`), and an unauthenticated health endpoint; Basic Auth supported
+- Add or remove proxies and kick clients from the dashboard, no config edit or restart needed
+- Dashboard API v2 (`/api/v2/*`): uniform error envelope, pagination, stable ordering; v1 endpoints are unchanged
+- Client local web UI / API (`[webServer] port = 7400`): inspect tunnels, connections, and traffic, and add or remove proxies
+- CPU profiling: with `pprofEnable = true`, exposed by both the server dashboard and the client web UI as `GET /debug/pprof/profile?seconds=N` (default 10 s, max 60 s). Returns protobuf on Unix; explicitly 501 on Windows (Rust's `pprof` needs perf signals / `ucontext_t`)
+- SSH tunnel gateway (`sshTunnelGateway`): an SSH server embedded in frps, so OpenSSH's `ssh -R` can register `tcp` / `http` / `https` / `tcpmux` / `stcp` proxies; the data plane reuses ordinary work connections. When `authorizedKeysFile` is non-empty only keys from that file are accepted, and the key comment is the frp user name
+- HTTP plugins (`httpPlugins`): the server calls out to an external HTTP service on `Login` / `NewProxy` / `CloseProxy` / `Ping` / `NewWorkConn` / `NewUserConn`, and can reject or rewrite the login content and proxy name/metas; 10 s timeout per request
 
-### NLink v1：可协商的扩展层（默认关闭）
+### NLink v1: negotiated extension layer (disabled by default)
 
-标准 frp 协议把传输、会话、鉴权、调度都固定死了。有些需求不是"实现得不好"，
-而是**协议里没有承载位置**——比如连接迁移需要传输层有独立的连接标识，而 frp 是
-在 TCP/TLS 之上套 yamux，这个位置不存在。
+The standard frp protocol fixes its transport, session, authentication, and
+scheduling model. Some needs are not cases of "implemented poorly" but of
+**the protocol having no place to carry the information** — for example,
+connection migration needs a transport-level connection identity, and frp
+layers yamux over TCP/TLS, so that slot does not exist.
 
-NLink 就是在标准 frp 线协议之上叠的一层扩展，两条铁律贯穿始终：
+NLink is a layer stacked on top of the standard frp wire protocol. Two rules
+govern everything:
 
-1. **标准帧一个字节都不动** —— 扩展走独立命名空间，官方 frp 永远看不到这些字节；
-2. **没协商成功就当它不存在** —— 任何一端不支持，行为与 0.6.x 完全一致。
+1. **Not a single byte of the standard frames changes** — extensions live in a
+   separate namespace, so official frp never sees them;
+2. **If it was not negotiated, it does not exist** — if either side lacks
+   support, behaviour is identical to 0.6.x.
 
-**零额外往返。** 客户端把能力声明搭车在第一条消息之前（`NFRPLNK1` preamble），
-服务端把确认结果搭车在本就要发的 `LoginResp._nlink` 上带回。识别只依赖首字节
-——`NFRPLNK1`、`FRP\0\x02\r\n`、`{` 三者互不重叠，不会误判。
+**Zero extra round trips.** The client piggybacks its capability declaration
+ahead of the first protocol message (the `NFRPLNK1` preamble), and the server
+piggybacks its confirmation onto the `LoginResp._nlink` it was sending anyway.
+Detection relies only on the first byte — `NFRPLNK1`, `FRP\0\x02\r\n`, and `{`
+do not overlap, so there is no ambiguity.
 
-| 能力 | 说明 |
+| Capability | Description |
 |---|---|
-| QUIC 传输与连接迁移 | 独立 ALPN `nfrp-nlink`，与标准 QUIC 分桶互不串味 |
-| 断线续传 | 进程级 `ConnectionId` 不变，服务端把代理监听器 / 端口 / vhost 路由原样保留 `resume_ttl` 秒 |
-| 零信任身份 | 每条工作连接带 `v1.<exp>.<hmac>` 令牌，绑定 `run_id + user + 过期时间` |
-| 细粒度限流 | 按「用户 × 代理」的令牌桶，支持突发 |
-| 端口敲门 | 端口默认不可见，敲对序列后按 IP 临时放行 |
-| 批量工作连接 | 一条 `BatchReq` 换 N 条连接，省掉逐条往返 |
-| 端到端 trace | 控制连接与数据面共享同一个 trace id |
+| QUIC transport and connection migration | Dedicated ALPN `nfrp-nlink`, bucketed separately from standard QUIC |
+| Session resumption | The process-wide `ConnectionId` stays the same; the server keeps the proxy listeners / ports / vhost routes as-is for `resume_ttl` seconds |
+| Zero-trust identity | Every work connection carries a `v1.<exp>.<hmac>` token bound to `run_id + user + expiry` |
+| Fine-grained rate limiting | Token buckets per user × proxy, with burst support |
+| Port knocking | Ports are invisible by default; the right knock sequence opens them for that IP temporarily |
+| Batched work connections | One `BatchReq` returns N connections, removing per-connection round trips |
+| End-to-end trace | Control and data planes share one trace id |
 
-**默认关闭**，两端都要显式开：
+**Disabled by default**; both ends must opt in:
 
 ```toml
 # frps.toml
 [nlink]
 enable = true
-quic_listen = "0.0.0.0:7000"   # 留空 = 不开 QUIC
+quic_listen = "0.0.0.0:7000"   # leave empty to disable QUIC
 resume_ttl = 30
 
 # frpc.toml
@@ -208,74 +236,80 @@ resume = true
 quic = true
 ```
 
-**与官方 frp 共存**：官方 frps 不认 preamble，会把它当 v1 消息头报错。客户端捕获
-这种失败后**自动回退标准模式并只重试一次**，日志留一行 warn，隧道照常工作。
+**Coexisting with upstream frp**: official frps does not understand the
+preamble and will reject it as a v1 message header. The client catches that
+failure and **automatically falls back to standard mode, retrying once**, with
+a single warning in the log. Tunnels keep working.
 
-| 组合 | 行为 |
+| Combination | Behaviour |
 |---|---|
-| NFrp × NFrp | 按协商结果启用 |
-| NFrp × 官方 frp | 回退标准模式，功能降级但**不影响连通** |
-| 官方 × 官方 | 完全不受影响 |
+| NFrp × NFrp | Enabled as negotiated |
+| NFrp × official frp | Falls back to standard mode; features degrade but **connectivity is unaffected** |
+| official × official | Completely unaffected |
 
-编译期用 `--no-default-features` 可把扩展字段整个摘掉，此时报文与 0.6.x 逐字节一致。
+Compiling with `--no-default-features` drops the extension fields entirely; the
+wire format is then byte-for-byte identical to 0.6.x.
 
-> 握手时序图、TLV 帧格式、各能力的承载方式、兼容性矩阵与设计约束，见
-> [文档站 NLink 页](https://nu0vo1212.github.io/Rust-Frp/#/nlink)。
+> For the handshake diagram, TLV framing, how each capability is carried, the
+> compatibility matrix, and the design constraints, see the
+> [NLink page on the docs site](https://nu0vo1212.github.io/Rust-Frp/#/nlink).
 
+### Engineering quality
 
-### 工程质量
+989 automated tests, including real QUIC stack handshakes, end-to-end
+integration, and decryption regressions against ciphertext captured from
+official frpc/frps; `cargo audit` reports zero hits; release artifacts ship
+with `SHA256SUMS` and an Ed25519 signature.
 
-965 个自动化测试，含真实 QUIC 栈握手、端到端集成、官方抓包密文解密回归；
-`cargo audit` 0 命中；发布产物附 `SHA256SUMS` + Ed25519 签名。
+Test distribution, the CI matrix, exactly what dependency security covers, the
+release gate, and the manual checklist all live in **[QUALITY.md](QUALITY.md)**.
 
-测试分布、CI 矩阵、依赖安全做到哪一步、发版闸门与人工核对清单，
-统一放在 **[QUALITY.md](QUALITY.md)**。
+## Quick start
 
-## 快速开始
-
-### 构建
+### Build
 
 ```bash
 cargo build --release
-# 产物：<target_directory>/release/nfrp-server（frps）、<target_directory>/release/nfrp-client（frpc）
-# target_directory 以 `cargo metadata` 为准：设了 CARGO_TARGET_DIR 或本机
-# `.cargo/config.toml` 时，产物就不在 ./target 下
+# Artifacts: <target_directory>/release/nfrp-server (frps), <target_directory>/release/nfrp-client (frpc)
+# target_directory follows `cargo metadata`: if CARGO_TARGET_DIR or a local
+# `.cargo/config.toml` is set, artifacts are not under ./target
 ```
 
-需要 Rust 1.75+。Windows 用 MSVC toolchain。
+Requires Rust 1.75+. Windows uses the MSVC toolchain.
 
-也可以直接下载发布包，包内二进制名为 `frps` / `frpc`（与官方一致）。
+You can also download a release package; the binaries inside are named `frps` /
+`frpc`, matching upstream.
 
-### 服务端（公网机器）
+### Server (public host)
 
 ```toml
 # frps.toml
 bind_addr = "0.0.0.0"
 bind_port = 7000
-token = "换成一个足够随机的口令"
+token = "replace with a sufficiently random secret"
 
-# 可选：xtcp 真 P2P 的牵线端口（需放行 UDP）
+# Optional: rendezvous port for real P2P xtcp (open UDP for it)
 p2p_port = 7002
 
-# 可选：内置面板（另可配 enablePrometheus = true 打开 /metrics）
+# Optional: built-in dashboard (add enablePrometheus = true for /metrics)
 dashboard_port = 7500
 dashboard_user = "admin"
-dashboard_pwd = "换成一个强口令"
+dashboard_pwd = "replace with a strong password"
 ```
 
 ```bash
 ./nfrp-server -c frps.toml
-# 生成带注释的完整示例配置：
+# Generate a fully commented example config:
 ./nfrp-server --gen-config frps.toml
 ```
 
-### 客户端（内网机器）
+### Client (internal host)
 
 ```toml
 # frpc.toml
 server_addr = "your.server.com"
 server_port = 7000
-token = "与服务端一致的口令"
+token = "same secret as the server"
 
 [[proxies]]
 name = "ssh"
@@ -288,116 +322,156 @@ remote_port = 6000
 ./nfrp-client -c frpc.toml
 ```
 
-之后 `your.server.com:6000` 即映射到内网机器的 22 端口。
+After that, `your.server.com:6000` maps to port 22 on the internal host.
 
-### 与官方 frp 互通
+### Interoperability with official frp
 
-NFrp 可运行在官方 frp 的任一侧，双向实测通过：
+NFrp runs on either side of an official frp deployment; both directions are
+verified in practice:
 
-| 服务端 | 客户端 | 状态 |
+| Server | Client | Status |
 |---|---|---|
-| nfrp frps | 官方 frpc（tcpMux on/off、TLS on、各类代理） | 通过 |
-| 官方 frps | nfrp frpc（tcp_mux on/off、TLS on、各类代理） | 通过 |
-| nfrp frps | 官方 frpc（stcp 提供者 / 访客） | 通过 |
+| nfrp frps | official frpc (tcpMux on/off, TLS on, various proxy types) | Pass |
+| official frps | nfrp frpc (tcp_mux on/off, TLS on, various proxy types) | Pass |
+| nfrp frps | official frpc (stcp provider / visitor) | Pass |
 
-**兼容标识不可更改**：`frpc -v` 仍输出裸 `0.71.0`，线协议魔术字与版本串、包内 `frps` / `frpc` 命名全部保持。改动这三样会立刻破坏与官方 frp 及第三方平台的互通。
+**Compatibility markers must not change**: `frpc -v` still prints a bare
+`0.71.0`, the wire magic and version string are preserved, and the packaged
+binaries are still named `frps` / `frpc`. Changing any of these immediately
+breaks interoperability with official frp and third-party platforms.
 
-## 配置
+## Configuration
 
-配置字段与官方 frp 对齐，**原版 `frps.toml` / `frpc.toml` 可以直接使用**（支持 camelCase、`localIP` + `localPort` 两段式写法、`[metadatas]` 等）。
+Configuration keys align with upstream frp, so **an unmodified
+`frps.toml` / `frpc.toml` works** (camelCase, the two-part `localIP` +
+`localPort` form, `[metadatas]`, and so on are all accepted).
 
-两处**有意偏离**官方，都需要注意：
+Two places **deliberately diverge** from upstream, and both matter:
 
-- `local_addr` 是合并式 `ip:port`（`127.0.0.1:8080`），不像官方分成 `localIP` + `localPort`。官方两段式也认，但两种写法**不要混用**。
-- 日志轮转按 **UTC** 零点切分（官方按本地时间），因为日志时间戳本身就是 UTC。
+- `local_addr` is the merged `ip:port` form (`127.0.0.1:8080`), not upstream's
+  separate `localIP` + `localPort`. The two-part form is also accepted, but do
+  not mix the two styles in one file.
+- Log rotation happens at **UTC** midnight (upstream uses local time), because
+  the log timestamps themselves are UTC.
 
-完整的带注释示例见仓库内 [`assets/frps.toml`](assets/frps.toml) 与 [`assets/frpc.toml`](assets/frpc.toml)，也可以用 `--gen-config` 生成。
+Fully commented examples are in [`assets/frps.toml`](assets/frps.toml) and
+[`assets/frpc.toml`](assets/frpc.toml), or generate one with `--gen-config`.
 
-## 升级注意
+## Upgrade notes
 
-0.5.2 起有几处**行为变更**，升级前请确认：
+Since 0.5.2 there are several **behaviour changes** to check before upgrading:
 
-| 变更 | 影响 | 处理 |
+| Change | Impact | What to do |
 |---|---|---|
-| 面板绑非回环地址且无 `dashboard_user` | 拒绝启动 | 配凭据 / 改 `bind_addr = "127.0.0.1"` / 显式写 `allow_insecure_dashboard = true` |
-| 客户端 `[webServer]` 绑非回环且无凭据 | 拒绝启动 | 逃生开关 `allowInsecureRemote = true` |
-| 本地界面写接口 | 需要 `X-Nfrp-Client: 1` 头 | 调写接口的脚本要加上 |
-| 空 token 且**显式**绑对外地址 | 拒绝启动 | 配 token / 绑回环 / 显式写 `allow_insecure_no_auth = true` |
-| `[acl]` 段拼错的键名 | 现在会报错（原先静默失效） | 检查拼写 |
+| Dashboard bound to a non-loopback address without `dashboard_user` | Refuses to start | Set credentials / set `bind_addr = "127.0.0.1"` / explicitly set `allow_insecure_dashboard = true` |
+| Client `[webServer]` bound to non-loopback without credentials | Refuses to start | Escape hatch: `allowInsecureRemote = true` |
+| Local UI write endpoints | Require an `X-Nfrp-Client: 1` header | Add it to any script calling write endpoints |
+| Empty token with an **explicit** external bind | Refuses to start | Set a token / bind loopback / explicitly set `allow_insecure_no_auth = true` |
+| Misspelled keys in `[acl]` | Now an error (previously silently ignored) | Fix the spelling |
 
-**0.5.5 起追加三处**（都是安全修复的必然结果）：
+**Three more since 0.5.5** (all consequences of security fixes):
 
-| 变更 | 影响 | 处理 |
+| Change | Impact | What to do |
 |---|---|---|
-| 远程下发**不再允许携带插件**（`plugin` / `pluginUser` / `pluginPasswd` / `pluginHostHeaderRewrite` / `pluginStripPrefix`） | 面板下发的代理若带插件会被拒 | 插件只能写在**本机配置文件**里（它决定客户端"变成什么"，不该由服务端远程指定）。要连内网服务请用普通 tcp/http 代理 |
-| 远程下发**不能删/覆盖配置文件里定义的代理** | 面板对这些代理的增删会返回明确错误 | 改本机配置文件；面板只管理它自己加的（以及 store 恢复的）动态代理 |
-| 工作连接需要凭证 | **对官方 frpc 无影响**（官方默认不带凭证，服务端退回"源 IP 一致"校验） | 无需处理。NFrp ≥ 0.5.5 客户端会自动声明并携带 |
+| Remotely pushed proxies **may no longer carry plugins** (`plugin` / `pluginUser` / `pluginPasswd` / `pluginHostHeaderRewrite` / `pluginStripPrefix`) | Proxies pushed from the dashboard with a plugin are rejected | Plugins may only be set in the **local config file** (a plugin decides what the client *becomes*, which the server must not choose remotely). To reach internal services, use a plain tcp/http proxy |
+| Remote pushes **cannot delete or override proxies defined in the config file** | Dashboard add/remove for those proxies returns an explicit error | Edit the local config; the dashboard only manages the dynamic proxies it created (and those restored from the store) |
+| Work connections require credentials | **No impact on official frpc** (it sends none by default, so the server falls back to "same source IP") | Nothing. NFrp ≥ 0.5.5 clients declare and send them automatically |
 
-**0.5.6 起追加三处**（都有意的行为变更，见 `第 5 轮`）：
+**Three more since 0.5.6** (intentional behaviour changes; see round 5):
 
-| 变更 | 影响 | 处理 |
+| Change | Impact | What to do |
 |---|---|---|
-| **INI 的段名与键名统一小写** | 代理名会小写化（`[MCCC]` → `mccc`） | **这是修正为与官方一致** —— 官方 `go-ini` 同样小写化，原先两边会产生不同的代理名。如果你的脚本按大写名引用代理，改成小写 |
-| **跨租户不得靠 `routeByHTTPUser` 共用域名 + 路径** | 跨租户的多作用域注册会被拒（返回"路径已被占用"） | 服务端分辨不出"合法的多作用域"与"寄生劫持"，而后者能直接收割 Basic 凭据，故收紧。**同租户**的多作用域拓扑（官方 tcpmux 文档的用法）不受影响 |
-| **UDP 回写限"真的发过包的访客 IP"** | 客户端无法让服务端向未通信过的 IP 发 UDP | 防 frps 被当作 UDP 反射跳板。诚实客户端零影响；TFTP 那类"换端口回包"的协议**不受影响**（只限 IP、不限端口） |
+| **INI section and key names are lowercased** | Proxy names are lowercased (`[MCCC]` → `mccc`) | **This is a fix for upstream parity** — Go's `go-ini` lowercases too, and previously the two sides produced different names. If your scripts reference proxies by an uppercase name, switch to lowercase |
+| **Cross-tenant sharing of a domain + path via `routeByHTTPUser` is no longer allowed** | Cross-tenant multi-scope registrations are rejected ("path already in use") | The server cannot distinguish a legitimate multi-scope setup from parasitic hijacking, and the latter harvests Basic credentials outright, so it was tightened. **Same-tenant** multi-scope topologies (the usage in upstream's tcpmux docs) are unaffected |
+| **UDP replies are limited to visitor IPs that actually sent packets** | The client cannot make the server send UDP to an IP that never communicated | Prevents frps from being used as a UDP reflector. Honest clients see zero impact; protocols that reply from a different port (like TFTP) are **unaffected** (the limit is on IP, not port) |
 
-**0.5.7 起追加三处**（见 `第 6 轮`）：
+**Three more since 0.5.7** (see round 6):
 
-| 变更 | 影响 | 处理 |
+| Change | Impact | What to do |
 |---|---|---|
-| **凭证新鲜性校验铺满全部 6 个入口** | 时间戳超出 `maxClockSkewSecs`（默认 ±300 秒）的登录 / 工作连接 / vnet 注册 / visitor 签名 / p2p 打洞签名**一律拒绝** | **对官方 frpc 无影响**（官方本来就用当前时间，已实测互通）。只有**两端时钟偏差超过 5 分钟**时才会失败 —— 症状是"能连上控制端口但登录被拒"，错误里会写明偏差多少秒。校准时钟，或把 `maxClockSkewSecs` 调大（`0` = 关闭校验） |
-| **跨租户不能用同组名共享公网端口** | 不同 `user` 的客户端即使组名与 `groupKey` 都相同也**不能**共享端口 | 这是堵一个实测打出来的劫持（攻击者能分走一半用户流量）。**同一租户**的多个 frpc（重连、多开、一份配置多条 `[[proxies]]`）照常成组，官方"一个运维跑多个冗余后端"的用法**不受影响** |
-| **visitor 的 `run_id` 不能留空** | 用 `run_id = ""` 的 visitor 连接会被拒 | 官方 frpc 的 visitor **一定**带自己的 `run_id`，所以零影响。原先空值会绕过会话校验（实测匿名连接能把数据送进别人的隧道） |
+| **Credential freshness checks cover all six entry points** | Logins, work connections, vnet registrations, visitor signatures, and p2p hole-punch signatures whose timestamp is outside `maxClockSkewSecs` (default ±300 s) are **rejected outright** | **No impact on official frpc** (it already uses the current time; interop is verified). Only fails when the two clocks differ by more than 5 minutes — the symptom is "control port connects but login is rejected", and the error states the skew in seconds. Sync the clocks, or raise `maxClockSkewSecs` (`0` disables the check) |
+| **Cross-tenant port sharing by group name is no longer allowed** | Clients under different `user` values cannot share a port even with the same group name and `groupKey` | This closes a hijack reproduced in testing (an attacker could divert half the traffic). Multiple frpc instances **under the same tenant** (reconnects, multiple instances, several `[[proxies]]` in one config) still group normally; upstream's "one operator, several redundant backends" usage is unaffected |
+| **A visitor's `run_id` cannot be empty** | Visitor connections with `run_id = ""` are rejected | Official frpc visitors **always** carry their own `run_id`, so zero impact. Previously an empty value bypassed session validation (an anonymous connection was observed pushing data into someone else's tunnel) |
 
-**0.5.8 起追加四处**（第七 / 八轮；详单见 `第 7 轮` 与 `第 8 轮`）：
+**Four more since 0.5.8** (rounds 7 and 8; details there):
 
-| 变更 | 影响 | 处理 |
+| Change | Impact | What to do |
 |---|---|---|
-| **xtcp 牵线加两层校验**：服务端把牵线 HELLO 的来源 IP 绑定到该 session 的控制连接 IP；provider 回**按 `secret_key`+`sid` 派生的应答口令**（替代固定 `"RTNL-OK"`），visitor 定长比较 | 修复"在途读到明文 HELLO（sid 泄露）⇒ 冒充 provider 劫持 P2P 会话"（第八轮 B-1，实测可拿到用户明文数据）。**混合版本时 P2P 直连会失败并自动回退中继**（新↔旧任意组合）：功能不受影响，只是少一层直连加速 | 两端都升到 0.5.8+ 才建立 P2P 直连；单边升级**不会**让连接失败，打洞窗口（8 秒）过后自动走中继。注意同一 NAT 后仍可能被同 IP 的观察者登记（第二层口令会拦住数据） |
-| **面板解析卫生 + 全名删除**：`Authorization` 只从请求**头区**解析（请求体里同形状的行不再"误投"）；面板列表展示的**线上全名**（`user.proxy`）可直接用于"移除代理" | ① 修复前，body 里带 `Authorization: Basic ...` 的请求能通过面板鉴权（与上游反代/WAF 口径不一致，属解析卫生）；② 修复前按列表全名删除会得到 502/400 且**两端状态分裂**（服务端已摘、客户端报"本地没有"） | 正常用法无感知；②修复后控制台/脚本从列表复制的名字（全名或短名）都能删 |
-| **`https2http` / `https2https` 上游收尾**：访问方断开时立刻放弃等待上游并释放上游连接；上游 connect / TLS 握手加 10 秒超时 | 修复前上游 accept 后悬挂时，每轮访问（连接→发请求→撤离）会留下一条永不释放的上游连接（可被公开访问方反复放大）；"等响应头"阶段仍然**没有**人为超时，长轮询 / SSE 不受影响 | 行为对齐官方 frpc（Go `http.Server` 在客户端断开时取消请求上下文）。上游就是慢（正常出数据）的场景不受影响，已实测 |
-| **`[acl]` 开始真正作用于数据面**（第七轮 F7-1）：公网 **TCP 代理端口**与 **HTTP/HTTPS vhost** 的 accept 现在过 IP 白/黑名单（修复前只挡控制连接） | 被你 `deny` 挡掉的来源此前"居然一直能访问"，本版起被拒（静默关连接 + 审计事件）；用白名单模式（`allow`）的部署尤其要注意：此前它对数据面形同虚设，本版起**按白名单收紧** | **UDP 代理端口与 xtcp 牵线（p2p）UDP 仍不在 `[acl]` 范围内**（面板另有自身鉴权）—— 如实记录在 `第 7 轮`。需要挡 UDP 来源请用防火墙（**v0.5.9 起 UDP 代理端口 / 牵线 / 面板也已纳入 ACL**，见下） |
+| **xtcp rendezvous gains two checks**: the server binds the HELLO's source IP to the session's control-connection IP, and the provider returns a **response secret derived from `secret_key` + `sid`** (replacing the fixed `"RTNL-OK"`), compared in constant time | Fixes "read the plaintext HELLO in flight (sid leaks) ⇒ impersonate the provider and hijack the P2P session" (round 8, B-1; user plaintext was recoverable in practice). **In mixed-version setups P2P direct connect fails and falls back to relay automatically** (any new↔old combination): functionality is unaffected, you just lose the direct-connect speedup | Both ends must be 0.5.8+ to establish P2P. A one-sided upgrade **will not** break the connection; after the hole-punch window (8 s) it relays. Note that behind the same NAT an observer on the same IP may still register (the second-layer secret blocks the data) |
+| **Dashboard parsing hygiene and delete-by-full-name**: `Authorization` is parsed only from the request **head** (similarly shaped lines in the body no longer "leak in"); the **wire full name** (`user.proxy`) shown in the list can be used directly for "remove proxy" | ① Before the fix, a request with `Authorization: Basic ...` in the body passed dashboard auth (inconsistent with upstream proxies/WAFs — a parsing hygiene issue); ② beforehand, deleting by the full name from the list returned 502/400 **and split the two sides' state** (the server had removed it, the client reported "not present locally") | Normal usage sees no change; after ②, names copied from the list (full or short) both delete correctly |
+| **`https2http` / `https2https` upstream cleanup**: when the visitor disconnects, stop waiting on the upstream and release it immediately; connect / TLS handshake get a 10 s timeout | Before the fix, an upstream that accepted and then hung left one never-released upstream connection per visit (connection → request → leave), amplifiable by any public visitor. Waiting for response headers still has **no** artificial timeout, so long polling / SSE are unaffected | Behaviour now matches official frpc (Go's `http.Server` cancels the request context on client disconnect). Genuinely slow upstreams (that do produce data) are unaffected; this was measured |
+| **`[acl]` now actually applies to the data plane** (round 7, F7-1): accepts on public **TCP proxy ports** and **HTTP/HTTPS vhost** now go through the IP allow/deny lists (before, only control connections did) | Sources you had `deny`ed "had been getting through all along"; from this version they are rejected (connection closed silently + audit event). Deployments using allowlist mode (`allow`) should take particular note: previously it was a no-op for the data plane, and from this version it **tightens to the allowlist** | **UDP proxy ports and xtcp rendezvous (p2p) UDP are still outside `[acl]`** (the dashboard has its own auth) — recorded honestly in round 7. To block UDP sources, use a firewall (**since v0.5.9, UDP proxy ports / rendezvous / dashboard are also covered by ACL**, see below) |
 
-**0.5.9 起追加六处**（第九轮；详单见 `第 9 轮`）：
+**Six more since 0.5.9** (round 9; details there):
 
-| 变更 | 影响 | 处理 |
+| Change | Impact | What to do |
 |---|---|---|
-| **`[acl]` 覆盖面补齐**（E9-0 / E9-1 / E9-2）：**UDP 代理端口**、**xtcp 牵线 UDP**、**管理面板**从此也过 IP 白 / 黑名单 | 修复前 UDP 代理端口**完全不遵守** `[acl]`（无需任何凭据即可把 UDP 包送进内网服务）；牵线与面板同样漏过（面板另有独立 Basic Auth，属纵深防御缺失） | 用白名单（`allow`）模式的部署请确认放行面；只想挡 UDP 来源也可以继续用防火墙。升级后来源突然被拦属于配置本意（此前是静默失效） |
-| **未认证连接的时间上界 + 全局闸门**（C9-3 / C9-4）：TLS 握手 30s 超时、yamux 空转会话看门狗（30s）、未认证握手全局并发闸（2048，排队 5s）；`0x00` / `0x16` / `0x17` 单字节后静默的连接不再永久驻留 | 修复前"发一个字节然后静默"即可无限挂住连接（实测 500 条 `0x00` 占 500 fd + 6.4 MB）；未认证开流可放大 **≈800×**（12 字节换 9.5 KB） | 常规流量零感知。**极端饱和**（同时 >2048 个未认证握手）时新连接排队 5 秒后被拒 —— 已有会话与合法工作流不受影响，含合法客户端重新登录 |
-| **审计日志轮转 `maxFileMB`**（A9-3，默认 64；`0` = 不轮转） | 修复前审计文件可被公开流量灌到任意大（实测 ~1000 条/秒、37 MB/h 起、无上界，还会挤掉环形缓冲里的真实事件） | 轮转保留单份 `<path>.1` 备份，总占用 ≈ 2× 阈值；需要更长历史请自行归档 `.1`。要恢复旧的无限增长行为设 `maxFileMB = 0` |
-| **stcp / xtcp visitor 默认配置恢复可用**（A9-5，修 0.5.7 / 0.5.8 的功能回归） | 双方都未配 `user` 时（官方默认语义 `"" == ""`），0.5.7 / 0.5.8 会"能登录、能配对、但数据永远不通" | 配了 `allow_users` 的部署行为不变；若你此前为绕开问题给双方硬配了 `user`，本版起可以去掉 |
-| **KCP 会话表封顶 1024**（C9-1，仅启用 `kcp_bind_port` 时）：同时最多 1024 条 KCP 会话，超出丢弃新会话（不回包，**已有会话不受影响**） | 修复前 25 字节的 UDP 包可换 ≈15 KB 内存（**放大 312×**，实测 757 KB 上行把内存推高到 238 MB） | 未启用 KCP 的部署不受影响；单实例 KCP 会话数持续 >1024 的部署请拆分实例 |
-| **客户端启动即点名插件配置错误**（D9-7）：原先 Windows 上 `unix_domain_socket` 配置错误仅 DEBUG 一行，默认级别完全静默 | 影响面很小（配置错误本来就不工作），只是从"看不见"变成"一眼看见" | 无 —— 看到 WARN 按提示修配置即可 |
+| **`[acl]` coverage completed** (E9-0 / E9-1 / E9-2): **UDP proxy ports**, **xtcp rendezvous UDP**, and the **dashboard** now also go through the IP allow/deny lists | Before the fix, UDP proxy ports **completely ignored** `[acl]` (UDP packets could reach internal services without any credentials); rendezvous and the dashboard leaked similarly (the dashboard has separate Basic Auth, so it was a defence-in-depth gap) | Deployments in allowlist (`allow`) mode should confirm what is permitted; to block only UDP sources you can still use a firewall. Sources suddenly being blocked after the upgrade is the config working as intended (it was silently ineffective before) |
+| **Time bounds on unauthenticated connections plus a global gate** (C9-3 / C9-4): 30 s TLS handshake timeout, a yamux idle-session watchdog (30 s), a global concurrency gate for unauthenticated handshakes (2048, 5 s queue), and connections that go silent after a single `0x00` / `0x16` / `0x17` byte no longer linger forever | Before the fix, sending one byte and then going silent could pin a connection indefinitely (500 `0x00` connections were measured holding 500 fds and 6.4 MB); unauthenticated stream opening could be amplified **≈800×** (12 bytes for 9.5 KB) | Normal traffic notices nothing. Under **extreme saturation** (more than 2048 concurrent unauthenticated handshakes) new connections queue for 5 s and are then rejected — existing sessions and legitimate work streams are unaffected, including legitimate clients logging back in |
+| **Audit log rotation `maxFileMB`** (A9-3; default 64, `0` disables) | Before the fix the audit file could be grown arbitrarily by public traffic (~1000 entries/s, from 37 MB/h, unbounded, also evicting real events from the ring buffer) | Rotation keeps a single `<path>.1` backup, so total usage is roughly 2× the threshold; archive `.1` yourself if you need longer history. To restore the old unbounded behaviour set `maxFileMB = 0` |
+| **stcp / xtcp visitor default config works again** (A9-5; regression fix for 0.5.7 / 0.5.8) | When neither side sets `user` (upstream's default semantics, `"" == ""`), 0.5.7 / 0.5.8 could "log in, pair up, but never pass data" | Deployments with `allow_users` are unchanged; if you hard-set a `user` on both sides to work around this, you can drop it from this version on |
+| **KCP session table capped at 1024** (C9-1; only when `kcp_bind_port` is enabled): at most 1024 concurrent KCP sessions, new ones are dropped (no reply, **existing sessions unaffected**) | Before the fix a 25-byte UDP packet could pin ≈15 KB of memory (**312× amplification**; 757 KB of upstream traffic pushed memory to 238 MB) | Deployments without KCP are unaffected; if a single instance consistently exceeds 1024 KCP sessions, split it |
+| **Client reports plugin config errors at startup** (D9-7): on Windows a bad `unix_domain_socket` config used to be a single DEBUG line, silent at default level | Small impact (a broken config was already not working); it just goes from invisible to obvious | Nothing — read the WARN and fix the config |
 
-其余需注意：
+Other things to note:
 
-- **OIDC 部署必须配 TLS**。OIDC 的 `privilege_key` 是原样的 access token，会明文出现在登录报文里；不加密链路上任何被动抓包的人都能拿走它。
-- **客户端 `transport.tls` 只加密、不校验对端证书**（与官方 frp 行为一致）。它防被动偷看，不防中间人；跨公网直连且需要防 MITM 时请在**外层**再套一层 TLS。
-- **v1 的登录凭据强度完全取决于 token**。v0.5.7 起服务端**校验时间戳新鲜性**（默认 ±300 秒窗口，见上表），把重放面从"无限期"压到"5 分钟"；但窗口内仍可重放，且**离线枚举 token 的成本与时间窗口无关** ⇒ 跨公网部署请用足够随机的 token，并优先 v2 / OIDC。
-- **`user` 是客户端自报字段，服务端无法验证**。未配 `[[roles]]` 时它只是标签；**配了 `[[roles]]` 之后也一样** —— 任何持有共享 token 的人都能把自己报成别人的 `user` 从而拿到那个人的角色。⇒ `[[roles]]` **不是租户隔离**，只是一层防误操作（v0.5.7 起服务端会就此打启动告警）。需要真正的隔离请用 OIDC（身份来自验签过的 `sub`），或给每租户发独立 token 并分实例部署。
-- **xtcp 的"数据不经服务端"不包含"防服务端"**：服务端持有 `secret_key` 且自行生成 `sid`，理论上能算出 P2P 口令。它防的是**路径上的第三方**，不是服务端本身。
-- 对手不想暴露内部细节时，可设 `detailed_errors_to_client = false`（默认与官方一致为 `true`）：它会把发给客户端的错误换成统一短句，顺带收掉 stcp/xtcp 隧道名的枚举面。
-- **UDP 代理的回写目标受限**（v0.5.6 起）：服务端只向"最近真的给该端口发过包的访客 IP"回写 UDP 报文。这是防 frps 被当成 UDP 反射跳板 —— 正常客户端本来就只回写给刚收到包的地址，**不会感知**。
-- 示例配置里默认**不包含**任何代理，需要什么自己打开对应的注释段。示例不再默认暴露 SSH。
+- **OIDC deployments must use TLS.** The OIDC `privilege_key` is the raw access
+  token and appears in clear text in the login message; anyone passively
+  capturing on an unencrypted link can take it.
+- **The client's `transport.tls` encrypts but does not verify the peer
+  certificate** (same as upstream frp). It protects against passive snooping,
+  not man-in-the-middle; if you need MITM protection on a direct public
+  connection, wrap it in another layer of TLS **outside**.
+- **v1 login credential strength depends entirely on the token.** Since v0.5.7
+  the server **checks timestamp freshness** (default ±300 s window, see the
+  table above), reducing the replay window from "indefinite" to "5 minutes";
+  replay is still possible within that window, and **the cost of offline token
+  enumeration is unrelated to the time window** ⇒ for public deployments use a
+  sufficiently random token, and prefer v2 / OIDC.
+- **`user` is self-reported by the client and cannot be verified by the
+  server.** Without `[[roles]]` it is just a label; and **that stays true even
+  with `[[roles]]` configured** — anyone holding the shared token can claim
+  someone else's `user` and obtain their role. ⇒ `[[roles]]` **is not tenant
+  isolation**, only a guard against mistakes (since v0.5.7 the server logs a
+  startup warning about this). For real isolation use OIDC (identity comes from
+  a verified `sub`), or issue a separate token per tenant and deploy separate
+  instances.
+- **xtcp's "data bypasses the server" does not mean "secure against the
+  server"**: the server holds `secret_key` and generates `sid` itself, so in
+  theory it can derive the P2P secret. It protects against **third parties
+  along the path**, not against the server.
+- If you would rather not expose internal details, set
+  `detailed_errors_to_client = false` (default `true`, matching upstream): it
+  replaces errors sent to clients with a uniform generic message, which also
+  reduces the enumeration surface for stcp/xtcp tunnel names.
+- **UDP proxy replies are restricted** (since v0.5.6): the server only sends
+  UDP to visitor IPs that recently sent packets to that port. This prevents
+  frps from being used as a UDP reflector — normal clients only ever reply to
+  the address they just received from, so they **notice nothing**.
+- The example configs contain **no** proxies by default; uncomment what you
+  need. SSH is no longer exposed by default.
 
-## 质量保障
+## Quality assurance
 
 ```bash
-cargo fmt --all -- --check                              # 格式
-cargo clippy --workspace --all-targets -- -D warnings   # 静态检查，0 告警
-cargo test --workspace                                  # 965 通过 / 0 失败 / 13 ignored
+cargo fmt --all -- --check                              # formatting
+cargo clippy --workspace --all-targets -- -D warnings   # static analysis, 0 warnings
+cargo test --workspace                                  # 989 passed / 0 failed / 13 ignored
 ```
 
-那 13 条 `#[ignore]` 全是**需要真机硬件或管理员权限**的设备面测试
-（Windows Wintun 网卡、Linux TUN 设备），不是被跳过的问题测试。
+The 13 `#[ignore]`d tests all **need real hardware or administrator
+privileges** (Windows Wintun adapters, Linux TUN devices); they are not broken
+tests that were skipped.
 
-CI 在每次 push / PR 上跑同样的三道门，外加三系统全量测试、两个 musl 目标交叉构建
-与端到端冒烟。
+CI runs the same three gates on every push / PR, plus the full test suite on
+three operating systems, cross-builds for two musl targets, and an end-to-end
+smoke test.
 
-**完整细节见 [QUALITY.md](QUALITY.md)**：测试分布明细、CI 矩阵、依赖安全做到哪一步
-（`cargo audit` / `deny` / `vet` 各自的真实含义）、发版闸门、人工核对清单。
+**Full details in [QUALITY.md](QUALITY.md)**: the per-target test table, the CI
+matrix, what dependency security actually covers (`cargo audit` / `deny` /
+`vet` each mean something different), release gates, and the manual checklist.
 
-## 发布与部署
+## Release and deployment
 
 ### Docker
 
@@ -407,73 +481,43 @@ docker run --rm -p 17000:17000 -p 17002:17002/udp \
   -v $PWD/frps.toml:/etc/nfrp/frps.toml nfrp
 ```
 
-镜像以非 root 用户运行，多阶段构建（musl 静态），最终镜像只含两个二进制与示例配置。
+The image runs as a non-root user, uses a multi-stage musl build, and the final
+image contains only the two binaries and example configs.
 
-### 自己打包
+### Building packages yourself
 
-打包、签名、跨平台交叉编译（含 Android NDK 环境变量）与发版闸门的完整命令，
-见 **[QUALITY.md](QUALITY.md#六发布产物校验)**。
+The full commands for packaging, signing, cross-compilation (including the
+Android NDK environment variables), and the release gate are in
+**[QUALITY.md](QUALITY.md)**.
 
-一句话概括：`release.py pack` 打完包会自动解包，把包内 `frps`/`frpc` 与源产物
-逐个 sha256 比对，不一致直接非零退出。这一步不是可选的——历史上真的出现过
-"包名和版本号都对，但里面的二进制是上一版"。
+In short: `release.py pack` unpacks what it just built and compares the `frps` /
+`frpc` inside against the source artifacts by sha256, exiting non-zero on any
+mismatch. That step is not optional — there really have been releases where
+"the package name and version were right but the binary inside was the previous
+version".
 
-`Dockerfile` **有意不加 `HEALTHCHECK`**：唯一合适的探针 `- /api/healthz` 挂在面板端口上，而示例配置里 `dashboard_port` 默认是注释掉的，写死探针会让容器一直显示 `unhealthy`。理由已写在文件里。
+## Current limitations
 
-## 当前限制
+See **[QUALITY.md](QUALITY.md)** and the
+[docs site](https://nu0vo1212.github.io/Rust-Frp/) for the up-to-date list.
+Things that are **not** done, stated plainly rather than checked off for
+appearance:
 
-- **VirtualNet 的 TUN 设备**：Linux 用 `/dev/net/tun`（需 root 或 `CAP_NET_ADMIN`）；
-  **Windows 用 Wintun**（v0.6.6 起支持，需管理员权限 + 自行下载 `wintun.dll`；
-  仓库含 `#[ignore]` 的真机网卡和双向 ping 数据面测试，需管理员权限手动执行；
-  非管理员会话已验证缺 DLL / 拒绝访问的错误路径，但本轮没有重跑真机数据面）；
-  macOS 未实现，配置了会明确报错而不是静默失败
-- 与官方 0.71 的配置字段对齐情况：
-
-  **已实现**：TLS 证书组（`transport.tls.certFile` / `keyFile` / `trustedCaFile`，
-  含服务端 mTLS 与客户端证书）、`auth.tokenSource`（文件 / 外部命令，客户端与服务端）、
-  `includes`（客户端配置包含）、`quicBindPort`、`enablePrometheus`、
-  `udpPacketSize`（两端；默认 65507 而非官方的 1500 —— 见下）、
-  客户端 `useEncryption` / `useCompression`（按官方 golib 的 AES-128-CFB + snappy
-  流实现，单测/内存双端通过；未做官方 frpc 组合 e2e）、
-  `proxyURL`（HTTP CONNECT / SOCKS5 出站代理）、
-  `dnsServer`（A/AAAA 查询走自定义 UDP DNS）、`natHoleStunServer`（RFC 5389
-  探测公网映射）、`pprofEnable`（Unix CPU profile，Windows 明确 501）、
-  `assetsDir`（面板静态资源目录）、`natholeAnalysisDataReserveHours`
-  （NatHole 分析记录保留期，0 = 不保留）、`httpPlugins`（服务端登录/代理/
-  工作连接回调）、`sshTunnelGateway`（OpenSSH `ssh -R` 隧道网关）。
-
-  **官方 NatHole / xtcp**：已实现官方控制器协议，并用官方 `frpc 0.71.0`
-  做过真实 e2e（provider/visitor 经 `NatHoleSid` 工作连接、`NatHoleClient`、
-  `NatHoleResp` 完成 UDP 打洞，访问成功）。当前覆盖 EasyNAT / 公网直连的
-  mode 0 场景；HardNAT、端口预测、多 STUN 地址与 TTL 探测等完整 NAT 分类
-  尚未实现，极端 NAT 组合下可能打洞失败后由客户端回退中继。
-
-  **仍未做**：真实外部 IdP（Keycloak / Azure AD 等）上的 OIDC 互操作 e2e
-  （目前是对本地 mock IdP 跑 9 条）。SSH 网关的 tcpmux / stcp 只验到注册与清理，
-  **数据面没有 e2e**。
-
-  > ~~`webServer.tls.certFile` / `webServer.tls.keyFile`（面板 HTTPS）未实现~~
-  > —— **这条更正**：面板 HTTPS 自 v0.6.x 起已实现并有真实 HTTPS + HSTS 回归
-  > （`server/src/dashboard.rs::web_server_tls_真实_https_和_hsts`）。原文保留
-  > 是为了不改写历史记录，当前状态以本行为准。
-
-  > `udpPacketSize` 的默认值**故意与官方不同**：官方默认 1500，NFrp 一直用
-  > 65507（UDP 协议上限）。改成 1500 会**静默截断**现有用户的大 UDP 报文
-  > （收得到包、内容少一截），比报错难查得多。想对齐官方行为的部署，
-  > 显式配 `udpPacketSize = 1500` 即可。
-
+- `tcpmux` proxy type is not implemented (upstream has it)
+- Some upstream plugins and fields are parsed only to keep configs from failing,
+  and are explicitly reported as unsupported at startup
+- **NLink v1 session resumption is a bearer-session design**; with
+  `transport.tls.force = false` (the default) the token travels in clear text.
+  Use TLS in production — see the [NLink page](https://nu0vo1212.github.io/Rust-Frp/#/nlink)
+- NatHole implements upstream's modes 0–4, but whether a hole is actually
+  punched still depends on the NAT devices on both ends; HardNAT failures fall
+  back to relay by design
+- The SSH gateway data plane and the Windows Wintun / Linux TUN data planes have
+  no real-hardware end-to-end tests in CI (they require administrator
+  privileges or specific hardware)
 
 ## License
 
-本项目基于 [Apache License 2.0](LICENSE) 发布。
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-```
 Copyright 2026 nfrp contributors
-```
-
----
-
-<p align="center">
-  Made by <a href="AUTHOR.md">Nu0vo1212</a> ·
-  <a href="https://nu0vo.xyz">nu0vo.xyz</a>
-</p>

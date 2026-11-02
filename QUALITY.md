@@ -13,7 +13,7 @@
 ```bash
 cargo fmt --all -- --check                 # 格式
 cargo clippy --workspace --all-targets -- -D warnings   # 静态检查，当前 0 告警
-cargo test --workspace                     # 965 个测试通过
+cargo test --workspace                     # 989 个测试通过
 ```
 
 三项全绿才算过。CI 上跑的是同一组命令，参数一致，不存在"本地过了 CI 不过"。
@@ -55,7 +55,7 @@ cargo test --workspace                     # 965 个测试通过
 | 真实 QUIC 栈握手 | 起真 `quinn` endpoint，不是 mock |
 | 端到端集成 | 真 frps + 真 frpc + 真内网回显服务 |
 | 官方密文解密回归 | 用官方 frpc/frps 真实抓下来的密文做解密断言 |
-| NLink 逐项覆盖 | `server/tests/nlink_e2e.rs` 的 14 条用例一一对应 8 项能力 |
+| NLink 逐项覆盖 | `server/tests/nlink_e2e.rs` 的 16 条用例一一对应 8 项能力 |
 | 打包产物核对 | 包内二进制与源产物逐个 sha256 比对 |
 
 ---

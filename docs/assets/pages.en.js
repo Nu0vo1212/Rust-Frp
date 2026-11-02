@@ -1310,7 +1310,7 @@ PAGES_EN['nlink'] = `
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
   <div>
     <strong>当前状态：已实现（v0.7.3 起，默认关闭）</strong>
-    <p>下面列出的能力<strong>均已实现并通过测试</strong>（<code>server/tests/nlink_e2e.rs</code> 的 14 条端到端用例逐项覆盖）。 但 NLink <strong>默认关闭</strong>：服务端与客户端都要显式写 <code>[nlink] enable = true</code> 才生效。 不开启时，行为与 0.6.x 完全一致。</p>
+    <p>下面列出的能力<strong>均已实现并通过测试</strong>（<code>server/tests/nlink_e2e.rs</code> 的 16 条端到端用例逐项覆盖）。 但 NLink <strong>默认关闭</strong>：服务端与客户端都要显式写 <code>[nlink] enable = true</code> 才生效。 不开启时，行为与 0.6.x 完全一致。</p>
   </div>
 </div>
 <h2 data-i18n="nlink-s1-h">握手：零额外往返</h2>
@@ -1414,7 +1414,7 @@ quic = true        # 走 QUIC 连服务端（需服务端开 quic_listen）</cod
 <p>frp 的协议是够用的，但它把「传输、会话、鉴权、调度」都固定死了。有些需求不是 "实现得不好"，而是<strong>协议里根本没有承载位置</strong>——比如连接迁移需要传输层有独立的 连接标识，而 frp 是在 TCP/TLS 之上套 yamux，这个位置不存在。</p>
 <p>NLink 就是在不改标准帧的前提下，补上这些位置。</p>
 <h2 data-i18n="nlink-s6-h">能力清单</h2>
-<p>八项能力全部已实现，由 <code>server/tests/nlink_e2e.rs</code> 的 14 条端到端用例逐项覆盖。</p>
+<p>八项能力全部已实现，由 <code>server/tests/nlink_e2e.rs</code> 的 16 条端到端用例逐项覆盖。</p>
 <div class="table-wrap">
 <table>
 <thead><tr>
@@ -1526,7 +1526,7 @@ quic = true        # 走 QUIC 连服务端（需服务端开 quic_listen）</cod
 <h3 data-i18n="nlink-c4-h">4. 双栈共存</h3>
 <p><strong>同一端口</strong>识别两种握手，只依赖首字节——<code>NFRPLNK1</code>、<code>FRP\0\x02\r\n</code>、<code>{</code> 三者互不重叠。扩展握手失败自动 fallback，用户无感。</p>
 <h3 data-i18n="nlink-c5-h">5. 可测试性</h3>
-<p>兼容性矩阵的每一行都有对应的 e2e 用例。NLink 相关的 e2e 共 14 条， 覆盖续传、身份、敲门、限流、QUIC、门控与旧客户端回退。</p>
+<p>兼容性矩阵的每一行都有对应的 e2e 用例。NLink 相关的 e2e 共 16 条， 覆盖续传、身份、敲门、限流、QUIC、门控与旧客户端回退。</p>
 <h2 data-i18n="nlink-s9-h">兼容性矩阵</h2>
 <div class="table-wrap">
 <table>

@@ -11,7 +11,7 @@
 <!-- /lang-switch -->
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.7.3-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.7.4-blue" alt="Version">
   <img src="https://img.shields.io/badge/protocol-frp%20v1%20%2F%20v2-orange" alt="Protocol">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey" alt="Platform">
   <img src="https://img.shields.io/badge/license-Apache--2.0-green" alt="License">
@@ -260,7 +260,7 @@ wire format は 0.6.x とバイト単位で同一になります。
 
 ### エンジニアリング品質
 
-自動テスト 989 件を通過。実際の QUIC スタックのハンドシェイク、エンドツーエンド
+自動テスト 992 件を通過。実際の QUIC スタックのハンドシェイク、エンドツーエンド
 統合、公式 frpc/frps から取得した暗号文に対する復号回帰を含みます。
 `cargo audit` の検出はゼロ。リリース成果物には `SHA256SUMS` と Ed25519 署名を
 添付しています。
@@ -459,7 +459,7 @@ wire magic とバージョン文字列、パッケージ内の `frps` / `frpc` �
 ```bash
 cargo fmt --all -- --check                              # フォーマット
 cargo clippy --workspace --all-targets -- -D warnings   # 静的解析、警告 0
-cargo test --workspace                                  # 989 通過 / 0 失敗 / 13 ignored
+cargo test --workspace                                  # 992 通過 / 0 失敗 / 13 ignored
 ```
 
 `#[ignore]` の 13 件はすべて**実機ハードウェアまたは管理者権限を必要とする**
@@ -533,7 +533,7 @@ docker run --rm -p 17000:17000 -p 17002:17002/udp \
   クライアントへ送信される。
 
   > 以前の版ではここに「mode 0 のみ対応」と書いていたが、それは 0.7.2 より前の古い結論で
-  > あり、無効である。この能力の欠落は 0.7.3 で `mode_选择的六个分支与官方一致` というテストに
+  > あり、無効である。この能力の欠落は 0.7.4 で `mode_选择的六个分支与官方一致` というテストに
   > よって固定され、6 つの分岐のどれかが壊れれば赤になる。
 
   現実的な制限は残る: 実際に穴が開くかどうかは**両端の NAT 機器の実際の挙動**に依存する。

@@ -11,7 +11,7 @@
 <!-- /lang-switch -->
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.7.3-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.7.4-blue" alt="Version">
   <img src="https://img.shields.io/badge/protocol-frp%20v1%20%2F%20v2-orange" alt="Protocol">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey" alt="Platform">
   <img src="https://img.shields.io/badge/license-Apache--2.0-green" alt="License">
@@ -267,7 +267,7 @@ quic = true
 
 ### Качество инженерии
 
-989 автоматических тестов, включая рукопожатие на реальном стеке QUIC,
+992 автоматических тестов, включая рукопожатие на реальном стеке QUIC,
 сквозную интеграцию и регрессии расшифровки на шифртексте, снятом с
 официальных frpc/frps; `cargo audit` не находит ничего; релизные артефакты
 сопровождаются `SHA256SUMS` и подписью Ed25519.
@@ -473,7 +473,7 @@ NFrp работает на любой стороне официального fr
 ```bash
 cargo fmt --all -- --check                              # форматирование
 cargo clippy --workspace --all-targets -- -D warnings   # статический анализ, 0 предупреждений
-cargo test --workspace                                  # 989 пройдено / 0 провалено / 13 ignored
+cargo test --workspace                                  # 992 пройдено / 0 провалено / 13 ignored
 ```
 
 Все 13 тестов с `#[ignore]` **требуют реального оборудования или прав
@@ -549,7 +549,7 @@ docker run --rm -p 17000:17000 -p 17002:17002/udp \
   TTL, `sendDelayMs` / `readTimeoutMs` и все кандидатные адреса STUN также передаются клиенту.
 
   > В предыдущих версиях этого файла было написано «покрыт только mode 0». Этот вывод относится к
-  > версиям до 0.7.2 и недействителен. В 0.7.3 пробел закрыт тестом
+  > версиям до 0.7.2 и недействителен. В 0.7.4 пробел закрыт тестом
   > `mode_选择的六个分支与官方一致`: поломка любой из шести ветвей делает его красным.
 
   Реальное ограничение сохраняется: откроется ли туннель, зависит от **фактического поведения

@@ -277,14 +277,38 @@ where
         w.flush().await?;
         total += n as u64;
     }
+
+    // ★ 读到 EOF 后必须 shutdown 写端。
+    //
+    // 否则对侧的 `read()` 永远等不到 EOF，`relay_throttled` 里的
+    // `try_join!` 就永远不返回 —— 工作连接不释放。这正是官方
+    // 「服务端带宽限制时工作连接不关闭」那条修复的同一个形态。
+    //
+    // 失败可忽略：链路本来就可能已经断了，这不该让整个转发判失败。
+    let _ = w.shutdown().await;
     Ok(total)
 }
 
-/// 带限流的双向转发（`util::relay_between` 的限流版）。
+/// 限流的双向转发（`util::relay_between` 的限流版）。
 ///
 /// 两个方向共用**同一个**令牌桶（按 `user + proxy` 划分），
 /// 所以上行 + 下行合计不超过规则里的 `rate` —— 与官方 `bandwidthLimit`
 /// 的语义一致（官方也是按代理算总带宽）。
+///
+/// # ★ 为什么不能简单用 `try_join!` 等两边都结束
+///
+/// 这是 0.7.4 修的一个真实缺陷（对应官方「服务端带宽限制时工作连接不关闭」）：
+///
+/// 客户端常常只关**一个**方向（半关闭）。一侧读到 EOF 退出后，另一侧的
+/// `read()` 还会挂着等数据 —— 而 `try_join!` 必须两边都完成才返回，
+/// 于是整个 bridge 任务永远不结束，**工作连接和它占用的 fd 都不释放**。
+///
+/// 这是限流路径独有的问题：不限流走 `copy_bidirectional`，它在一侧 EOF 时
+/// 会 shutdown 另一侧的写端，对端收到 FIN 后自然结束。
+///
+/// 修法：`copy_throttled` 在自己读到 EOF 后**主动 shutdown 写端**（它本来就
+/// 持有 `w` 的独占借用，能这么做），对端收到 FIN 后也会读到 EOF 并退出，
+/// 于是 `try_join!` 自然收敛。
 pub async fn relay_throttled<A, B>(
     limiter: &RateLimiter,
     user: &str,
@@ -307,6 +331,57 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 半关闭后 `relay_throttled` 必须返回，不能两边互相等。
+    ///
+    /// 对应官方「服务端带宽限制时工作连接不关闭」那条修复。
+    ///
+    /// # 场景
+    ///
+    /// 客户端发完数据就关掉自己的写端（TCP 半关闭），但**继续读**响应。
+    /// 旧的 `try_join!` 实现里，正向 `copy_throttled` 读到 EOF 退出了，
+    /// 反向还在 `read()` 上等 —— 而 `try_join!` 要两边都完成，于是永远不返回，
+    /// 工作连接和它的 fd 都泄漏。
+    ///
+    /// 现在 `copy_throttled` 在 EOF 时 shutdown 写端，对端读到 EOF 后也会退出，
+    /// 整个转发随之返回。
+    ///
+    /// 用 `timeout` 包住：一旦回归，失败是 2 秒后报"超时"，
+    /// 而不是把整个测试挂死。
+    #[tokio::test]
+    async fn 限流转发在半关闭后必须返回释放连接() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let limiter = RateLimiter::new(vec![]); // 空规则 = 不限速，但走同一条代码路径
+
+        // 服务端侧 a <-> b（都用 duplex 模拟两条真实连接）
+        let (mut a_server, mut a_client) = tokio::io::duplex(64 * 1024);
+        let (mut b_server, mut b_client) = tokio::io::duplex(64 * 1024);
+
+        let relay = tokio::spawn(async move {
+            relay_throttled(&limiter, "u", "p", &mut a_server, &mut b_server).await
+        });
+
+        // a 侧发一句话，然后**关掉写端**（半关闭）
+        a_client.write_all(b"hello").await.unwrap();
+        a_client.shutdown().await.unwrap();
+
+        // b 侧应当收到那句话，并读到 EOF
+        let mut got = Vec::new();
+        b_client.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"hello", "b 侧必须收到完整数据");
+
+        // b 侧也关掉写端，让反向也结束
+        b_client.shutdown().await.unwrap();
+
+        // 关键断言：转发必须在超时内返回，而不是挂住
+        let r = tokio::time::timeout(std::time::Duration::from_secs(2), relay)
+            .await
+            .expect("限流转发在半关闭后必须返回（否则工作连接泄漏）")
+            .expect("任务不应 panic");
+        let (up, _down) = r.expect("转发不应报错");
+        assert_eq!(up, 5, "正向应当搬运 5 字节");
+    }
 
     #[test]
     fn 默认实例是关闭的() {

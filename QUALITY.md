@@ -2,7 +2,7 @@
 
 > 这份文件收纳 README 里放不下的质量细节。README 只留一句话概述 + 指向这里。
 >
-> 对应版本：**v0.7.3** · 最后核对：2026-10-31
+> 对应版本：**v0.7.4** · 最后核对：2026-10-31
 
 ---
 
@@ -13,30 +13,30 @@
 ```bash
 cargo fmt --all -- --check                 # 格式
 cargo clippy --workspace --all-targets -- -D warnings   # 静态检查，当前 0 告警
-cargo test --workspace                     # 989 个测试通过
+cargo test --workspace                     # 992 个测试通过
 ```
 
 三项全绿才算过。CI 上跑的是同一组命令，参数一致，不存在"本地过了 CI 不过"。
 
 ---
 
-## 二、测试分布（v0.7.3 实测）
+## 二、测试分布（v0.7.4 实测）
 
 `cargo test --workspace` 实测输出：
 
 | 目标 | 通过 | 忽略 |
 |---|---|---|
 | `nfrp-client` 单元测试 | 134 |  |
-| `nfrp-common` 单元测试（lib） | 499 | 3（需真机网卡） |
+| `nfrp-common` 单元测试（lib） | 501 | 3（需真机网卡） |
 | `nfrp-common` 集成测试 | 9 |  |
-| `nfrp-server` 单元测试（lib） | 286 |  |
+| `nfrp-server` 单元测试（lib） | 287 |  |
 | `nfrp-server` 单元测试（bin） | 17 |  |
 | `nfrp-server` 端到端集成测试 | 26 |  |
 | `nfrp-server` NLink 端到端 | 16 |  |
 | `nfrp-server` OIDC 端到端 | 2 |  |
 | Wintun 真机（Windows） | 0 | 5 |
 | Linux TUN 真机 | 0 | 5 |
-| **合计** | **989** | **13** |
+| **合计** | **992** | **13** |
 
 **关于 13 条 `#[ignore]`**：全部是**需要真机硬件或管理员权限**的设备面测试
 （Windows Wintun 网卡、Linux TUN 设备），不是被跳过的问题测试。它们在有权限的
@@ -57,6 +57,23 @@ cargo test --workspace                     # 989 个测试通过
 | 官方密文解密回归 | 用官方 frpc/frps 真实抓下来的密文做解密断言 |
 | NLink 逐项覆盖 | `server/tests/nlink_e2e.rs` 的 16 条用例一一对应 8 项能力 |
 | 打包产物核对 | 包内二进制与源产物逐个 sha256 比对 |
+
+---
+
+## 三之二、值得记住的修复
+
+有些缺陷不值得单独写一篇文档，但"为什么代码长成这样"必须留个记号，
+否则将来有人会"顺手简化"掉关键的几行。
+
+| 版本 | 缺陷 | 关键点 |
+|---|---|---|
+| **0.7.4** | 限流转发在半关闭后不释放工作连接 | `relay_throttled` 原先用 `try_join!` 等两个方向都结束。客户端只关一个方向时，另一侧的 `read()` 一直挂着，`try_join!` 永不返回 ⇒ 工作连接与 fd 泄漏。修法：`copy_throttled` 读到 EOF 后**主动 shutdown 写端**，对端收到 FIN 也会读到 EOF。测试 `限流转发在半关闭后必须返回释放连接`，用 `timeout` 包住，回归时 2 秒失败而不是挂死 |
+| **0.7.4** | `ResumeCommit` 分片上限按"片数"限不合理 | 0.7.2 写死"最多 64 片"（≈512 KiB）。改成按**字节预算**（8 MiB），片数由预算推出。额外加了一道"累计字节"检查——片数合法但每片塞满时仍可能超预算 |
+| **0.7.3** | NatHole 的六个 mode 分支只测了一个 | 补 `mode_选择的六个分支与官方一致`，把六种 `(easy, hard, regular)` 组合的首选 mode 全钉死。之前只测 `easy==2` 那一支，其余写错不会被发现 |
+| **0.7.2** | 续传是 bearer 会话（`user + client_id + session_id`） | 三个值都是**标识**不是凭证。加一次性令牌（HMAC 绑定四项 + 用一次就作废）。但明文链路上仍可被抢先消费——`transport.tls.force = true` 才是根治 |
+| **0.7.2** | `ResumeCommit` 超 8 KiB 静默降级 | 名单装不下时客户端只能拒发，对账能力退化成 10 秒宽限期。改自动分片，单帧时线上格式不变 |
+| **0.7.1** | 续传只恢复"名单"，没恢复监听器 | 之前续传回 `ok=1` 但端口没保留，等于重连。改成保留同一份 `ClientState`（监听器 / 端口 / vhost / visitor 全在） |
+| **0.7.0** | HTTP 插件在 Linux 上偶发挂起 | `HttpIo::fill()` 改用 `read_buf` 直接写自有缓冲——`select!` 取消 future 时，局部数组里的字节会跟着消失 |
 
 ---
 

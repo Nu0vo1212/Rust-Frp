@@ -11,7 +11,7 @@
 <!-- /lang-switch -->
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.7.3-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.7.4-blue" alt="Version">
   <img src="https://img.shields.io/badge/protocol-frp%20v1%20%2F%20v2-orange" alt="Protocol">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey" alt="Platform">
   <img src="https://img.shields.io/badge/license-Apache--2.0-green" alt="License">
@@ -231,7 +231,7 @@ quic = true
 
 ### 工程质量
 
-989 个自动化测试，含真实 QUIC 栈握手、端到端集成、官方抓包密文解密回归；
+992 个自动化测试，含真实 QUIC 栈握手、端到端集成、官方抓包密文解密回归；
 `cargo audit` 0 命中；发布产物附 `SHA256SUMS` + Ed25519 签名。
 
 测试分布、CI 矩阵、依赖安全做到哪一步、发版闸门与人工核对清单，
@@ -391,7 +391,7 @@ NFrp 可运行在官方 frp 的任一侧，双向实测通过：
 ```bash
 cargo fmt --all -- --check                              # 格式
 cargo clippy --workspace --all-targets -- -D warnings   # 静态检查，0 告警
-cargo test --workspace                                  # 989 通过 / 0 失败 / 13 ignored
+cargo test --workspace                                  # 992 通过 / 0 失败 / 13 ignored
 ```
 
 那 13 条 `#[ignore]` 全是**需要真机硬件或管理员权限**的设备面测试
@@ -460,7 +460,7 @@ docker run --rm -p 17000:17000 -p 17002:17002/udp \
   与全部 STUN 候选地址也都会下发给客户端。
 
   > 早期版本这里曾写"只覆盖 mode 0"，那是 0.7.2 之前的旧结论，已作废。
-  > 这个能力缺口在 0.7.3 里通过 `mode_选择的六个分支与官方一致` 这条测试
+  > 这个能力缺口在 0.7.4 里通过 `mode_选择的六个分支与官方一致` 这条测试
   > 钉死，六个分支任何一个被改坏都会红。
 
   仍有现实限制：能不能真的打通取决于**两端 NAT 设备的实际行为**，

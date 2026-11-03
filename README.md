@@ -11,7 +11,7 @@
 <!-- /lang-switch -->
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.7.3-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.7.4-blue" alt="Version">
   <img src="https://img.shields.io/badge/protocol-frp%20v1%20%2F%20v2-orange" alt="Protocol">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey" alt="Platform">
   <img src="https://img.shields.io/badge/license-Apache--2.0-green" alt="License">
@@ -263,7 +263,7 @@ wire format is then byte-for-byte identical to 0.6.x.
 
 ### Engineering quality
 
-989 automated tests, including real QUIC stack handshakes, end-to-end
+992 automated tests, including real QUIC stack handshakes, end-to-end
 integration, and decryption regressions against ciphertext captured from
 official frpc/frps; `cargo audit` reports zero hits; release artifacts ship
 with `SHA256SUMS` and an Ed25519 signature.
@@ -463,7 +463,7 @@ Other things to note:
 ```bash
 cargo fmt --all -- --check                              # formatting
 cargo clippy --workspace --all-targets -- -D warnings   # static analysis, 0 warnings
-cargo test --workspace                                  # 989 passed / 0 failed / 13 ignored
+cargo test --workspace                                  # 992 passed / 0 failed / 13 ignored
 ```
 
 The 13 `#[ignore]`d tests all **need real hardware or administrator
@@ -540,7 +540,7 @@ version".
   addresses are all sent down to the client.
 
   > Earlier versions of this file said "only mode 0 is covered". That conclusion predates 0.7.2 and is
-  > void. 0.7.3 pins the gap shut with the `mode_选择的六个分支与官方一致` test: breaking any of the
+  > void. 0.7.4 pins the gap shut with the `mode_选择的六个分支与官方一致` test: breaking any of the
   > six branches turns it red.
 
   A real limitation remains: whether a hole actually opens depends on the **actual behaviour of the NAT

@@ -65,14 +65,38 @@ pub const TAG_CHUNKS: u16 = TAG_BASE + 20;
 /// 续传令牌（一次性）。登录成功时由服务端下发，重连时客户端带回。
 pub const TAG_RESUME_TOKEN: u16 = TAG_BASE + 21;
 
-/// `ResumeCommit` 最多允许拆成多少片。
+/// `ResumeCommit` 名单的**总字节预算**（不是片数）。
 ///
-/// 这是**防 DoS 的硬上限**：没有它，恶意客户端可以声称 `chunks = 65535`
-/// 让服务端一直攒内存等一个永远不会到的"最后一片"。
+/// 这是**防 DoS 的硬上限**：没有它，恶意客户端可以一直发分片让服务端攒内存，
+/// 或者声称一个巨大的总片数然后永远不发完。
 ///
-/// 8192 字节 × 64 片 ≈ 512 KiB 的名单空间，按每个代理名平均 40 字节算，
-/// 够放下约 1.3 万个代理 —— 远超单 frps 实际能承载的代理数。
-pub const MAX_COMMIT_CHUNKS: u16 = 64;
+/// # 为什么改成按字节而不是按片数
+///
+/// 0.7.2 写的是"最多 64 片"，换算下来约 512 KiB —— 按每个代理名平均 40 字节
+/// 算只能放 1.3 万个代理。单 frps 实际能承载的代理数虽然远小于此，但把上限
+/// 硬编码成"片数"有个隐患：`MAX_FRAME` 将来变大或变小，56 KiB 的实际承载
+/// 能力会跟着漂移，而代码里的常量不会跟着变。
+///
+/// 改成字节预算后，片数由 `总字节 / 单片预算` 自动推出，语义更稳。
+///
+/// 取 8 MiB：按每名 40 字节算可容纳约 20 万个代理名 —— 远超任何单机 frps 的
+/// 实际承载量，同时这个量级的内存占用对服务端是完全可接受的（而且只有**续传
+/// 会话**才会走到这条路径）。
+pub const MAX_COMMIT_BYTES: usize = 8 * 1024 * 1024;
+
+/// 由字节预算推出的片数上限。
+///
+/// 仍然保留一个片数常量供协议字段（`u16`）使用：`TAG_CHUNKS` 是 u16，
+/// 不能超过 65535。8 MiB / 7.5 KiB ≈ 1093 片，远在 u16 范围内。
+pub const MAX_COMMIT_CHUNKS: u16 = {
+    let n = MAX_COMMIT_BYTES.div_ceil(COMMIT_CHUNK_BUDGET) as u32;
+    // 编译期断言：必须能用 u16 表示
+    if n > u16::MAX as u32 {
+        u16::MAX
+    } else {
+        n as u16
+    }
+};
 
 /// 一个 TLV 项。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,12 +309,16 @@ pub fn encode_resume_commit(names: &[String]) -> Vec<Frame> {
 /// * `total == 0` 或 `total > MAX_COMMIT_CHUNKS` 直接判错 —— 前者是坏帧，
 ///   后者是 DoS 尝试（否则恶意客户端可以声称 65535 片让服务端一直攒内存）；
 /// * `idx >= total` 判错，防止用越界序号把表撑大；
+/// * **累计字节**超过 [`MAX_COMMIT_BYTES`] 也判错 —— 片数在范围内但每片塞满时，
+///   总量仍可能超出预算；
 /// * 收不到的片永远不完成，但表是按会话保存的，会话断开即释放。
 #[derive(Debug, Default)]
 pub struct CommitAssembler {
     total: u16,
     parts: Vec<Option<Vec<String>>>,
     received: u16,
+    /// 已收到的名字累计字节数（用于总的字节预算检查）。
+    bytes: usize,
 }
 
 impl CommitAssembler {
@@ -319,12 +347,25 @@ impl CommitAssembler {
             self.total = total;
             self.parts = vec![None; total as usize];
             self.received = 0;
+            self.bytes = 0;
         }
+
+        // 字节预算：替换同一片时要先扣掉旧的
+        let incoming: usize = names.iter().map(|n| n.len() + 1).sum();
         let slot = &mut self.parts[idx as usize];
+        let replaced = slot
+            .as_ref()
+            .map(|old| old.iter().map(|n| n.len() + 1).sum::<usize>())
+            .unwrap_or(0);
+        let projected = self.bytes - replaced + incoming;
+        if projected > MAX_COMMIT_BYTES {
+            bail!("ResumeCommit 名单总量 {projected} 字节超过预算 {MAX_COMMIT_BYTES}");
+        }
         if slot.is_none() {
             self.received += 1;
         }
         *slot = Some(names);
+        self.bytes = projected;
 
         if self.received == self.total {
             let mut all: Vec<String> = Vec::new();
@@ -335,6 +376,7 @@ impl CommitAssembler {
             }
             self.total = 0;
             self.received = 0;
+            self.bytes = 0;
             return Ok(Some(all));
         }
         Ok(None)
@@ -767,9 +809,80 @@ mod tests {
     fn 分片数超上限被拒() {
         let mut asm = CommitAssembler::new();
         let e = asm
-            .push(0, MAX_COMMIT_CHUNKS + 1, vec!["x".into()])
+            .push(0, MAX_COMMIT_CHUNKS.saturating_add(1), vec!["x".into()])
             .unwrap_err();
         assert!(format!("{e:#}").contains("超过上限"), "应当报超限：{e:#}");
+    }
+
+    /// 片数在范围内、但**累计字节**超预算时也必须拒。
+    ///
+    /// 这是 0.7.4 新加的防护：0.7.2 只按"片数 ≤ 64"限，现在改成按字节预算，
+    /// 就需要一条针对"每片塞满"的测试 —— 否则片数合法却能把内存吃光。
+    #[test]
+    fn 累计字节超预算被拒() {
+        let mut asm = CommitAssembler::new();
+        // 单片塞到预算的一半，两片就超
+        let half = MAX_COMMIT_BYTES / 2;
+        let big = "x".repeat(half);
+
+        // 第一片：约占一半，能收下
+        asm.push(0, 2, vec![big.clone()])
+            .expect("单片占一半预算应当可以");
+
+        // 第二片：再来一半 → 超预算
+        let e = asm.push(1, 2, vec![big]).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("超过预算"),
+            "累计超预算必须报错：{e:#}"
+        );
+    }
+
+    /// 预算上限足够装下非常大的名单。
+    ///
+    /// 0.7.2 的 64 片 ≈ 512 KiB（约 1.3 万代理）；0.7.4 提到 8 MiB
+    /// （约 20 万代理）。这条测试钉住"上限不能被悄悄改小"。
+    #[test]
+    fn 预算能装下十万级代理名() {
+        // 造 5 万个 40 字节的代理名 ≈ 2 MB，仍在预算内
+        let names: Vec<String> = (0..50_000)
+            .map(|i| format!("u.proxy-{i:06}-padding-xxxxxxxx"))
+            .collect();
+        let total: usize = names.iter().map(|n| n.len() + 1).sum();
+        assert!(
+            total < MAX_COMMIT_BYTES,
+            "5 万个代理名（{total} 字节）应当能装进预算 {MAX_COMMIT_BYTES}"
+        );
+
+        let frames = encode_resume_commit(&names);
+        assert!(
+            frames.len() <= MAX_COMMIT_CHUNKS as usize,
+            "片数 {} 不应超过上限 {}",
+            frames.len(),
+            MAX_COMMIT_CHUNKS
+        );
+
+        // 走一遍完整重组，确认大名单不会在中途出问题
+        let mut asm = CommitAssembler::new();
+        let mut got = None;
+        for f in &frames {
+            let (idx, tot) = f.tlvs.commit_chunk_info().expect("多帧必须带分片标记");
+            let part: Vec<String> = f
+                .tlvs
+                .get_str(TAG_DETAIL)
+                .unwrap_or_default()
+                .lines()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+            if let Some(all) = asm.push(idx, tot, part).expect("分片合法") {
+                got = Some(all);
+            }
+        }
+        assert_eq!(
+            got.expect("必须收齐").len(),
+            50_000,
+            "重组的代理数必须对得上"
+        );
     }
 
     #[test]

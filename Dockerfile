@@ -20,30 +20,50 @@
 # TODO（有 docker 的环境里补）：
 #   docker pull alpine:3.20 && docker inspect --format='{{index .RepoDigests 0}}' alpine:3.20
 #   然后写成 FROM alpine:3.20@sha256:<上面查到的值>
-FROM rust:1.90-alpine AS builder
+ARG REGISTRY=docker.m.daocloud.io/library/
+FROM ${REGISTRY}rust:1.90-alpine AS builder
 
 RUN apk add --no-cache musl-dev build-base
 
 WORKDIR /src
-# 先只拷清单文件，把依赖编译这层缓存下来（改代码时不必重编依赖）
-COPY Cargo.toml Cargo.lock ./
-COPY common ./common
-COPY server ./server
-COPY client ./client
-# 占位：让 cargo 能解析工作区结构
-RUN mkdir -p common/src server/src client/src \
-    && echo "" > common/src/lib.rs \
-    && echo "fn main() {}" > server/src/main.rs \
-    && echo "fn main() {}" > client/src/main.rs \
-    && cargo build --release --locked 2>/dev/null || true
 
-# 真正的源码
+# ★ 不再做"占位文件预热依赖"那一层。
+#
+# 原写法（写空 src → cargo build || true → 拷真实源码 → touch → 重编）想在
+# 改代码时复用依赖编译缓存，但那个 `|| true` 会把**半成品构建脚本状态**留在
+# target/ 里，真实构建复用时报：
+#   error: failed to join paths from `$LD_LIBRARY_PATH` together
+# 0.7.3 的镜像构建就是这么失败的（exit 101）。
+#
+# 试过"占位编完再删本项目产物"的补救，仍然不可靠：cargo 的指纹可能认为
+# 占位版就是最新，从而链接到空 main。镜像构建的可靠性优先于那点缓存收益，
+# 所以直接一次编完。需要加速就给构建机配好 crates 缓存（BuildKit 的
+# --mount=type=cache）。
 COPY . .
-# touch 一下确保时间戳比占位文件新
-RUN touch common/src/lib.rs server/src/main.rs client/src/main.rs \
-    && cargo build --release --locked -p nfrp-server -p nfrp-client
 
-FROM alpine:3.20
+# ★ musl 基础镜像里 `LD_LIBRARY_PATH` 是**空字符串**（不是未设置）。
+#   空值时 cargo 会报：
+#     error: failed to join paths from `$LD_LIBRARY_PATH` together
+#   但给多段（含 `:`）同样会报 "path segment contains separator `:`"
+#   —— cargo 的某些代码路径把它当单一路径处理。
+#   所以这里只给**一个**目录，满足"非空且不含分隔符"。
+ENV LD_LIBRARY_PATH=/usr/local/lib
+
+# crates 源。默认用 rsproxy 的 sparse 协议（国内可达）；
+# 海外构建可传 --build-arg CARGO_REGISTRY=https://index.crates.io/ 覆盖。
+ARG CARGO_REGISTRY=sparse+https://rsproxy.cn/index/
+RUN mkdir -p "$CARGO_HOME" && \
+    printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "%s"\n\n[net]\nretry = 5\ntimeout = 120\n' \
+      "$CARGO_REGISTRY" > "$CARGO_HOME/config.toml"
+
+# 先只编依赖（不碰本项目源码）：
+# 这一步用 --offline 不行（依赖还没下），所以靠 crates 源。
+RUN cargo fetch --locked
+
+RUN cargo build --release --locked -p nfrp-server -p nfrp-client \
+    && ls -l target/release/nfrp-server target/release/nfrp-client
+
+FROM ${REGISTRY}alpine:3.20
 
 RUN apk add --no-cache ca-certificates \
     && addgroup -S nfrp \

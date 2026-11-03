@@ -5,5 +5,25 @@ tmp/
 .github/
 .workbuddy/
 *.log
+
+# ★ 本机专用配置，绝不能进构建上下文。
+#
+# `.cargo/config.toml` 里写着 `target-dir = "D:/cargo-target-nfrp"` —— 那是
+# Windows 绝对路径。带进 Linux 构建容器后 cargo 会直接崩：
+#   error: failed to join paths from `$LD_LIBRARY_PATH` together
+#   Caused by: path segment contains separator `:`
+# （`D:` 里的冒号被当成路径分隔符。）
+#
+# 这个文件在 .gitignore 里本来就被屏蔽，说明它明确是"每台机器各自建一份"的
+# 本机配置，不该出现在任何交付物里。
+.cargo/
+
+# 本地备份 / 编辑器临时文件
+Dockerfile.bak
+*.orig
+*.rej
+.idea/
+.vscode/
+
 # 注意：`assets/` 不能排除 —— Dockerfile 末尾要 COPY assets/frps.toml。
 # 签名私钥在 dist/keys/ 下，靠上面的 dist/ 一并挡在构建上下文之外。

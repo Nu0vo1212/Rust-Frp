@@ -26,6 +26,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use nfrp_common::frp::{
     conn::FrpConn,
     msg::{constant_time_eq, FrpMessage, StartWorkConn},
+    stream::PrefixedStream,
 };
 // HTTP 报文的读写原语住在 common 里 —— 客户端的 http2http / https2http 那组插件
 // 需要**一模一样**的能力（读头、按框架读体、原样转发），复制一份就得修两遍 bug。
@@ -956,18 +957,37 @@ where
             .next()
             .unwrap_or("")
             .to_string();
-        let path = req
-            .start_line
-            .split_whitespace()
-            .nth(1)
-            .unwrap_or("/")
-            .to_string();
+        let is_connect = method.eq_ignore_ascii_case("CONNECT");
+        // CONNECT 的请求行是 authority-form（`host:port`），不是路径。
+        // 路由时把它当成 `/`，域名取 authority；否则 `locations = ["/"]`
+        // 的普通 HTTP 代理会匹配不到，客户端只会看到 405。
+        let path = if is_connect {
+            "/".to_string()
+        } else {
+            req.start_line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("/")
+                .to_string()
+        };
         // `Host` 头里可能带端口，也可能写成 IPv6 的 `[::1]:8080`。
         // 原先直接 `split(':').next()` —— 对 IPv6 会切出一个孤零零的 `[`，
         // 对 `a.example.com:8080` 倒是对，但口径与 tcpmux/CONNECT 那条路径
         // 用的 `canonical_host` 不一致。统一走同一个函数，顺带把
         // 尾点和大小写也规范化了（与官方 `util.CanonicalHost` 对齐）。
-        let host_header = req.get("host").map(canonical_host).unwrap_or_default();
+        //
+        // CONNECT 优先用请求行里的 authority（Go 的 `req.Host` 对它也是这么取
+        // 的），`Host` 头只作兜底。
+        let host_header = if is_connect {
+            let authority = canonical_host(req.start_token(1).unwrap_or(""));
+            if authority.is_empty() {
+                req.get("host").map(canonical_host).unwrap_or_default()
+            } else {
+                authority
+            }
+        } else {
+            req.get("host").map(canonical_host).unwrap_or_default()
+        };
         let auth_user = basic_auth_user(&req);
         let visitor_keep_alive = wants_keep_alive(&req);
 
@@ -989,7 +1009,7 @@ where
             table.lookup(&host_header, &path, auth_user.as_deref(), VhostKind::Http)
         else {
             debug!(%peer, host = %nfrp_common::util::LogSafe(&host_header), path = %path, "没有匹配的 http 代理");
-            if method == "CONNECT" {
+            if is_connect {
                 io.stream
                     .write_all(&simple_response(
                         "405 Method Not Allowed",
@@ -1037,6 +1057,45 @@ where
                     .await?;
                 return Ok(());
             }
+        }
+
+        // ---- CONNECT：先校验帧，后面走裸字节隧道 ----
+        //
+        // CONNECT 的语义是"请求头之后立刻就是隧道数据"，没有 HTTP 请求体。
+        // 官方 v0.71.1 的 `connectHandler` 明确拒绝带正 `Content-Length` 或
+        // `Transfer-Encoding` 的 CONNECT（400）—— 这两种头会让"头后的字节"
+        // 到底是隧道数据还是请求体产生歧义，正是请求走私/截断的入口。
+        //
+        // `Content-Length: 0` 仍然允许（很多客户端会顺手带上），但转发前要摘掉，
+        // 否则上游可能按 HTTP 请求而不是隧道处理。
+        if is_connect {
+            let cl_count = req.count("content-length");
+            let bad_cl = match cl_count {
+                0 => false,
+                1 => match req.content_length_strict() {
+                    Ok(0) => false,
+                    Ok(_) | Err(_) => true,
+                },
+                _ => true,
+            };
+            if bad_cl || req.get("transfer-encoding").is_some() {
+                debug!(
+                    %peer,
+                    cl = ?req.get_all("content-length"),
+                    te = ?req.get("transfer-encoding"),
+                    "CONNECT 带请求体框架，按歧义直接拒绝"
+                );
+                io.stream
+                    .write_all(&simple_response(
+                        "400 Bad Request",
+                        "CONNECT 请求不能带请求体\n",
+                    ))
+                    .await?;
+                return Ok(());
+            }
+            req.remove("content-length");
+            req.remove("transfer-encoding");
+            req.remove("trailer");
         }
 
         // ---- 读请求体（原样保留编码）----
@@ -1110,7 +1169,11 @@ where
             return Ok(());
         }
 
-        let body = if let Some(te) = req.get("transfer-encoding") {
+        let body = if is_connect {
+            // CONNECT 没有 HTTP 请求体；头后的字节是隧道预读数据，留给下面
+            // `take_buffered()` 显式补到上游。
+            Vec::new()
+        } else if let Some(te) = req.get("transfer-encoding") {
             // ★ 复用公共判定（与转发侧同一个口径），不要再写一遍 contains
             if nfrp_common::http_relay::is_chunked(&req) {
                 io.read_chunked().await?
@@ -1222,6 +1285,34 @@ where
 
         registry.metrics().http_requests.inc();
         let _guard = ConnGuard::new(&registry);
+
+        if is_connect {
+            // CONNECT 不是"转发一条 HTTP 请求再读回响应"，而是把两端直接对接。
+            // 官方 `connectHandler` 用 Hijack 后的 `buffered.Reader` 和远端做
+            // `libio.Join`；这里对应的是 `HttpIo` 的预读缓冲 + `PrefixedStream`
+            // （工作连接握手时可能已经预读到上游的早期字节）。
+            //
+            // 关键：`read_head()` 只消费到 `\r\n\r\n`，客户端如果没等 200 就发了
+            // 隧道数据，那些字节正躺在 `io` 的缓冲里。不 `take_buffered()` 就会
+            // 永久丢失 —— 这正是官方 v0.71.1 修的 early-data loss。
+            let (mut upstream, leftover) = work_conn.into_stream();
+            upstream.write_all(&req.to_bytes()).await?;
+            let prefetched = io.take_buffered();
+            if !prefetched.is_empty() {
+                debug!(%peer, bytes = prefetched.len(), "CONNECT 有预读数据，补发给上游");
+                upstream.write_all(&prefetched).await?;
+            }
+            upstream.flush().await?;
+
+            let mut upstream = PrefixedStream::new(leftover, upstream);
+            let mut visitor = io.stream;
+            let r = nfrp_common::util::relay_between(&mut visitor, &mut upstream).await;
+            record_bytes(&registry, &r);
+            if let Err(e) = r {
+                debug!(%peer, "HTTP CONNECT 隧道中断：{e}");
+            }
+            return Ok(());
+        }
 
         let (mut upstream, leftover) = work_conn.into_stream();
         upstream.write_all(&req.to_bytes()).await?;
@@ -2107,6 +2198,175 @@ mod tests {
             head.contains(&format!("Content-Length: {}", body.len())),
             "{head}"
         );
+    }
+
+    /// 从流里读到 `needle` 为止（测试用；超时/EOF 都直接 panic）。
+    async fn read_until(stream: &mut DuplexStream, needle: &[u8], what: &str) -> Vec<u8> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut got = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                panic!(
+                    "等待 {what} 超时，已收到 {} 字节：{:?}",
+                    got.len(),
+                    String::from_utf8_lossy(&got)
+                );
+            }
+            let mut buf = [0u8; 4096];
+            match tokio::time::timeout(left, stream.read(&mut buf)).await {
+                Ok(Ok(0)) => panic!(
+                    "等待 {what} 时流已 EOF，已收到：{:?}",
+                    String::from_utf8_lossy(&got)
+                ),
+                Ok(Ok(n)) => {
+                    got.extend_from_slice(&buf[..n]);
+                    if find_subslice(&got, needle).is_some() {
+                        return got;
+                    }
+                }
+                Ok(Err(e)) => panic!("等待 {what} 时读失败：{e}"),
+                Err(_) => panic!(
+                    "等待 {what} 超时，已收到 {} 字节：{:?}",
+                    got.len(),
+                    String::from_utf8_lossy(&got)
+                ),
+            }
+        }
+    }
+
+    /// ★ 回归测试：HTTP vhost 的 CONNECT 是**裸隧道**，头后的预读数据不能丢。
+    ///
+    /// 官方 v0.71.1 修的就是这个：`read_head`/Hijack 只消费到 `\r\n\r\n`，
+    /// 客户端没等 200 就发来的隧道数据留在缓冲里，直接 `relay_between`
+    /// 底层流会把它永久丢掉。这里同时验证：
+    /// 1. `Content-Length: 0` 允许；
+    /// 2. 头后的 `EARLY` 必须补发给上游；
+    /// 3. 上游响应和后续双向字节都能透传。
+    #[tokio::test]
+    async fn http_connect_预读数据不丢且双向透传() {
+        let registry = Arc::new(Registry::unlimited());
+        let client = dummy_client("run-connect-early");
+        let (up_srv, mut up_cli) = duplex(64 * 1024);
+        client.submit_work(crate::pool::WorkItem::new(FrpConn::new(
+            Box::pin(up_srv),
+            nfrp_common::frp::WireVersion::V1,
+        )));
+
+        let table = Arc::new(table_with(vec![route_of(
+            &client,
+            "web",
+            "a.example.com",
+            &["/"],
+        )]));
+        let (mut visitor, srv) = duplex(64 * 1024);
+        let opts =
+            VhostOpts::new(VhostKind::Http, false).with_timeout(Some(Duration::from_secs(5)));
+        let task = tokio::spawn(async move {
+            handle_http(
+                srv,
+                SocketAddr::from(([127, 0, 0, 1], 5000)),
+                table,
+                0,
+                opts,
+                registry,
+            )
+            .await
+        });
+
+        visitor
+            .write_all(
+                b"CONNECT a.example.com:443 HTTP/1.1\r\n\
+                  Host: a.example.com\r\n\
+                  Content-Length: 0\r\n\r\nEARLY",
+            )
+            .await
+            .unwrap();
+
+        let up = read_until(&mut up_cli, b"EARLY", "上游收到 CONNECT 预读数据").await;
+        let up_text = String::from_utf8_lossy(&up);
+        assert!(
+            up_text.contains("CONNECT a.example.com:443 HTTP/1.1"),
+            "上游必须先收到 CONNECT 请求头：{up_text}"
+        );
+        assert!(
+            !up_text.to_ascii_lowercase().contains("content-length:"),
+            "CONNECT 的 Content-Length 必须在转发前摘掉：{up_text}"
+        );
+
+        // 上游 → 访客：响应头 + 隧道数据必须原样回来
+        up_cli
+            .write_all(b"HTTP/1.1 200 OK\r\n\r\nPONG")
+            .await
+            .unwrap();
+        let got = read_until(&mut visitor, b"PONG", "访客收到上游隧道数据").await;
+        let got_text = String::from_utf8_lossy(&got);
+        assert!(
+            got_text.starts_with("HTTP/1.1 200 OK"),
+            "上游 200 必须回到访客：{got_text}"
+        );
+
+        // 访客 → 上游：隧道建立后的后续字节也必须透传
+        visitor.write_all(b"MORE").await.unwrap();
+        read_until(&mut up_cli, b"MORE", "上游收到后续隧道数据").await;
+
+        drop(visitor);
+        drop(up_cli);
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+
+    /// ★ 回归测试：CONNECT 带正 `Content-Length` 或 `Transfer-Encoding` 必须 400。
+    ///
+    /// 这两种头都会让"头后的字节"产生歧义（隧道数据 vs 请求体），官方
+    /// `connectHandler` 明确拒绝；这里锁住同样的口径。
+    #[tokio::test]
+    async fn http_connect_带请求体框架必须_400() {
+        let cases: &[&[u8]] = &[
+            b"CONNECT a.example.com:443 HTTP/1.1\r\nHost: a.example.com\r\nContent-Length: 4\r\n\r\nbody",
+            b"CONNECT a.example.com:443 HTTP/1.1\r\nHost: a.example.com\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        ];
+
+        for (i, raw) in cases.iter().enumerate() {
+            let registry = Arc::new(Registry::unlimited());
+            let client = dummy_client(&format!("run-connect-bad-{i}"));
+            // 刻意不提交工作连接：若实现错误地放行，会卡在 acquire_work_conn
+            // 直到 userConnTimeout，下面的 3 秒读取就会失败。
+            let table = Arc::new(table_with(vec![route_of(
+                &client,
+                "web",
+                "a.example.com",
+                &["/"],
+            )]));
+            let (mut visitor, srv) = duplex(64 * 1024);
+            let opts =
+                VhostOpts::new(VhostKind::Http, false).with_timeout(Some(Duration::from_secs(5)));
+            let task = tokio::spawn(async move {
+                handle_http(
+                    srv,
+                    SocketAddr::from(([127, 0, 0, 1], 5000)),
+                    table,
+                    0,
+                    opts,
+                    registry,
+                )
+                .await
+            });
+
+            visitor.write_all(raw).await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = tokio::time::timeout(Duration::from_secs(3), visitor.read(&mut buf))
+                .await
+                .expect("必须立刻回 400，不能去等请求体或工作连接")
+                .unwrap();
+            let text = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                text.starts_with("HTTP/1.1 400 Bad Request"),
+                "第 {i} 种 CONNECT 必须 400，实际：{text}"
+            );
+
+            drop(visitor);
+            let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        }
     }
 
     /// ★ 回归测试：`Transfer-Encoding` 与 `Content-Length` 同时出现必须 400。

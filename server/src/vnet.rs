@@ -123,6 +123,13 @@ struct HubInner {
     /// 注销时要**两边一起清**，只清一边会出现"路由指向一个没人收的信箱"，
     /// 包被悄悄丢掉，比直接报错更难查。
     sinks: HashMap<String, mpsc::Sender<Vec<u8>>>,
+    /// 客户端 id → 当前登记的代次。
+    ///
+    /// `JoinGuard` 只能回收**自己那一次**登记：旧连接如果在同一 id 被新连接
+    /// 接手后才 Drop，不能把新连接的路由/租约删掉。官方 v0.71.1 修的正是
+    /// 这种"stale cleanup 删 replacement route"的黑洞。
+    owners: HashMap<String, u64>,
+    next_generation: u64,
     /// 统计：目的地址查不到人的包。
     dropped_unroutable: u64,
     /// 统计：下游队列满了被丢掉的包。
@@ -158,6 +165,8 @@ pub struct Joined {
     pub subnet: Subnet,
     pub gateway: Ipv4Addr,
     pub mtu: u32,
+    /// 本次登记的代次；`JoinGuard` 用它避免旧连接清掉新连接。
+    generation: u64,
 }
 
 impl VnetHub {
@@ -207,6 +216,8 @@ impl VnetHub {
                 pool: IpPool::new(subnet),
                 routes: Switch::new(),
                 sinks: HashMap::new(),
+                owners: HashMap::new(),
+                next_generation: 0,
                 dropped_unroutable: 0,
                 dropped_full: 0,
                 dropped_spoofed: 0,
@@ -260,18 +271,39 @@ impl VnetHub {
             }
         }
         g.sinks.insert(client.to_string(), sink);
+        let generation = g.next_generation.wrapping_add(1);
+        g.next_generation = generation;
+        g.owners.insert(client.to_string(), generation);
 
         Ok(Joined {
             ip,
             subnet: g.subnet,
             gateway: g.gateway,
             mtu: g.mtu,
+            generation,
         })
     }
 
     /// 客户端离开：路由与地址**一起**回收。
+    ///
+    /// 这是无条件清理，主要给测试和显式管理用。连接生命周期请用
+    /// [`JoinGuard`]：它只会清理**自己那一代**登记。
     pub fn leave(&self, client: &SessionKey) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Self::leave_locked(&mut g, client.as_str());
+    }
+
+    /// 只有当前登记仍然是 `generation` 时才清理。
+    ///
+    /// 旧连接的 `JoinGuard` 可能在新连接完成登记之后才 Drop；如果按 id
+    /// 无条件删，就会把新连接的路由、租约和 sink 一起删掉。官方 frp
+    /// v0.71.1 的 VNet 修复就是要求"清理必须属于当前 owner"。
+    fn leave_if_current(&self, client: &SessionKey, generation: u64) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.owners.get(client.as_str()).copied() != Some(generation) {
+            debug!(%client, generation, "旧 VNet 会话的清理晚到，跳过（当前登记已属于新连接）");
+            return;
+        }
         Self::leave_locked(&mut g, client.as_str());
     }
 
@@ -279,6 +311,7 @@ impl VnetHub {
         g.routes.unregister(&g.network, client);
         g.pool.release(client);
         g.sinks.remove(client);
+        g.owners.remove(client);
     }
 
     /// 处理一个从 `from` 客户端收到的 IP 报文：按目的地址转发。
@@ -600,6 +633,7 @@ async fn serve_conn(
     let _guard = JoinGuard {
         hub: hub.clone(),
         client: session_key.clone(),
+        generation: joined.generation,
     };
 
     let resp = VnetRegisterResp {
@@ -716,11 +750,12 @@ async fn serve_conn(
 struct JoinGuard {
     hub: Arc<VnetHub>,
     client: SessionKey,
+    generation: u64,
 }
 
 impl Drop for JoinGuard {
     fn drop(&mut self) {
-        self.hub.leave(&self.client);
+        self.hub.leave_if_current(&self.client, self.generation);
         debug!(client = %self.client, "VirtualNet 客户端已离开，地址与路由已回收");
     }
 }
@@ -1134,6 +1169,76 @@ mod tests {
             "用错身份键时应当计入 dropped_spoofed（这正是线上观察到的现象）"
         );
         let _ = rx_a.try_recv();
+    }
+
+    /// ★ 回归测试（对应官方 v0.71.1 的 VNet 路由清理）：
+    /// **旧会话的 `JoinGuard` 晚于新会话触发时，只能回收自己的路由/租约。**
+    ///
+    /// 官方修复的形态是"replacement route 已注册，stale cleanup 按名字把它删了"。
+    /// NFrp 的 owner 是 `"{client}-{run_id}"`，旧连接不可能删掉新连接的 key；
+    /// 这条用例在 Hub 层锁住这个不变量，并确认旧租约不会把新租约一起释放。
+    #[test]
+    fn 旧会话清理不得回收新会话的路由() {
+        let h = hub();
+        let old = SessionKey::new_for("laptop");
+        let new = SessionKey::new_for("laptop");
+        let (tx_old, _rx_old) = sink();
+        let (tx_new, _rx_new) = sink();
+
+        let j_old = h.join(&old, None, tx_old).expect("旧会话加入");
+        let j_new = h.join(&new, None, tx_new).expect("新会话加入");
+        assert_ne!(j_old.ip, j_new.ip, "不同会话应当拿到不同地址");
+
+        // 模拟旧连接晚到的 Drop：只清理旧 key
+        h.leave(&old);
+
+        assert_eq!(
+            h.address_of(new.as_str()),
+            Some(j_new.ip),
+            "旧会话清理把新会话的路由删掉了"
+        );
+        assert_eq!(h.stats().unwrap().peers, 1);
+        assert_eq!(h.stats().unwrap().leased, 1, "新会话的租约不能被旧清理释放");
+
+        // 新会话仍然可用：自己发广播能被其他成员收到（这里先加一个成员）
+        let (tx_peer, mut rx_peer) = sink();
+        h.join(&SessionKey::new_for("peer"), None, tx_peer)
+            .expect("peer 加入");
+        let pkt = fake_udp(j_new.ip, Ipv4Addr::BROADCAST, b"still-alive");
+        assert!(h.route(&new, &pkt), "新会话必须仍能转发");
+        assert_eq!(rx_peer.try_recv().unwrap(), pkt);
+    }
+
+    /// ★ 回归测试：即使**同一个会话键**发生了重连，旧 `JoinGuard` 晚到的
+    /// Drop 也只能按代次跳过，不能把新登记一起删掉。
+    ///
+    /// 这比"服务端总是生成唯一 key"更硬一层：将来如果有人改成复用 key，
+    /// 也不会退回官方那个"stale cleanup 删 replacement route"的黑洞。
+    #[test]
+    fn 同一会话键的旧_guard_不得删掉新登记() {
+        let h = Arc::new(hub());
+        let key = sk("laptop-same-key");
+        let (tx1, _rx1) = sink();
+        let (tx2, _rx2) = sink();
+
+        let j1 = h.join(&key, None, tx1).expect("旧连接加入");
+        let old_guard = JoinGuard {
+            hub: h.clone(),
+            client: key.clone(),
+            generation: j1.generation,
+        };
+
+        let j2 = h.join(&key, None, tx2).expect("新连接接手");
+        // 旧连接此刻才 Drop（网络延迟/调度都可能导致这种顺序）
+        drop(old_guard);
+
+        assert_eq!(
+            h.address_of(key.as_str()),
+            Some(j2.ip),
+            "旧 Guard 把新连接的路由删掉了"
+        );
+        assert_eq!(h.stats().unwrap().peers, 1);
+        assert_eq!(h.stats().unwrap().leased, 1, "新连接的租约不能丢");
     }
 
     /// 反向：**同一个会话键**重连时，仍然要清掉旧登记（原有行为，防回归）。

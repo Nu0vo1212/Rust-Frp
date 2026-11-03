@@ -2,7 +2,7 @@
 
 > 这份文件收纳 README 里放不下的质量细节。README 只留一句话概述 + 指向这里。
 >
-> 对应版本：**v0.7.4** · 最后核对：2026-10-31
+> 对应版本：**v0.7.4** · 最后核对：2026-11-03
 
 ---
 
@@ -13,7 +13,7 @@
 ```bash
 cargo fmt --all -- --check                 # 格式
 cargo clippy --workspace --all-targets -- -D warnings   # 静态检查，当前 0 告警
-cargo test --workspace                     # 992 个测试通过
+cargo test --workspace                     # 999 个测试通过
 ```
 
 三项全绿才算过。CI 上跑的是同一组命令，参数一致，不存在"本地过了 CI 不过"。
@@ -26,21 +26,21 @@ cargo test --workspace                     # 992 个测试通过
 
 | 目标 | 通过 | 忽略 |
 |---|---|---|
-| `nfrp-client` 单元测试 | 134 |  |
-| `nfrp-common` 单元测试（lib） | 501 | 3（需真机网卡） |
-| `nfrp-common` 集成测试 | 9 |  |
-| `nfrp-server` 单元测试（lib） | 287 |  |
+| `nfrp-client` 单元测试 | 136 |  |
+| `nfrp-common` 单元测试（lib） | 502 | 3（Wintun 真机） |
+| `nfrp-common` 集成测试（OIDC） | 9 |  |
+| `nfrp-server` 单元测试（lib） | 291 |  |
 | `nfrp-server` 单元测试（bin） | 17 |  |
 | `nfrp-server` 端到端集成测试 | 26 |  |
 | `nfrp-server` NLink 端到端 | 16 |  |
-| `nfrp-server` OIDC 端到端 | 2 |  |
-| Wintun 真机（Windows） | 0 | 5 |
-| Linux TUN 真机 | 0 | 5 |
-| **合计** | **992** | **13** |
+| 文档测试（common） | 2 | 5 |
+| 文档测试（server） | 0 | 5 |
+| **合计** | **999** | **13** |
 
-**关于 13 条 `#[ignore]`**：全部是**需要真机硬件或管理员权限**的设备面测试
-（Windows Wintun 网卡、Linux TUN 设备），不是被跳过的问题测试。它们在有权限的
-环境里可以用 `cargo test -- --ignored` 单独跑。
+**关于 13 条 `#[ignore]`**：3 条是**需要真机硬件或管理员权限**的 Windows Wintun
+设备面测试，另外 10 条是文档示例里明确标注 `ignore` 的代码块（不是失败/被跳过
+的问题测试）。Wintun 真机测试在有权限的环境里可以用 `cargo test -- --ignored`
+单独跑。
 
 **数字对不上时以 `cargo test` 输出为准** —— 这张表是人手抄的，会漂移。
 
@@ -69,6 +69,8 @@ cargo test --workspace                     # 992 个测试通过
 |---|---|---|
 | **0.7.4** | 限流转发在半关闭后不释放工作连接 | `relay_throttled` 原先用 `try_join!` 等两个方向都结束。客户端只关一个方向时，另一侧的 `read()` 一直挂着，`try_join!` 永不返回 ⇒ 工作连接与 fd 泄漏。修法：`copy_throttled` 读到 EOF 后**主动 shutdown 写端**，对端收到 FIN 也会读到 EOF。测试 `限流转发在半关闭后必须返回释放连接`，用 `timeout` 包住，回归时 2 秒失败而不是挂死 |
 | **0.7.4** | `ResumeCommit` 分片上限按"片数"限不合理 | 0.7.2 写死"最多 64 片"（≈512 KiB）。改成按**字节预算**（8 MiB），片数由预算推出。额外加了一道"累计字节"检查——片数合法但每片塞满时仍可能超预算 |
+| **0.7.4** | HTTP vhost CONNECT 的早期数据被丢掉 | 客户端没等 200 就把隧道数据发来时，`read_head` 已把字节预读进 `HttpIo` 缓冲；随后直接对底层流做 `relay_between` 会跳过缓冲。修法：CONNECT 分支先 `take_buffered()` 补写上游，再用 `PrefixedStream` 把工作连接预读字节补回下游。带正 `Content-Length` 或 `Transfer-Encoding` 的 CONNECT 按官方口径回 400 |
+| **0.7.4** | VNet 重连后旧地址/旧路由残留，连续失败重试无上限 | `ip addr replace` / `New-NetIPAddress` 换 IP 时会留下旧地址和旧直连路由；改为显式删除旧地址。连续失败改为指数退避并封顶 300 秒，同时把超大失败计数限制在安全移位范围内，避免溢出成 0 后疯狂重试；并为每次登记分配代次，旧 `JoinGuard` 晚到的 Drop 只能跳过，不能删新连接的路由 |
 | **0.7.3** | NatHole 的六个 mode 分支只测了一个 | 补 `mode_选择的六个分支与官方一致`，把六种 `(easy, hard, regular)` 组合的首选 mode 全钉死。之前只测 `easy==2` 那一支，其余写错不会被发现 |
 | **0.7.2** | 续传是 bearer 会话（`user + client_id + session_id`） | 三个值都是**标识**不是凭证。加一次性令牌（HMAC 绑定四项 + 用一次就作废）。但明文链路上仍可被抢先消费——`transport.tls.force = true` 才是根治 |
 | **0.7.2** | `ResumeCommit` 超 8 KiB 静默降级 | 名单装不下时客户端只能拒发，对账能力退化成 10 秒宽限期。改自动分片，单帧时线上格式不变 |

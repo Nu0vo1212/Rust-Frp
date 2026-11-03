@@ -460,6 +460,57 @@ impl Tun {
         self.apply_mtu()
     }
 
+    /// 地址变化时**先删旧、再加新**。
+    ///
+    /// `New-NetIPAddress` 不会自动移除旧地址；不删的话，旧地址的直连路由
+    /// 会继续把旧网段送进 Wintun，重连后表现为一部分流量黑洞。
+    /// 先删再加会有一个很短的"无地址"窗口，但只发生在地址真的变化时，
+    /// 比留下错误路由安全。
+    pub fn replace_address(&self, old_spec: &str, new_spec: &str) -> anyhow::Result<()> {
+        let old_spec = old_spec.trim();
+        if old_spec.is_empty() || old_spec == new_spec.trim() {
+            return self.set_address(new_spec);
+        }
+        let old_ip = old_spec
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .replace('\'', "''");
+        if old_ip.is_empty() {
+            return self.set_address(new_spec);
+        }
+
+        let ps = format!(
+            "$ErrorActionPreference='Stop'; \
+             Get-NetIPAddress -InterfaceAlias '{}' -IPAddress '{}' -ErrorAction SilentlyContinue | \
+             Remove-NetIPAddress -Confirm:$false -ErrorAction Stop | Out-Null; \
+             if (Get-NetIPAddress -InterfaceAlias '{}' -IPAddress '{}' -ErrorAction SilentlyContinue) {{ \
+                 throw '旧地址仍然存在' \
+             }}",
+            self.name.replace('\'', "''"),
+            old_ip,
+            self.name.replace('\'', "''"),
+            old_ip
+        );
+        let out = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
+            .output()
+            .map_err(|e| anyhow::anyhow!("调用 PowerShell 删除旧地址失败：{e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            return Err(anyhow::anyhow!(
+                "删除 [{}] 的旧地址 {old_spec} 失败（旧路由残留会导致重连后流量黑洞）：{}{}",
+                self.name,
+                err.trim(),
+                stdout.trim()
+            ));
+        }
+
+        self.set_address(new_spec)
+    }
+
     /// 设 MTU。失败只告警 —— 地址已经有了，连通性不受影响。
     fn apply_mtu(&self) -> anyhow::Result<()> {
         if self.mtu == 0 {

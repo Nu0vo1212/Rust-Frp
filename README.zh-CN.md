@@ -231,7 +231,7 @@ quic = true
 
 ### 工程质量
 
-992 个自动化测试，含真实 QUIC 栈握手、端到端集成、官方抓包密文解密回归；
+999 个自动化测试，含真实 QUIC 栈握手、端到端集成、官方抓包密文解密回归；
 `cargo audit` 0 命中；发布产物附 `SHA256SUMS` + Ed25519 签名。
 
 测试分布、CI 矩阵、依赖安全做到哪一步、发版闸门与人工核对清单，
@@ -391,7 +391,7 @@ NFrp 可运行在官方 frp 的任一侧，双向实测通过：
 ```bash
 cargo fmt --all -- --check                              # 格式
 cargo clippy --workspace --all-targets -- -D warnings   # 静态检查，0 告警
-cargo test --workspace                                  # 992 通过 / 0 失败 / 13 ignored
+cargo test --workspace                                  # 999 通过 / 0 失败 / 13 ignored
 ```
 
 那 13 条 `#[ignore]` 全是**需要真机硬件或管理员权限**的设备面测试

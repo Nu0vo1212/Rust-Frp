@@ -744,6 +744,10 @@ impl Tun {
     pub fn set_address(&self, _addr_spec: &str) -> anyhow::Result<()> {
         match self._never {}
     }
+
+    pub fn replace_address(&self, _old_spec: &str, _new_spec: &str) -> anyhow::Result<()> {
+        match self._never {}
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -990,6 +994,34 @@ mod tests {
         assert_eq!(sw.lookup("net-c", a), None, "没登记的网络查不到");
         sw.unregister("net-a", "alice");
         assert_eq!(sw.lookup("net-b", a), Some("bob"));
+    }
+
+    /// ★ 回归测试（对应官方 v0.71.1 的 VNet 路由清理）：
+    /// 旧会话的延迟清理**不得**删掉新会话已经登记的路由。
+    ///
+    /// 官方 frpc 的 route 以 visitor 名字为键，重连时新 visitor 可能先注册，
+    /// 旧插件随后按名字注销，把新路由一起删掉 —— 表现为 TUN 还在、流量全黑洞。
+    /// NFrp 的服务端路由以**服务端生成的唯一会话键**为 owner，天然不会被
+    /// 同名旧会话误删；这条测试把这个不变量锁在 `Switch` 层。
+    #[test]
+    fn 旧会话清理不得删掉新会话的路由() {
+        let mut sw = Switch::new();
+        let ip: Ipv4Addr = "100.64.0.2".parse().unwrap();
+        sw.register("default", ip, "laptop-old");
+        // 新会话接手同一个 IP（模拟路由替换）
+        assert_eq!(
+            sw.register("default", ip, "laptop-new").as_deref(),
+            Some("laptop-old")
+        );
+        // 旧会话的清理晚到：只能按自己的 owner 删，不能误伤 replacement
+        sw.unregister("default", "laptop-old");
+        assert_eq!(
+            sw.lookup("default", ip),
+            Some("laptop-new"),
+            "旧会话清理把新会话的路由删掉了 —— 这正是官方 VNet 重连黑洞的形态"
+        );
+        assert!(sw.ips_of("default", "laptop-old").is_empty());
+        assert_eq!(sw.ips_of("default", "laptop-new"), vec![ip]);
     }
 
     #[test]

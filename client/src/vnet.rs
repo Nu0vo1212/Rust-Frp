@@ -48,9 +48,31 @@ const TUN_NAME: &str = "nfrp%d";
 /// 注册响应的行上限。
 const MAX_RESP_LINE: usize = 8 * 1024;
 
+/// 连续失败时的最大重连间隔。
+///
+/// 与官方 frp v0.71.1 的 `virtualNetReconnectMaxDelay` 对齐（300 秒）。
+/// 没有上限的话，指数退避最终会把间隔推到小时级；反过来，如果直接在
+/// `1 << n` 上算而不封顶，n 变大后还会溢出成 0，变成疯狂重试 ——
+/// 官方这次修的正是后一种。
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
+
+/// 计算第 `consecutive_failures` 次连续失败后的重连间隔。
+///
+/// 1 次失败用配置的 `reconnect_interval`，之后翻倍，最多 300 秒。
+/// `shift` 在 16 处封顶只是为了让 `1u32 << shift` 永远安全；真正的
+/// 300 秒上限由最后的 `min` 保证。
+fn reconnect_delay(base: Duration, consecutive_failures: u32) -> Duration {
+    if consecutive_failures <= 1 {
+        return base.min(MAX_RECONNECT_DELAY);
+    }
+    let shift = (consecutive_failures - 1).min(16);
+    base.saturating_mul(1u32 << shift).min(MAX_RECONNECT_DELAY)
+}
+
 /// 常驻任务：断线就一直重连，直到进程退出。
 pub async fn run(cfg: Arc<ClientConfig>, token_source: Option<Arc<TokenSource>>) -> Result<()> {
-    let interval = Duration::from_secs(cfg.reconnect_interval.max(1));
+    let base = Duration::from_secs(cfg.reconnect_interval.max(1));
+    let mut consecutive_failures: u32 = 0;
     let mut tun: Option<Tun> = None;
     // 上一次配到网卡上的地址。重连后地址变了就必须 replace，否则包会以
     // 一个服务端不认识的源地址发出去（查无此人 → 对端回包无处可去）。
@@ -58,7 +80,17 @@ pub async fn run(cfg: Arc<ClientConfig>, token_source: Option<Arc<TokenSource>>)
 
     loop {
         match session(&cfg, &token_source, &mut tun, &mut current_spec).await {
-            Ok(()) => info!("VirtualNet 会话正常结束，{interval:?} 后重连"),
+            Ok(()) => {
+                if consecutive_failures > 0 {
+                    info!(
+                        failures = consecutive_failures,
+                        "VirtualNet 已恢复正常，重置连续失败计数"
+                    );
+                    consecutive_failures = 0;
+                }
+                info!("VirtualNet 会话正常结束，{base:?} 后重连");
+                tokio::time::sleep(base).await;
+            }
             Err(e) => {
                 error!("VirtualNet 会话中断：{e:#}");
                 // 建设备失败是**不可重试**的：重试一万次还是没权限，
@@ -66,10 +98,16 @@ pub async fn run(cfg: Arc<ClientConfig>, token_source: Option<Arc<TokenSource>>)
                 if e.to_string().contains("TUN") && tun.is_none() {
                     return Err(e);
                 }
-                warn!("{interval:?} 后重试");
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                let delay = reconnect_delay(base, consecutive_failures);
+                warn!(
+                    failures = consecutive_failures,
+                    delay = ?delay,
+                    "VirtualNet 连续失败，按退避间隔重试"
+                );
+                tokio::time::sleep(delay).await;
             }
         }
-        tokio::time::sleep(interval).await;
     }
 }
 
@@ -156,7 +194,13 @@ async fn session(
                     new = %spec,
                     "重连后虚拟地址变了，正在更新网卡"
                 );
-                dev.set_address(&spec)?;
+                // 必须把旧地址一起删掉，而不是只 `ip addr replace` 新地址：
+                // Linux 的 replace 只匹配同一个 local 地址，换 IP 时会留下
+                // 第二个地址；Windows 的 New-NetIPAddress 同理。旧地址的
+                // 直连路由会继续把旧网段送进 TUN，表现为重连后一部分流量
+                // 黑洞。`replace_address` 负责"先加新、再删旧"。
+                let old = current_spec.clone().unwrap_or_default();
+                dev.replace_address(&old, &spec)?;
                 *current_spec = Some(spec);
             }
             debug!(dev = dev.name(), %ip, "VirtualNet 重连成功");
@@ -193,7 +237,10 @@ async fn relay(stream: TcpStream, tun: &mut Tun) -> Result<()> {
             n = sock_rd.read(&mut sock_buf) => {
                 let n = n.context("读 VirtualNet socket 失败")?;
                 if n == 0 {
-                    anyhow::bail!("服务端关闭了 VirtualNet 连接");
+                    // 正常 EOF（服务端重启 / 运维关闭）不是"连接失败"，不应
+                    // 触发指数退避；回到 run 的 Ok 分支，按基础间隔重连。
+                    info!("服务端关闭了 VirtualNet 连接");
+                    return Ok(());
                 }
                 pending.extend_from_slice(&sock_buf[..n]);
                 while let Some(pkt) = take_frame(&mut pending)? {
@@ -203,5 +250,43 @@ async fn relay(stream: TcpStream, tun: &mut Tun) -> Result<()> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ★ 回归测试（对应官方 v0.71.1 的 VNet 重连退避）：
+    /// 连续失败要指数增长，但必须有 300 秒硬上限。
+    #[test]
+    fn 连续失败按指数退避且有上限() {
+        let base = Duration::from_secs(5);
+        assert_eq!(reconnect_delay(base, 0), base);
+        assert_eq!(reconnect_delay(base, 1), base);
+        assert_eq!(reconnect_delay(base, 2), Duration::from_secs(10));
+        assert_eq!(reconnect_delay(base, 3), Duration::from_secs(20));
+        assert_eq!(reconnect_delay(base, 4), Duration::from_secs(40));
+        assert_eq!(reconnect_delay(base, 5), Duration::from_secs(80));
+        assert_eq!(reconnect_delay(base, 6), Duration::from_secs(160));
+        assert_eq!(reconnect_delay(base, 7), MAX_RECONNECT_DELAY);
+    }
+
+    /// 错误计数很大时不能因为移位溢出而变成 0（官方这次修的"疯狂重试"）。
+    #[test]
+    fn 超大失败计数不会溢出成零() {
+        let base = Duration::from_secs(5);
+        for n in [8, 31, 32, 63, 64, 1000, u32::MAX] {
+            assert_eq!(
+                reconnect_delay(base, n),
+                MAX_RECONNECT_DELAY,
+                "consecutive_failures={n} 必须仍然封顶在 300s"
+            );
+        }
+        // 配置的基础间隔本身超过上限时也要收敛到 300s
+        assert_eq!(
+            reconnect_delay(Duration::from_secs(3600), 1),
+            MAX_RECONNECT_DELAY
+        );
     }
 }

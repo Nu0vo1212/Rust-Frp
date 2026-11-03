@@ -269,6 +269,51 @@ impl Tun {
         Ok(())
     }
 
+    /// 地址变化时**先加新、再删旧**。
+    ///
+    /// `ip addr replace` 只替换"同一个 local 地址"的条目；换一个 IP 时它会
+    /// 再加一条，旧地址和旧直连路由都会留着。服务端重启/换网段后，旧网段
+    /// 的流量仍会进 TUN，造成黑洞。这里显式删除旧地址。
+    pub fn replace_address(&self, old_spec: &str, new_spec: &str) -> anyhow::Result<()> {
+        let old = old_spec.trim();
+        if old.is_empty() || old == new_spec.trim() {
+            return self.set_address(new_spec);
+        }
+        let old_ip = old.split('/').next().unwrap_or("").trim();
+        let new_ip = new_spec.trim().split('/').next().unwrap_or("").trim();
+
+        // 先加新地址（保证切换期间仍有地址可用）
+        self.set_address(new_spec)?;
+
+        // 同一个 IP 只换前缀：replace 已经更新了条目，再 del 会把新地址删掉
+        if old_ip == new_ip {
+            return Ok(());
+        }
+
+        let out = std::process::Command::new("ip")
+            .args(["addr", "del", old, "dev", self.name.as_str()])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => {
+                let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                // 旧地址已经不存在（例如上次删除成功但进程在返回前退出）不是错
+                if err.contains("Cannot assign requested address")
+                    || err.contains("No such process")
+                    || err.contains("not found")
+                {
+                    return Ok(());
+                }
+                Err(anyhow::anyhow!(
+                    "删除 TUN 旧地址 {old} 失败：{err}（旧路由残留会导致重连后流量黑洞）"
+                ))
+            }
+            Err(e) => Err(anyhow::anyhow!(
+                "执行 `ip addr del` 失败：{e}。需要 iproute2（Debian/Ubuntu: apt install iproute2）。"
+            )),
+        }
+    }
+
     /// 设备名，如 `tun0`。
     pub fn name(&self) -> &str {
         &self.name

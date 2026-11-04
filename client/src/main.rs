@@ -455,15 +455,18 @@ async fn main() -> Result<()> {
     let shutdown = util::shutdown_signal();
     tokio::pin!(shutdown);
 
-    // 进程生命周期内**是否成功登录过**。用来实现官方 frpc 的 `loginFailExit`
-    // （默认 true）：首次登录失败就退出，登录成功过之后断线则一直重连。
+    // 进程生命周期内**是否成功登录过**。
     //
-    // 这一项很关键，不是可有可无的礼节：第三方启动器（NetTool 拉 LoliaFRP 就是）
-    // 判断"隧道到底起没起来"靠的是**看子进程还活着没**。老版本无脑重试，
-    // 配置/令牌错的时候进程也不退，启动器只会显示绿灯 —— 用户看到"已启动"
-    // 但实际根本连不上，还得自己去翻日志。官方 frpc 遇到这种情况会毫秒级退出，
-    // 启动器才能把错误原样弹给用户。
+    // 登录成功后断线 → 按 `reconnect_interval` 无限重连；
+    // 从未登录成功 → 区分"连不上"与"被服务端拒绝"：
+    //   * 连不上（dial / DNS / 代理 / KCP(UDP) / 握手超时）：开机自启时网络、
+    //     代理、UDP 通道都可能还没就绪，**必须退避重试**，不能被 loginFailExit
+    //     一刀切杀掉进程；
+    //   * 被拒绝（服务端已回包且明确报错）：重试不会变，按 `loginFailExit` 退出，
+    //     让启动器把配置错误如实报出来。
     let logged_in_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // 首次登录连续失败次数：只用于指数退避与日志升级（登录成功后不再累加）。
+    let mut first_login_failures: u32 = 0;
 
     loop {
         let fut = run_session(SessionDeps {
@@ -476,25 +479,50 @@ async fn main() -> Result<()> {
             proxies: proxies.clone(),
             hub: hub.clone(),
         });
+        let mut retry_delay = Duration::from_secs(cfg.reconnect_interval);
         tokio::select! {
             r = fut => {
                 match r {
                     Ok(()) => info!("与控制服务端的会话结束"),
                     Err(e) => {
-                        // 首次登录（连不上 / 认证被拒 / 握手失败）就没成功过 → 退出，
-                        // 让启动器据此报错。已经登录过则只是普通断线，继续重连。
-                        if cfg.login_fail_exit
-                            && !logged_in_once.load(std::sync::atomic::Ordering::SeqCst)
-                        {
-                            return Err(e).with_context(|| {
-                                format!(
-                                    "首次登录 {}:{} 失败；已启用 loginFailExit（默认行为），\
-                                     不再重试。想让它一直重试请在配置里写 loginFailExit = false",
-                                    cfg.server_addr, cfg.server_port
-                                )
-                            });
+                        if logged_in_once.load(std::sync::atomic::Ordering::SeqCst) {
+                            // 已经成功登录过：这次只是普通断线。
+                            error!("会话出错：{e:#}");
+                        } else if is_login_rejected(&e) {
+                            // 服务端明确拒绝（令牌错 / 用户被禁用 / 协议不兼容…）。
+                            if cfg.login_fail_exit {
+                                return Err(e).with_context(|| {
+                                    format!(
+                                        "登录 {}:{} 被服务端拒绝；已启用 loginFailExit（默认行为），\
+                                         不再重试。loginFailExit 只对“服务端明确拒绝”生效 —— \
+                                         连不上（网络/代理/KCP 未就绪）会自动退避重试。",
+                                        cfg.server_addr, cfg.server_port
+                                    )
+                                });
+                            }
+                            warn!("服务端拒绝登录（loginFailExit = false，将继续重试）：{e:#}");
+                        } else {
+                            // 连不上：开机自启场景最常见的失败点。
+                            first_login_failures = first_login_failures.saturating_add(1);
+                            retry_delay = startup_retry_delay(first_login_failures);
+                            if first_login_failures >= 5 {
+                                error!(
+                                    attempt = first_login_failures,
+                                    delay = retry_delay.as_secs(),
+                                    "首次登录连续失败（{e:#}）；{} 秒后继续重试。\
+                                     若 serverAddr / 端口 / proxyURL 写错，请检查配置",
+                                    retry_delay.as_secs()
+                                );
+                            } else {
+                                warn!(
+                                    attempt = first_login_failures,
+                                    delay = retry_delay.as_secs(),
+                                    "首次登录失败（网络 / 代理 / KCP(UDP) 可能尚未就绪），\
+                                     {} 秒后重试：{e:#}",
+                                    retry_delay.as_secs()
+                                );
+                            }
                         }
-                        error!("会话出错：{e:#}");
                     }
                 }
             }
@@ -510,9 +538,9 @@ async fn main() -> Result<()> {
         // 会话已失效，visitor 在拿到新会话之前不要再用旧连接
         let _ = session_tx.send(None);
 
-        info!("{} 秒后重连…", cfg.reconnect_interval);
+        info!("{} 秒后重连…", retry_delay.as_secs());
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(cfg.reconnect_interval)) => {}
+            _ = tokio::time::sleep(retry_delay) => {}
             _ = &mut shutdown => {
                 info!("客户端已停止");
                 return Ok(());
@@ -523,6 +551,43 @@ async fn main() -> Result<()> {
             }
         }
     }
+}
+
+/// 首次登录**连不上**时的重试间隔：1、2、4、8、10、10… 秒。
+///
+/// 与官方 frpc 的 `loopLoginUntilSuccess` 同一思路（`wait.FastBackoffManager`，
+/// 起始 1 秒、翻倍、上限 10 秒）。上限 10 秒是为了让开机时"网络刚就绪"
+/// 能在十秒内被接住，而不是退到几分钟后才重连。
+fn startup_retry_delay(failures: u32) -> Duration {
+    const CAP_SECS: u64 = 10;
+    let secs = match failures {
+        0 | 1 => 1,
+        n => 1u64 << (n - 1).min(4), // 1,2,4,8,16 → 与上限取 min
+    };
+    Duration::from_secs(secs.min(CAP_SECS))
+}
+
+/// 登录阶段（拨号 + 握手 + 等 LoginResp）的墙钟上限。
+///
+/// 沿用 `dialServerTimeout`（官方默认 10 秒）。配 0（"不设拨号超时"）时这里
+/// 仍取 10 秒 —— 登录阶段**不能**没有死线：KCP/UDP 的"连接"只是建本地
+/// socket，服务端不存在时不会报错，只能靠这个上限把它变成一次可重试的失败。
+fn login_stage_timeout(cfg: &ClientConfig) -> Duration {
+    let secs = if cfg.dial_server_timeout == 0 {
+        10
+    } else {
+        cfg.dial_server_timeout
+    };
+    Duration::from_secs(secs)
+}
+
+/// 这次失败是不是"服务端明确拒绝登录"。
+///
+/// 只有 [`conn::LoginRejected`] 才算；dial 失败、DNS 未就绪、代理/KCP 通道
+/// 未起、等待 LoginResp 超时等都算**瞬时**失败 → 退避重试。
+fn is_login_rejected(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|cause| cause.downcast_ref::<conn::LoginRejected>().is_some())
 }
 
 /// 等 `stop` 信号；没启用 `[webServer]` 时（None）永远挂起。
@@ -1501,7 +1566,22 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
         hub,
     } = deps;
     let server = format!("{}:{}", cfg.server_addr, cfg.server_port);
-    let link = Arc::new(ServerLink::open(cfg.clone()).await?);
+    // 登录阶段（拨号 + 握手 + 等 LoginResp）的墙钟上限。
+    //
+    // 官方 frpc 在 `exchangeLogin` 里给读取设了 10 秒死线；这里把整个登录阶段
+    // 包起来。否则 KCP/UDP（建"连接"不发包）或"TCP 已建立但服务端不回"会
+    // **永久挂住** —— 既不退出也不重试，比直接退出更糟，开机自启时无从恢复。
+    let login_timeout = login_stage_timeout(&cfg);
+    let link = Arc::new(
+        tokio::time::timeout(login_timeout, ServerLink::open(cfg.clone()))
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "连接服务端超时（{} 秒）：网络 / 代理 / KCP(UDP) 可能尚未就绪",
+                    login_timeout.as_secs()
+                )
+            })??,
+    );
     // 走 NLink QUIC 且开了迁移时，起一个"出口 IP 变了就 rebind"的看门狗。
     if cfg.nlink.enable && cfg.nlink.quic && cfg.nlink.quic_migrate {
         spawn_quic_migrator(Arc::downgrade(&link), cfg.clone());
@@ -1510,19 +1590,28 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
 
     // NLink：一个进程一份状态（connection id 跨重连不变，续传要它）。
     let nlink = nlink::install(&cfg);
-    let (mut conn, run_id, udp_binary, caps) =
+    let handshake = async {
         match handshake_once(&cfg, &link, &token_source, &nlink, true).await {
-            Ok(v) => v,
+            Ok(v) => Ok(v),
             // ★ 自动回退：对端不认 preamble 时（官方 frps 会把 `NFRPLNK1` 当成
             //   v1 消息头直接报错），立刻用标准模式重连一次。用户只会在日志里
             //   看到一行 warn，隧道照常工作。
             Err(e) if nlink.want_preamble() => {
                 warn!("NLink 握手未成功（对端可能不支持扩展层），自动回退标准模式：{e:#}");
                 nlink.mark_fallback();
-                handshake_once(&cfg, &link, &token_source, &nlink, false).await?
+                handshake_once(&cfg, &link, &token_source, &nlink, false).await
             }
-            Err(e) => return Err(e),
-        };
+            Err(e) => Err(e),
+        }
+    };
+    let (mut conn, run_id, udp_binary, caps) = tokio::time::timeout(login_timeout, handshake)
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "等待登录应答超时（{} 秒）：服务端未回 LoginResp",
+                login_timeout.as_secs()
+            )
+        })??;
     link.udp_binary
         .store(udp_binary, std::sync::atomic::Ordering::Relaxed);
     if udp_binary {
@@ -3349,6 +3438,59 @@ bandwidthLimitMode = 'server'
         assert!(
             err.to_string().contains("alice.web"),
             "错误里保留原名：{err}"
+        );
+    }
+
+    /// 开机自启回归：只有"服务端明确拒绝"才算致命，连不上必须继续重试。
+    #[test]
+    fn 首次登录失败分类_拒绝才算致命() {
+        let rejected = anyhow::Error::new(conn::LoginRejected {
+            message: "token 不正确".into(),
+        });
+        assert!(is_login_rejected(&rejected));
+        // context 包一层也不能丢类型（实际链路里会带 `首次登录 …` 之类上下文）
+        let wrapped = rejected.context("登录 1.2.3.4:7000 被拒绝");
+        assert!(is_login_rejected(&wrapped));
+
+        let dial = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "actively refused",
+        ))
+        .context("连接 127.0.0.1:1 失败");
+        assert!(
+            !is_login_rejected(&dial),
+            "拨号失败是瞬时错误，必须走退避重试"
+        );
+
+        let timeout = anyhow!("等待登录应答超时（10 秒）：服务端未回 LoginResp");
+        assert!(!is_login_rejected(&timeout), "登录超时同样必须重试");
+    }
+
+    /// 首次登录退避：1、2、4、8、10、10… 秒，有上限、不回到 0。
+    #[test]
+    fn 首次登录退避_指数增长且封顶() {
+        let got: Vec<u64> = (1..=7).map(|n| startup_retry_delay(n).as_secs()).collect();
+        assert_eq!(got, vec![1, 2, 4, 8, 10, 10, 10]);
+        assert_eq!(startup_retry_delay(0).as_secs(), 1, "0 次也要有正延迟");
+        assert_eq!(
+            startup_retry_delay(u32::MAX).as_secs(),
+            10,
+            "溢出/极值都不能 panic，且仍要封顶"
+        );
+    }
+
+    /// 登录阶段必须有墙钟上限：KCP/UDP 与"接通但不回包"都靠它变成可重试失败。
+    #[test]
+    fn 登录阶段超时_默认十秒_配零也兜底() {
+        let mut cfg = ClientConfig::default();
+        assert_eq!(login_stage_timeout(&cfg).as_secs(), 10);
+        cfg.dial_server_timeout = 3;
+        assert_eq!(login_stage_timeout(&cfg).as_secs(), 3);
+        cfg.dial_server_timeout = 0;
+        assert_eq!(
+            login_stage_timeout(&cfg).as_secs(),
+            10,
+            "dialServerTimeout = 0（不设拨号超时）时登录阶段仍要死线"
         );
     }
 }

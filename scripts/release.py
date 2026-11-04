@@ -63,7 +63,7 @@ ASSET_CANDIDATES = [
 # 包内文件名 -> 构建产物名（按平台补 .exe）
 BINARIES = [("frps", "nfrp-server"), ("frpc", "nfrp-client")]
 # 随包附带的素材文件（README.md 由仓库 README 现场合成，见 build_readme）
-DOCS = ["frps.toml", "frpc.toml", "LICENSE", "NOTICE"]
+DOCS = ["frps.toml", "frpc.toml", "LICENSE", "NOTICE", "frpc-autostart.vbs"]
 # 校验值文件名（Release 里就把这个贴出去）
 SUMS_NAME = "SHA256SUMS.txt"
 SIG_NAME = f"{SUMS_NAME}.sig"

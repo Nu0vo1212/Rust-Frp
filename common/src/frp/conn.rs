@@ -44,6 +44,38 @@ const MAX_BUFFER: usize = 8 * 1024 * 1024;
 /// 只可能是对端在灌数据 ⇒ 断开。
 const MAX_PLAIN: usize = 8 * 1024 * 1024;
 
+/// 服务端在**登录阶段**明确拒绝本次连接（令牌错、用户被禁用、协议不兼容…）。
+///
+/// 为什么必须是**类型化**错误：客户端要据此区分两件完全不同的事 ——
+///
+/// * **连不上**（`dial` 失败、DNS 没就绪、代理/KCP 通道未起、服务端还没监听）：
+///   开机自启时极常见，重试就会好，必须退避重试；
+/// * **被拒绝**（服务端已经回包，且明确说"不行"）：重试不会变，继续重试只会
+///   把配置错误藏起来，应按 `loginFailExit` 退出。
+///
+/// 两者原先都只是 `anyhow!("登录失败: …")` 字符串，客户端无法区分，只能按
+/// `loginFailExit` 一刀切 —— 于是开机时网络慢一点进程就退出且不再重连。
+#[derive(Debug, Clone)]
+pub struct LoginRejected {
+    /// 服务端给出的原文（或登录阶段的协议错误说明）。
+    pub message: String,
+}
+
+impl std::fmt::Display for LoginRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "服务端拒绝登录：{}", self.message)
+    }
+}
+
+impl std::error::Error for LoginRejected {}
+
+/// 构造一个 [`LoginRejected`]（保留原文，客户端会原样打给用户）。
+fn login_rejected(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(LoginRejected {
+        message: message.into(),
+    })
+}
+
 /// v2 的控制通道加密状态（AES-256-GCM AEAD 帧流，`golib/crypto/aead_stream.go`）。
 ///
 /// 单独成结构体并装箱，理由见 [`ControlCrypto`]。
@@ -757,10 +789,10 @@ pub async fn client_handshake_with(
             None => bail!("服务端在 LoginResp 之前断开连接"),
         };
         if !login_resp.error.is_empty() {
-            bail!("登录失败: {}", login_resp.error);
+            return Err(login_rejected(login_resp.error));
         }
         if login_resp.run_id.is_empty() {
-            bail!("服务端未下发 run_id");
+            return Err(login_rejected("服务端未下发 run_id"));
         }
         // 官方时序：Login / LoginResp 明文，之后的控制消息才走 CFB
         conn.enable_v1_crypto(cred.raw())?;
@@ -791,7 +823,10 @@ pub async fn client_handshake_with(
     }
     let server_hello: ServerHello = serde_json::from_slice(&sh_payload)?;
     if !server_hello.error.is_empty() {
-        bail!("ServerHello 返回错误: {}", server_hello.error);
+        return Err(login_rejected(format!(
+            "ServerHello 返回错误: {}",
+            server_hello.error
+        )));
     }
     wire::validate_server_hello(&hello, &server_hello)?;
     let algorithm = server_hello.selected.crypto.algorithm.clone();

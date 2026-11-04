@@ -200,7 +200,7 @@ remote_port = 6000</code></pre>
 <tr><td><code>server_addr</code></td><td>必填</td><td>服务端地址</td></tr>
 <tr><td><code>server_port</code></td><td><code>7000</code></td><td>服务端控制端口</td></tr>
 <tr><td><code>user</code></td><td>空</td><td>租户名。代理对外用 <code>{user}.{name}</code> 做命名空间隔离</td></tr>
-<tr><td><code>login_fail_exit</code></td><td><code>true</code></td><td>首次登录失败是否退出进程</td></tr>
+<tr><td><code>login_fail_exit</code></td><td><code>true</code></td><td>首次登录被服务端明确拒绝时是否退出；连不上（网络/代理/KCP 未就绪）会退避重试</td></tr>
 <tr><td><code>dial_server_timeout</code></td><td><code>10</code></td><td>拨号超时（秒）</td></tr>
 <tr><td><code>dial_server_keepalive</code></td><td><code>0</code></td><td>TCP keepalive 空闲秒数，0 表示不开</td></tr>
 </tbody>

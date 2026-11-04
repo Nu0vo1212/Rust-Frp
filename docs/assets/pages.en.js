@@ -202,7 +202,7 @@ remote_port = 6000</code></pre>
 <tr><td><code>server_addr</code></td><td>required</td><td>Server address</td></tr>
 <tr><td><code>server_port</code></td><td><code>7000</code></td><td>Server control port</td></tr>
 <tr><td><code>user</code></td><td>empty</td><td>Tenant name. Proxies are namespaced as <code>{user}.{name}</code></td></tr>
-<tr><td><code>login_fail_exit</code></td><td><code>true</code></td><td>Exit the process when the first login fails</td></tr>
+<tr><td><code>login_fail_exit</code></td><td><code>true</code></td><td>Exit when the server explicitly rejects the first login; connect failures (network/proxy/KCP not ready) retry with backoff</td></tr>
 <tr><td><code>dial_server_timeout</code></td><td><code>10</code></td><td>Dial timeout in seconds</td></tr>
 <tr><td><code>dial_server_keepalive</code></td><td><code>0</code></td><td>TCP keepalive idle seconds; 0 disables</td></tr>
 </tbody>

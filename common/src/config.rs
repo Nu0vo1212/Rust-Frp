@@ -2001,17 +2001,22 @@ pub struct ClientConfig {
     #[serde(default = "default_reconnect_interval")]
     pub reconnect_interval: u64,
 
-    /// **首次**登录失败后是否直接退出（对应 frp 的 `loginFailExit`，默认 `true`）。
+    /// **首次**登录被服务端**明确拒绝**后是否直接退出（对应 frp 的 `loginFailExit`，默认 `true`）。
     ///
-    /// 语义与官方 frpc 对齐，不是"一失败就永远不重试"：
-    /// - 进程启动后第一次登录（连不上 / 认证被拒 / 握手失败）如果失败，
-    ///   直接以非 0 退出码结束 —— 这样外部启动器（NetTool、systemd 之流）
-    ///   能立刻知道"没起来"并把错误原样报给用户，而不是显示一个假的"已启动"；
-    /// - **一旦成功登录过**，之后断线就永远按 `reconnect_interval` 重连，不受此项影响。
+    /// # 与官方 0.71 的差异（v0.7.5 起，针对开机自启）
     ///
-    /// 官方 frp 里这一项默认就是 `true`（`pkg/config/v1/client.go`：
-    /// `c.LoginFailExit = util.EmptyOr(c.LoginFailExit, lo.ToPtr(true))`），
-    /// 想让客户端无脑一直重试就写 `loginFailExit = false`。
+    /// 官方实现里"连不上"和"认证被拒"都算登录失败，`loginFailExit = true` 时
+    /// 第一次失败就退出。开机自启时网络、`proxyURL` 代理、KCP(UDP) 通道往往比
+    /// frpc 晚就绪几秒，官方这种一刀切会让进程直接消失且**不再恢复**。
+    ///
+    /// 所以本项现在**只**管"服务端明确拒绝"（`LoginResp.error` /
+    /// `ServerHello.error`：令牌错、用户被禁用、协议不兼容…）。"连不上"
+    /// （拨号失败、DNS 未就绪、代理/KCP 通道未起、等待 LoginResp 超时）
+    /// 一律按 1/2/4/8/10 秒退避**持续重试**，并在日志里逐次报出真实错误。
+    ///
+    /// **成功登录过之后**断线仍按 `reconnect_interval` 无限重连，不受本项影响。
+    ///
+    /// 想让"被拒"时也无限重试就写 `loginFailExit = false`。
     #[serde(default = "default_true")]
     pub login_fail_exit: bool,
 
@@ -2859,10 +2864,11 @@ log_level = "info"
 # protocol = "frp-v2"
 
 # ---- 启动失败时的行为（对应原版 frp 的 loginFailExit，默认 true）----
-# true：**首次**登录失败就退出（退出码非 0）。
-#       外部启动器靠"进程退没退"判断隧道起没起来，所以默认跟随 frp 取 true；
-#       连不上时会立刻报错，而不是默默重试、让面板误显示"已启动"。
-# false：无脑一直重试。手机热点 / 隧道机房抖动等场景更耐操。
+# true：**首次**登录被服务端**明确拒绝**（令牌错 / 用户被禁用 / 协议不兼容）
+#       时退出（退出码非 0），让启动器把配置错误如实报出来。
+#       注意：**连不上**（网络未就绪、proxyURL / KCP(UDP) 通道还没起）不算在内，
+#       会自动按 1/2/4/8/10 秒退避持续重试 —— 开机自启不再"10 秒后进程消失"。
+# false：被拒绝时也无脑一直重试。手机热点 / 隧道机房抖动等场景更耐操。
 # 注意：**成功登录过之后**，断线永远会自动重连，不受这一项影响。
 # login_fail_exit = true
 

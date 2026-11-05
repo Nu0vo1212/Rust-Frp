@@ -593,12 +593,19 @@ async fn handle_https(
     let _guard = ConnGuard::new(&registry);
 
     debug!(%peer, sni = %nfrp_common::util::LogSafe(&sni), proxy = %route.proxy_name, "HTTPS 透传开始");
-    let (mut upstream, leftover) = work_conn.into_stream();
+    let (stream, leftover) = work_conn.into_stream();
     if !leftover.is_empty() {
         // 极少见：StartWorkConn 之后客户端已经把响应写回来了
         debug!("HTTPS 上游有 {} 字节预读数据", leftover.len());
     }
+    let mut upstream = wrap_work_stream(
+        stream,
+        leftover,
+        route.client.proxy_flags(&route.proxy_name),
+        registry.security().auth_cfg.token.as_str(),
+    );
     upstream.write_all(&hello_bytes).await?;
+    upstream.flush().await?;
     let mut visitor = visitor;
     let r = nfrp_common::util::relay_between(&mut visitor, &mut upstream).await;
     record_bytes(&registry, &r);
@@ -606,6 +613,37 @@ async fn handle_https(
         debug!(%peer, sni = %nfrp_common::util::LogSafe(&sni), "HTTPS 透传中断：{e}");
     }
     Ok(())
+}
+
+/// 把「工作连接 + 握手期预读字节」按代理的数据面标志包成一条流。
+///
+/// `flags` 是 `(useEncryption, useCompression)`，由调用方从
+/// `ClientState::proxy_flags(proxy_name)` 取（注册时记下）。
+///
+/// ★ v0.7.6 修：vhost 的三条转发路径（http / https / tcpmux）此前都是**直接对
+/// 原始工作连接做中继**，`useEncryption` / `useCompression` 被完全忽略。
+/// 客户端开了加密时，服务端把密文当成明文透传 —— 隧道能建立、握手也可能过，
+/// 但数据全乱或直接超时，而日志里没有任何报错。
+///
+/// 包装顺序与 `serve.rs::bridge` 保持一致（压缩在外、加密在内）；
+/// `leftover` 是握手期间已经从工作连接读到、属于业务数据的字节，这里挂成
+/// **读方向前缀**：开了加密时它是一段密文，必须经过解密才能交给下游。
+fn wrap_work_stream(
+    stream: nfrp_common::frp::stream::BoxStream,
+    leftover: Vec<u8>,
+    flags: (bool, bool),
+    token: &str,
+) -> nfrp_common::frp::stream::BoxStream {
+    let (enc, comp) = flags;
+    if !enc && !comp {
+        return Box::pin(PrefixedStream::new(leftover, stream));
+    }
+    let key = enc.then(|| nfrp_common::frp::v1::derive_key(token.as_bytes()));
+    Box::pin(nfrp_common::frp::proxy_stream::ProxyStream::new(
+        PrefixedStream::new(leftover, stream),
+        key,
+        comp,
+    ))
 }
 
 /// 累计一次转发的流量。
@@ -871,7 +909,13 @@ async fn handle_tcpmux(
     let _guard = ConnGuard::new(&registry);
 
     debug!(%peer, %host, proxy = %route.proxy_name, passthrough, "tcpmux 隧道开始");
-    let (mut upstream, leftover) = work_conn.into_stream();
+    let (stream, leftover) = work_conn.into_stream();
+    let mut upstream = wrap_work_stream(
+        stream,
+        leftover,
+        route.client.proxy_flags(&route.proxy_name),
+        registry.security().auth_cfg.token.as_str(),
+    );
 
     // 开场白：透传模式把 CONNECT 请求转过去（由内网服务回 200），
     // 否则我们自己回 200，客户端收到后才开始发数据。
@@ -880,9 +924,6 @@ async fn handle_tcpmux(
     } else {
         io.stream.write_all(CONNECT_OK).await?;
         io.stream.flush().await?;
-    }
-    if !leftover.is_empty() {
-        upstream.write_all(&leftover).await?;
     }
     // ★ 关键：客户端**没等 200 就把数据发过来**时（curl 之外不少客户端会这样），
     //   这些字节已经被 `read_head` 预读进缓冲了。下一步是直接对着底层流对拷，
@@ -1295,7 +1336,13 @@ where
             // 关键：`read_head()` 只消费到 `\r\n\r\n`，客户端如果没等 200 就发了
             // 隧道数据，那些字节正躺在 `io` 的缓冲里。不 `take_buffered()` 就会
             // 永久丢失 —— 这正是官方 v0.71.1 修的 early-data loss。
-            let (mut upstream, leftover) = work_conn.into_stream();
+            let (stream, leftover) = work_conn.into_stream();
+            let mut upstream = wrap_work_stream(
+                stream,
+                leftover,
+                route.client.proxy_flags(&route.proxy_name),
+                registry.security().auth_cfg.token.as_str(),
+            );
             upstream.write_all(&req.to_bytes()).await?;
             let prefetched = io.take_buffered();
             if !prefetched.is_empty() {
@@ -1304,7 +1351,6 @@ where
             }
             upstream.flush().await?;
 
-            let mut upstream = PrefixedStream::new(leftover, upstream);
             let mut visitor = io.stream;
             let r = nfrp_common::util::relay_between(&mut visitor, &mut upstream).await;
             record_bytes(&registry, &r);
@@ -1314,7 +1360,13 @@ where
             return Ok(());
         }
 
-        let (mut upstream, leftover) = work_conn.into_stream();
+        let (stream, leftover) = work_conn.into_stream();
+        let mut upstream = wrap_work_stream(
+            stream,
+            leftover,
+            route.client.proxy_flags(&route.proxy_name),
+            registry.security().auth_cfg.token.as_str(),
+        );
         upstream.write_all(&req.to_bytes()).await?;
         if !body.is_empty() {
             upstream.write_all(&body).await?;
@@ -1328,9 +1380,9 @@ where
         // 吐了响应（或预读时顺带读到了响应开头），这部分字节就永久丢失，
         // 表现为**响应体被截断**。
         //
-        // 必须在 write/flush **之后**构造（`HttpIo::with_prefill` 会拿走
-        // `upstream` 的所有权）。
-        let mut up = HttpIo::with_prefill(upstream, leftover);
+        // ★ v0.7.6：`leftover` 已经由 `wrap_work_stream` 挂成流的**读前缀**，
+        // 这里传空缓冲即可 —— 再传一次会重复消费。
+        let mut up = HttpIo::with_prefill(upstream, Vec::new());
 
         // ---- 读响应头 ----
         //
@@ -3390,5 +3442,70 @@ mod tests {
              否则 NFrp 按 chunked 转发、RFC 下游按'读到关闭'解析，\
              两者的口径分歧就是跨访客响应走私（D7-1）"
         );
+    }
+
+    /// ★★ v0.7.6 回归：vhost 工作连接必须按代理的加密/压缩标志包装。
+    ///
+    /// 守的是**行为**而不是 helper：两端都按生产同一条包装，数据必须能原样往返。
+    /// 退回修复（裸流中继）时，客户端侧的密文会被当成明文，读出来的内容与写入
+    /// 的不一致 —— 这正是线上「隧道建立了、页面空白/超时」的成因。
+    #[tokio::test]
+    async fn vhost_工作连接必须按加密压缩标志包装() {
+        use nfrp_common::frp::proxy_stream::ProxyStream;
+        use nfrp_common::frp::v1::derive_key;
+        use tokio::io::AsyncReadExt;
+
+        let (server_side, client_side) = tokio::io::duplex(64 * 1024);
+        let token = "vhost-test-token";
+
+        // 客户端侧：与生产完全一致（压缩在外、加密在内）
+        let key = derive_key(token.as_bytes());
+        let mut client = ProxyStream::new(client_side, Some(key), true);
+
+        // 服务端侧：被测包装（没有 leftover —— 开了加密时 leftover 必须是密文，
+        // 明文前缀单独由下一条测试覆盖）
+        let mut server = wrap_work_stream(Box::pin(server_side), Vec::new(), (true, true), token);
+
+        // 客户端 -> 服务端
+        client.write_all(b"hello vhost").await.unwrap();
+        client.flush().await.unwrap();
+        let mut got = [0u8; 11];
+        server.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"hello vhost", "密文/压缩字节必须被正确解密解压");
+
+        // 服务端 -> 客户端
+        server.write_all(b"world").await.unwrap();
+        server.flush().await.unwrap();
+        let mut back = [0u8; 5];
+        client.read_exact(&mut back).await.unwrap();
+        assert_eq!(&back, b"world", "发送方向也必须按同一套编码写入");
+    }
+
+    /// `leftover` 必须作为**读方向前缀**交出去（明文路径）。
+    ///
+    /// 客户端在握手期抢跑写出的字节属于业务数据，丢掉就会截断响应；
+    /// 把它写回工作连接（旧 tcpmux 路径的写法）则是把数据弹回给客户端。
+    #[tokio::test]
+    async fn vhost_工作连接把预读字节作为读前缀() {
+        use tokio::io::AsyncReadExt;
+
+        let (server_side, client_side) = tokio::io::duplex(4096);
+        let mut server = wrap_work_stream(
+            Box::pin(server_side),
+            b"PRE".to_vec(),
+            (false, false),
+            "unused",
+        );
+        let mut client = client_side;
+
+        let mut pre = [0u8; 3];
+        server.read_exact(&mut pre).await.unwrap();
+        assert_eq!(&pre, b"PRE", "握手期预读的字节必须原样交给下游");
+
+        client.write_all(b"later").await.unwrap();
+        client.flush().await.unwrap();
+        let mut got = [0u8; 5];
+        server.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"later", "前缀之后的数据必须照常可读");
     }
 }

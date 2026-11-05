@@ -24,6 +24,7 @@
 //! 没有监听端口，没有后台任务，与上一个版本完全一致。
 
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -108,6 +109,22 @@ pub struct Hub {
     /// 用 `watch` 而不是 `Notify`：watch 的**值会留存**，所以 stop 请求即使在
     /// 主循环还没进 `select!` 时到达也不会丢（`Notify` 只在恰好有 waiter 时生效）。
     stop: tokio::sync::watch::Sender<bool>,
+    /// 最近一次会话的失败原因（连不上 / 被拒绝 / 注册超时……）。
+    ///
+    /// ★ v0.7.6：自启动场景（`frpc.vbs` 隐藏窗口）下没有控制台，进程又按
+    /// 退避策略**不再退出**，于是失败会完全静默 —— 用户只看到面板里的空列表。
+    /// 这里把最后一次错误留在内存里，由 `/api/status` 与页面直接展示。
+    last_error: Mutex<String>,
+    /// 每条代理在**当前/最近一次**会话里的注册结果（键是配置里的原始 `name`）。
+    reg_states: Mutex<HashMap<String, RegState>>,
+}
+
+/// 单条代理的注册结果。
+#[derive(Clone, Default)]
+pub struct RegState {
+    pub registered: bool,
+    /// 服务端回的错误（注册失败时非空）。
+    pub error: String,
 }
 
 impl Hub {
@@ -127,6 +144,8 @@ impl Hub {
             session,
             req_tx: Mutex::new(None),
             stop,
+            last_error: Mutex::new(String::new()),
+            reg_states: Mutex::new(HashMap::new()),
         })
     }
 
@@ -138,6 +157,48 @@ impl Hub {
     /// 请求客户端退出 —— `POST /api/stop` 的落点，对应原版 `frpc stop`。
     fn request_stop(&self) {
         let _ = self.stop.send(true);
+    }
+
+    /// 会话建好时调用：清掉上一轮的失败原因与注册结果。
+    pub fn on_session_started(&self) {
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = String::new();
+        self.reg_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// 记录一次会话失败，供面板展示。
+    pub fn note_session_error(&self, err: impl Into<String>) {
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = err.into();
+    }
+
+    /// 记录一条代理注册成功（`name` 用配置里的原始名字）。
+    pub fn note_proxy_ok(&self, name: &str) {
+        self.reg_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                name.to_string(),
+                RegState {
+                    registered: true,
+                    error: String::new(),
+                },
+            );
+    }
+
+    /// 记录一条代理注册失败（`name` 用配置里的原始名字）。
+    pub fn note_proxy_err(&self, name: &str, error: impl Into<String>) {
+        self.reg_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                name.to_string(),
+                RegState {
+                    registered: false,
+                    error: error.into(),
+                },
+            );
     }
 
     /// 会话建立时挂上请求通道。
@@ -784,6 +845,13 @@ fn status_json(hub: &Arc<Hub>) -> String {
             "wire_protocol": wire,
             "proxies": proxies,
             "visitor_count": hub.cfg.visitors.len(),
+            // ★ v0.7.6：最近一次失败原因。自启动（隐藏窗口）时这是唯一能看到
+            // "为什么列表是空的"的地方。
+            "last_error": hub
+                .last_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
             "store": {
                 "enabled": hub.store.is_enabled(),
                 "path": hub
@@ -828,6 +896,12 @@ fn proxies_json(hub: &Arc<Hub>) -> String {
 }
 
 fn proxy_json(hub: &Hub, p: &ProxyConfig) -> serde_json::Value {
+    let reg = hub
+        .reg_states
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&p.name)
+        .cloned();
     serde_json::json!({
         "name": p.name,
         "type": p.proxy_type,
@@ -835,6 +909,10 @@ fn proxy_json(hub: &Hub, p: &ProxyConfig) -> serde_json::Value {
         "remote_port": p.remote_port,
         "custom_domains": p.custom_domains,
         "healthy": hub.health.is_healthy(&p.name),
+        // ★ v0.7.6：注册结果。`registered = false && error 空` 表示"还没收到
+        // 服务端回应"（注册中 / 控制连接刚断），面板据此区分三种状态。
+        "registered": reg.as_ref().map(|r| r.registered).unwrap_or(false),
+        "register_error": reg.as_ref().map(|r| r.error.clone()).unwrap_or_default(),
     })
 }
 
@@ -867,6 +945,9 @@ fn html_page() -> String {
   .on { background:#e1f5ee; color:#0f6e56; }
   .off { background:#f1efe8; color:#5f5e5a; }
   .bad { background:#fcebeb; color:#a32d2d; }
+  .notice { margin:12px 0 0; padding:10px 12px; background:#fff4e5; color:#7a4b00;
+            border:1px solid #f0c48a; border-radius:8px; font-size:13px;
+            white-space:pre-wrap; word-break:break-word; }
   code { background:#eff1f3; padding:1px 5px; border-radius:4px; }
 </style>
 </head>
@@ -874,6 +955,7 @@ fn html_page() -> String {
 <header>NFrp 客户端管理</header>
 <main>
   <div class="cards" id="cards"></div>
+  <div id="notice"></div>
   <section>
     <h2>代理</h2>
     <div id="proxies"></div>
@@ -907,17 +989,30 @@ function refresh() {
       card('run_id', d.run_id || '-') +
       card('代理数', (d.proxies || []).length) +
       card('Store', d.store && d.store.enabled ? '已启用' : '未启用');
+    var err = d.last_error || '';
+    document.getElementById('notice').innerHTML =
+      err ? '<div class="notice">最近一次会话失败：' + esc(err) + '</div>' : '';
     var rows = (d.proxies || []).map(function (p) {
       var h = p.healthy === false
         ? '<span class="tag bad">不健康</span>'
         : '<span class="tag on">正常</span>';
+      var reg = p.register_error
+        ? '<span class="tag bad">注册失败</span><br>' + esc(p.register_error)
+        : p.registered
+          ? '<span class="tag on">已注册</span>'
+          : (d.connected
+              ? '<span class="tag off">注册中</span>'
+              : '<span class="tag off">未连接</span>');
       return '<tr><td>' + esc(p.name) + '</td><td>' + esc(p.type) + '</td><td>' +
         esc(p.local_addr) + '</td><td>' + esc(p.remote_port || '-') + '</td><td>' +
-        esc((p.custom_domains || []).join(', ')) + '</td><td>' + h + '</td></tr>';
+        esc((p.custom_domains || []).join(', ')) + '</td><td>' + reg + '</td><td>' + h + '</td></tr>';
     }).join('');
     document.getElementById('proxies').innerHTML = rows
-      ? '<table><tr><th>名字</th><th>类型</th><th>本地地址</th><th>远程端口</th><th>域名</th><th>健康</th></tr>' + rows + '</table>'
-      : '<div class="empty">还没有代理</div>';
+      ? '<table><tr><th>名字</th><th>类型</th><th>本地地址</th><th>远程端口</th><th>域名</th><th>注册</th><th>健康</th></tr>' + rows + '</table>'
+      : '<div class="empty">配置里没有任何代理（<code>[[proxies]]</code>）。' +
+        '在 <code>frpc.toml</code> 里添加后重启 frpc，或用 ' +
+        '<code>POST /api/proxies/add</code> 在线新增；' +
+        '当前服务端 ' + esc(d.server) + (d.connected ? '（已连接）' : '（未连接）') + '。</div>';
   }).catch(function (e) {
     document.getElementById('cards').innerHTML =
       '<div class="card"><div class="k">错误</div><div class="v">' + esc(e) + '</div></div>';
@@ -1454,5 +1549,57 @@ mod tests {
         .await;
         assert!(resp.starts_with("HTTP/1.1 501"), "{resp}");
         assert!(resp.contains("only supported on Unix"), "{resp}");
+    }
+
+    /// ★★ v0.7.6 回归：面板必须能看到「为什么列表是空的」。
+    ///
+    /// 自启动是隐藏窗口，没有控制台；0.7.5 起进程又不再退出。若面板不暴露
+    /// 失败原因与注册结果，用户面对的就只有一个空列表 —— 这正是被报告的问题。
+    #[tokio::test]
+    async fn 面板暴露最近失败原因与代理注册结果() {
+        let table = ProxyTable::default();
+        table.load_dynamic([proxy("web")]);
+        let hub = hub_with(table);
+        hub.note_session_error("连接被拒绝：127.0.0.1:7000");
+        hub.note_proxy_err("web", "remote port 8080 not allowed");
+
+        let r = route(
+            &hub,
+            "GET",
+            "/api/status",
+            &req("GET /api/status HTTP/1.1\r\n\r\n"),
+        )
+        .await;
+        let j = body_of(&r);
+        assert_eq!(j["data"]["last_error"], "连接被拒绝：127.0.0.1:7000");
+        let p = &j["data"]["proxies"][0];
+        assert_eq!(p["name"], "web");
+        assert_eq!(p["registered"], false);
+        assert_eq!(p["register_error"], "remote port 8080 not allowed");
+
+        // 登录成功必须清掉上一轮的旧错误与旧注册结果
+        hub.on_session_started();
+        let r = route(
+            &hub,
+            "GET",
+            "/api/status",
+            &req("GET /api/status HTTP/1.1\r\n\r\n"),
+        )
+        .await;
+        let j = body_of(&r);
+        assert_eq!(j["data"]["last_error"], "");
+        assert_eq!(j["data"]["proxies"][0]["register_error"], "");
+    }
+
+    /// 页面必须真的把这些字段渲染出来（防止只加 API 不改页面）。
+    #[test]
+    fn 客户端面板渲染注册状态与空列表说明() {
+        let page = html_page();
+        assert!(page.contains("last_error"), "页面要读最近失败原因");
+        assert!(page.contains("register_error"), "页面要读注册错误");
+        assert!(
+            page.contains("[[proxies]]"),
+            "空列表必须给出可执行的说明，而不是一片空白"
+        );
     }
 }

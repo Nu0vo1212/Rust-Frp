@@ -2419,6 +2419,14 @@ async fn register_udp(
     );
     registry.attach_listener(m.remote_port, handle.abort_handle());
     client.add_proxy(m.proxy_name.clone(), Some(m.remote_port), slot);
+    // ★ v0.7.6 修：udp 此前漏记数据面标志与代理类型。
+    //
+    // tcp / stcp / xtcp 都在注册后写了这两项，只有 udp 没写 —— 于是
+    // `proxy_flags()` 永远返回 (false,false)、`proxy_type()` 返回空串。
+    // udp 的数据面由 `udp_proxy` 自己处理加解密，但类型缺失会直接影响
+    // `NewUserConn` 插件与面板/审计里的类型展示，口径必须与其它类型一致。
+    client.set_proxy_flags(&m.proxy_name, m.use_encryption, m.use_compression);
+    client.set_proxy_type(&m.proxy_name, &m.proxy_type);
     Ok(format!("{proxy_host}:{}/udp", m.remote_port))
 }
 
@@ -2508,6 +2516,14 @@ async fn register_vhost(
         }))?;
     }
     client.add_proxy(m.proxy_name.clone(), None, slot);
+    // ★ v0.7.6 修：vhost（http / https / tcpmux）此前**既没记类型，也没记
+    // 加密/压缩标志** —— tcp / stcp / xtcp 都记了，只有这三条漏了。
+    //
+    // 后果不是"少个字段"，而是数据面错误：客户端开了 `useEncryption` 后
+    // 工作连接上是密文，而 vhost 转发路径按明文透传（还不做解压），
+    // 表现为"隧道建立了、页面空白或连接超时"，日志里却没有任何报错。
+    client.set_proxy_flags(&m.proxy_name, m.use_encryption, m.use_compression);
+    client.set_proxy_type(&m.proxy_name, &m.proxy_type);
     Ok(domains
         .iter()
         .map(|d| format!("{d}:{vhost_port}"))

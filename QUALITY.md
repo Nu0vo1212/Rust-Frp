@@ -20,23 +20,23 @@ cargo test --workspace                     # 999 个测试通过
 
 ---
 
-## 二、测试分布（v0.7.5 实测）
+## 二、测试分布（v0.7.6 实测）
 
 `cargo test --workspace` 实测输出：
 
 | 目标 | 通过 | 忽略 |
 |---|---|---|
-| `nfrp-client` 单元测试 | 139 |  |
+| `nfrp-client` 单元测试 | 141 |  |
 | `nfrp-client` 开机自启端到端（真进程） | 2 |  |
 | `nfrp-common` 单元测试（lib） | 502 | 3（Wintun 真机） |
 | `nfrp-common` 集成测试（OIDC） | 9 |  |
-| `nfrp-server` 单元测试（lib） | 291 |  |
+| `nfrp-server` 单元测试（lib） | 293 |  |
 | `nfrp-server` 单元测试（bin） | 17 |  |
 | `nfrp-server` 端到端集成测试 | 26 |  |
 | `nfrp-server` NLink 端到端 | 16 |  |
 | 文档测试（common） | 2 | 5 |
 | 文档测试（server） | 0 | 5 |
-| **合计** | **1004** | **13** |
+| **合计** | **1008** | **13** |
 
 **关于 13 条 `#[ignore]`**：3 条是**需要真机硬件或管理员权限**的 Windows Wintun
 设备面测试，另外 10 条是文档示例里明确标注 `ignore` 的代码块（不是失败/被跳过

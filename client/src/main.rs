@@ -483,8 +483,22 @@ async fn main() -> Result<()> {
         tokio::select! {
             r = fut => {
                 match r {
-                    Ok(()) => info!("与控制服务端的会话结束"),
+                    Ok(()) => {
+                        info!("与控制服务端的会话结束");
+                        if let Some(h) = &hub {
+                            h.note_session_error("控制连接已断开（正在重连）");
+                        }
+                    }
                     Err(e) => {
+                        // ★ v0.7.6：把失败原因也写进本地面板。
+                        //
+                        // 开机自启用 `frpc.vbs` 隐藏窗口拉起，没有控制台；
+                        // 0.7.5 起进程又按退避策略持续重试、不再退出 ——
+                        // 结果就是"进程活着、代理列表空白、却没有任何线索"。
+                        // 面板（`[webServer]` 启用时）是唯一还能看到原因的地方。
+                        if let Some(h) = &hub {
+                            h.note_session_error(format!("{e:#}"));
+                        }
                         if logged_in_once.load(std::sync::atomic::Ordering::SeqCst) {
                             // 已经成功登录过：这次只是普通断线。
                             error!("会话出错：{e:#}");
@@ -1640,6 +1654,12 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
     }
     info!(%run_id, wire = %link.wire, "登录成功（控制通道已加密）");
 
+    // 登录成功 ⇒ 清掉上一轮的失败原因与注册结果：面板上的状态必须反映
+    // **这一次**会话，而不是上一次重试留下的旧错误。
+    if let Some(h) = &hub {
+        h.on_session_started();
+    }
+
     // 记下"这个进程登录成功过"。上面那行之前的任何失败都算**首次登录失败**，
     // 由 main 的循环按 `loginFailExit` 决定是退出还是重试。
     logged_in_once.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1726,6 +1746,13 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
                     info!(proxy = %raw, remote = %r.remote_addr, local, "代理注册成功");
                 } else {
                     error!(proxy = %raw, "代理注册失败：{}", r.error);
+                }
+                if let Some(h) = &hub {
+                    if r.error.is_empty() {
+                        h.note_proxy_ok(&raw);
+                    } else {
+                        h.note_proxy_err(&raw, &r.error);
+                    }
                 }
             }
             Some(FrpMessage::ReqWorkConn) => {

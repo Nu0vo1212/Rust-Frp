@@ -253,6 +253,25 @@ user = "admin"
 password = "strong password"</code></pre>
 <p>Open <code>http://127.0.0.1:7400</code> to add and remove tunnels at runtime. Write calls require the custom header <code>X-Nfrp-Client: 1</code> (CSRF protection), and <code>Origin</code> must be a loopback origin.</p>
 
+<h3>Diagnostics in the UI</h3>
+<p>A "last error" banner at the top records the raw reason for the most recent failed login or dropped control connection. Every proxy entry carries its registration result (<code>registered</code> / <code>register_error</code>), so a server refusal shows its cause directly - port already taken, duplicate name, or ACL denial. When the list is empty, the UI states which step you are at: not logged in, logged in with no proxies defined, or proxies defined but rejected.</p>
+
+<div class="callout warn">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4M12 17h.01"/></svg>
+<div>
+<strong>An empty list is not necessarily a failure</strong>
+<p>The most common cause is that the config contains no <code>[[proxies]]</code> at all (the shipped template comments all of them out), followed by a placeholder <code>server_addr</code> / <code>token</code>. Read the banner first, then the registration column, then the log.</p>
+</div>
+</div>
+
+<div class="callout">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+<div>
+<strong>Autostart logs land in frpc.log</strong>
+<p><code>assets/frpc-autostart.vbs</code> starts the client in a hidden window, so stdout and stderr are appended to <code>frpc.log</code> in the same directory (truncated above 5 MB). When the process survives boot but no tunnel appears, that file is the first piece of evidence.</p>
+</div>
+</div>
+
 <div class="callout warn">
 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4M12 17h.01"/></svg>
 <div>
@@ -1123,8 +1142,8 @@ PAGES_EN['api'] = `
 <thead><tr><th>Method</th><th>Path</th><th>Notes</th></tr></thead>
 <tbody>
 <tr><td>GET</td><td><code>/</code></td><td>Web page</td></tr>
-<tr><td>GET</td><td><code>/api/status</code></td><td>Connection state and proxy list</td></tr>
-<tr><td>GET</td><td><code>/api/proxies</code></td><td>Current tunnels</td></tr>
+<tr><td>GET</td><td><code>/api/status</code></td><td>Connection state and proxy list; includes <code>last_error</code> (most recent failure reason)</td></tr>
+<tr><td>GET</td><td><code>/api/proxies</code></td><td>Current tunnels; each entry carries <code>registered</code> / <code>register_error</code> (server-side registration result)</td></tr>
 <tr><td>POST</td><td><code>/api/proxies/add</code></td><td>Add, body is the proxy JSON</td></tr>
 <tr><td>POST</td><td><code>/api/proxies/remove</code></td><td>Remove, body is the proxy name</td></tr>
 <tr><td>POST</td><td><code>/api/stop</code></td><td>Stop the client</td></tr>
@@ -1303,363 +1322,354 @@ PAGES_EN['compat'] = `
 </div>
 `;
 
-<!-- BEGIN nlink (generated from docs/nlink.md, do not edit) -->
+<!-- BEGIN nlink (generated from docs/nlink.en.md, do not edit) -->
 PAGES_EN['nlink'] = `
-<p class="lead" data-i18n="nlink-lead">NLink 是 NFrp 在标准 frp 协议之外的扩展层。它只承载那些 <strong>frp 协议本身没有位置表达</strong>、且 <strong>确实有用户被卡住</strong> 的能力。</p>
+<h1>NLink v1: the NFrp extension protocol</h1>
+<p class="lead">NLink is an extension layer that NFrp defines on top of the standard frp wire protocol. It carries capabilities that the standard protocol has no place to express. It shares the same connection as v1 and v2: it does not change the fields, ordering, or semantics of standard frames, and it does not require the peer to implement it.</p>
 <div class="callout">
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
   <div>
-    <strong>当前状态：已实现（v0.7.4 起，默认关闭）</strong>
-    <p>下面列出的能力<strong>均已实现并通过测试</strong>（<code>server/tests/nlink_e2e.rs</code> 的 16 条端到端用例逐项覆盖）。 但 NLink <strong>默认关闭</strong>：服务端与客户端都要显式写 <code>[nlink] enable = true</code> 才生效。 不开启时，行为与 0.6.x 完全一致。</p>
+    <strong>Status: available since v0.7.4, disabled by default</strong>
+    <p>Every capability is implemented and covered by the 16 end-to-end cases in <code>server/tests/nlink_e2e.rs</code>. Both the server and the client must set <code>[nlink] enable = true</code> explicitly. When disabled, behaviour is identical to 0.6.x.</p>
   </div>
 </div>
-<h2 data-i18n="nlink-s1-h">握手：零额外往返</h2>
-<p>客户端把能力声明<strong>搭车</strong>在第一条协议消息之前，服务端把确认结果<strong>搭车</strong>在本就要发的 <code>LoginResp</code> 上带回。全程不新增任何往返。</p>
-<pre class="code-block"><code class="language-text">frpc                                          frps
- │                                             │
- ├─ [8] NFRPLNK1        魔术字                 │   首字节 'N' 是标准 frp
- ├─ [1] ver = 1         扩展版本               │   永远不产生的值
- ├─ [8] caps            能力位图（大端 u64）    │   （v1 首字节是 '{'）
- ├─ [16] session_id     进程级连接标识          │   （v2 是 'F'，TLS 是 0x16）
- ├─ [8] trace_id        端到端追踪              │
- ├─ 标准 v1/v2 握手 ────────────────────────▶ │
- │                                             ├─ 解析 preamble
- │                                             ├─ 协商结果 = 编译期实现
- │                             ◀────────────── ┤            ∩ 对端声明
- │  LoginResp { _nlink: { caps, session, ... } }│            ∩ 运行期允许
- │                                             │
- ├─ 后续扩展帧（与标准消息同一条流，同为密文） │</code></pre>
-<p><strong>为什么不会误判</strong>：识别只依赖首字节。<code>MAGIC_V2</code> 是 <code>FRP\0\x02\r\n</code>，NLink 是 <code>NFRPLNK1</code>，v1 的 JSON 以 <code>{</code> 开头 —— 三者互不重叠。</p>
-<p>探测统一读 <code>max(8, 7) = 8</code> 字节。早期实现按 <code>MAGIC_V2.len()</code>（7）去填，紧接着 切片到 8 字节做比较 —— 一个<strong>只发 7 字节就闭嘴</strong>的客户端就能把服务端 panic 掉。 现在这条有专门的回归测试（<code>首帧不足时_detect_version_报错而不是_panic</code>）。</p>
-<h2 data-i18n="nlink-s2-h">扩展帧：版本化 TLV</h2>
-<pre class="code-block"><code class="language-text">u8   version    扩展帧版本（当前 1）
-u8   kind       帧种类
-u16  flags      保留，必须为 0（不认识就忽略）
-TLV*            每个：u16 tag + u32 len + len 字节</code></pre>
-<p><strong>对方不认识的 <code>kind</code> 或 <code>tag</code> 必须跳过，不能报错</strong> —— 这是前向兼容的唯一前提。 帧长度自描述，所以跳过是安全的。</p>
-<p>v2 侧走专用帧类型 <code>0x4E</code>；v1 侧走专用消息类型字节 <code>0x7F</code>。这两个值官方到 v0.71.0 为止都没用过（官方 v1 的类型字节都是可打印 ASCII），所以不会撞号。</p>
-<h2 data-i18n="nlink-s3-h">各能力的承载方式</h2>
-<div class="table-wrap">
-<table>
-<thead><tr>
-<th>能力</th>
-<th>承载</th>
-<th>说明</th>
-</tr></thead>
-<tbody>
-<tr>
-<td>能力协商</td>
-<td>preamble + <code>LoginResp._nlink</code></td>
-<td>双方交集非空才启用</td>
-</tr>
-<tr>
-<td>QUIC 与连接迁移</td>
-<td>独立 ALPN <code>nfrp-nlink</code></td>
-<td>与标准 QUIC 分桶，互不串味</td>
-</tr>
-<tr>
-<td>断线续传</td>
-<td><code>session_id</code> + 服务端保留表</td>
-<td>保留 <code>resume_ttl</code> 秒，重连后原样恢复</td>
-</tr>
-<tr>
-<td>零信任身份</td>
-<td><code>NewWorkConn._nlink</code> 令牌</td>
-<td><code>v1.&lt;exp&gt;.&lt;hmac&gt;</code>，绑定 <code>run_id + user + 过期时间</code></td>
-</tr>
-<tr>
-<td>细粒度限流</td>
-<td>桥接层令牌桶</td>
-<td>按「用户 × 代理」，支持突发</td>
-</tr>
-<tr>
-<td>端口敲门</td>
-<td>数据面 33 字节序列</td>
-<td>敲对了按 IP 临时放行</td>
-</tr>
-<tr>
-<td>批量工作连接</td>
-<td><code>BatchReq</code></td>
-<td>一条帧换 N 条连接</td>
-</tr>
-<tr>
-<td>端到端 trace</td>
-<td><code>trace_id</code></td>
-<td>控制连接与数据面共享</td>
-</tr>
-</tbody>
-</table>
-</div>
-<div class="callout">
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
-  <div>
-    <strong>续传的认证边界</strong>
-    <p>从 0.7.4 起，续传需要出示<strong>服务端签发的一次性令牌</strong>，光知道 <code>session_id</code> 不再够用。 令牌用 HMAC 绑定 <code>session + user + client_id + 过期时间 + 随机 nonce</code>， 登记在待用表里，<strong>用一次就作废</strong>。它在登录成功时通过 <code>ResumeResp</code> 下发 （断线时连接已经断了，发不出去，所以必须提前给）。 这样"抄走 preamble 就能冒充"这条路堵上了：伪造不出签名，重放上一轮的令牌 也会因为已被消费而失败。 <strong>但仍有一处需要你自己判断</strong>：<code>transport.tls.force = false</code>（默认值）时， 链路上的观察者可以<strong>直接抄走令牌并抢先消费</strong>。这时真客户端会续传失败并告警—— 可检测，但拦不住。<strong>生产环境请开 <code>transport.tls.force = true</code></strong>， 让令牌本身也在加密通道里。</p>
-  </div>
-</div>
-<h2 data-i18n="nlink-s4-h">续传后的代理对账</h2>
-<p>续传保住的是"会话身份 + 监听器 + 端口"，但<strong>代理清单可能已经变了</strong>—— 客户端在断线期间可能改过配置、删了某个代理。所以续传成功后客户端要把 "最终还在的代理"报上来，服务端据此回收没被提到的那些。</p>
-<p>这条帧叫 <code>ResumeCommit</code>，走 <code>TAG_DETAIL</code> 承载代理名（换行分隔）。</p>
-<h3 data-i18n="nlink-c1-h">名单大了怎么办：自动分片</h3>
-<p>一帧的上限是 8192 字节。代理多的时候一份名单装不下，0.7.2 之前客户端只能 <strong>拒绝发送并记日志</strong> —— 续传照样成功，但"删掉的代理立即回收"这个能力会 静默降级成 10 秒宽限期。</p>
-<p>现在客户端自动分片：每片带 <code>TAG_CHUNK</code>（片序号）与 <code>TAG_CHUNKS</code>（总片数）， 服务端收齐才结算。</p>
+<h2>Scope</h2>
+<p>NLink addresses one class of problem only: the requirement is legitimate, but the standard frp protocol has no place to carry it. The clearest example is connection migration, which requires a connection identifier at the transport layer. Standard frp stacks yamux over TCP/TLS, so that position does not exist.</p>
+<p>The boundary is therefore fixed:</p>
 <ul>
-<li><strong>只有一片时不带分片标记</strong>，线上格式与 0.7.1 完全一致，老服务端照常解析；</li>
-<li>分片按<strong>代理名边界</strong>切，不会切断单个名字；</li>
-<li>乱序到达能正确重组；重复到达不重复计入；新一轮分片会重置旧状态。</li>
+<li>no standard frame field changes meaning;</li>
+<li>the standard handshake keeps its exact shape;</li>
+<li>if either side does not advertise a capability, behaviour falls back to the standard protocol;</li>
+<li>when disabled, the cost is zero and the code is not compiled in.</li>
 </ul>
-<h3 data-i18n="nlink-c2-h">上限</h3>
+<h2>Version detection</h2>
+<p>The server distinguishes four handshakes on the same port, using the first byte only:</p>
 <div class="table-wrap">
 <table>
 <thead><tr>
-<th>限制</th>
-<th>值</th>
-<th>说明</th>
+<th>First byte</th>
+<th>Verdict</th>
+<th>Basis</th>
 </tr></thead>
 <tbody>
 <tr>
-<td>名单总字节</td>
-<td><strong>8 MiB</strong></td>
-<td>按每个代理名 40 字节算约 20 万个 —— 远超单机 frps 的实际承载量</td>
+<td><code>0x4E</code> (<code>N</code>)</td>
+<td><strong>NLink</strong></td>
+<td>magic <code>NFRPLNK1</code></td>
 </tr>
 <tr>
-<td>分片数</td>
-<td>由字节预算推出（约 1100 片）</td>
-<td><code>TAG_CHUNKS</code> 是 u16，不会溢出</td>
+<td><code>0x46</code> (<code>F</code>)</td>
+<td><strong>v2</strong></td>
+<td>magic <code>FRP\\0\\x02\\r\\n</code></td>
+</tr>
+<tr>
+<td><code>0x16</code></td>
+<td><strong>v1 over TLS</strong></td>
+<td>first byte of a TLS ClientHello</td>
+</tr>
+<tr>
+<td>anything else</td>
+<td><strong>v1 plaintext</strong></td>
+<td>parsed as <code>[1 byte type][8 byte big-endian length][JSON]</code></td>
 </tr>
 </tbody>
 </table>
 </div>
-<p>这两个上限都是<strong>防 DoS</strong>的：没有它们，恶意客户端可以一直发分片让服务端攒内存， 或者声称一个巨大的总片数却永远不发完。超过预算会被拒绝并记 warn，不影响会话本身。</p>
-<h2 data-i18n="nlink-s5-h">怎么开启</h2>
-<pre class="code-block"><code class="language-toml"># frps 端
-[nlink]
-enable = true
-# features = ["quic", "resume", "trace"]   # 留空 = 只协商、不启用任何一项
-quic_listen = "0.0.0.0:7000"               # 留空 = 不开 QUIC
-resume_ttl = 30                            # 断线续传保留时长（秒）</code></pre>
-<pre class="code-block"><code class="language-toml"># frpc 端
-[nlink]
-enable = true
-resume = true      # 断线后用同一个 connection id 续传
-quic = true        # 走 QUIC 连服务端（需服务端开 quic_listen）</code></pre>
-<p>官方面（官方 frpc/frps）不认 preamble，会把首字节当成 v1 消息头报错。 客户端捕获到这种失败后<strong>自动回退标准模式并只重试一次</strong>，日志里留一行 warn，隧道照常工作。</p>
-<h2 data-i18n="nlink-s6-h">为什么需要扩展层</h2>
-<p>frp 的协议是够用的，但它把「传输、会话、鉴权、调度」都固定死了。有些需求不是 "实现得不好"，而是<strong>协议里根本没有承载位置</strong>——比如连接迁移需要传输层有独立的 连接标识，而 frp 是在 TCP/TLS 之上套 yamux，这个位置不存在。</p>
-<p>NLink 就是在不改标准帧的前提下，补上这些位置。</p>
-<h2 data-i18n="nlink-s7-h">能力清单</h2>
-<p>八项能力全部已实现，由 <code>server/tests/nlink_e2e.rs</code> 的 16 条端到端用例逐项覆盖。</p>
+<p>The three constants never overlap: v1 JSON starts with <code>{</code>, v2 starts with <code>F</code>, NLink starts with <code>N</code>. Detection involves no heuristic.</p>
+<p>The probe always reads <strong>8 bytes</strong> (<code>max(NLink magic, v2 magic)</code>). An earlier implementation filled only 7 bytes (the v2 magic length) and then sliced to 8, so a client that sent 7 bytes and stopped could trigger an out-of-bounds panic. That bug is fixed and covered by the regression test <code>首帧不足时_detect_version_报错而不是_panic</code>.</p>
+<h2>Handshake and capability negotiation</h2>
+<p>The capability declaration rides in front of the first standard message, and the result rides back on the <code>LoginResp</code> that would be sent anyway. No additional round trip is introduced:</p>
+<pre class="code-block"><code class="language-text">frpc                                             frps
+ │                                                │
+ ├─ [8]  NFRPLNK1      magic                      │
+ ├─ [1]  ver = 1       extension version          │
+ ├─ [8]  caps          capability bitmap (u64 BE) │
+ ├─ [16] session_id    process-level connection id│
+ ├─ [8]  trace_id      end-to-end trace           │
+ ├─ standard v1/v2 handshake ───────────────────▶ │
+ │                                                ├─ parse preamble
+ │                                                ├─ result =
+ │                                                │    compiled ∩ peer caps
+ │                             ◀───────────────── ┤    ∩ runtime allowed
+ │  LoginResp { _nlink: { caps, session, ... } }   │
+ │                                                │
+ ├─ later extension frames (same stream, same ciphertext) │</code></pre>
+<p>The negotiated result defines this connection for its whole lifetime and never changes mid-session. Unknown capability bits are ignored, which is the precondition for forward compatibility.</p>
+<h2>Extension frame format</h2>
+<p>Extension frames use versioned TLVs with self-describing lengths, so unknown content can be skipped safely:</p>
+<pre class="code-block"><code class="language-text">u8   version    extension frame version (currently 1)
+u8   kind       frame kind
+u16  flags      reserved, must be 0
+TLV*            each: u16 tag + u32 len + len bytes</code></pre>
+<p>Carrier positions:</p>
+<ul>
+<li>v2: dedicated frame type <code>0x4E</code>;</li>
+<li>v1: dedicated message type byte <code>0x7F</code>.</li>
+</ul>
+<p>Neither value is used by the official implementation up to v0.71.0 (official v1 type bytes are all printable ASCII), so no numbering conflict exists.</p>
+<p>A peer that does not recognise a <code>kind</code> or <code>tag</code> must skip it rather than fail. Failing would break forward compatibility.</p>
+<h2>Capabilities and carriers</h2>
 <div class="table-wrap">
 <table>
 <thead><tr>
-<th>能力</th>
-<th>承载</th>
-<th>说明</th>
+<th>Capability</th>
+<th>Carrier</th>
+<th>Notes</th>
 </tr></thead>
 <tbody>
 <tr>
-<td>原生 QUIC 传输与连接迁移</td>
-<td>独立 ALPN <code>nfrp-nlink</code></td>
-<td>与标准 frp 的 <code>nfrp-frp</code> 分桶，同一 UDP 端口可并存</td>
+<td>Native QUIC transport and connection migration</td>
+<td>separate ALPN <code>nfrp-nlink</code></td>
+<td>bucketed apart from standard frp <code>nfrp-frp</code>; both can share one UDP port</td>
 </tr>
 <tr>
-<td>多路复用</td>
-<td>QUIC 流</td>
-<td>一条 QUIC 连接跑多条隧道，弱网下不受 TCP 队头阻塞牵连</td>
+<td>Multiplexing</td>
+<td>QUIC streams</td>
+<td>one QUIC connection carries several tunnels, free of TCP head-of-line blocking</td>
 </tr>
 <tr>
-<td>断线续传</td>
-<td><code>session_id</code> + 一次性令牌 + 服务端保留表</td>
-<td>保留 <code>resume_ttl</code> 秒（默认 30），<strong>恢复的是监听器/端口/vhost/visitor 本体</strong>，不只是名单。令牌单次有效，见下方认证边界</td>
+<td>Session resume</td>
+<td><code>session_id</code> + one-time token + server-side table</td>
+<td>keeps entries for <code>resume_ttl</code> seconds (default 30), restoring listeners, ports, vhosts and visitors</td>
 </tr>
 <tr>
-<td>零信任身份</td>
-<td><code>NewWorkConn._nlink</code> 令牌</td>
-<td><code>v1.&lt;exp&gt;.&lt;hmac&gt;</code>，绑定 <code>run_id + user + 过期时间</code>，伪造和过期都被拒</td>
+<td>Zero-trust identity</td>
+<td><code>NewWorkConn._nlink</code> token</td>
+<td>form <code>v1.&lt;exp&gt;.&lt;hmac&gt;</code>, bound to <code>run_id + user + expiry</code></td>
 </tr>
 <tr>
-<td>细粒度限流</td>
-<td>桥接层令牌桶</td>
-<td>按「用户 × 代理」共享桶，支持突发；低速率时自动缩小 relay chunk</td>
+<td>Fine-grained rate limiting</td>
+<td>bridge token bucket</td>
+<td>per user × proxy, burst-friendly; relay chunks shrink automatically at low rates</td>
 </tr>
 <tr>
-<td>端口敲门</td>
-<td>数据面 33 字节序列</td>
-<td>端口默认对外不可见，敲对后按 IP 临时放行（窗口可配）</td>
+<td>Port knocking</td>
+<td>33-byte data-plane sequence</td>
+<td>the port stays invisible until a correct knock grants a temporary per-IP allowance</td>
 </tr>
 <tr>
-<td>批量工作连接</td>
-<td><code>BatchReq</code> 帧</td>
-<td>一条帧换 N 条连接，省掉逐条 <code>StartWorkConn</code> 的往返</td>
+<td>Batched work connections</td>
+<td><code>BatchReq</code> frame</td>
+<td>one frame obtains N connections instead of N <code>StartWorkConn</code> round trips</td>
 </tr>
 <tr>
-<td>端到端 trace</td>
+<td>End-to-end trace</td>
 <td><code>trace_id</code></td>
-<td>控制连接与数据面共享同一个 id</td>
+<td>shared by the control connection and the data plane</td>
 </tr>
 </tbody>
 </table>
 </div>
-<p><strong>设计上的补充</strong>：XTCP 混合版本直连策略、与官方双向兼容的边界用例集， 也一并落地（见下方兼容性矩阵）。</p>
-<h2 data-i18n="nlink-s8-h">P2P 打洞：NatHole 的五种 mode</h2>
-<p>服务端按官方 <code>pkg/nathole/{classify,analysis}.go</code> 实现了完整的行为选择， <strong>mode 0~4 全都在用</strong>，不是只有 EasyNAT 的 mode 0。</p>
-<p>判定依据是双方 NAT 特征的三个计数：<code>easyCount</code> / <code>hardCount</code> / <code>portsChangedRegularCount</code>。</p>
+<p>The XTCP mixed-version direct-connect policy, together with the bidirectional compatibility boundary cases, has also landed; see the compatibility matrix below.</p>
+<h2>Session resume</h2>
+<h3>What is preserved</h3>
+<p>Resume preserves the session identity, listeners, ports, vhosts and visitors — not merely a list of names. A reconnect succeeds only when the <code>session_id</code> and the server-issued one-time token are both valid.</p>
+<h3>Proxy reconciliation</h3>
+<p>A client may change its configuration while disconnected. After a successful resume it must report the proxies that still exist, and the server reclaims everything not mentioned. The frame is <code>ResumeCommit</code>, carrying proxy names in <code>TAG_DETAIL</code> separated by newlines.</p>
+<h3>Automatic chunking</h3>
+<p>A single frame is capped at 8192 bytes. With many proxies the list does not fit, so implementations before 0.7.2 could only refuse to send and log it, silently downgrading "reclaim deleted proxies immediately" to a 10-second grace period.</p>
+<p>The client now chunks automatically: each chunk carries <code>TAG_CHUNK</code> (index) and <code>TAG_CHUNKS</code> (total), and the server settles only once all chunks have arrived.</p>
+<ul>
+<li>a single chunk carries no chunk markers, so the wire format matches 0.7.1 exactly;</li>
+<li>chunks are cut on proxy-name boundaries and never split a name;</li>
+<li>out-of-order arrival reassembles correctly, duplicates are not double-counted, and a new round resets old state.</li>
+</ul>
+<h3>Limits</h3>
 <div class="table-wrap">
 <table>
 <thead><tr>
-<th>条件</th>
-<th>首选 mode</th>
-<th>含义</th>
+<th>Limit</th>
+<th>Value</th>
+<th>Notes</th>
 </tr></thead>
 <tbody>
 <tr>
-<td>双方都 EasyNAT</td>
-<td><strong>mode 0</strong></td>
-<td>映射稳定，直接对发即可</td>
+<td>Total list bytes</td>
+<td>8 MiB</td>
+<td>about 200,000 names at 40 bytes each, far beyond what a single node realistically serves</td>
 </tr>
 <tr>
-<td>一方 HardNAT + 端口规律变化</td>
-<td><strong>mode 1</strong></td>
-<td>预测端口范围扫描</td>
-</tr>
-<tr>
-<td>一方 HardNAT + 端口不规律</td>
-<td><strong>mode 2</strong></td>
-<td>TTL 控制 + 多轮重试</td>
-</tr>
-<tr>
-<td>双方 HardNAT + 都规律</td>
-<td><strong>mode 3</strong></td>
-<td>双向预测 + 随机监听端口</td>
-</tr>
-<tr>
-<td>双方 HardNAT + 一方规律</td>
-<td><strong>mode 4</strong></td>
-<td>单侧预测 + 随机监听端口</td>
-</tr>
-<tr>
-<td>双方 HardNAT + 都不规律</td>
-<td>mode 0（分数 1）</td>
-<td>极难，硬着头皮试</td>
+<td>Chunk count</td>
+<td>derived from the byte budget (about 1100)</td>
+<td><code>TAG_CHUNKS</code> is u16 and cannot overflow</td>
 </tr>
 </tbody>
 </table>
 </div>
-<p>每张行为表都还按「历史成功率」打分：续传/重试时优先选之前成功过的 mode + index，成功后分数 +2（上限 10），由客户端通过 <code>NatHoleReport</code> 回报。</p>
-<p>配套参数也一并下发：<code>portsRangeNumber</code> / <code>portsRandomNumber</code>（端口预测范围）、 <code>listenRandomPorts</code>（随机监听端口数）、<code>ttl</code>、<code>sendDelayMs</code>、<code>readTimeoutMs</code>、 以及全部 STUN 候选地址 <code>candidateAddrs</code>。</p>
-<p><strong>仍然存在的限制</strong>：这些是<strong>协议层的能力</strong>，最终能不能打洞成功还取决于 两端 NAT 设备的实际行为。HardNAT 场景下失败仍会按 <code>fallbackTo</code> 退回中继—— 这是设计好的降级路径，不是缺陷。</p>
-<h2 data-i18n="nlink-s9-h">设计约束</h2>
-<p>这五条是 NLink 的硬约束。不满足就不合入——它们是这份协议能被安全启用的前提。</p>
-<h3 data-i18n="nlink-c3-h">1. 握手期能力协商</h3>
-<p>双方都声明才启用，否则自动回退标准 frp 行为；协商结果决定本次连接的全部行为， 中途不改。能力用位图 + 版本号表示，<strong>未知位一律忽略</strong>（前向兼容）。</p>
-<h3 data-i18n="nlink-c4-h">2. 版本化 TLV / 扩展帧</h3>
-<p>扩展帧放在<strong>独立命名空间</strong>，<strong>绝不改变标准帧语义</strong>——标准帧的字段、顺序、 含义一律不动。对方不认识的 TLV 必须<strong>跳过而非报错</strong>。帧长度自描述，跳过是安全的。</p>
-<h3 data-i18n="nlink-c5-h">3. 两层开关，关闭即零开销</h3>
-<p>编译期 <code>nlink</code> feature（默认开）+ 运行期 <code>[nlink] enable</code>（<strong>默认 false</strong>）。</p>
-<p>用 <code>--no-default-features</code> 编译时，<code>LoginResp</code> / <code>NewWorkConn</code> 的 <code>_nlink</code> 键 <strong>根本不存在</strong>，报文与 0.6.x 逐字节一致。这一点是实测验证的（<code>cargo tree --no-default-features</code> 中不含 nlink）。</p>
-<h3 data-i18n="nlink-c6-h">4. 双栈共存</h3>
-<p><strong>同一端口</strong>识别两种握手，只依赖首字节——<code>NFRPLNK1</code>、<code>FRP\0\x02\r\n</code>、<code>{</code> 三者互不重叠。扩展握手失败自动 fallback，用户无感。</p>
-<h3 data-i18n="nlink-c7-h">5. 可测试性</h3>
-<p>兼容性矩阵的每一行都有对应的 e2e 用例。NLink 相关的 e2e 共 16 条， 覆盖续传、身份、敲门、限流、QUIC、门控与旧客户端回退。</p>
-<h2 data-i18n="nlink-s10-h">兼容性矩阵</h2>
+<p>Both limits are defensive: without them a client could keep sending chunks and force unbounded memory allocation, or claim a huge chunk count and never finish. Exceeding the budget is rejected with a warn log and does not affect the session itself.</p>
+<h2>Authentication boundary of resume</h2>
+<p>A resume must present a <strong>one-time token issued by the server</strong>; holding only the <code>session_id</code> is no longer sufficient.</p>
+<p>The token has the form <code>r1.&lt;exp&gt;.&lt;nonce&gt;.&lt;sig&gt;</code>, uses HMAC-SHA256, and is bound to <code>session + user + client_id + expiry + random nonce</code>. The random nonce makes tokens issued repeatedly for the same session distinct. The token is registered in a pending table and <strong>is invalidated on first use</strong>; verification and deletion happen in one step to avoid a race.</p>
+<p>The token is delivered in <code>ResumeResp</code> at login time. At the moment the connection drops, nothing can be sent any more, so it must be provided in advance.</p>
+<p>One boundary still requires the operator's judgement: with <code>transport.tls.force = false</code> (the default), an observer on the path can steal the token and consume it first. The real client then fails to resume and raises an alert — detectable, but not preventable.</p>
+<p>Mitigations:</p>
+<ul>
+<li>the server logs a warning at startup when resume is enabled without forced TLS;</li>
+<li>this document records the boundary;</li>
+<li><strong>production deployments should enable <code>transport.tls.force = true</code></strong> so the token itself travels inside the encrypted channel.</li>
+</ul>
+<h2>Enabling it</h2>
+<pre class="code-block"><code class="language-toml"># frps
+[nlink]
+enable = true
+# features = ["quic", "resume", "trace"]   # empty = negotiate only, enable nothing
+quic_listen = "0.0.0.0:7000"               # empty = no QUIC listener
+resume_ttl = 30                            # resume retention in seconds</code></pre>
+<pre class="code-block"><code class="language-toml"># frpc
+[nlink]
+enable = true
+resume = true      # resume with the same connection id after a drop
+quic = true        # connect to the server over QUIC (requires quic_listen)</code></pre>
+<p>Official frpc / frps do not recognise the preamble and will treat the first byte as a v1 message header, then fail. The client catches that failure, falls back to standard mode, retries exactly once, logs one warning, and the tunnel keeps working.</p>
+<h2>P2P hole punching: six NatHole combinations</h2>
+<p>The server implements the complete behaviour selection of the official <code>pkg/nathole/{classify,analysis}.go</code>, with modes 0–4 all present rather than only EasyNAT mode 0.</p>
+<p>The decision uses three counters describing both NATs: <code>easyCount</code>, <code>hardCount</code>, and <code>portsChangedRegularCount</code>.</p>
 <div class="table-wrap">
 <table>
 <thead><tr>
-<th>功能</th>
+<th>Condition</th>
+<th>Preferred mode</th>
+<th>Meaning</th>
+</tr></thead>
+<tbody>
+<tr>
+<td>both EasyNAT</td>
+<td>mode 0</td>
+<td>stable mapping; send directly</td>
+</tr>
+<tr>
+<td>one HardNAT, regular port changes</td>
+<td>mode 1</td>
+<td>predict and scan a port range</td>
+</tr>
+<tr>
+<td>one HardNAT, irregular ports</td>
+<td>mode 2</td>
+<td>TTL control plus repeated rounds</td>
+</tr>
+<tr>
+<td>both HardNAT, both regular</td>
+<td>mode 3</td>
+<td>two-sided prediction plus random listening ports</td>
+</tr>
+<tr>
+<td>both HardNAT, one regular</td>
+<td>mode 4</td>
+<td>one-sided prediction plus random listening ports</td>
+</tr>
+<tr>
+<td>both HardNAT, both irregular</td>
+<td>mode 0 (score 1)</td>
+<td>hardest case; still attempted as mode 0</td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Each behaviour table is ranked by historical success: resume and retry prefer a previously successful mode and index, a success adds 2 points (capped at 10), and the client reports results via <code>NatHoleReport</code>.</p>
+<p>The tables ship with parameters <code>portsRangeNumber</code>, <code>portsRandomNumber</code>, <code>listenRandomPorts</code>, <code>ttl</code>, <code>sendDelayMs</code>, <code>readTimeoutMs</code>, and all STUN candidates in <code>candidateAddrs</code>.</p>
+<p>These are protocol-level capabilities. Whether punching succeeds ultimately depends on the two NAT devices. When a HardNAT case fails, <code>fallbackTo</code> returns to relaying — a designed degradation path, not a defect.</p>
+<h2>Compatibility with official frp</h2>
+<div class="table-wrap">
+<table>
+<thead><tr>
+<th>Feature</th>
 <th>NFrp × NFrp</th>
-<th>NFrp × 官方 frp</th>
-<th>官方 × 官方</th>
+<th>NFrp × official frp</th>
+<th>official × official</th>
 </tr></thead>
 <tbody>
 <tr>
-<td>QUIC 传输 / 连接迁移</td>
-<td>支持</td>
-<td>回退 TCP</td>
-<td>不支持</td>
+<td>QUIC transport / migration</td>
+<td>supported</td>
+<td>falls back to TCP</td>
+<td>unsupported</td>
 </tr>
 <tr>
-<td>断线续传</td>
-<td>支持</td>
-<td>重连重建</td>
-<td>不支持</td>
+<td>Session resume</td>
+<td>supported</td>
+<td>reconnect from scratch</td>
+<td>unsupported</td>
 </tr>
 <tr>
-<td>零信任身份</td>
-<td>支持</td>
-<td>不启用（令牌不出现）</td>
-<td>不支持</td>
+<td>Zero-trust identity</td>
+<td>supported</td>
+<td>not enabled (token absent)</td>
+<td>unsupported</td>
 </tr>
 <tr>
-<td>细粒度限流</td>
-<td>支持</td>
-<td>不启用</td>
-<td>不支持</td>
+<td>Fine-grained rate limiting</td>
+<td>supported</td>
+<td>not enabled</td>
+<td>unsupported</td>
 </tr>
 <tr>
-<td>批量工作连接</td>
-<td>支持</td>
-<td>逐条建</td>
-<td>不支持</td>
+<td>Batched work connections</td>
+<td>supported</td>
+<td>one per connection</td>
+<td>unsupported</td>
 </tr>
 <tr>
-<td>端口敲门</td>
-<td>支持</td>
-<td>不支持</td>
-<td>不支持</td>
+<td>Port knocking</td>
+<td>supported</td>
+<td>unsupported</td>
+<td>unsupported</td>
 </tr>
 <tr>
-<td>端到端 trace</td>
-<td>支持</td>
-<td>不启用</td>
-<td>不支持</td>
+<td>End-to-end trace</td>
+<td>supported</td>
+<td>not enabled</td>
+<td>unsupported</td>
 </tr>
 <tr>
-<td>XTCP 混合版本直连</td>
-<td>支持</td>
-<td>需显式策略</td>
-<td>官方行为</td>
+<td>XTCP mixed-version direct</td>
+<td>supported</td>
+<td>requires explicit policy</td>
+<td>official behaviour</td>
 </tr>
 </tbody>
 </table>
 </div>
-<p><strong>与官方 frp 的全部交互都是"不启用"，不影响连通性。</strong> 唯一需要特殊处理的是 preamble：官方 frps 会把它当 v1 消息头报错，客户端捕获后回退标准模式重试一次。</p>
-<h2 data-i18n="nlink-s11-h">续传的认证边界（重要）</h2>
-<p>续传身份是 <strong><code>user</code> + <code>client_id</code> + <code>session_id</code></strong> 的 bearer 会话，不是一次性凭证。</p>
-<p><strong>当 <code>transport.tls.force = false</code>（默认值）时</strong>，preamble 与登录凭据在链路上是明文。 能观察到有效 token 的人，可以抢在原客户端之前完成续传，占住原会话的代理与端口。</p>
-<p>本版的处置：</p>
-<ul>
-<li>服务端若开了续传但没强制 TLS，<strong>启动时打告警</strong>；</li>
-<li>文档记录此边界（就是你正在读的这一节）；</li>
-<li>明确建议：<strong>生产环境开 <code>transport.tls.force = true</code></strong>。</li>
-</ul>
-<p>彻底修复需要一次性 resume token（签发 + 消费语义），不在当前版本范围内。</p>
-<h2 data-i18n="nlink-s12-h">明确不做</h2>
+<p>Every interaction with official frp lands on "not enabled" and does not affect connectivity. The only special case is the preamble: an official frps treats it as a v1 message header and fails, after which the client falls back to standard mode and retries once.</p>
+<h2>Design constraints</h2>
+<p>The five rules below are hard requirements. A change that violates one is not merged; they are what makes this extension safe to enable.</p>
+<h3>1. Negotiation at handshake time</h3>
+<p>Both sides must advertise; if either side is missing, behaviour falls back to standard frp. The negotiated result governs the whole connection and never changes afterwards. Capabilities are expressed as a bitmap plus a version, and unknown bits are ignored.</p>
+<h3>2. Versioned TLV in a separate namespace</h3>
+<p>Extension frames live in their own namespace and never change standard frame semantics. Fields, ordering, and meaning stay untouched. An unrecognised TLV must be skipped rather than rejected, and self-describing lengths make skipping safe.</p>
+<h3>3. Two layers of switches, zero cost when off</h3>
+<p>A compile-time <code>nlink</code> feature (on by default) plus a runtime <code>[nlink] enable</code> (false by default).</p>
+<p>With <code>--no-default-features</code>, the <code>_nlink</code> key is <strong>absent</strong> from <code>LoginResp</code> and <code>NewWorkConn</code>, so packets are byte-identical to 0.6.x. This was verified: such a build has no nlink in <code>cargo tree --no-default-features</code>.</p>
+<h3>4. Dual-stack coexistence</h3>
+<p>Two handshakes are recognised on the same port using only the first byte: <code>NFRPLNK1</code>, <code>FRP\\0\\x02\\r\\n</code>, and <code>{</code> never overlap. If the extension handshake fails, the client falls back transparently.</p>
+<h3>5. Testability</h3>
+<p>Every row of the compatibility matrix has a matching end-to-end case. There are 16 NLink cases covering resume, identity, knocking, rate limiting, QUIC, gating, and old-client fallback. The matrix itself is checked by a test: a case-name mismatch fails CI.</p>
+<h2>Explicitly out of scope</h2>
 <div class="table-wrap">
 <table>
 <thead><tr>
-<th>想法</th>
-<th>为什么不做</th>
+<th>Idea</th>
+<th>Why it is rejected</th>
 </tr></thead>
 <tbody>
 <tr>
-<td>改标准帧的字段含义</td>
-<td>破坏与官方的兼容，违反约束 2</td>
+<td>Change the meaning of standard frame fields</td>
+<td>breaks compatibility with official implementations; violates constraint 2</td>
 </tr>
 <tr>
-<td>让扩展默认开启</td>
-<td>风险不可控，违反约束 3</td>
+<td>Enable the extension by default</td>
+<td>unacceptable risk; violates constraint 3</td>
 </tr>
 <tr>
-<td>在 yamux 之上模拟连接迁移</td>
-<td>语义错了——迁移必须在传输层，模拟出来的东西不解决问题</td>
+<td>Emulate connection migration above yamux</td>
+<td>semantically wrong: migration must happen at the transport layer, and an emulation solves nothing</td>
 </tr>
 <tr>
-<td>把鉴权从「连接级」改成「每帧」</td>
-<td>会对不支持的对端产生不兼容；应做成可选扩展</td>
+<td>Make authentication per-frame instead of per-connection</td>
+<td>incompatible with peers that do not support it; belongs in an optional extension</td>
 </tr>
 <tr>
-<td>自定义压缩 / 加密算法</td>
-<td>已有 <code>useCompression</code> / <code>useEncryption</code> 与官方逐字节对齐，改算法只会破坏互通</td>
+<td>Invent new compression or cipher algorithms</td>
+<td><code>useCompression</code> and <code>useEncryption</code> already match the official implementation byte for byte; new algorithms only break interoperability</td>
 </tr>
 </tbody>
 </table>

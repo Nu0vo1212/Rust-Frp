@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""把 `docs/nlink.md` 同步到站点页面与本地记忆文档。
+"""把 `docs/nlink.md` / `docs/nlink.en.md` 同步到站点页面与本地记忆文档。
 
 ## 为什么要有这个脚本
 
-NLink 的内容同时出现在两处：
+NLink 的内容同时出现在三处：
 
-1. **站点页面** `docs/assets/pages.zh.js` / `pages.en.js` 里的 `PAGES_XX['nlink']`
-2. **本地记忆** `memory/NLINK-V1-EVALUATION.md`（不上传）
+1. **中文站点页面** `docs/assets/pages.zh.js` 里的 `PAGES_ZH['nlink']`
+2. **英文站点页面** `docs/assets/pages.en.js` 里的 `PAGES_EN['nlink']`
+3. **本地记忆** `memory/NLINK-V1-EVALUATION.md`（不上传）
 
-两处手工维护迟早漂移 —— 改了一处忘了另一处，或者站点上是新版、
-memory 里还是旧的。所以约定：
+手工维护迟早漂移 —— 改了一处忘了另一处。所以约定：
 
-* 唯一内容源是 `docs/nlink.md`
-* 这个脚本负责生成两个**生成物**
+* 中文唯一内容源是 `docs/nlink.md`
+* 英文唯一内容源是 `docs/nlink.en.md`
+* 这个脚本负责生成三个**生成物**
 * `--check` 只校验有没有漂移，不改文件（适合放进 CI / 提交前跑）
 
 ## 用法
@@ -27,14 +28,16 @@ python scripts/sync_nlink_doc.py --check   # 只检查，有漂移则退出码 1
 
 站点页面是直接 innerHTML 注入的静态 HTML，所以：
 
-* `## 标题` → `<h2 data-i18n="nlink-xxx-h">`
-* `### 标题` → `<h3 data-i18n="nlink-xxx-h">`
+* `# 标题` → `<h1>`（与 v1 / v2 等页面一致）
+* `## 标题` → `<h2>`
+* `### 标题` → `<h3>`
 * 表格 → `<div class="table-wrap"><table>...`
 * `:::callout 标题 / 正文 / :::` → `<div class="callout">` 结构
 * 内联 `**粗体**` / `` `代码` `` → `<strong>` / `<code>`
 
-`data-i18n` 的 key 由序号生成（`nlink-s1`、`nlink-s2`…），不依赖标题文本，
-这样改标题也不会让 key 漂移。
+**不再生成 `data-i18n` 属性**：站点按语言选择整份页面文件
+（`PAGES_ZH` / `PAGES_EN`），页面内元素不需要再挂 key；
+v1 / v2 页面也是这么写的。
 """
 import argparse
 import io
@@ -44,11 +47,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent          # nfrp/
 SRC = ROOT / "docs" / "nlink.md"
+SRC_EN = ROOT / "docs" / "nlink.en.md"
 ZH = ROOT / "docs" / "assets" / "pages.zh.js"
 EN = ROOT / "docs" / "assets" / "pages.en.js"
 MEM = ROOT / "memory" / "NLINK-V1-EVALUATION.md"
 
-BEGIN = "<!-- BEGIN nlink (generated from docs/nlink.md, do not edit) -->"
 END = "<!-- END nlink -->"
 
 
@@ -78,17 +81,11 @@ def inline_html(text: str) -> str:
     return text
 
 
-def slug_key(prefix: str, n: int) -> str:
-    return f"{prefix}{n}"
-
-
 def md_to_html(md: str) -> str:
     """整篇 Markdown 转站点用的 HTML 片段。"""
     lines = md.split("\n")
     out: list[str] = []
     i = 0
-    h2_n = 0
-    h3_n = 0
     lead_used = False
 
     while i < len(lines):
@@ -134,8 +131,9 @@ def md_to_html(md: str) -> str:
             i += 1
             continue
 
-        # 一级标题（页面里被站点的 h1 占位，跳过）
+        # 一级标题 -> 页面标题
         if s.startswith("# ") and not s.startswith("## "):
+            out.append(f"<h1>{inline_html(s[2:].strip())}</h1>")
             i += 1
             continue
 
@@ -167,17 +165,13 @@ def md_to_html(md: str) -> str:
 
         # 三级标题
         if s.startswith("### "):
-            h3_n += 1
-            key = slug_key("nlink-c", h3_n) + "-h"
-            out.append(f'<h3 data-i18n="{key}">{inline_html(s[4:])}</h3>')
+            out.append(f"<h3>{inline_html(s[4:])}</h3>")
             i += 1
             continue
 
         # 二级标题
         if s.startswith("## "):
-            h2_n += 1
-            key = f"nlink-s{h2_n}-h"
-            out.append(f'<h2 data-i18n="{key}">{inline_html(s[3:])}</h2>')
+            out.append(f"<h2>{inline_html(s[3:])}</h2>")
             i += 1
             continue
 
@@ -238,8 +232,8 @@ def md_to_html(md: str) -> str:
         if para:
             text = " ".join(para)
             # 第一段当作 lead（与站点既有页面风格一致）
-            if not lead_used and h2_n == 0:
-                out.append(f'<p class="lead" data-i18n="nlink-lead">{inline_html(text)}</p>')
+            if not lead_used:
+                out.append(f'<p class="lead">{inline_html(text)}</p>')
                 lead_used = True
             else:
                 out.append(f"<p>{inline_html(text)}</p>")
@@ -253,13 +247,26 @@ def md_to_html(md: str) -> str:
 # --------------------------------------------------------------------------
 # 生成物拼接
 # --------------------------------------------------------------------------
-def build_pages_block(html: str, var: str) -> str:
+def build_pages_block(html: str, var: str, source: str) -> str:
     """生成页面块。
 
     `var` 必须是目标文件里真实存在的对象名（`PAGES_ZH` / `PAGES_EN`）——
     写错不会立刻报错，而是让页面在浏览器里抛 ReferenceError 白屏。
+
+    页面块是 **JS 模板字符串**，因此必须处理两个会让内容失真的字符：
+
+    * 反斜杠：`FRP\\0\\x02\\r\\n` 这样的魔术字若原样写进模板字符串，
+      JS 会把 `\\0` / `\\x02` / `\\r\\n` 当成转义序列，浏览器实际显示的是一串控制字符。
+      所以先转义成 `\\\\`，让页面显示字面量。
+    * 反引号与 `${`：直接终止模板字符串，属于语法错误，出现即拒绝生成。
     """
-    return f"{BEGIN}\n{var}['nlink'] = `\n{html}\n`;\n{END}"
+    if "`" in html:
+        raise SystemExit("内容里出现反引号，会终止 JS 模板字符串，请改用其它写法")
+    if "${" in html:
+        raise SystemExit("内容里出现 ${，会当作模板插值，请改成其它写法")
+    body = html.replace("\\", "\\\\")
+    marker = f"<!-- BEGIN nlink (generated from {source}, do not edit) -->"
+    return f"{marker}\n{var}['nlink'] = `\n{body}\n`;\n{END}"
 
 
 def strip_meta(md: str) -> str:
@@ -281,7 +288,7 @@ def strip_meta(md: str) -> str:
     return "\n".join(lines[i:]).strip() + "\n"
 
 
-MEM_HEADER = """# NLink v1 规划（本地记忆版）
+MEM_HEADER = """# NLink v1 规范（本地记忆版）
 
 > **这是生成物，不要直接编辑。**
 >
@@ -290,7 +297,7 @@ MEM_HEADER = """# NLink v1 规划（本地记忆版）
 > 改完内容源后运行：`python scripts/sync_nlink_doc.py`
 >
 > 同一个内容源还会生成站点页面 `docs/assets/pages.zh.js` 里的 `PAGES_ZH['nlink']`，
-> 所以改一处、跑一次，两边都同步。
+> 英文页由 `docs/nlink.en.md` 生成；改一处、跑一次，全部同步。
 >
 > 这个文件放在 `memory/` 下，已被 `.gitignore` 的 `/memory` 屏蔽，**不会上传**。
 
@@ -300,11 +307,16 @@ MEM_HEADER = """# NLink v1 规划（本地记忆版）
 
 
 def replace_block(text: str, new_block: str) -> str:
-    """替换两个标记之间的内容；没有标记就追加到末尾。"""
-    if BEGIN in text and END in text:
-        pre = text[: text.index(BEGIN)]
-        post = text[text.index(END) + len(END) :]
-        return pre + new_block + post
+    """替换两个标记之间的内容；没有标记就追加到末尾。
+
+    起始标记里带内容源文件名，所以用正则匹配而不是精确比较 ——
+    否则换了内容源文件名之后，旧块永远匹配不上，会在文件里堆叠两份页面。
+    """
+    m = re.search(re.escape("<!-- BEGIN nlink") + r".*?-->", text, re.S)
+    if m and END in text:
+        end = text.index(END) + len(END)
+        if end > m.end():
+            return text[: m.start()] + new_block + text[end:]
     return text.rstrip() + "\n\n" + new_block + "\n"
 
 
@@ -314,16 +326,21 @@ def main() -> int:
     args = ap.parse_args()
 
     if not SRC.is_file():
-        print(f"内容源不存在：{SRC}")
+        print(f"中文内容源不存在：{SRC}")
+        return 2
+    if not SRC_EN.is_file():
+        print(f"英文内容源不存在：{SRC_EN}")
         return 2
 
-    md = io.open(SRC, encoding="utf-8").read()
-    html = md_to_html(md)
-    mem_text = MEM_HEADER + strip_meta(md)
+    md_zh = io.open(SRC, encoding="utf-8").read()
+    md_en = io.open(SRC_EN, encoding="utf-8").read()
+    html_zh = md_to_html(md_zh)
+    html_en = md_to_html(md_en)
+    mem_text = MEM_HEADER + strip_meta(md_zh)
 
     targets = [
-        (ZH, build_pages_block(html, "PAGES_ZH"), "docs/assets/pages.zh.js"),
-        (EN, build_pages_block(html, "PAGES_EN"), "docs/assets/pages.en.js"),
+        (ZH, build_pages_block(html_zh, "PAGES_ZH", "docs/nlink.md"), "docs/assets/pages.zh.js"),
+        (EN, build_pages_block(html_en, "PAGES_EN", "docs/nlink.en.md"), "docs/assets/pages.en.js"),
         (MEM, mem_text, "memory/NLINK-V1-EVALUATION.md"),
     ]
 

@@ -674,6 +674,36 @@ impl AuthProvider {
         }
     }
 
+    /// 校验**原始 token**（SSH 网关专用）。
+    ///
+    /// 为什么不能复用 [`Self::verify_login`]：普通客户端在 `Login` 里发的是
+    /// `auth_key(token, ts)` 派生值（带时间戳，防重放）；而 SSH 网关的
+    /// `--token` 是用户在命令行里直接输入的**原始 token**，两者不是同一个量。
+    ///
+    /// 0.7.6 及以前这里直接调了 `verify_login(cmd.token, ...)`，结果
+    /// **任何 token 都不可能通过**（派生值 ≠ 原始值），SSH 网关的 token
+    /// 认证实际处于「永远失败」状态，只是没人跑过数据面 e2e 所以没暴露。
+    pub fn verify_raw_token(&self, raw: &str) -> anyhow::Result<String> {
+        match self {
+            Self::Token(secret) => {
+                if secret.is_empty() {
+                    return Ok(String::new());
+                }
+                if !crate::frp::msg::constant_time_eq(secret, raw) {
+                    anyhow::bail!("SSH 网关 token 与 frps 配置不一致");
+                }
+                Ok(String::new())
+            }
+            Self::Oidc(_) => anyhow::bail!(
+                "SSH 网关不支持 --token 认证（服务端为 OIDC 模式）；\
+                 请改用 sshTunnelGateway.authorizedKeysFile 公钥认证"
+            ),
+            Self::OidcUnavailable(e) => {
+                anyhow::bail!("OIDC 认证不可用（{e}），拒绝本次 SSH 隧道")
+            }
+        }
+    }
+
     /// 登录时间戳的新鲜性校验（v0.5.6，M3）。
     ///
     /// ★ v0.5.7：**已经由 [`Self::verify_login`] 内部调用**，
@@ -1284,6 +1314,38 @@ mod tests {
 
     fn cidr(s: &str, ip: &str) -> bool {
         Cidr::parse(s).unwrap().contains(ip.parse().unwrap())
+    }
+
+    /// SSH 网关的 `--token` 是**原始 token**，不是 `auth_key` 派生值。
+    ///
+    /// 0.7.6 及以前 SSH 网关误用 `verify_login` 比对派生值，导致 token 认证
+    /// 永远失败（任何正确 token 都被拒）。这条测试锁住两种形态的区别：
+    /// 原始 token 必须过，派生值必须**不**过（否则说明又混回派生语义了）。
+    #[test]
+    fn ssh_网关校验原始_token_而不是派生值() {
+        let s = AuthProvider::Token("secret-1".to_string());
+        assert!(s.verify_raw_token("secret-1").is_ok());
+        assert!(s.verify_raw_token("secret-2").is_err());
+
+        // 派生值不能当作原始 token 通过 —— 反过来也一样，
+        // 这正是 0.7.6 的 bug 所在。
+        // 时间戳必须用当前时刻：`verify_login` 会做新鲜性校验。
+        let now = crate::util::now_unix_secs() as i64;
+        let derived = crate::frp::msg::auth_key("secret-1", now);
+        assert!(s.verify_raw_token(&derived).is_err());
+        assert!(s.verify_login(&derived, now, "run", 300).is_ok());
+        assert!(s.verify_login("secret-1", now, "run", 300).is_err());
+    }
+
+    /// token 为空 = 不做认证（与官方一致）；OIDC 模式必须明确拒绝 `--token`，
+    /// 而不是静默放行。
+    #[test]
+    fn ssh_网关原始_token_的边界() {
+        let empty = AuthProvider::Token(String::new());
+        assert!(empty.verify_raw_token("anything").is_ok());
+
+        let oidc = AuthProvider::OidcUnavailable("test".to_string());
+        assert!(oidc.verify_raw_token("x").is_err());
     }
 
     #[test]

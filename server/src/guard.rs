@@ -235,6 +235,14 @@ impl SecurityContext {
         auth.verify_login(cred, ts, run_id, self.max_clock_skew_secs)
     }
 
+    /// 校验**原始 token**（SSH 网关专用，见 `common::security::verify_raw_token`）。
+    ///
+    /// SSH 网关的 `--token` 是用户在 SSH 命令行里输入的原始值，不是
+    /// `auth_key(token, ts)` 派生值，所以不能走 [`Self::verify_login`]。
+    pub fn verify_raw_token(&self, raw: &str) -> anyhow::Result<String> {
+        self.auth().verify_raw_token(raw)
+    }
+
     /// 只做新鲜性校验（不校验凭证内容）。
     ///
     /// 给"自己手写凭证比对"的路径用：工作连接在 token 模式下是就地

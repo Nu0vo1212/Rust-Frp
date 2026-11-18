@@ -1373,7 +1373,15 @@ pub async fn client_work_conn(
     token: &str,
     ts: i64,
 ) -> Result<(BoxStream, Vec<u8>, StartWorkConn)> {
-    client_work_conn_with(stream, version, run_id, token, ts, None).await
+    client_work_conn_with(
+        stream,
+        version,
+        run_id,
+        &crate::security::Credential::Token(token.to_string()),
+        ts,
+        None,
+    )
+    .await
 }
 
 /// [`client_work_conn`] + NLink 身份令牌。
@@ -1384,7 +1392,12 @@ pub async fn client_work_conn_with(
     stream: BoxStream,
     version: WireVersion,
     run_id: &str,
-    token: &str,
+    // ★ 这里必须是 `Credential` 而不是 `&str`：
+    //   token 模式发 `auth_key(token, ts)` 派生值，OIDC 模式必须发**原始 JWT**
+    //   （服务端 OIDC 分支要解析签名与 sub）。0.7.6 及以前固定发派生值，
+    //   导致 OIDC 部署下所有工作连接被服务端以「不是合法的 JWT」拒掉 ——
+    //   控制连接能登录、代理列表也显示已注册，但**一条隧道都用不了**。
+    credential: &crate::security::Credential,
     ts: i64,
     // 关掉 `nlink` feature 时这个参数用不上（下面整段被 cfg 掉），
     // 但签名保持一致，免得调用点也要跟着写 `#[cfg]`。
@@ -1393,20 +1406,21 @@ pub async fn client_work_conn_with(
     let mut conn = FrpConn::new(stream, version);
     // v2 要求每条连接都先发魔术字；v1 什么都不发，直接上消息
     conn.write_magic().await?;
+    let privilege_key = credential.wire_value(ts);
     // 两种 feature 配置下字段数不同，所以整个构造函数写两遍。
     // 用 `#[cfg]` 而不是 `..Default::default()`：后者在默认配置下会被
     // clippy 判成"所有字段都已指定、这行没作用"（needless_update）。
     #[cfg(feature = "nlink")]
     let new_work = NewWorkConn {
         run_id: run_id.to_string(),
-        privilege_key: msg::auth_key(token, ts),
+        privilege_key,
         timestamp: ts,
         nlink: nlink_identity.map(str::to_string),
     };
     #[cfg(not(feature = "nlink"))]
     let new_work = NewWorkConn {
         run_id: run_id.to_string(),
-        privilege_key: msg::auth_key(token, ts),
+        privilege_key,
         timestamp: ts,
     };
     conn.send_msg(&FrpMessage::NewWorkConn(new_work)).await?;

@@ -2,7 +2,7 @@
 
 > 这份文件收纳 README 里放不下的质量细节。README 只留一句话概述 + 指向这里。
 >
-> 对应版本：**v0.7.4** · 最后核对：2026-11-03
+> 对应版本：**v0.7.7** · 最后核对：2026-11-18
 
 ---
 
@@ -13,14 +13,14 @@
 ```bash
 cargo fmt --all -- --check                 # 格式
 cargo clippy --workspace --all-targets -- -D warnings   # 静态检查，当前 0 告警
-cargo test --workspace                     # 999 个测试通过
+cargo test --workspace                     # 1010 个测试通过
 ```
 
 三项全绿才算过。CI 上跑的是同一组命令，参数一致，不存在"本地过了 CI 不过"。
 
 ---
 
-## 二、测试分布（v0.7.6 实测）
+## 二、测试分布（v0.7.7 实测）
 
 `cargo test --workspace` 实测输出：
 
@@ -28,7 +28,7 @@ cargo test --workspace                     # 999 个测试通过
 |---|---|---|
 | `nfrp-client` 单元测试 | 141 |  |
 | `nfrp-client` 开机自启端到端（真进程） | 2 |  |
-| `nfrp-common` 单元测试（lib） | 502 | 3（Wintun 真机） |
+| `nfrp-common` 单元测试（lib） | 504 | 3（Wintun 真机） |
 | `nfrp-common` 集成测试（OIDC） | 9 |  |
 | `nfrp-server` 单元测试（lib） | 293 |  |
 | `nfrp-server` 单元测试（bin） | 17 |  |
@@ -36,7 +36,7 @@ cargo test --workspace                     # 999 个测试通过
 | `nfrp-server` NLink 端到端 | 16 |  |
 | 文档测试（common） | 2 | 5 |
 | 文档测试（server） | 0 | 5 |
-| **合计** | **1008** | **13** |
+| **合计** | **1010** | **13** |
 
 **关于 13 条 `#[ignore]`**：3 条是**需要真机硬件或管理员权限**的 Windows Wintun
 设备面测试，另外 10 条是文档示例里明确标注 `ignore` 的代码块（不是失败/被跳过
@@ -68,6 +68,8 @@ cargo test --workspace                     # 999 个测试通过
 
 | 版本 | 缺陷 | 关键点 |
 |---|---|---|
+| **0.7.7** | SSH 网关 token 认证**永远失败** | `--token` 是用户在 SSH 命令行给的**原始 token**，代码却拿去比对 `auth_key(token, ts)` 派生值（复用了 `verify_login`）。加到 CI 的 `e2e_ssh_gateway.py` 一跑就暴露：任何正确 token 都被拒。修法：新增 `verify_raw_token` 做常量时间原始值比较；OIDC 模式明确拒绝 `--token` 并提示用 authorizedKeysFile |
+| **0.7.7** | OIDC 部署下**所有工作连接被拒** | 工作连接固定发 `auth_key(token, ts)`，而 OIDC 分支要解析 JWT ⇒ 报「不是合法的 JWT（应当有 3 段，实际 1 段）」。表现为控制连接登录成功、面板显示已注册，但一条隧道都用不了。修法：`Credential::wire_value(ts)` 决定线上形态，`ServerLink` 持有 `token_source`，每条工作连接现取 |
 | **0.7.4** | 限流转发在半关闭后不释放工作连接 | `relay_throttled` 原先用 `try_join!` 等两个方向都结束。客户端只关一个方向时，另一侧的 `read()` 一直挂着，`try_join!` 永不返回 ⇒ 工作连接与 fd 泄漏。修法：`copy_throttled` 读到 EOF 后**主动 shutdown 写端**，对端收到 FIN 也会读到 EOF。测试 `限流转发在半关闭后必须返回释放连接`，用 `timeout` 包住，回归时 2 秒失败而不是挂死 |
 | **0.7.4** | `ResumeCommit` 分片上限按"片数"限不合理 | 0.7.2 写死"最多 64 片"（≈512 KiB）。改成按**字节预算**（8 MiB），片数由预算推出。额外加了一道"累计字节"检查——片数合法但每片塞满时仍可能超预算 |
 | **0.7.4** | HTTP vhost CONNECT 的早期数据被丢掉 | 客户端没等 200 就把隧道数据发来时，`read_head` 已把字节预读进 `HttpIo` 缓冲；随后直接对底层流做 `relay_between` 会跳过缓冲。修法：CONNECT 分支先 `take_buffered()` 补写上游，再用 `PrefixedStream` 把工作连接预读字节补回下游。带正 `Content-Length` 或 `Transfer-Encoding` 的 CONNECT 按官方口径回 400 |
@@ -87,7 +89,12 @@ cargo test --workspace                     # 999 个测试通过
 1. `fmt --check` + `clippy -D warnings`
 2. Linux / Windows / macOS 三系统全量测试
 3. 两个 musl 目标的交叉构建
-4. 端到端冒烟
+4. 端到端冒烟，含三个真二进制 e2e：
+   `e2e_vhost_crypto.py`（加密压缩矩阵）、`e2e_ssh_gateway.py`（SSH 网关数据面）、
+   `e2e_oidc.py`（自建 IdP + RS256 验签）
+5. 文档生成物漂移拦截：`sync_nlink_doc.py --check`
+
+`e2e_nathole_netns.py` 需要 root 与 iproute2/iptables，**不进 CI**，手动跑。
 
 **第三方 GitHub Action 全部 pin 到 commit SHA**（不用浮动 tag，避免上游被投毒）。
 cosign 签名失败即红灯，不会"警告后继续"。

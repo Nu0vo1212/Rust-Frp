@@ -1125,6 +1125,22 @@ PAGES_ZH['api'] = `
 </table>
 </div>
 
+<div class="callout warn">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4M12 17h.01"/></svg>
+<div>
+<strong>与官方 frps 的 v2 API 故意不一致</strong>
+<p>官方 0.71 的 <code>/api/v2</code> 响应形状是 <code>{"code":0,"msg":"","data":...}</code>，本实现用 <code>{"api":"v2","data":...}</code> 并在错误时给出 <code>{"error":{"code","message"}}</code>；两者字段名与成功/失败判定方式都不同，<strong>不是可直接替换的客户端接口</strong>。另外 <code>/api/v2/proxies</code> 在不带 <code>all=1</code> 时返回 400，而不是默认返回全量列表——大集群上一次性拉全量会把面板拖垮，这里要求调用方显式确认。</p>
+</div>
+</div>
+
+<div class="callout">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+<div>
+<strong>为什么不改成和官方一样</strong>
+<p>线协议（v1 / v2 隧道）必须与官方逐字节互通，这一点有端到端用例锁死；但面板 HTTP API 不在 frp 线协议范围内，官方也没有承诺跨实现兼容。把两者混为一谈会让「兼容官方」这个说法失去边界。</p>
+</div>
+</div>
+
 <div class="callout">
 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
 <div>

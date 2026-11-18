@@ -861,6 +861,12 @@ struct ServerLink {
     /// 放在 `ServerLink` 而不是 `FrpConn` 上，是因为工作连接、visitor、
     /// web 面板都可能要读它，而它们只拿得到 `Arc<ServerLink>`。
     nlink_caps: std::sync::atomic::AtomicU64,
+    /// OIDC 令牌源。
+    ///
+    /// 工作连接也要现取 access token（见 [`current_credential`]），
+    /// 而工作连接只拿得到 `Arc<ServerLink>`。放在这里就不用把
+    /// `token_source` 一路透传到 `spawn_work_conn` 的每个调用点。
+    token_source: Option<Arc<nfrp_common::auth::oidc::TokenSource>>,
 }
 
 /// NLink QUIC 是否应在本会话尝试。
@@ -876,7 +882,10 @@ fn nlink_quic_requested(cfg: &ClientConfig) -> bool {
 }
 
 impl ServerLink {
-    async fn open(cfg: Arc<ClientConfig>) -> Result<Self> {
+    async fn open(
+        cfg: Arc<ClientConfig>,
+        token_source: Option<Arc<nfrp_common::auth::oidc::TokenSource>>,
+    ) -> Result<Self> {
         let wire = cfg.protocol.wire_version().ok_or_else(|| {
             anyhow!("当前版本尚未实现 NFrp 自研协议，请把 protocol 设为 frp-v1 或 frp-v2")
         })?;
@@ -940,6 +949,7 @@ impl ServerLink {
             quic,
             udp_binary: std::sync::atomic::AtomicBool::new(false),
             nlink_caps: std::sync::atomic::AtomicU64::new(0),
+            token_source,
         })
     }
 
@@ -1587,14 +1597,17 @@ async fn run_session(deps: SessionDeps) -> Result<()> {
     // **永久挂住** —— 既不退出也不重试，比直接退出更糟，开机自启时无从恢复。
     let login_timeout = login_stage_timeout(&cfg);
     let link = Arc::new(
-        tokio::time::timeout(login_timeout, ServerLink::open(cfg.clone()))
-            .await
-            .map_err(|_| {
-                anyhow!(
-                    "连接服务端超时（{} 秒）：网络 / 代理 / KCP(UDP) 可能尚未就绪",
-                    login_timeout.as_secs()
-                )
-            })??,
+        tokio::time::timeout(
+            login_timeout,
+            ServerLink::open(cfg.clone(), token_source.clone()),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "连接服务端超时（{} 秒）：网络 / 代理 / KCP(UDP) 可能尚未就绪",
+                login_timeout.as_secs()
+            )
+        })??,
     );
     // 走 NLink QUIC 且开了迁移时，起一个"出口 IP 变了就 rebind"的看门狗。
     if cfg.nlink.enable && cfg.nlink.quic && cfg.nlink.quic_migrate {
@@ -2113,17 +2126,16 @@ async fn work_conn_flow(
     let stream = link.connect().await?;
 
     let ts = util::now_unix_secs() as i64;
+    // ★ 每次建工作连接都现取一次凭证：OIDC 的 access token 会过期。
+    //   token 模式 → `auth_key(token, ts)`；OIDC 模式 → 原始 JWT。
+    //   0.7.6 及以前这里固定用 `link.cfg.token` 派生，OIDC 部署下服务端
+    //   会以「不是合法的 JWT」拒掉每一条工作连接。
+    let cred = current_credential(&link.cfg, &link.token_source).await?;
     // NLink 身份令牌：协商了才带（`identity()` 为 None 时字段不出现）。
     let identity = nlink.identity();
-    let (work, leftover, start) = conn::client_work_conn_with(
-        stream,
-        link.wire,
-        &run_id,
-        &link.cfg.token,
-        ts,
-        identity.as_deref(),
-    )
-    .await?;
+    let (work, leftover, start) =
+        conn::client_work_conn_with(stream, link.wire, &run_id, &cred, ts, identity.as_deref())
+            .await?;
 
     // 服务端下发的名字是**线上全名**（带 `{user}.` 前缀），本地映射表按配置里的
     // 原始 `name` 建 —— 统一走 `resolve_uploaded_proxy`。

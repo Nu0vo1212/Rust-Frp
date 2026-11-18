@@ -1127,6 +1127,22 @@ PAGES_EN['api'] = `
 </table>
 </div>
 
+<div class="callout warn">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4M12 17h.01"/></svg>
+<div>
+<strong>The v2 API is deliberately not shape-compatible with official frps</strong>
+<p>Official 0.71 returns <code>{"code":0,"msg":"","data":...}</code>; this implementation returns <code>{"api":"v2","data":...}</code> and signals failures with <code>{"error":{"code","message"}}</code>. Field names and the success/failure test both differ, so it is <strong>not a drop-in client API</strong>. In addition, <code>/api/v2/proxies</code> returns 400 without <code>all=1</code> instead of listing everything by default - on a large cluster a full pull would overwhelm the dashboard, so the caller must opt in.</p>
+</div>
+</div>
+
+<div class="callout">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+<div>
+<strong>Why not match official</strong>
+<p>The wire protocol (v1 / v2 tunnels) must interoperate byte for byte with official frp, and end-to-end cases lock that down. The dashboard HTTP API is not part of the frp wire protocol, and official implementations never promised cross-implementation compatibility. Conflating the two would make the phrase "compatible with official" meaningless.</p>
+</div>
+</div>
+
 <div class="callout">
 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
 <div>

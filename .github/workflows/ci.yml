@@ -34,6 +34,15 @@ jobs:
       - name: cargo clippy (含测试代码)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # 文档生成物漂移检查。
+      #
+      # NLink 页面的正文同时在三个地方出现：中文内容源 `docs/nlink.md`、
+      # 英文内容源 `docs/nlink.en.md`、生成的 `docs/assets/pages.*.js`。
+      # 手工维护必然漂移（0.7.6 就出现过英文站显示中文正文）。这一步让
+      # 「改了内容源却没重新生成」在 CI 上直接红掉。
+      - name: docs generated pages are in sync
+        run: python3 scripts/sync_nlink_doc.py --check
+
       # 依赖漏洞门禁。
       #
       # v0.5.1 发版时锁的 rustls 0.23.44 带着 RUSTSEC-2026-0285
@@ -130,6 +139,36 @@ jobs:
       - name: run integration tests
         run: cargo test --workspace --release --test '*'
         timeout-minutes: 10
+
+      # 数据面加密/压缩矩阵（真二进制，不是 mock）。
+      #
+      # 0.7.6 修的缺陷是「vhost 工作连接按裸流中继、忽略 useEncryption /
+      # useCompression」。这条路径的单元测试是内存流对拷，永远能过；
+      # 只有真起 frps + frpc + 真后端才能发现「客户端发密文、服务端按明文转发」。
+      # 放在冒烟 job 里，release 构建产物直接复用，不额外编译。
+      - name: data-plane crypto matrix (http/tcp/udp/https/tcpmux)
+        run: |
+          # https 用例要自签证书（用 cryptography 生成，不依赖系统 openssl）。
+          # 不装的话该用例会被跳过 —— 跳过不等于通过。
+          python3 -m pip install --quiet cryptography
+          python3 scripts/e2e_vhost_crypto.py --bin-dir target/release
+        timeout-minutes: 8
+
+      # SSH 网关数据面（tcp / tcpmux / stcp）。
+      # 0.7.7 跑这个才发现：token 认证拿原始 token 去比对 auth_key 派生值，
+      # 于是**永远失败**；只测"注册成功"是发现不了的。
+      - name: ssh tunnel gateway data plane
+        run: python3 scripts/e2e_ssh_gateway.py --bin-dir target/release
+        timeout-minutes: 8
+
+      # 真实 OIDC 流程：frps 真的拉 discovery/jwks，frpc 真的发
+      # client_credentials 拿 RS256 JWT。0.7.7 由此发现工作连接凭证用错了
+      # 形态（派生值 vs 原始 JWT），OIDC 部署下隧道完全不可用。
+      - name: oidc end-to-end (real discovery + jwks + RS256)
+        run: |
+          python3 -m pip install --quiet cryptography
+          python3 scripts/e2e_oidc.py --bin-dir target/release
+        timeout-minutes: 8
 
       - name: check --gen-config works and produced config reloads
         run: |

@@ -394,9 +394,13 @@ async fn run_tunnel(
     if require_token || !cmd.token.trim().is_empty() {
         // 公钥认证通过时官方不再验 token；只有 authorized_keys 为空才强制。
         // 但用户显式给了 --token 也校验一次，避免“token 写错却静默通过”。
-        let ts = util::now_unix_secs() as i64;
+        //
+        // ★ 0.7.7：这里必须用 `verify_raw_token`。`--token` 是**原始 token**，
+        //   而 `verify_login` 期望的是 `auth_key(token, ts)` 派生值 ——
+        //   0.7.6 及以前直接调 `verify_login`，导致 token 认证**永远失败**
+        //   （报 "token in login doesn't match token from configuration"）。
         security
-            .verify_login(&cmd.token, ts, &run_id)
+            .verify_raw_token(&cmd.token)
             .map_err(|e| anyhow!("SSH 网关 token 认证失败：{e}"))?;
     }
 

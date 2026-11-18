@@ -346,6 +346,11 @@ def main() -> int:
 
     drift = []
     for path, block, label in targets:
+        # `memory/` 不进仓库（见 .gitignore），CI 上根本不存在。
+        # `--check` 时缺失的只是本地记忆产物，不能算漂移 —— 否则每次 CI 都红，
+        # 而且报的还是「生成物与内容源不一致」这种误导性原因（0.7.7 踩过）。
+        if args.check and not path.is_file():
+            continue
         cur = io.open(path, encoding="utf-8").read() if path.is_file() else ""
         want = replace_block(cur, block) if path != MEM else block
         if cur.strip() != want.strip():

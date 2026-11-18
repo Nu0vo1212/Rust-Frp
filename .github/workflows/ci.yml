@@ -21,6 +21,11 @@ jobs:
   lint:
     name: fmt / clippy
     runs-on: ubuntu-latest
+    # rustsec/audit-check 要通过 Checks API 发布审计结果，需要 checks: write。
+    # 一旦声明 job 级 permissions，未列出的权限会归零，所以保留 checkout 需要的 contents: read。
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable

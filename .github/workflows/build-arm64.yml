@@ -72,7 +72,9 @@ jobs:
           # 必须经 qemu-user-static 转译。
           V=$(qemu-aarch64-static "$D/nfrp-server" -V)
           echo "server -V -> $V"
-          echo "$V" | grep -q '^nfrp-server 0\.6\.' \
+          # 版本断言别写死小版本：这里原来写的是 `0\.6\.`，升到 0.7.x 之后
+          # 每次打 tag 都会在这里假红（产物其实是好的）。改成只校验格式。
+          echo "$V" | grep -qE '^nfrp-server [0-9]+\.[0-9]+\.' \
             || { echo "-V 输出不对"; exit 1; }
 
           P=$(qemu-aarch64-static "$D/nfrp-server" -v)
@@ -80,7 +82,7 @@ jobs:
           echo "$P" | grep -q '^0\.71\.0$' \
             || { echo "-v 必须输出裸协议版本 0.71.0（对齐官方 frp）"; exit 1; }
 
-          qemu-aarch64-static "$D/nfrp-client" -V | grep -q '^nfrp-client 0\.6\.' \
+          qemu-aarch64-static "$D/nfrp-client" -V | grep -qE '^nfrp-client [0-9]+\.[0-9]+\.' \
             || { echo "client -V 输出不对"; exit 1; }
 
           echo "✅ arm64 产物已在 qemu 下真实执行验证"

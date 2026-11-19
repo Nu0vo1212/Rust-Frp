@@ -1,0 +1,362 @@
+name: Release
+
+# 发布一直有两大缺口：①三平台产物没有校验值，用户无法验证下载到的东西没被换过；
+# ②没有容器镜像。这个工作流一次补齐：
+#   - 构建 Windows / Linux amd64 / Linux arm64 三个产物
+#   - 生成 SHA256SUMS + 用 cosign/sigstore 做无密钥签名（默认可用）
+#   - 上传 GitHub Release 并推 ghcr.io 镜像
+# 触发：git tag v0.5.1 && git push --tags
+#
+# 手动 dry run：Actions 里 workflow_dispatch，填 tag + 勾 dry_run=true。
+# 跑完 build / build-mips / checksums（含真签名与逐包验签），
+# 但**不创建 Release、不推 ghcr 镜像** —— 验证流水线本身而不产出发布物。
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的标签（例如 v0.5.1）"
+        required: true
+      dry_run:
+        description: "只跑构建/打包/校验/签名，不创建 Release、不推镜像"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write # cosign 的 keyless signing 需要
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-amd64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: nfrp-windows-amd64.zip
+            platform: windows-amd64
+          - name: linux-amd64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: nfrp-linux-amd64.tar.gz
+            platform: linux-amd64
+          - name: linux-arm64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            asset: nfrp-linux-arm64.tar.gz
+            platform: linux-arm64
+          # OpenWrt arm_cortex-a*_vfp（linux-arm-hf）。cross 镜像自带 musl-gcc。
+          - name: linux-arm-hf
+            os: ubuntu-latest
+            target: armv7-unknown-linux-musleabihf
+            asset: nfrp-linux-arm-hf.tar.gz
+            platform: linux-arm-hf
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: install cross (linux targets)
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: cross
+
+      - name: build --release
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            cross build --release --workspace --target ${{ matrix.target }}
+          else
+            cargo build --release --workspace --target ${{ matrix.target }}
+          fi
+        shell: bash
+        timeout-minutes: 40
+
+      # 统一走 scripts/release.py pack：它负责改名 frps/frpc、附带示例配置、
+      # LICENSE/NOTICE、包内 README，以及 Linux 包的 openwrt/ 目录与安装器，
+      # 并在打包后逐个 sha256 自检（手写 tar 那套会漏掉 openwrt/）。
+      # checksum / 签名 / 验证步骤保持不变。
+      - name: package (release.py pack)
+        shell: bash
+        run: |
+          # windows-latest 上只有 `python`，Git Bash 里不一定有 `python3`。
+          # 先探测再调用，别让打包步骤因为解释器名字挂掉。
+          PY=python3
+          command -v python3 >/dev/null 2>&1 || PY=python
+          "$PY" scripts/release.py pack \
+            --target ${{ matrix.platform }}:target/${{ matrix.target }}/release \
+            --out .
+          test -f "${{ matrix.asset }}" || { echo "没有产出 ${{ matrix.asset }}"; exit 1; }
+
+      - name: upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  # OpenWrt MIPS 两个目标（24kc）单独构建：Tier 3 + nightly build-std +
+  # OpenWrt SDK 工具链，与路由器 libc 一致。continue-on-error 让它不阻塞
+  # 另外几个稳定目标的发布；红了就没有 mips 包，其余照常发。
+  build-mips:
+    name: ${{ matrix.name }} (best effort)
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-mipsle
+            target: mipsel-unknown-linux-musl
+            platform: linux-mipsle
+            asset: nfrp-linux-mipsle.tar.gz
+            sdk_url: https://downloads.openwrt.org/releases/23.05.5/targets/ramips/mt76x8/openwrt-sdk-23.05.5-ramips-mt76x8_gcc-12.3.0_musl.Linux-x86_64.tar.xz
+            sdk_sha: d3fc656e5ecc5099f16379860582c22fd57b9e03a81521b17c9ad31034cde1c0
+            gcc_prefix: mipsel-openwrt-linux-musl
+          - name: linux-mips
+            target: mips-unknown-linux-musl
+            platform: linux-mips
+            asset: nfrp-linux-mips.tar.gz
+            sdk_url: https://downloads.openwrt.org/releases/23.05.5/targets/ath79/generic/openwrt-sdk-23.05.5-ath79-generic_gcc-12.3.0_musl.Linux-x86_64.tar.xz
+            sdk_sha: dc2ffaf036929630e3de601be2006829d57ed30d018ed4e9e71496bd75d9cbb6
+            gcc_prefix: mips-openwrt-linux-musl
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # nightly
+        with:
+          toolchain: nightly
+          components: rust-src
+
+      - name: download & verify OpenWrt SDK
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o sdk.tar.xz "${{ matrix.sdk_url }}"
+          echo "${{ matrix.sdk_sha }}  sdk.tar.xz" | sha256sum -c -
+          mkdir -p sdk
+          tar -xJf sdk.tar.xz -C sdk --strip-components=1
+          GCC=$(find sdk/staging_dir -type f -name '${{ matrix.gcc_prefix }}-gcc' | head -n1)
+          test -n "$GCC" || { echo "SDK 里找不到交叉 gcc"; exit 1; }
+          echo "SDK_BIN=$(dirname "$(realpath "$GCC")")" >> "$GITHUB_ENV"
+
+      - name: build --release (-Zbuild-std)
+        env:
+          CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.gcc_prefix }}-gcc
+          CARGO_TARGET_MIPS_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.gcc_prefix }}-gcc
+          CC_mipsel_unknown_linux_musl: ${{ matrix.gcc_prefix }}-gcc
+          CC_mips_unknown_linux_musl: ${{ matrix.gcc_prefix }}-gcc
+          AR_mipsel_unknown_linux_musl: ${{ matrix.gcc_prefix }}-ar
+          AR_mips_unknown_linux_musl: ${{ matrix.gcc_prefix }}-ar
+          # 不设 -latomic：portable-atomic 在 mips32 用纯 Rust seq_lock，
+          # 依赖里的 std 64 位原子均有 cfg 门控，无需链接 libatomic。
+        run: |
+          set -euo pipefail
+          export PATH="$SDK_BIN:$PATH"
+          cargo +nightly build --release --workspace \
+            -Z build-std=std,panic_abort \
+            --target ${{ matrix.target }} \
+            -p nfrp-server -p nfrp-client
+          D="target/${{ matrix.target }}/release"
+          file "$D/nfrp-server" | grep -Eq 'statically linked|static-pie' \
+            || { echo "不是静态链接"; exit 1; }
+
+      - name: package (release.py pack)
+        shell: bash
+        run: |
+          # windows-latest 上只有 `python`，Git Bash 里不一定有 `python3`。
+          # 先探测再调用，别让打包步骤因为解释器名字挂掉。
+          PY=python3
+          command -v python3 >/dev/null 2>&1 || PY=python
+          "$PY" scripts/release.py pack \
+            --target ${{ matrix.platform }}:target/${{ matrix.target }}/release \
+            --out .
+          test -f "${{ matrix.asset }}" || { echo "没有产出 ${{ matrix.asset }}"; exit 1; }
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: warn
+
+  checksums:
+    name: checksums + signature
+    runs-on: ubuntu-latest
+    needs: [build, build-mips]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+
+      - name: flatten artifacts
+        run: |
+          mkdir -p out
+          find dist -type f \( -name '*.zip' -o -name '*.tar.gz' \) -exec cp {} out/ \;
+          ls -l out
+
+      - name: generate SHA256SUMS
+        run: |
+          cd out
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      # ★★ 签名必须"真的签出来"（v0.5.3 修）。
+      #
+      # 这里原来两个步骤都写了 `continue-on-error: true`，shell 里还有
+      # `|| echo "::warning::..."` —— 三重失效叠加，结果是
+      # **一个字节都没签出来这条流水线也会全绿通过**，Release 里剩一个
+      # 谁都能替换的裸 SHA256SUMS。而 README 宣称"发布可验真"，
+      # 那在 CI 这条路径上是不成立的（自相矛盾的发布比没有签名更糟）。
+      #
+      # 现在：装不上 cosign 或签名失败 = **红灯**，不允许"看起来签过了"。
+      # 紧接着加一步 verify-blob 自检，确保签出来的东西当场能验。
+      - name: sign with cosign (keyless)
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      - name: cosign sign blobs
+        run: |
+          cd out
+          for f in *; do
+            [ "$f" = "SHA256SUMS" ] && continue
+            case "$f" in *.sig) continue ;; esac
+            cosign sign-blob --yes --output-signature "$f.sig" "$f"
+          done
+          cosign sign-blob --yes --output-signature SHA256SUMS.sig SHA256SUMS
+          echo "--- 签出来的文件 ---"
+          ls -la *.sig
+
+      # ★★ v0.5.4 修（M2）：**逐个**验证所有签名，并断言"每个产物都有对应签名"。
+      #
+      # 原先只验了 `SHA256SUMS.sig` 一个（4 个签名里的 1 个），
+      # 于是"某个包的签名丢了/签错了"这条流水线完全无感。
+      - name: verify signatures
+        run: |
+          set -euo pipefail
+          cd out
+
+          # 1) 每个非 .sig 产物都必须有 .sig（缺一即失败）
+          missing=0
+          for f in *; do
+            case "$f" in
+              *.sig|SHA256SUMS) continue ;;
+            esac
+            if [ ! -f "$f.sig" ]; then
+              echo "::error::产物 $f 没有对应签名"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+
+          # 2) 逐个验签（不是只验 SHA256SUMS 那一个）
+          for sig in *.sig; do
+            target="${sig%.sig}"
+            echo "--- verify $target ---"
+            cosign verify-blob \
+              --certificate-identity-regexp '^https://github.com/' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --signature "$sig" "$target"
+          done
+
+          # 3) SHA256SUMS 自身的签名也要验
+          cosign verify-blob \
+            --certificate-identity-regexp '^https://github.com/' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --signature SHA256SUMS.sig SHA256SUMS
+          echo "全部签名验证通过"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: checksums
+          # ★ 必须连 `*.sig` 一起传：只传 SHA256SUMS 的话，上面 cosign 签出来的
+          # 分离签名会随着 job 结束一起消失，Release 里只剩一个没人能验证的校验和文件。
+          path: |
+            out/SHA256SUMS
+            out/*.sig
+
+  release:
+    name: github release
+    runs-on: ubuntu-latest
+    needs: [build, checksums]
+    # dry run 时不发 Release；打 tag 触发时 inputs.dry_run 为空，!空 = true。
+    if: ${{ !inputs.dry_run }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+
+      - name: flatten
+        run: |
+          mkdir -p out
+          find dist -type f ! -name '*.md' -exec cp {} out/ \;
+          ls -l out
+
+      - name: create release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          # ★ 显式给 tag_name：手动触发（workflow_dispatch）时 `github.ref_name` 是
+          # **分支名**，不指定的话会打出个叫 `main` 的 Release。
+          # 打 tag 触发时 ref_name 就是标签本身，表达式的右侧兜底。
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            out/*
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+
+  docker:
+    name: push ghcr.io image
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ !inputs.dry_run }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: resolve version
+        id: ver
+        # 手动触发时优先用输入的标签；GITHUB_REF_NAME 在 dispatch 下是**分支名**，
+        # 只有打 tag 触发时它才是标签，所以不能把它放在前面当首选。
+        #
+        # ★ v0.5.3：不再把 `${{ github.event.inputs.tag }}` 直接拼进 shell。
+        #   那是**表达式注入**面 —— 输入里带 `; rm -rf /` 之类会被当命令执行。
+        #   虽然说能触发 workflow_dispatch 的人本就有 write 权限（不是提权），
+        #   但没有理由留一个"参数能变成命令"的入口。
+        #   改成先经 env 传值（env 不参与 shell 解析），再做正则白名单校验。
+        env:
+          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag="$RAW_TAG"
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::标签格式非法（要求形如 v1.2.3）：$tag"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

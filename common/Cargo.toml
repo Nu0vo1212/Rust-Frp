@@ -53,10 +53,16 @@ toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
-[target.'cfg(all(unix, not(target_os = "android")))'.dependencies]
+[target.'cfg(all(unix, not(target_os = "android"), any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
 # pprof-rs 依赖 perf 信号与 nix，只在桌面 Unix（Linux / macOS）可用。
 # ★ Android 虽然同样是 `unix`，但 pprof-rs 在它上面**编译不过**
 #   （`frame_pointer` 相关 cfg 没实现），所以必须显式排除，
 #   否则 Android 包（aarch64 / x86_64）直接编不出来。
-# Windows / Android 上 pprof_http 返回明确的 501，而不是让整个 crate 编译失败。
+# ★ 32 位 ARM（armv7 musl，OpenWrt 常见）也编不过：pprof 0.15 的
+#   `Profiler::is_blocklisted` 只在 x86_64/aarch64/riscv64/loongarch64 上定义，
+#   而 frame-pointer 采样路径无条件调用它 ⇒ E0599。
+#   所以 32 位 ARM / MIPS 一律不编 pprof，端点返回 501 并写明原因。
+# 条件必须与 common/src/pprof_http.rs 里的 cfg 完全一致。
+# Windows / Android / 32 位 ARM / MIPS 上 pprof_http 返回明确的 501，
+# 而不是让整个 crate 编译失败。
 pprof = { workspace = true }

@@ -226,7 +226,7 @@ jobs:
           # mipsel_24kc：ramips/mt76x8。SDK sha256 取自官方 sha256sums。
           - target: mipsel-unknown-linux-musl
             sdk_url: https://downloads.openwrt.org/releases/23.05.5/targets/ramips/mt76x8/openwrt-sdk-23.05.5-ramips-mt76x8_gcc-12.3.0_musl.Linux-x86_64.tar.xz
-            sdk_sha: d3fc656e5ecc5099f16379860582c22fd57b9e03a81521b17c9ad31034cde1c0172421
+            sdk_sha: d3fc656e5ecc5099f16379860582c22fd57b9e03a81521b17c9ad31034cde1c0
             gcc_prefix: mipsel-openwrt-linux-musl
             openwrt_arch: mipsel_24kc
           # mips_24kc（大端）：ath79/generic。
@@ -325,13 +325,16 @@ jobs:
       - name: build musl binaries
         env:
           CARGO_TARGET_DIR: target-cross
-        run: cross build --release --workspace --target x86_64-unknown-linux-musl \
-          -p nfrp-server -p nfrp-client
+        # 必须用块标量：折行标量会把"反斜杠+换行"折成空格，
+        # 传给 cross 的参数变成 " -p"，报 unexpected argument。
+        run: |
+          cross build --release --workspace --target x86_64-unknown-linux-musl \
+            -p nfrp-server -p nfrp-client
 
       - name: import official OpenWrt rootfs
         env:
           ROOTFS_URL: https://downloads.openwrt.org/releases/23.05.5/targets/x86/64/openwrt-23.05.5-x86-64-rootfs.tar.gz
-          ROOTFS_SHA: 383311300e1fd796f5a39bf09ad87bcedec61a7f09263f79cd1352757a3573a94221
+          ROOTFS_SHA: 383311300e1fd796f5a39bf09ad87bcedec61a7f09263f79cd1352757a3573a9
         run: |
           set -euo pipefail
           curl -fsSL --retry 3 -o rootfs.tar.gz "$ROOTFS_URL"

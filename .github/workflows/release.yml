@@ -123,7 +123,7 @@ jobs:
             platform: linux-mipsle
             asset: nfrp-linux-mipsle.tar.gz
             sdk_url: https://downloads.openwrt.org/releases/23.05.5/targets/ramips/mt76x8/openwrt-sdk-23.05.5-ramips-mt76x8_gcc-12.3.0_musl.Linux-x86_64.tar.xz
-            sdk_sha: d3fc656e5ecc5099f16379860582c22fd57b9e03a81521b17c9ad31034cde1c0172421
+            sdk_sha: d3fc656e5ecc5099f16379860582c22fd57b9e03a81521b17c9ad31034cde1c0
             gcc_prefix: mipsel-openwrt-linux-musl
           - name: linux-mips
             target: mips-unknown-linux-musl

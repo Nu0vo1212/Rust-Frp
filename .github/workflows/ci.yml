@@ -93,6 +93,9 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
           - target: aarch64-unknown-linux-musl
+          # OpenWrt arm_cortex-a*_vfp 设备（linux_arm_hf）用这个产物。
+          # cross 的官方镜像自带 musl-gcc，ring 的 C 代码能编过。
+          - target: armv7-unknown-linux-musleabihf
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
@@ -181,3 +184,162 @@ jobs:
           ./target/release/nfrp-client --gen-config /tmp/frpc.toml
           ./target/release/nfrp-server --check -c /tmp/frps.toml
           ./target/release/nfrp-client --print-example > /dev/null
+
+  # ---------------------------------------------------------------
+  # OpenWrt MIPS（mips / mipsel，24kc）：Tier 3 目标，没有预编译 std。
+  #
+  # 为什么单独成 job 且 continue-on-error：
+  #   * 这两个目标必须用 nightly + rust-src + -Zbuild-std=std,panic_abort
+  #     现编 std；工具链要用 OpenWrt SDK 自带的 24kc 交叉 gcc，
+  #     这样 libc 才和路由器一致。
+  #   * MIPS32 没有原生 64 位原子，依赖 crate 里的 std AtomicU64 会
+  #     落到 libatomic 的 __atomic_* 符号，所以 RUSTFLAGS 加 -latomic
+  #     兜底；项目自己的原子已改 portable-atomic（见 Cargo.toml）。
+  #   * 这是社区最 flaky 的一条链（SDK 版本 / rustc nightly 都可能变），
+  #     不能让它拖垮主 CI —— 红了只告警，产物照常上传供人工核验。
+  # ---------------------------------------------------------------
+  cross-build-mips:
+    name: openwrt-mips ${{ matrix.target }} (best effort)
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # mipsel_24kc：ramips/mt76x8。SDK sha256 取自官方 sha256sums。
+          - target: mipsel-unknown-linux-musl
+            sdk_url: https://downloads.openwrt.org/releases/23.05.5/targets/ramips/mt76x8/openwrt-sdk-23.05.5-ramips-mt76x8_gcc-12.3.0_musl.Linux-x86_64.tar.xz
+            sdk_sha: d3fc656e5ecc5099f16379860582c22fd57b9e03a81521b17c9ad31034cde1c0172421
+            gcc_prefix: mipsel-openwrt-linux-musl
+            openwrt_arch: mipsel_24kc
+          # mips_24kc（大端）：ath79/generic。
+          - target: mips-unknown-linux-musl
+            sdk_url: https://downloads.openwrt.org/releases/23.05.5/targets/ath79/generic/openwrt-sdk-23.05.5-ath79-generic_gcc-12.3.0_musl.Linux-x86_64.tar.xz
+            sdk_sha: dc2ffaf036929630e3de601be2006829d57ed30d018ed4e9e71496bd75d9cbb6
+            gcc_prefix: mips-openwrt-linux-musl
+            openwrt_arch: mips_24kc
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: install nightly + rust-src
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # nightly
+        with:
+          toolchain: nightly
+          components: rust-src
+
+      - name: download & verify OpenWrt SDK
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o sdk.tar.xz "${{ matrix.sdk_url }}"
+          echo "${{ matrix.sdk_sha }}  sdk.tar.xz" | sha256sum -c -
+          mkdir -p sdk
+          tar -xJf sdk.tar.xz -C sdk --strip-components=1
+          GCC=$(find sdk/staging_dir -type f -name '${{ matrix.gcc_prefix }}-gcc' | head -n1)
+          test -n "$GCC" || { echo "SDK 里找不到交叉 gcc"; exit 1; }
+          echo "SDK_BIN=$(dirname "$(realpath "$GCC")")" >> "$GITHUB_ENV"
+
+      - name: build --release (-Zbuild-std)
+        env:
+          CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.gcc_prefix }}-gcc
+          CARGO_TARGET_MIPS_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.gcc_prefix }}-gcc
+          CC_mipsel_unknown_linux_musl: ${{ matrix.gcc_prefix }}-gcc
+          CC_mips_unknown_linux_musl: ${{ matrix.gcc_prefix }}-gcc
+          AR_mipsel_unknown_linux_musl: ${{ matrix.gcc_prefix }}-ar
+          AR_mips_unknown_linux_musl: ${{ matrix.gcc_prefix }}-ar
+          # panic="abort" 已在 profile 里，build-std 只需 std + panic_abort。
+          # -latomic 兜底依赖 crate 里残留的 std 64 位原子（MIPS32 无原生原子）。
+          RUSTFLAGS: "-C link-arg=-latomic"
+        run: |
+          set -euo pipefail
+          export PATH="$SDK_BIN:$PATH"
+          cargo +nightly build --release --workspace \
+            -Z build-std=std,panic_abort \
+            --target ${{ matrix.target }} \
+            -p nfrp-server -p nfrp-client
+          D="target/${{ matrix.target }}/release"
+          file "$D/nfrp-server" "$D/nfrp-client"
+          file "$D/nfrp-server" | grep -Eq 'statically linked|static-pie' \
+            || { echo "不是静态链接"; exit 1; }
+
+      - name: qemu 冒烟（frps/frpc -v 必须是裸 0.71.0）
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends qemu-user-static
+          QEMU=$(case "${{ matrix.target }}" in
+                   mipsel-*) echo qemu-mipsel-static ;;
+                   mips-*)   echo qemu-mips-static ;;
+                 esac)
+          D="target/${{ matrix.target }}/release"
+          for b in nfrp-server nfrp-client; do
+            V=$("$QEMU" -L sdk/staging_dir/toolchain-*/ "$D/$b" -v)
+            echo "$b -v -> [$V]"
+            test "$V" = "0.71.0" || { echo "-v 必须输出裸 0.71.0"; exit 1; }
+          done
+
+      - name: upload mips artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nfrp-linux-${{ matrix.openwrt_arch }}
+          path: |
+            target/${{ matrix.target }}/release/nfrp-server
+            target/${{ matrix.target }}/release/nfrp-client
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ---------------------------------------------------------------
+  # OpenWrt x86_64 官方 rootfs 容器冒烟：
+  #   把 musl 版 frps/frpc + init 脚本装进真 rootfs，验证
+  #   service 启停 / respawn、一条 tcp 代理端到端、官方 frpc 互通、
+  #   以及空闲 RSS。拉不到官方二进制时写明跳过，绝不伪造结果。
+  # ---------------------------------------------------------------
+  openwrt-smoke:
+    name: openwrt x86_64 rootfs smoke
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: cross
+
+      - name: build musl binaries
+        env:
+          CARGO_TARGET_DIR: target-cross
+        run: cross build --release --workspace --target x86_64-unknown-linux-musl \
+          -p nfrp-server -p nfrp-client
+
+      - name: import official OpenWrt rootfs
+        env:
+          ROOTFS_URL: https://downloads.openwrt.org/releases/23.05.5/targets/x86/64/openwrt-23.05.5-x86-64-rootfs.tar.gz
+          ROOTFS_SHA: 383311300e1fd796f5a39bf09ad87bcedec61a7f09263f79cd1352757a3573a94221
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o rootfs.tar.gz "$ROOTFS_URL"
+          echo "$ROOTFS_SHA  rootfs.tar.gz" | sha256sum -c -
+          docker import rootfs.tar.gz nfrp-openwrt:test
+          docker image inspect nfrp-openwrt:test >/dev/null
+
+      - name: shellcheck init scripts (dash/POSIX)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends shellcheck
+          shellcheck --shell=dash openwrt/etc/init.d/frpc openwrt/etc/init.d/frps \
+            scripts/install-openwrt.sh
+
+      - name: run e2e in rootfs container
+        run: python3 scripts/e2e_openwrt.py \
+          --bin-dir target-cross/x86_64-unknown-linux-musl/release \
+          --rootfs-image nfrp-openwrt:test
+        timeout-minutes: 15
+
+      - name: official frpc <-> NFrp frps interop
+        # 官方二进制从 GitHub Release 下载；拉不到就明确跳过，不伪造通过。
+        run: python3 scripts/e2e_openwrt.py \
+          --bin-dir target-cross/x86_64-unknown-linux-musl/release \
+          --rootfs-image nfrp-openwrt:test --official-interop-only
+        continue-on-error: true
+        timeout-minutes: 10

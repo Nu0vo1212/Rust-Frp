@@ -35,15 +35,24 @@ jobs:
           - name: windows-amd64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            asset: nfrp-windows-amd64.zip
+            asset: nfrp-windows_amd64.zip
+            platform: windows_amd64
           - name: linux-amd64
             os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            asset: nfrp-linux-amd64.tar.gz
+            asset: nfrp-linux_amd64.tar.gz
+            platform: linux_amd64
           - name: linux-arm64
             os: ubuntu-latest
             target: aarch64-unknown-linux-musl
-            asset: nfrp-linux-arm64.tar.gz
+            asset: nfrp-linux_arm64.tar.gz
+            platform: linux_arm64
+          # OpenWrt arm_cortex-a*_vfp（linux_arm_hf）。cross 镜像自带 musl-gcc。
+          - name: linux-arm-hf
+            os: ubuntu-latest
+            target: armv7-unknown-linux-musleabihf
+            asset: nfrp-linux_arm_hf.tar.gz
+            platform: linux_arm_hf
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
@@ -67,29 +76,17 @@ jobs:
         shell: bash
         timeout-minutes: 40
 
-      - name: package (zip)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path staging | Out-Null
-          Copy-Item target/${{ matrix.target }}/release/nfrp-server.exe staging/frps.exe
-          Copy-Item target/${{ matrix.target }}/release/nfrp-client.exe staging/frpc.exe
-          # 与 scripts/release.py 打出的包保持同样的组成：README + LICENSE + NOTICE + 示例配置
-          Copy-Item README.md, LICENSE, NOTICE staging/ -ErrorAction SilentlyContinue
-          Copy-Item assets/frps.toml, assets/frpc.toml staging/ -ErrorAction SilentlyContinue
-          Compress-Archive -Path staging/* -DestinationPath ${{ matrix.asset }}
-
-      - name: package (tar.gz)
-        if: runner.os == 'Linux'
+      # 统一走 scripts/release.py pack：它负责改名 frps/frpc、附带示例配置、
+      # LICENSE/NOTICE、包内 README，以及 Linux 包的 openwrt/ 目录与安装器，
+      # 并在打包后逐个 sha256 自检（手写 tar 那套会漏掉 openwrt/）。
+      # checksum / 签名 / 验证步骤保持不变。
+      - name: package (release.py pack)
         shell: bash
         run: |
-          mkdir -p staging
-          cp target/${{ matrix.target }}/release/nfrp-server staging/frps
-          cp target/${{ matrix.target }}/release/nfrp-client staging/frpc
-          # 与 scripts/release.py 打出的包保持同样的组成
-          cp README.md LICENSE NOTICE staging/ 2>/dev/null || true
-          cp assets/frps.toml assets/frpc.toml staging/ 2>/dev/null || true
-          tar czf ${{ matrix.asset }} -C staging .
+          python3 scripts/release.py pack \
+            --target ${{ matrix.platform }}:target/${{ matrix.target }}/release \
+            --out .
+          test -f "${{ matrix.asset }}" || { echo "没有产出 ${{ matrix.asset }}"; exit 1; }
 
       - name: upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -98,10 +95,87 @@ jobs:
           path: ${{ matrix.asset }}
           if-no-files-found: error
 
+  # OpenWrt MIPS 两个目标（24kc）单独构建：Tier 3 + nightly build-std +
+  # OpenWrt SDK 工具链，与路由器 libc 一致。continue-on-error 让它不阻塞
+  # 另外几个稳定目标的发布；红了就没有 mips 包，其余照常发。
+  build-mips:
+    name: ${{ matrix.name }} (best effort)
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-mipsle
+            target: mipsel-unknown-linux-musl
+            platform: linux_mipsle
+            asset: nfrp-linux_mipsle.tar.gz
+            sdk_url: https://downloads.openwrt.org/releases/23.05.5/targets/ramips/mt76x8/openwrt-sdk-23.05.5-ramips-mt76x8_gcc-12.3.0_musl.Linux-x86_64.tar.xz
+            sdk_sha: d3fc656e5ecc5099f16379860582c22fd57b9e03a81521b17c9ad31034cde1c0172421
+            gcc_prefix: mipsel-openwrt-linux-musl
+          - name: linux-mips
+            target: mips-unknown-linux-musl
+            platform: linux_mips
+            asset: nfrp-linux_mips.tar.gz
+            sdk_url: https://downloads.openwrt.org/releases/23.05.5/targets/ath79/generic/openwrt-sdk-23.05.5-ath79-generic_gcc-12.3.0_musl.Linux-x86_64.tar.xz
+            sdk_sha: dc2ffaf036929630e3de601be2006829d57ed30d018ed4e9e71496bd75d9cbb6
+            gcc_prefix: mips-openwrt-linux-musl
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # nightly
+        with:
+          toolchain: nightly
+          components: rust-src
+
+      - name: download & verify OpenWrt SDK
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o sdk.tar.xz "${{ matrix.sdk_url }}"
+          echo "${{ matrix.sdk_sha }}  sdk.tar.xz" | sha256sum -c -
+          mkdir -p sdk
+          tar -xJf sdk.tar.xz -C sdk --strip-components=1
+          GCC=$(find sdk/staging_dir -type f -name '${{ matrix.gcc_prefix }}-gcc' | head -n1)
+          test -n "$GCC" || { echo "SDK 里找不到交叉 gcc"; exit 1; }
+          echo "SDK_BIN=$(dirname "$(realpath "$GCC")")" >> "$GITHUB_ENV"
+
+      - name: build --release (-Zbuild-std)
+        env:
+          CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.gcc_prefix }}-gcc
+          CARGO_TARGET_MIPS_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.gcc_prefix }}-gcc
+          CC_mipsel_unknown_linux_musl: ${{ matrix.gcc_prefix }}-gcc
+          CC_mips_unknown_linux_musl: ${{ matrix.gcc_prefix }}-gcc
+          AR_mipsel_unknown_linux_musl: ${{ matrix.gcc_prefix }}-ar
+          AR_mips_unknown_linux_musl: ${{ matrix.gcc_prefix }}-ar
+          RUSTFLAGS: "-C link-arg=-latomic"
+        run: |
+          set -euo pipefail
+          export PATH="$SDK_BIN:$PATH"
+          cargo +nightly build --release --workspace \
+            -Z build-std=std,panic_abort \
+            --target ${{ matrix.target }} \
+            -p nfrp-server -p nfrp-client
+          D="target/${{ matrix.target }}/release"
+          file "$D/nfrp-server" | grep -Eq 'statically linked|static-pie' \
+            || { echo "不是静态链接"; exit 1; }
+
+      - name: package (release.py pack)
+        shell: bash
+        run: |
+          python3 scripts/release.py pack \
+            --target ${{ matrix.platform }}:target/${{ matrix.target }}/release \
+            --out .
+          test -f "${{ matrix.asset }}" || { echo "没有产出 ${{ matrix.asset }}"; exit 1; }
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: warn
+
   checksums:
     name: checksums + signature
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, build-mips]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 

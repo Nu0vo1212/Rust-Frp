@@ -68,9 +68,12 @@ russh = { version = "0.65", default-features = false, features = ["ring"] }
 # 64 位原子可移植垫片：在 x86_64 / aarch64 等有原生 64 位原子的目标上，
 # 这些类型就是 std::sync::atomic 的 type alias（零开销、行为完全一致）；
 # 在 MIPS32（mips / mipsel，OpenWrt 24kc）等没有原生 64 位原子的目标上，
-# 提供软件 fallback。项目里 atomic 计数器的写法保持不变，只是换 use 路径。
-# 依赖 crate 里的 std 原子仍由 MIPS CI job 的 `-C link-arg=-latomic` 兜底。
-portable-atomic = { version = "1", default-features = false, features = ["std"] }
+# 由 `fallback` 特性提供软件实现（基于锁的 seq_lock），**不链接 libatomic**。
+# ★ `fallback` 必须显式打开：只开 "std" 时，32 位目标上
+#   `portable_atomic::AtomicU64` 这个类型根本不存在，编译期就报
+#   `error[E0425]: cannot find type AtomicU64 in crate portable_atomic`
+#   （2026-11-19 的 CI 日志就是这么红的）。
+portable-atomic = { version = "1", default-features = false, features = ["std", "fallback"] }
 
 # OIDC / JWKS 走 HTTPS 需要一份内置根证书；系统根证书在部分 Linux 上要去读
 # /etc/ssl/certs 且路径因发行版而异，内置一份最省事（纯数据 crate，无 C 依赖）

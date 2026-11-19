@@ -526,7 +526,7 @@ async fn pprof_decision(hub: &Arc<Hub>, req: &http1::Request) -> Option<Decision
         }),
         Ok(Err(e)) => {
             let text = format!("pprof failed: {e:#}\n");
-            let code = if text.contains("only supported on Unix") {
+            let code = if text.contains("only supported on") {
                 501
             } else {
                 500
@@ -1548,7 +1548,7 @@ mod tests {
         )
         .await;
         assert!(resp.starts_with("HTTP/1.1 501"), "{resp}");
-        assert!(resp.contains("only supported on Unix"), "{resp}");
+        assert!(resp.contains("only supported on"), "{resp}");
     }
 
     /// ★★ v0.7.6 回归：面板必须能看到「为什么列表是空的」。

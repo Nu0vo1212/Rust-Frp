@@ -114,10 +114,12 @@ else
     ROOT=$(find "$TMPDIR" -type f -name frpc -exec dirname {} \; | head -n 1)
 fi
 # 用 -f 而非 -x：install -m 0755 会重设权限，存在即可
-[ -n "$ROOT" ] && [ -f "$ROOT/frpc" ] && [ -f "$ROOT/frps" ] || {
+# 写成 if 而不是 `A && B || C`：后者在 A 为真、B 为假时也会执行 C，
+# SC2015 就是抓这个写法（CI 上会直接红）。
+if [ -z "$ROOT" ] || [ ! -f "$ROOT/frpc" ] || [ ! -f "$ROOT/frps" ]; then
     echo "包里没有 frpc / frps 二进制 拒绝安装" >&2
     exit 1
-}
+fi
 
 mkdir -p "$DESTDIR/usr/bin" "$DESTDIR/etc/init.d"
 install -m 0755 "$ROOT/frpc" "$DESTDIR/usr/bin/frpc"

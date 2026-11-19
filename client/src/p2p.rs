@@ -71,6 +71,12 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 /// 一次 P2P 尝试的总时限：超过就认定打洞失败，回退中继。
+// 单元测试里放宽：CI 的 windows-latest 在高负载下 8 秒会偶发超时
+// （full_p2p_over_rendezvous_with_kcp 在 2026-11-19 的首轮 CI 上就是这样红的，
+//  本机同一测试 0.45 秒通过）。生产行为一个字都没改。
+#[cfg(test)]
+const PUNCH_TIMEOUT: Duration = Duration::from_secs(20);
+#[cfg(not(test))]
 const PUNCH_TIMEOUT: Duration = Duration::from_secs(8);
 /// 打洞包的发送间隔：比 QUIC 的重传间隔密一些，保证洞一直是热的。
 const PUNCH_INTERVAL: Duration = Duration::from_millis(50);

@@ -6,6 +6,10 @@ name: Release
 #   - 生成 SHA256SUMS + 用 cosign/sigstore 做无密钥签名（默认可用）
 #   - 上传 GitHub Release 并推 ghcr.io 镜像
 # 触发：git tag v0.5.1 && git push --tags
+#
+# 手动 dry run：Actions 里 workflow_dispatch，填 tag + 勾 dry_run=true。
+# 跑完 build / build-mips / checksums（含真签名与逐包验签），
+# 但**不创建 Release、不推 ghcr 镜像** —— 验证流水线本身而不产出发布物。
 
 on:
   push:
@@ -15,6 +19,10 @@ on:
       tag:
         description: "要发布的标签（例如 v0.5.1）"
         required: true
+      dry_run:
+        description: "只跑构建/打包/校验/签名，不创建 Release、不推镜像"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -37,18 +45,18 @@ jobs:
             target: x86_64-pc-windows-msvc
             asset: nfrp-windows_amd64.zip
             platform: windows_amd64
-          - name: linux-amd64
+          - name: linux_amd64
             os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             asset: nfrp-linux_amd64.tar.gz
             platform: linux_amd64
-          - name: linux-arm64
+          - name: linux_arm64
             os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             asset: nfrp-linux_arm64.tar.gz
             platform: linux_arm64
           # OpenWrt arm_cortex-a*_vfp（linux_arm_hf）。cross 镜像自带 musl-gcc。
-          - name: linux-arm-hf
+          - name: linux_arm_hf
             os: ubuntu-latest
             target: armv7-unknown-linux-musleabihf
             asset: nfrp-linux_arm_hf.tar.gz
@@ -106,14 +114,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: linux-mipsle
+          - name: linux_mipsle
             target: mipsel-unknown-linux-musl
             platform: linux_mipsle
             asset: nfrp-linux_mipsle.tar.gz
             sdk_url: https://downloads.openwrt.org/releases/23.05.5/targets/ramips/mt76x8/openwrt-sdk-23.05.5-ramips-mt76x8_gcc-12.3.0_musl.Linux-x86_64.tar.xz
             sdk_sha: d3fc656e5ecc5099f16379860582c22fd57b9e03a81521b17c9ad31034cde1c0172421
             gcc_prefix: mipsel-openwrt-linux-musl
-          - name: linux-mips
+          - name: linux_mips
             target: mips-unknown-linux-musl
             platform: linux_mips
             asset: nfrp-linux_mips.tar.gz
@@ -146,7 +154,8 @@ jobs:
           CC_mips_unknown_linux_musl: ${{ matrix.gcc_prefix }}-gcc
           AR_mipsel_unknown_linux_musl: ${{ matrix.gcc_prefix }}-ar
           AR_mips_unknown_linux_musl: ${{ matrix.gcc_prefix }}-ar
-          RUSTFLAGS: "-C link-arg=-latomic"
+          # 不设 -latomic：portable-atomic 在 mips32 用纯 Rust seq_lock，
+          # 依赖里的 std 64 位原子均有 cfg 门控，无需链接 libatomic。
         run: |
           set -euo pipefail
           export PATH="$SDK_BIN:$PATH"
@@ -272,6 +281,8 @@ jobs:
     name: github release
     runs-on: ubuntu-latest
     needs: [build, checksums]
+    # dry run 时不发 Release；打 tag 触发时 inputs.dry_run 为空，!空 = true。
+    if: ${{ !inputs.dry_run }}
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -299,6 +310,7 @@ jobs:
     name: push ghcr.io image
     runs-on: ubuntu-latest
     needs: build
+    if: ${{ !inputs.dry_run }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3

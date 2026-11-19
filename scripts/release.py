@@ -10,8 +10,8 @@ python scripts/release.py keygen
 # 1) 打包：每个目标平台的产物目录里找 nfrp-server / nfrp-client，
 #    统一改名成 frps / frpc 后和示例配置、README 一起打成压缩包
 python scripts/release.py pack \\
-    --target windows-amd64:target/release \\
-    --target linux-amd64:/opt/build/amd64
+    --target windows_amd64:target/release \\
+    --target linux_amd64:/opt/build/amd64
 
 # 2) 生成 SHA256SUMS.txt 并签名（有 release.key 用 Ed25519，否则退回 gpg）
 python scripts/release.py checksum --dir dist/release --sign
@@ -920,8 +920,8 @@ def main() -> int:
         action="append",
         required=True,
         metavar="平台:目录",
-        help="例如 windows-amd64:@release（@ 开头表示相对 cargo metadata 的 "
-        "target_directory，推荐）或 linux-amd64:/opt/build/amd64",
+        help="例如 windows_amd64:@release（@ 开头表示相对 cargo metadata 的 "
+        "target_directory，推荐）或 linux_amd64:/opt/build/amd64",
     )
     p_pack.add_argument("--out", default=str(DEFAULT_OUT), help="输出目录")
     p_pack.add_argument("--assets", help="素材目录（默认自动探测）")

@@ -127,9 +127,12 @@ cosign 签名失败即红灯，不会"警告后继续"。
 # `@release` = `cargo metadata` 认定的 target_directory + /release，
 # 不要写死 `target/release`：本机构建目录可能被挪到别的盘。
 python scripts/release.py pack \
-  --target windows-amd64:@release \
-  --target linux-amd64:/path/to/amd64 \
-  --target linux-arm64:/path/to/arm64 \
+  --target windows_amd64:@release \
+  --target linux_amd64:/path/to/amd64 \
+  --target linux_arm64:/path/to/arm64 \
+  --target linux_arm_hf:/path/to/armhf \
+  --target linux_mipsle:/path/to/mipsel \
+  --target linux_mips:/path/to/mips \
   --out dist/release
 
 # 源码包（可复现：同一个树打两次字节一致，脚本自己验）

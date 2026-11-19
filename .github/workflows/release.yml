@@ -91,7 +91,11 @@ jobs:
       - name: package (release.py pack)
         shell: bash
         run: |
-          python3 scripts/release.py pack \
+          # windows-latest 上只有 `python`，Git Bash 里不一定有 `python3`。
+          # 先探测再调用，别让打包步骤因为解释器名字挂掉。
+          PY=python3
+          command -v python3 >/dev/null 2>&1 || PY=python
+          "$PY" scripts/release.py pack \
             --target ${{ matrix.platform }}:target/${{ matrix.target }}/release \
             --out .
           test -f "${{ matrix.asset }}" || { echo "没有产出 ${{ matrix.asset }}"; exit 1; }
@@ -170,7 +174,11 @@ jobs:
       - name: package (release.py pack)
         shell: bash
         run: |
-          python3 scripts/release.py pack \
+          # windows-latest 上只有 `python`，Git Bash 里不一定有 `python3`。
+          # 先探测再调用，别让打包步骤因为解释器名字挂掉。
+          PY=python3
+          command -v python3 >/dev/null 2>&1 || PY=python
+          "$PY" scripts/release.py pack \
             --target ${{ matrix.platform }}:target/${{ matrix.target }}/release \
             --out .
           test -f "${{ matrix.asset }}" || { echo "没有产出 ${{ matrix.asset }}"; exit 1; }

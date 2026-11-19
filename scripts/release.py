@@ -64,6 +64,10 @@ ASSET_CANDIDATES = [
 BINARIES = [("frps", "nfrp-server"), ("frpc", "nfrp-client")]
 # 随包附带的素材文件（README.md 由仓库 README 现场合成，见 build_readme）
 DOCS = ["frps.toml", "frpc.toml", "LICENSE", "NOTICE", "frpc-autostart.vbs"]
+# OpenWrt 交付物：procd 启动脚本 + 最小示例配置随每个 Linux 包一起发。
+# 用整棵目录复制（保留 openwrt/etc/... 层级），安装器单独放包根。
+OPENWRT_DIR = ROOT / "openwrt"
+OPENWRT_INSTALLER = ROOT / "scripts" / "install-openwrt.sh"
 # 校验值文件名（Release 里就把这个贴出去）
 SUMS_NAME = "SHA256SUMS.txt"
 SIG_NAME = f"{SUMS_NAME}.sig"
@@ -453,6 +457,8 @@ def build_readme(out_dir: Path) -> str:
         | `frpc.toml` | 客户端配置示例（含 stcp / xtcp / 插件 / 限流写法） |
         | `LICENSE` | Apache License 2.0 全文 |
         | `NOTICE` | 版权声明与第三方组件许可说明 |
+        | `install-openwrt.sh` | OpenWrt 安装器（校验 SHA256 后安装） |
+        | `openwrt/` | procd 启动脚本与最小示例配置（仅 Linux 包） |
 
         ```bash
         # 服务端（公网机器）
@@ -541,6 +547,21 @@ def collect(
                 shutil.copy2(icon, dest / rel)
                 files.append(dest / rel)
 
+        # OpenWrt 交付物：只给 Linux 包附，Windows 包用不上 procd。
+        # 保留 openwrt/etc/init.d/... 的层级，安装器按这个路径找文件。
+        if not platform.startswith("windows") and OPENWRT_DIR.is_dir():
+            for src_file in sorted(OPENWRT_DIR.rglob("*")):
+                if not src_file.is_file():
+                    continue
+                rel = Path("openwrt") / src_file.relative_to(OPENWRT_DIR)
+                (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_file, dest / rel)
+                files.append(dest / rel)
+            if OPENWRT_INSTALLER.is_file():
+                shutil.copy2(OPENWRT_INSTALLER, dest / "install-openwrt.sh")
+                (dest / "install-openwrt.sh").chmod(0o755)
+                files.append(dest / "install-openwrt.sh")
+
         staged[platform] = files
         log(f"已暂存 {platform}：{len(files)} 个文件")
     return staged, origins
@@ -557,11 +578,14 @@ def _arcname(f: Path) -> str:
     包内 README 会显示裂图。所以这类文件**保留 `assets/...` 层级**。
     """
     parts = f.parts
-    if "assets" in parts:
-        # 从后往前找最后一个 `assets` 段，取它及其之后的部分
-        i = len(parts) - 1 - parts[::-1].index("assets")
-        if i < len(parts) - 1:  # 后面确实还有内容，不是恰好叫 assets 的文件
-            return "/".join(parts[i:])
+    # 只有 assets/ 与 openwrt/ 保留层级：前者 README 用相对路径引用 logo，
+    # 后者安装器按 openwrt/etc/init.d/... 的相对路径找 procd 脚本与示例配置。
+    for anchor in ("assets", "openwrt"):
+        if anchor in parts:
+            # 从后往前找最后一个 anchor 段，取它及其之后的部分
+            i = len(parts) - 1 - parts[::-1].index(anchor)
+            if i < len(parts) - 1:  # 后面确实还有内容，不是恰好叫 anchor 的文件
+                return "/".join(parts[i:])
     return f.name
 
 
@@ -601,17 +625,19 @@ def verify_archive(archive: Path, expected: dict[str, Path]) -> None:
     if archive.suffix == ".zip":
         with zipfile.ZipFile(archive) as z:
             for name in z.namelist():
-                base = Path(name).name
-                if base in expected:
-                    got[base] = hashlib.sha256(z.read(name)).hexdigest()
+                # 按归档内完整名精确匹配，不能用 basename：
+                # openwrt/etc/init.d/frps 与包根 frps 同名，用 basename 会
+                # 让 init 脚本覆盖掉真正二进制的校验值（v0.7.7+ 引入
+                # openwrt/ 目录后踩到）。expected 的 key 就是包根文件名。
+                if name in expected:
+                    got[name] = hashlib.sha256(z.read(name)).hexdigest()
     else:
         with tarfile.open(archive, "r:*") as t:
             for m in t.getmembers():
-                base = Path(m.name).name
-                if m.isfile() and base in expected:
+                if m.isfile() and m.name in expected:
                     fh = t.extractfile(m)
                     if fh is not None:
-                        got[base] = hashlib.sha256(fh.read()).hexdigest()
+                        got[m.name] = hashlib.sha256(fh.read()).hexdigest()
 
     bad: list[str] = []
     for name, src in expected.items():

@@ -48,6 +48,19 @@ jobs:
       - name: docs generated pages are in sync
         run: python3 scripts/sync_nlink_doc.py --check
 
+      # OpenWrt 发布包命名一致性：install / release.py / release.yml /
+      # e2e / README / 下载页里的 linux_* 包名必须完全一致，
+      # 且 mipsel 一律用官方 frp 的 linux_mipsle 拼法（mipsel 直译是错的）。
+      - name: openwrt package naming is consistent
+        run: python3 scripts/check-openwrt-naming.py
+
+      # OpenWrt e2e 脚本的纯逻辑单测（不依赖 docker）：RSS 解析、
+      # mock procd 记录解析、docker 命令参数拼装。
+      - name: openwrt e2e unit tests
+        run: |
+          python3 -m py_compile scripts/e2e_openwrt.py scripts/test_e2e_openwrt.py
+          python3 scripts/test_e2e_openwrt.py
+
       # 依赖漏洞门禁。
       #
       # v0.5.1 发版时锁的 rustls 0.23.44 带着 RUSTSEC-2026-0285
@@ -192,11 +205,14 @@ jobs:
   #   * 这两个目标必须用 nightly + rust-src + -Zbuild-std=std,panic_abort
   #     现编 std；工具链要用 OpenWrt SDK 自带的 24kc 交叉 gcc，
   #     这样 libc 才和路由器一致。
-  #   * MIPS32 没有原生 64 位原子，依赖 crate 里的 std AtomicU64 会
-  #     落到 libatomic 的 __atomic_* 符号，所以 RUSTFLAGS 加 -latomic
-  #     兜底；项目自己的原子已改 portable-atomic（见 Cargo.toml）。
-  #   * 这是社区最 flaky 的一条链（SDK 版本 / rustc nightly 都可能变），
-  #     不能让它拖垮主 CI —— 红了只告警，产物照常上传供人工核验。
+  #   * 64 位原子：项目源码已改 portable-atomic，在 mips32 上走纯 Rust
+  #     seq_lock（不链接 libatomic）；依赖树里 tokio/serde/zerocopy 的
+  #     std AtomicU64 全部有 cfg(target_has_atomic="64") 门控，pprof 的
+  #     perfmaps feature 未开。因此不需要 -C link-arg=-latomic。
+  #   * 已知硬阻塞：ring 0.17 没有 mips32 的预生成汇编、build.rs 也无
+  #     mips 分支，官方不支持 32 位 MIPS。本 job 大概率在编译 ring 时
+  #     失败；这是 continue-on-error 的实验性 job，红了只告警不拖垮主 CI。
+  #     详见 run/OPENWRT-REPORT.md 第七节。
   # ---------------------------------------------------------------
   cross-build-mips:
     name: openwrt-mips ${{ matrix.target }} (best effort)
@@ -247,8 +263,8 @@ jobs:
           AR_mipsel_unknown_linux_musl: ${{ matrix.gcc_prefix }}-ar
           AR_mips_unknown_linux_musl: ${{ matrix.gcc_prefix }}-ar
           # panic="abort" 已在 profile 里，build-std 只需 std + panic_abort。
-          # -latomic 兜底依赖 crate 里残留的 std 64 位原子（MIPS32 无原生原子）。
-          RUSTFLAGS: "-C link-arg=-latomic"
+          # 不设 -latomic：portable-atomic 在 mips32 用纯 Rust seq_lock，
+          # 依赖里的 std 64 位原子均有 cfg 门控，无需链接 libatomic。
         run: |
           set -euo pipefail
           export PATH="$SDK_BIN:$PATH"

@@ -155,6 +155,26 @@ def check_versions() -> None:
         report(f"{name} -v 裸版本", v == OFFICIAL_VERSION, f"[{v}]")
 
 
+def check_procd_log(out: str) -> tuple[bool, str]:
+    """解析 mock procd 记录，返回 (是否满足 respawn/logd/reload, 结论说明)。
+
+    纯函数，便于单元测试（不碰 docker / subprocess）。
+    """
+    has_respawn = any(line.startswith("param:respawn ") for line in out.splitlines())
+    has_stdout = "param:stdout 1" in out
+    has_stderr = "param:stderr 1" in out
+    has_reload = any("restart-called" in line for line in out.splitlines())
+    ok = has_respawn and has_stdout and has_stderr and has_reload
+    missing = [
+        n for n, v in [
+            ("respawn", has_respawn), ("stdout=logd", has_stdout),
+            ("stderr=logd", has_stderr), ("reload/restart", has_reload),
+        ] if not v
+    ]
+    detail = "全部满足" if ok else "缺少: " + ", ".join(missing)
+    return ok, detail
+
+
 def check_init_scripts() -> None:
     """用 mock procd 函数 source init 脚本，验证 respawn / logd / reload。"""
     # 直接把 mock 写成脚本注入容器执行，避免 shell 引号层层转义
@@ -184,13 +204,9 @@ cat "$LOG"
         run(["docker", "cp", str(local), f"{CONTAINER}:/tmp/mock-procd.sh"])
         p = dexec("/bin/sh", "/tmp/mock-procd.sh", f"/etc/init.d/{name}", check=False)
         out = p.stdout
-        ok = (
-            "param:respawn " in out
-            and "param:stdout 1" in out
-            and "param:stderr 1" in out
-            and "restart-called" in out
-        )
-        report(f"{name} init: respawn/logd/reload", ok, out.replace("\n", " | ")[:300])
+        ok, why = check_procd_log(out)
+        report(f"{name} init: respawn/logd/reload", ok,
+               f"{why} | " + out.replace("\n", " | ")[:240])
 
 
 def write_server_config(work: Path, bind_port: int) -> None:
@@ -212,10 +228,32 @@ def write_client_config(work: Path, server_port: int, local_port: int, remote_po
     )
 
 
+def parse_rss_line(text: str) -> int | None:
+    """从 /proc/<pid>/status 的 VmRSS 行解析出整数 kB；解析不出返回 None。
+
+    纯函数，便于单元测试（不碰 docker / subprocess）。
+    """
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("VmRSS:"):
+            parts = line.split()
+            # 形如 "VmRSS:    1234 kB" -> parts = ["VmRSS:", "1234", "kB"]
+            if len(parts) >= 2:
+                try:
+                    return int(parts[1])
+                except ValueError:
+                    return None
+    return None
+
+
 def read_rss(pid_marker: str) -> str:
     p = dexec("sh", "-c", f'pid=$(pgrep -f "{pid_marker}" | head -1); '
                           f'[ -n "$pid" ] && grep VmRSS /proc/$pid/status || echo NO-RSS', check=False)
-    return p.stdout.strip() or "NO-RSS"
+    raw = p.stdout.strip()
+    if not raw or raw == "NO-RSS":
+        return "NO-RSS"
+    kb = parse_rss_line(raw)
+    return f"{kb} kB" if kb is not None else f"UNPARSED[{raw}]"
 
 
 def tcp_proxy_e2e(work: Path) -> tuple[bool, str]:

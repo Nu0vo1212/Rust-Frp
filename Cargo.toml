@@ -65,6 +65,13 @@ ring = "0.17"
 # 官方声明无修复版本）与 RUSTSEC-2026-0387（crypto-bigint 常量时间问题）。
 # 关掉它只影响 "RSA 客户端证书认证"，ed25519 / ECDSA 照常可用。
 russh = { version = "0.65", default-features = false, features = ["ring"] }
+# 64 位原子可移植垫片：在 x86_64 / aarch64 等有原生 64 位原子的目标上，
+# 这些类型就是 std::sync::atomic 的 type alias（零开销、行为完全一致）；
+# 在 MIPS32（mips / mipsel，OpenWrt 24kc）等没有原生 64 位原子的目标上，
+# 提供软件 fallback。项目里 atomic 计数器的写法保持不变，只是换 use 路径。
+# 依赖 crate 里的 std 原子仍由 MIPS CI job 的 `-C link-arg=-latomic` 兜底。
+portable-atomic = { version = "1", default-features = false, features = ["std"] }
+
 # OIDC / JWKS 走 HTTPS 需要一份内置根证书；系统根证书在部分 Linux 上要去读
 # /etc/ssl/certs 且路径因发行版而异，内置一份最省事（纯数据 crate，无 C 依赖）
 webpki-roots = "0.26"

@@ -1,18 +1,21 @@
 //! 可观测性：进程内指标收集 + Prometheus 文本导出。
 //!
-//! 只依赖标准库（`AtomicU64` / `AtomicI64`），不引入 Prometheus client crate：
-//! 一是保持二进制体积，二是这里的指标量级很小（十几个时间序列），
-//! 手写一个符合 [exposition format] 的编码器就是几十行的成本。
+//! 只用原子计数器（portable_atomic 的 `AtomicU64` / `AtomicI64`），
+//! 不引入 Prometheus client crate：一是保持二进制体积，二是这里的指标量级
+//! 很小（十几个时间序列），手写一个符合 [exposition format] 的编码器就是
+//! 几十行的成本。
+//!
+//! portable_atomic 在 x86_64 / aarch64 上就是 std 原子的类型别名，
+//! 在 MIPS32（OpenWrt 24kc）上提供 64 位原子 fallback，行为一致。
 //!
 //! [exposition format]: https://prometheus.io/docs/instrumenting/exposition_formats/
 
 use std::{
-    sync::{
-        atomic::{AtomicI64, AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
+
+use portable_atomic::{AtomicI64, AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // 原子计数器 / 计量表

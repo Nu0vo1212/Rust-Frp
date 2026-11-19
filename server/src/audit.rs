@@ -39,6 +39,8 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use portable_atomic::AtomicU64;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -142,11 +144,11 @@ pub struct AuditLog {
     /// 是否已经为"写失败"告过警 —— 防止磁盘满时把日志刷爆。
     warned: AtomicBool,
     /// 累计写入条数（含因缓冲上限被挤掉的）。
-    total: std::sync::atomic::AtomicU64,
+    total: AtomicU64,
     /// 轮转阈值（字节）；`0` = 不轮转（`maxFileMB = 0`）。
     max_bytes: u64,
     /// 当前文件累计写入字节数（打开时的既有大小也算）。
-    written: std::sync::atomic::AtomicU64,
+    written: AtomicU64,
 }
 
 /// 打开（或新建）审计文件；含目录创建与 0600 权限口径。
@@ -216,9 +218,9 @@ impl AuditLog {
             file: Mutex::new(file),
             path,
             warned: AtomicBool::new(false),
-            total: std::sync::atomic::AtomicU64::new(0),
+            total: AtomicU64::new(0),
             max_bytes,
-            written: std::sync::atomic::AtomicU64::new(written),
+            written: AtomicU64::new(written),
         })
     }
 
@@ -231,9 +233,9 @@ impl AuditLog {
             file: Mutex::new(None),
             path: None,
             warned: AtomicBool::new(true),
-            total: std::sync::atomic::AtomicU64::new(0),
+            total: AtomicU64::new(0),
             max_bytes: 0,
-            written: std::sync::atomic::AtomicU64::new(0),
+            written: AtomicU64::new(0),
         }
     }
 

@@ -17,6 +17,7 @@ name = "nfrp-server"
 path = "src/main.rs"
 
 [dependencies]
+portable-atomic = { workspace = true }
 quinn = { workspace = true }
 base64.workspace = true
 nfrp-common = { workspace = true }

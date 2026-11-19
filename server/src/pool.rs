@@ -9,11 +9,13 @@ use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, SocketAddr},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc, Mutex, RwLock,
     },
     time::{Duration, Instant},
 };
+
+use portable_atomic::AtomicU64;
 
 use nfrp_common::frp::{
     conn::FrpConn,
@@ -376,7 +378,7 @@ pub struct ClientState {
     /// 批量工作连接条数（0 = 不走批量）。由登录后的协商结果写入。
     nlink_batch: std::sync::atomic::AtomicUsize,
     /// 上次批量请求的时间（Unix 毫秒），用于去抖。
-    last_batch_ms: std::sync::atomic::AtomicU64,
+    last_batch_ms: AtomicU64,
     /// 控制连接已断开、正在等续传（`resume_ttl` 窗口内）。
     ///
     /// 暂停期间监听器**仍然持有端口**，但不再向客户端要工作连接 ——
@@ -456,7 +458,7 @@ impl ClientState {
             peer_ip: Mutex::new(peer_ip),
             nlink: Mutex::new(None),
             nlink_batch: std::sync::atomic::AtomicUsize::new(0),
-            last_batch_ms: std::sync::atomic::AtomicU64::new(0),
+            last_batch_ms: AtomicU64::new(0),
             suspended: AtomicBool::new(false),
             resumed_session: AtomicBool::new(false),
             resume_epoch: AtomicU64::new(0),

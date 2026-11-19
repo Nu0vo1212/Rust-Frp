@@ -112,7 +112,7 @@ pub struct RateLimiter {
     rules: Vec<RateLimitRule>,
     buckets: Mutex<HashMap<String, TokenBucket>>,
     /// 统计：累计因限流等待的次数（指标 / 测试用）。
-    throttled: std::sync::atomic::AtomicU64,
+    throttled: portable_atomic::AtomicU64,
 }
 
 impl RateLimiter {

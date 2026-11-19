@@ -34,6 +34,7 @@ use nfrp_common::{
     },
     proxy_protocol, throttle, util, ws,
 };
+use portable_atomic::AtomicU64;
 use tokio::io::AsyncWriteExt;
 use tokio::{
     net::{TcpSocket, TcpStream, UdpSocket},
@@ -860,7 +861,7 @@ struct ServerLink {
     ///
     /// 放在 `ServerLink` 而不是 `FrpConn` 上，是因为工作连接、visitor、
     /// web 面板都可能要读它，而它们只拿得到 `Arc<ServerLink>`。
-    nlink_caps: std::sync::atomic::AtomicU64,
+    nlink_caps: AtomicU64,
     /// OIDC 令牌源。
     ///
     /// 工作连接也要现取 access token（见 [`current_credential`]），
@@ -948,7 +949,7 @@ impl ServerLink {
             mux,
             quic,
             udp_binary: std::sync::atomic::AtomicBool::new(false),
-            nlink_caps: std::sync::atomic::AtomicU64::new(0),
+            nlink_caps: AtomicU64::new(0),
             token_source,
         })
     }

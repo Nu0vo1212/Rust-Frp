@@ -3532,7 +3532,7 @@ async fn sudp_bridge(
 /// 通道交换报文。任一端退出会 drop 掉自己那侧的 sender，对侧 `recv` 因此
 /// 返回 `None` 而连锁收工，不会留下半边悬挂。
 async fn relay_sudp_frames(a: FrpConn, b: FrpConn) -> Result<(u64, u64)> {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use portable_atomic::{AtomicU64, Ordering};
     use tokio::sync::mpsc;
 
     // a -> b 方向：协程 A 读 a，协程 B 写 b（上行，访客请求）

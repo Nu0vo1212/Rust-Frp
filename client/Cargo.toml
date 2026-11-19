@@ -17,6 +17,7 @@ name = "nfrp-client"
 path = "src/main.rs"
 
 [dependencies]
+portable-atomic = { workspace = true }
 nfrp-common = { workspace = true }
 
 # xtcp 真 P2P 用 QUIC 承载直连流量（打洞成功后不再经过服务端）

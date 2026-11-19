@@ -19,6 +19,7 @@ default = ["nlink"]
 nlink = []
 
 [dependencies]
+portable-atomic = { workspace = true }
 quinn = { workspace = true }
 yamux = { workspace = true }
 rustls = { workspace = true }

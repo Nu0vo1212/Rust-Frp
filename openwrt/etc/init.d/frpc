@@ -1,0 +1,92 @@
+#!/bin/sh /etc/rc.common
+# NFrp 客户端（frpc）procd 启动脚本
+# 安装到 /etc/init.d/frpc 后执行 chmod +x && /etc/init.d/frpc enable
+#
+# 设计要点
+#   * USE_PROCD=1 交给 procd 托管 退出后由 respawn 自动拉起
+#   * stdout / stderr 交给 logd 不写 flash 日志用 logread 查看
+#   * 启动前等 WAN 与系统时间 路由器无 RTC 1970 年时间会破坏 TLS 与 OIDC
+#   * 配置放在 /etc/frp/frpc.toml 脚本不碰它 reload 只做服务重启
+
+# 这三个变量由 /etc/rc.common source 本脚本后读取 不是脚本自身使用
+# shellcheck disable=SC2034
+USE_PROCD=1
+# shellcheck disable=SC2034
+START=95
+# shellcheck disable=SC2034
+STOP=10
+
+CONF=/etc/frp/frpc.toml
+BIN=/usr/bin/frpc
+
+# 2020-01-01 00:00:00 UTC 的时间戳
+# 低于它一律视作「NTP 还没同步」 此时 TLS 校时会失败
+MIN_EPOCH=1577836800
+
+wait_for_wan() {
+    local i=0
+    while [ "$i" -lt 30 ]; do
+        if ifstatus wan 2>/dev/null | grep -q '"up" *: *true'; then
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+wait_for_clock() {
+    local i=0 now
+    while [ "$i" -lt 30 ]; do
+        now=$(date +%s 2>/dev/null || echo 0)
+        case "$now" in
+            ''|*[!0-9]*) now=0 ;;
+        esac
+        if [ "$now" -ge "$MIN_EPOCH" ]; then
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+start_service() {
+    [ -x "$BIN" ] || {
+        logger -t frpc "缺少 $BIN 跳过启动"
+        return 1
+    }
+    [ -f "$CONF" ] || {
+        logger -t frpc "缺少 $CONF 跳过启动"
+        return 1
+    }
+
+    if ! wait_for_wan; then
+        logger -t frpc "WAN 未就绪 推迟启动 网络恢复后会由接口触发器重试"
+        return 1
+    fi
+    if ! wait_for_clock; then
+        logger -t frpc "系统时间未就绪 推迟启动 避免 TLS 校时失败 时间同步后会由接口触发器重试"
+        return 1
+    fi
+
+    procd_open_instance
+    procd_set_param command "$BIN" -c "$CONF"
+    # respawn <threshold> <timeout> <retry> retry=0 表示无限重试
+    procd_set_param respawn 3600 5 0
+    # 日志交给 logd 不落 flash
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_set_param term_timeout 10
+    procd_close_instance
+}
+
+# reload_config 会调用本函数 这里只做一次干净重启
+reload_service() {
+    restart
+}
+
+service_triggers() {
+    # WAN 重新拿到地址时再拉起 弥补启动时 WAN/时间未就绪而跳过的情况
+    procd_add_interface_trigger "interface.*" wan /etc/init.d/frpc restart
+}

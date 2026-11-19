@@ -1,0 +1,19 @@
+# NFrp 服务端最小示例（OpenWrt）
+# 安装到 /etc/frp/frps.toml 后先改 token
+#
+# ★ 防火墙不会自动放行 请用 fw4/nftables 手动放行 bind_port（默认 7000）
+#   做法见 /etc/init.d/frps 顶部注释 面板端口不要对公网开放
+
+bind_addr = "0.0.0.0"
+bind_port = 7000
+token = "change_me"
+
+tcp_mux = true
+
+# 日志不落 flash
+# 不配 [log].to 时日志走标准输出 由 /etc/init.d/frps 交给 logd 存在内存里
+# 查看： logread -e frps
+# ★ 想持久化请改到 U 盘之类 注意 flash 寿命
+# [log]
+# to = "/tmp/frps.log"
+# maxDays = 3

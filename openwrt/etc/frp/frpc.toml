@@ -1,0 +1,36 @@
+# NFrp 客户端最小示例（OpenWrt）
+# 安装到 /etc/frp/frpc.toml 后按需要填写 server_addr / token 并追加 [[proxies]]
+# 本文件故意不含任何 [[proxies]] 因此启动后不会暴露任何内网服务
+#
+# ★ 不要在这里写暴露 SSH（local_port = 22）的代理
+#   需要远程管理路由器请用 SSH 连路由器本身 或走 VPN 不要把 22 转发到公网
+
+server_addr = "example.com"
+server_port = 7000
+token = "change_me"
+
+# 复用单条连接 省内存 路由器上建议保持开启
+tcp_mux = true
+
+# 日志不落 flash
+# 不配 [log].to 时日志走标准输出 由 /etc/init.d/frpc 交给 logd 存在内存里
+# 查看： logread -e frpc
+# ★ 想持久化日志请自行改到 U 盘之类 并注意 flash 寿命
+# [log]
+# to = "/tmp/frpc.log"          # /tmp 是 tmpfs 掉电即失 不会磨损 flash
+# maxDays = 3
+
+# 动态代理落盘（面板里临时加的代理）
+# 默认不落盘 进程重启即失 这是避免写 flash 的有意选择
+# 想持久化请指向 U 盘或 overlay 可写目录 例如
+# [store]
+# path = "/tmp/frpc-store.json"  # /tmp 掉电即失
+
+# ===== 在此下方追加你要暴露的服务 =====
+# 例 把内网 192.168.1.10:80 暴露为服务端的 tcp 6000 端口
+# [[proxies]]
+# name = "web"
+# type = "tcp"
+# local_ip = "192.168.1.10"
+# local_port = 80
+# remote_port = 6000

@@ -90,6 +90,11 @@ jobs:
       # checksum / 签名 / 验证步骤保持不变。
       - name: package (release.py pack)
         shell: bash
+        # ★ Windows runner 的 Python 默认 cp1252 编码 stdout，release.py 的日志是中文，
+        # 打印第一行就 UnicodeEncodeError（2026-11-19 windows-amd64 的实际失败原因）。
+        # 脚本内部已 reconfigure 成 UTF-8，这里再兜一层。
+        env:
+          PYTHONIOENCODING: utf-8
         run: |
           # windows-latest 上只有 `python`，Git Bash 里不一定有 `python3`。
           # 先探测再调用，别让打包步骤因为解释器名字挂掉。
@@ -173,6 +178,11 @@ jobs:
 
       - name: package (release.py pack)
         shell: bash
+        # ★ Windows runner 的 Python 默认 cp1252 编码 stdout，release.py 的日志是中文，
+        # 打印第一行就 UnicodeEncodeError（2026-11-19 windows-amd64 的实际失败原因）。
+        # 脚本内部已 reconfigure 成 UTF-8，这里再兜一层。
+        env:
+          PYTHONIOENCODING: utf-8
         run: |
           # windows-latest 上只有 `python`，Git Bash 里不一定有 `python3`。
           # 先探测再调用，别让打包步骤因为解释器名字挂掉。

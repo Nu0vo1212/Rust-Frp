@@ -535,7 +535,7 @@ where
                     }
                     Ok(Err(e)) => {
                         let text = format!("pprof failed: {e:#}\n");
-                        let code = if text.contains("only supported on Unix") {
+                        let code = if text.contains("only supported on") {
                             501
                         } else {
                             500
@@ -2191,7 +2191,7 @@ Authorization: Basic ",
         )
         .await;
         assert!(resp.starts_with("HTTP/1.1 501"), "{resp}");
-        assert!(resp.contains("only supported on Unix"), "{resp}");
+        assert!(resp.contains("only supported on"), "{resp}");
     }
 
     /// Unix 上真正跑一次 1 秒 CPU profile，验证 200 + protobuf 二进制响应，

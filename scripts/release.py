@@ -78,6 +78,20 @@ KEY_NAME = "release.key"
 PUB_NAME = "release.pub"
 
 
+# ★★ Windows runner 上的 Python 默认按 **cp1252** 编码 stdout（不是 UTF-8），
+# 这个脚本的日志里全是中文 ⇒ `UnicodeEncodeError: 'charmap' codec can't encode
+# characters in position 10-14`，**在打印第一行日志时就崩**。
+# 2026-11-19 就是这么把 windows-amd64 那个打包步骤干掉的：二进制都编好了，
+# 只是打印"素材目录：…"fail 的，于是 checksums / release 两个 job 全被 skip，
+# 整条 Release 一个 Release 都没创建出来。
+# ⇒ 进程启动时就把 stdout/stderr 切成 UTF-8，别指望调用方记得设 PYTHONIOENCODING。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    except (AttributeError, ValueError):
+        pass
+
+
 def log(msg: str) -> None:
     print(f"[release] {msg}", flush=True)
 

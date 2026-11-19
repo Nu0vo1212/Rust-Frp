@@ -6,11 +6,11 @@
 
 | OpenWrt `DISTRIB_ARCH` | 发布包 | rustc target |
 |---|---|---|
-| `aarch64_*` | `nfrp-linux_arm64.tar.gz` | aarch64-unknown-linux-musl |
-| `arm_cortex-a*` 带 vfp / neon | `nfrp-linux_arm_hf.tar.gz` | armv7-unknown-linux-musleabihf |
-| `x86_64` | `nfrp-linux_amd64.tar.gz` | x86_64-unknown-linux-musl |
-| `mipsel_24kc` | `nfrp-linux_mipsle.tar.gz` | mipsel-unknown-linux-musl |
-| `mips_24kc` | `nfrp-linux_mips.tar.gz` | mips-unknown-linux-musl |
+| `aarch64_*` | `nfrp-linux-arm64.tar.gz` | aarch64-unknown-linux-musl |
+| `arm_cortex-a*` 带 vfp / neon | `nfrp-linux-arm-hf.tar.gz` | armv7-unknown-linux-musleabihf |
+| `x86_64` | `nfrp-linux-amd64.tar.gz` | x86_64-unknown-linux-musl |
+| `mipsel_24kc` | `nfrp-linux-mipsle.tar.gz` | mipsel-unknown-linux-musl |
+| `mips_24kc` | `nfrp-linux-mips.tar.gz` | mips-unknown-linux-musl |
 
 ## 安装
 
@@ -26,7 +26,8 @@ sh install-openwrt.sh /path/to/dist
 2. 用 `SHA256SUMS.txt` 校验包的 sha256 不匹配就拒绝
 3. 装 `/usr/bin/frpc` `/usr/bin/frps` 与 `/etc/init.d` 脚本 示例配置只在不存在时落盘
 
-老版本发布用连字符命名的包（如 `nfrp-linux-arm64.tar.gz`）安装器也认
+包名不带版本号 全部用连字符。v0.7.7 之前有一版试过下划线（如 `nfrp-linux_amd64.tar.gz`）
+安装器也认 优先连字符
 
 ## 启用
 

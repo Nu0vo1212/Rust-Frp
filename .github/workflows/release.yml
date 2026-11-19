@@ -43,24 +43,24 @@ jobs:
           - name: windows-amd64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            asset: nfrp-windows_amd64.zip
-            platform: windows_amd64
-          - name: linux_amd64
+            asset: nfrp-windows-amd64.zip
+            platform: windows-amd64
+          - name: linux-amd64
             os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            asset: nfrp-linux_amd64.tar.gz
-            platform: linux_amd64
-          - name: linux_arm64
+            asset: nfrp-linux-amd64.tar.gz
+            platform: linux-amd64
+          - name: linux-arm64
             os: ubuntu-latest
             target: aarch64-unknown-linux-musl
-            asset: nfrp-linux_arm64.tar.gz
-            platform: linux_arm64
-          # OpenWrt arm_cortex-a*_vfp（linux_arm_hf）。cross 镜像自带 musl-gcc。
-          - name: linux_arm_hf
+            asset: nfrp-linux-arm64.tar.gz
+            platform: linux-arm64
+          # OpenWrt arm_cortex-a*_vfp（linux-arm-hf）。cross 镜像自带 musl-gcc。
+          - name: linux-arm-hf
             os: ubuntu-latest
             target: armv7-unknown-linux-musleabihf
-            asset: nfrp-linux_arm_hf.tar.gz
-            platform: linux_arm_hf
+            asset: nfrp-linux-arm-hf.tar.gz
+            platform: linux-arm-hf
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
@@ -118,17 +118,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: linux_mipsle
+          - name: linux-mipsle
             target: mipsel-unknown-linux-musl
-            platform: linux_mipsle
-            asset: nfrp-linux_mipsle.tar.gz
+            platform: linux-mipsle
+            asset: nfrp-linux-mipsle.tar.gz
             sdk_url: https://downloads.openwrt.org/releases/23.05.5/targets/ramips/mt76x8/openwrt-sdk-23.05.5-ramips-mt76x8_gcc-12.3.0_musl.Linux-x86_64.tar.xz
             sdk_sha: d3fc656e5ecc5099f16379860582c22fd57b9e03a81521b17c9ad31034cde1c0172421
             gcc_prefix: mipsel-openwrt-linux-musl
-          - name: linux_mips
+          - name: linux-mips
             target: mips-unknown-linux-musl
-            platform: linux_mips
-            asset: nfrp-linux_mips.tar.gz
+            platform: linux-mips
+            asset: nfrp-linux-mips.tar.gz
             sdk_url: https://downloads.openwrt.org/releases/23.05.5/targets/ath79/generic/openwrt-sdk-23.05.5-ath79-generic_gcc-12.3.0_musl.Linux-x86_64.tar.xz
             sdk_sha: dc2ffaf036929630e3de601be2006829d57ed30d018ed4e9e71496bd75d9cbb6
             gcc_prefix: mips-openwrt-linux-musl

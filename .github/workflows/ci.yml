@@ -50,7 +50,8 @@ jobs:
 
       # OpenWrt 发布包命名一致性：install / release.py / release.yml /
       # e2e / README / 下载页里的 linux_* 包名必须完全一致，
-      # 且 mipsel 一律用官方 frp 的 linux_mipsle 拼法（mipsel 直译是错的）。
+      # 且 mipsel 一律写 linux-mipsle（官方的 frp_<ver>_linux_mipsle 也是这么拼的，
+      # 直接按 mipsel 直译拼出来的名字是错的）。
       - name: openwrt package naming is consistent
         run: python3 scripts/check-openwrt-naming.py
 
@@ -106,7 +107,7 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
           - target: aarch64-unknown-linux-musl
-          # OpenWrt arm_cortex-a*_vfp 设备（linux_arm_hf）用这个产物。
+          # OpenWrt arm_cortex-a*_vfp 设备（linux-arm-hf）用这个产物。
           # cross 的官方镜像自带 musl-gcc，ring 的 C 代码能编过。
           - target: armv7-unknown-linux-musleabihf
     steps:

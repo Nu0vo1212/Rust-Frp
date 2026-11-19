@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""打包 Android 交付物：`nfrp-android-v<ver>.zip`。
+"""打包 Android 交付物：`nfrp-android.zip`（文件名不带版本号，与桌面包一致）。
 
 包内结构（二进制改名成官方风格 `frps` / `frpc`，与桌面版一致）：
 
@@ -123,7 +123,7 @@ def main() -> int:
         raise SystemExit(f"缺少 {readme}")
     shutil.copy2(readme, stage / "README-ANDROID.md")
 
-    zip_path = OUT / f"nfrp-android-v{ver}.zip"
+    zip_path = OUT / "nfrp-android.zip"
     if zip_path.exists():
         zip_path.unlink()
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:

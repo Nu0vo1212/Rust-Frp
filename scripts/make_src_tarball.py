@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""打一个可复现的源码包：`nfrp-src-<ver>.tar.gz`。
+"""打一个可复现的源码包：`nfrp-src.tar.gz`（文件名不带版本号，版本在包内 `nfrp-<ver>/` 目录）。
 
 为什么要自己写而不是 `git archive`：工作区没有 `.git`，推送走 GitHub API。
 所以这里按"会入库的文件"清单采源码（规则：`.gitignore` + 固定目录排除），
@@ -122,7 +122,7 @@ def main() -> int:
         raise SystemExit("可复现性自检失败：同一个树打两次 sha256 不一致")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    out = OUT_DIR / f"nfrp-src-{ver.replace('.', '')}.tar.gz"
+    out = OUT_DIR / "nfrp-src.tar.gz"
     out.write_bytes(data)
     print(f"版本      : {ver}")
     print(f"文件数    : {len(paths)}")

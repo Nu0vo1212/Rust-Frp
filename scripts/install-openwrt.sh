@@ -3,7 +3,7 @@
 #
 # 用法：
 #   sh install-openwrt.sh /path/to/dist/release
-#   sh install-openwrt.sh /path/to/nfrp-linux_mipsle.tar.gz
+#   sh install-openwrt.sh /path/to/nfrp-linux-mipsle.tar.gz
 #
 # 流程：
 #   1) 读 /etc/openwrt_release 的 DISTRIB_ARCH 决定该下哪个包（认不出就退出，绝不猜）
@@ -36,18 +36,18 @@ DISTRIB_ARCH=$(sed -n "s/^DISTRIB_ARCH=['\"]\{0,1\}\([^'\"]*\)['\"]\{0,1\}$/\1/p
 [ -n "$DISTRIB_ARCH" ] || { echo "无法从 $ARCH_FILE 读取 DISTRIB_ARCH" >&2; exit 1; }
 
 # 架构到发布包后缀的映射
-#   mipsel_24kc            -> linux_mipsle  （小端 MIPS 24kc）
-#   mips_24kc              -> linux_mips    （大端 MIPS 24kc）
-#   aarch64_*              -> linux_arm64
-#   arm_cortex-a*_...vfp.. -> linux_arm_hf  （带 VFP 的硬浮点 ARMv7）
-#   x86_64                 -> linux_amd64
+#   mipsel_24kc            -> linux-mipsle  （小端 MIPS 24kc）
+#   mips_24kc              -> linux-mips    （大端 MIPS 24kc）
+#   aarch64_*              -> linux-arm64
+#   arm_cortex-a*_...vfp.. -> linux-arm-hf  （带 VFP 的硬浮点 ARMv7）
+#   x86_64                 -> linux-amd64
 case "$DISTRIB_ARCH" in
-    mipsel_24kc)        PLATFORM=linux_mipsle ;;
-    mips_24kc)          PLATFORM=linux_mips ;;
-    aarch64_*)          PLATFORM=linux_arm64 ;;
+    mipsel_24kc)        PLATFORM=linux-mipsle ;;
+    mips_24kc)          PLATFORM=linux-mips ;;
+    aarch64_*)          PLATFORM=linux-arm64 ;;
     arm_cortex-a*vfp*|\
-    arm_cortex-a*neon*) PLATFORM=linux_arm_hf ;;
-    x86_64)             PLATFORM=linux_amd64 ;;
+    arm_cortex-a*neon*) PLATFORM=linux-arm-hf ;;
+    x86_64)             PLATFORM=linux-amd64 ;;
     *)
         echo "不支持的 DISTRIB_ARCH=$DISTRIB_ARCH" >&2
         echo "本发布支持 mipsel_24kc / mips_24kc / aarch64_* / arm_cortex-a*(vfp) / x86_64" >&2
@@ -57,9 +57,9 @@ case "$DISTRIB_ARCH" in
 esac
 
 PKG_NAME="nfrp-$PLATFORM.tar.gz"
-# 历史兼容：早期发布用连字符（nfrp-linux-arm64.tar.gz），
-# 本版起对齐官方下划线（nfrp-linux_arm64.tar.gz）。两个都认，优先下划线。
-LEGACY_NAME=$(printf '%s' "$PKG_NAME" | tr '_' '-')
+# 历史兼容：v0.7.7 之前有一版试过下划线命名（nfrp-linux_arm64.tar.gz）。
+# 现在统一回连字符（nfrp-linux-arm64.tar.gz），下划线那版也认，优先连字符。
+LEGACY_NAME="nfrp-$(printf '%s' "$PLATFORM" | tr '-' '_').tar.gz"
 
 # 定位包与 SHA256SUMS.txt
 if [ -d "$SRC" ]; then

@@ -1,5 +1,26 @@
 # OpenWrt 兼容交付报告
 
+> ## ★ 2026-11-21 更正（v0.7.10）
+>
+> 本文件下文多处写着「MIPS 不产出包，因为 ring 0.17 上游对 32 位 MIPS 零支持」。
+> **这句话是错的，已在 v0.7.10 翻案。** 两件事同时成立：
+>
+> 1. **ring 没有任何问题。** 0.17.14 的 `build.rs` 对没命中 `ASM_TARGETS` 的
+>    架构取 `asm_target=None`，不生成汇编也不 panic；`sources_for_arch()` 会把
+>    标着 `&[]` 的纯 C 源无条件编进去。MIPS 走的就是通用 C 回退。上游 CI 里
+>    powerpc / powerpc64 / s390x / riscv64gc 四个同样没有汇编的目标天天在跑。
+> 2. **当初判断"必红"的依据是我们自己写的断言。** 那条
+>    `file | grep -Eq 'statically linked|static-pie'` 要求静态链接，而 OpenWrt
+>    SDK 的 gcc 默认产 PIE 动态链接（interpreter 是 `/lib/ld-musl-<arch>-sf.so.1`），
+>    于是正常产物被判死；再拿这个红去对外宣布"上游不支持"，属于自我印证。
+>
+> 实测证据：CI run `44858902791` 里两个 MIPS job 编完并 qemu 跑出裸 `0.71.0`；
+> `44887634498` 起 11/11 全绿。v0.7.10 正式提供
+> `nfrp-linux-mips.tar.gz`（大端 mips_24kc）与 `nfrp-linux-mipsle.tar.gz`
+> （小端 mipsel_24kc），两者都在 qemu 里跑过完整穿透（token + TLS + TCP 转发）。
+>
+> 下文第 11、42、43、63、156–171 行的相关表述均以本节为准。
+
 > **2026-11-19 22:55 更新：已发版 v0.7.8**
 >
 > | 项 | 结果 |
@@ -8,7 +29,7 @@
 > | `main` | 已 fast-forward 到 `8d8aa5fa` |
 > | tag | `v0.7.8` |
 > | CI | 三轮红点全部修完（armv7 pprof / YAML 折行 / sha256 长度 / SC2015 / MIPS 原子 / Windows 501 / KCP 超时） |
-> | MIPS | 走路线 A：`continue-on-error` best effort，**不产出包**（ring 0.17 上游零支持，见第七节） |
+> | MIPS | ~~不产出包~~ → **v0.7.10 起正式出包**，见文首更正 |
 >
 > 以下第 1–7 节是**发版前**写的分析与验证记录，保留原始内容不改，
 > 冲突之处以本节与 `PUSH-STEPS.md` 为准。

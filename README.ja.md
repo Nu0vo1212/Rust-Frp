@@ -184,8 +184,9 @@ nfrp-common = "0.7"
 - Dashboard API v2（`/api/v2/*`）: 統一されたエラーエンベロープ、ページネーション、安定した並び順。v1 エンドポイントの挙動は不変
 - クライアントのローカル Web UI / API（`[webServer] port = 7400`）: トンネル / 接続 / トラフィックの確認と、プロキシの追加 / 削除
 - CPU プロファイル: `pprofEnable = true` にすると、サーバーのダッシュボードとクライアントのローカル Web の両方が
-  `GET /debug/pprof/profile?seconds=N` を提供（既定 10 秒、上限 60 秒）。Unix では
-  protobuf を返し、Windows では明示的に 501（Rust の `pprof` は perf シグナル / `ucontext_t` を必要とする）
+  `GET /debug/pprof/profile?seconds=N` を提供（既定 10 秒、上限 60 秒）。64 ビット Unix のみ
+  protobuf を返し、Windows / Android / 32 ビット ARM / MIPS では明示的に 501（Rust の `pprof` は
+  perf シグナル / `ucontext_t` を必要とし、`Profiler::is_blocklisted` は 32 ビット対象では未定義）
 - SSH トンネルゲートウェイ（`sshTunnelGateway`）: サーバーに SSH サーバーを内蔵し、OpenSSH の
   `ssh -R` で `tcp` / `http` / `https` / `tcpmux` / `stcp` プロキシを直接登録できる。データプレーンは
   通常の作業接続を再利用。`authorizedKeysFile` が空でなければそのファイル内の公開鍵のみを受け付け、
@@ -516,7 +517,7 @@ docker run --rm -p 17000:17000 -p 17002:17002/udp \
   ストリームに合わせて実装。単体テストとメモリ上の双方向は通過。公式 frpc との組み合わせ
   e2e は未実施）、`proxyURL`（HTTP CONNECT / SOCKS5 の外向きプロキシ）、
   `dnsServer`（A/AAAA 問い合わせを独自の UDP DNS で解決）、`natHoleStunServer`（RFC 5389
-  によるパブリックマッピング検出）、`pprofEnable`（Unix の CPU プロファイル、Windows は明示的に 501）、
+  によるパブリックマッピング検出）、`pprofEnable`（64 ビット Unix の CPU プロファイルのみ、Windows / Android / 32 ビット ARM / MIPS は明示的に 501）、
   `assetsDir`（ダッシュボードの静的リソースディレクトリ）、`natholeAnalysisDataReserveHours`
   （NatHole 分析記録の保持期間、0 で保持しない）、`httpPlugins`（サーバー側のログイン / プロキシ /
   作業接続コールバック）、`sshTunnelGateway`（OpenSSH `ssh -R` トンネルゲートウェイ）。
@@ -541,8 +542,13 @@ docker run --rm -p 17000:17000 -p 17002:17002/udp \
   設計された縮退経路である。
 
   **まだ未実施**: 実際の外部 IdP（Keycloak / Azure AD など）に対する OIDC 相互運用の
-  e2e（現在はローカルのモック IdP に対して 9 件）。SSH ゲートウェイの tcpmux / stcp は
-  登録と後始末までしか検証しておらず、**データプレーンの e2e はない**。
+  e2e。現在は自己ホストの最小 HTTP IdP に対して discovery / JWKS / `client_credentials` を
+  実際に流すテストを実行しているが、外部製品ではない。
+  SSH ゲートウェイのデータプレーン e2e は 0.7.8 以降**カバー済み**
+  （`scripts/e2e_ssh_gateway.py`、実際の `ssh -R` 経由で tcp / tcpmux / stcp）。
+  このテストが 0.7.6 の token バグを発見した — ゲートウェイが生の `--token` を
+  `auth_key(token, ts)` の派生値と比較していたため、正しい token がすべて拒否されていた。
+  `verify_raw_token()` で修正済み。
 
   > ~~`webServer.tls.certFile` / `webServer.tls.keyFile`（ダッシュボード HTTPS）は未実装~~
   > —— **訂正**: ダッシュボード HTTPS は v0.6.x 以降で実装済みで、実際の HTTPS + HSTS

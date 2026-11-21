@@ -189,8 +189,9 @@ round together with reproduction, fix, and regression test.
 - Dashboard API v2 (`/api/v2/*`): uniform error envelope, pagination, stable ordering; v1 endpoints behave exactly as before
 - Client local web UI / API (`[webServer] port = 7400`): inspect tunnels, connections and traffic, and add or remove proxies
 - CPU profiling: with `pprofEnable = true`, both the server dashboard and the client's local web UI expose
-  `GET /debug/pprof/profile?seconds=N` (default 10 s, max 60 s); returns
-  protobuf on Unix and an explicit 501 on Windows (Rust's `pprof` needs perf signals / `ucontext_t`)
+  `GET /debug/pprof/profile?seconds=N` (default 10 s, max 60 s); returns protobuf on 64-bit Unix
+  only, with an explicit 501 elsewhere (Windows, Android, 32-bit ARM and MIPS). Rust's `pprof`
+  needs perf signals / `ucontext_t`, and `Profiler::is_blocklisted` is not defined on 32-bit targets
 - SSH tunnel gateway (`sshTunnelGateway`): an SSH server embedded in the server, so OpenSSH's
   `ssh -R` can register `tcp` / `http` / `https` / `tcpmux` / `stcp` proxies directly, with the
   data plane reusing ordinary work connections; when `authorizedKeysFile` is non-empty only keys from
@@ -526,7 +527,8 @@ version".
   snappy stream, passing unit tests and in-memory round trips on both ends; no combined e2e against
   official frpc yet), `proxyURL` (HTTP CONNECT / SOCKS5 outbound proxy),
   `dnsServer` (A/AAAA lookups over a custom UDP DNS resolver), `natHoleStunServer` (RFC 5389
-  public mapping discovery), `pprofEnable` (Unix CPU profile, explicit 501 on Windows),
+  public mapping discovery), `pprofEnable` (64-bit Unix CPU profile only, explicit 501 on Windows,
+  Android, 32-bit ARM and MIPS),
   `assetsDir` (dashboard static asset directory), `natholeAnalysisDataReserveHours`
   (NatHole analysis retention, 0 = keep nothing), `httpPlugins` (server-side login / proxy /
   work-connection callbacks), `sshTunnelGateway` (OpenSSH `ssh -R` tunnel gateway).
@@ -552,8 +554,12 @@ version".
   to `fallbackTo` — that is the designed degradation path.
 
   **Still not done**: end-to-end OIDC interoperability against a real external IdP (Keycloak / Azure AD
-  and so on) — currently nine cases run against a local mock IdP. The SSH gateway's tcpmux / stcp only
-  have registration and cleanup verified; **the data plane has no e2e**.
+  and so on) — the current suite runs against a self-hosted minimal HTTP IdP that really serves
+  discovery, JWKS and `client_credentials`, but it is not an external product.
+  SSH gateway data-plane e2e **is covered** since 0.7.8 (`scripts/e2e_ssh_gateway.py`, tcp / tcpmux /
+  stcp through a real `ssh -R`). It was that test which exposed the 0.7.6 token bug — the gateway
+  compared the raw `--token` against an `auth_key(token, ts)` derived value, so every correct token
+  was rejected. Fixed by `verify_raw_token()`.
 
   > ~~`webServer.tls.certFile` / `webServer.tls.keyFile` (dashboard HTTPS) is not implemented~~
   > — **correction**: dashboard HTTPS has been implemented since v0.6.x, with a real HTTPS + HSTS

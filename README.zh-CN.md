@@ -165,8 +165,9 @@ nfrp-common = "0.6"
 - Dashboard API v2（`/api/v2/*`）：统一错误信封 + 分页 + 稳定排序；v1 接口行为不变
 - 客户端本地 Web UI / API（`[webServer] port = 7400`）：查看隧道 / 连接 / 流量，并可增删代理
 - CPU profile：`pprofEnable = true` 后，服务端面板与客户端本地 Web 都提供
-  `GET /debug/pprof/profile?seconds=N`（默认 10 秒、上限 60 秒）；Unix 返回
-  protobuf，Windows 明确 501（Rust `pprof` 依赖 perf signal / `ucontext_t`）
+  `GET /debug/pprof/profile?seconds=N`（默认 10 秒、上限 60 秒）；仅 64 位 Unix
+  返回 protobuf，Windows / Android / 32 位 ARM / MIPS 明确 501（Rust `pprof`
+  依赖 perf signal / `ucontext_t`，且 `Profiler::is_blocklisted` 在 32 位目标上未定义）
 - SSH 隧道网关（`sshTunnelGateway`）：服务端内嵌 SSH 服务器，OpenSSH 的
   `ssh -R` 可直接注册 `tcp` / `http` / `https` / `tcpmux` / `stcp` 代理，
   数据面复用普通工作连接；`authorizedKeysFile` 非空时只接受文件内公钥，
@@ -445,7 +446,7 @@ docker run --rm -p 17000:17000 -p 17002:17002/udp \
   流实现，单测/内存双端通过；未做官方 frpc 组合 e2e）、
   `proxyURL`（HTTP CONNECT / SOCKS5 出站代理）、
   `dnsServer`（A/AAAA 查询走自定义 UDP DNS）、`natHoleStunServer`（RFC 5389
-  探测公网映射）、`pprofEnable`（Unix CPU profile，Windows 明确 501）、
+  探测公网映射）、`pprofEnable`（仅 64 位 Unix CPU profile，Windows / Android / 32 位 ARM / MIPS 明确 501）、
   `assetsDir`（面板静态资源目录）、`natholeAnalysisDataReserveHours`
   （NatHole 分析记录保留期，0 = 不保留）、`httpPlugins`（服务端登录/代理/
   工作连接回调）、`sshTunnelGateway`（OpenSSH `ssh -R` 隧道网关）。
@@ -469,8 +470,14 @@ docker run --rm -p 17000:17000 -p 17002:17002/udp \
   HardNAT 场景失败时客户端会按 `fallbackTo` 回退中继——这是设计好的降级路径。
 
   **仍未做**：真实外部 IdP（Keycloak / Azure AD 等）上的 OIDC 互操作 e2e
-  （目前是对本地 mock IdP 跑 9 条）。SSH 网关的 tcpmux / stcp 只验到注册与清理，
-  **数据面没有 e2e**。
+  目前是对自建的最小 HTTP IdP 跑 真发 discovery / JWKS / client_credentials
+  但它毕竟不是外部产品
+
+  SSH 网关的数据面 e2e 从 0.7.8 起**已经有了**（`scripts/e2e_ssh_gateway.py`
+  经真实 `ssh -R` 覆盖 tcp / tcpmux / stcp）
+  正是这个测试在 0.7.6 抓出了 token bug 网关把原始的 `--token` 拿去跟
+  `auth_key(token, ts)` 派生值比对 导致任何正确 token 都被拒
+  现已由 `verify_raw_token()` 修掉
 
   > ~~`webServer.tls.certFile` / `webServer.tls.keyFile`（面板 HTTPS）未实现~~
   > —— **这条更正**：面板 HTTPS 自 v0.6.x 起已实现并有真实 HTTPS + HSTS 回归

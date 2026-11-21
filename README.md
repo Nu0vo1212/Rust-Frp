@@ -92,8 +92,12 @@ nfrp-common = "0.7"
 > **`cargo install nfrp-server@0.6.6` and the `frps` in the Release package may
 > behave differently**. For reproducible artifacts you can cite in an issue,
 > use [Option 2: download binaries](#option-2-download-binaries).
-> From later versions on, the release order is fixed: **publish to crates.io
-> first, then package the Release from that same build**.
+> From `0.7.8` on the release order is meant to be fixed: **publish to
+> crates.io first, then package the Release from that same build**. In
+> practice `0.7.8` and `0.7.10` shipped as GitHub Releases only and
+> crates.io is still at `0.7.7`, because no publishing token was available
+> at the time. So for the MIPS packages and for anything newer than `0.7.7`,
+> use [Option 2: download binaries](#option-2-download-binaries).
 
 Module map for `nfrp-common`:
 

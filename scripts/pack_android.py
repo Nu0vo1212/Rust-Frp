@@ -44,6 +44,7 @@ python scripts/pack_android.py
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import re
@@ -55,6 +56,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT.parent / "dist" / "android"
+# README 素材原先只躺在 dist/android 下（仓库外），CI 上根本没有这个文件，
+# 于是 Android 包只能在本地打。收一份进仓库，扫描顺序：仓库 assets 优先，
+# 再回退到 dist/android 里的历史位置。
+README_CANDIDATES = [
+    ROOT / "assets" / "README-ANDROID.md",
+    OUT / "README-ANDROID.md",
+]
 
 ARCHS = [("aarch64", "aarch64-linux-android"), ("x86_64", "x86_64-linux-android")]
 BINS = [("frps", "nfrp-server"), ("frpc", "nfrp-client")]
@@ -98,11 +106,26 @@ def sha256(p: Path) -> str:
 
 
 def main() -> int:
+    ap = argparse.ArgumentParser(description="打包 nfrp-android.zip")
+    ap.add_argument(
+        "--out",
+        default=str(OUT),
+        help="输出目录（默认仓库上一层的 dist/android；CI 上建议传 . 让产物落在 workspace 内）",
+    )
+    ap.add_argument(
+        "--no-sync-release",
+        action="store_true",
+        help="不再往 dist/release 复制一份（CI 上那里没有意义）",
+    )
+    args = ap.parse_args()
+    out = Path(args.out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+
     ver = version()
     target = cargo_target_dir()
     log(f"版本 {ver}，源产物目录 {target}")
 
-    stage = OUT / "stage"
+    stage = out / "stage"
     if stage.exists():
         shutil.rmtree(stage)
 
@@ -118,12 +141,12 @@ def main() -> int:
             real[f"nfrp-android-{arch}/{dst}"] = s
             log(f"  {arch:<8} {dst:<5} {s.stat().st_size / 1e6:.2f} MB  ({s})")
 
-    readme = OUT / "README-ANDROID.md"
-    if not readme.is_file():
-        raise SystemExit(f"缺少 {readme}")
+    readme = next((p for p in README_CANDIDATES if p.is_file()), None)
+    if readme is None:
+        raise SystemExit("缺少 README-ANDROID.md，找过：" + ", ".join(str(p) for p in README_CANDIDATES))
     shutil.copy2(readme, stage / "README-ANDROID.md")
 
-    zip_path = OUT / "nfrp-android.zip"
+    zip_path = out / "nfrp-android.zip"
     if zip_path.exists():
         zip_path.unlink()
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
@@ -147,6 +170,8 @@ def main() -> int:
     # 再放一份到 dist/release：那里是"Release 资产目录"，
     # `verify_dist_matches_release.py` 会把它和 GitHub 上的资产逐个比对。
     # 只在 dist/android 留一份的话，闸门会报"Release 里有、本地没有"。
+    if args.no_sync_release:
+        return 0
     release_dir = ROOT.parent / "dist" / "release"
     if release_dir.is_dir():
         target = release_dir / zip_path.name

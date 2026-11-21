@@ -199,10 +199,57 @@ jobs:
           path: ${{ matrix.asset }}
           if-no-files-found: warn
 
+  # Android 交付物：aarch64（真机）+ x86_64（模拟器）两套，打包成
+  # nfrp-android.zip。ubuntu-latest 自带 Android SDK / NDK，不必自己装。
+  build-android:
+    name: android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: build --release
+        run: |
+          set -euo pipefail
+          # runner 预装的 NDK 路径由 ANDROID_NDK_LATEST_HOME 给出，拿不到就报出来，
+          # 不猜路径也不静默跳过。
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [ -z "$NDK" ]; then
+            echo "找不到 ANDROID_NDK_LATEST_HOME"
+            ls /usr/local/lib/android/sdk/ndk 2>/dev/null || true
+            exit 1
+          fi
+          echo "NDK=$NDK"
+          BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          API=26
+          export CC_aarch64_linux_android="$BIN/aarch64-linux-android${API}-clang"
+          export AR_aarch64_linux_android="$BIN/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$BIN/aarch64-linux-android${API}-clang"
+          export CC_x86_64_linux_android="$BIN/x86_64-linux-android${API}-clang"
+          export AR_x86_64_linux_android="$BIN/llvm-ar"
+          export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$BIN/x86_64-linux-android${API}-clang"
+          cargo build --release --target aarch64-linux-android -p nfrp-server -p nfrp-client
+          cargo build --release --target x86_64-linux-android  -p nfrp-server -p nfrp-client
+        timeout-minutes: 40
+
+      - name: package (pack_android.py)
+        # --out . 让产物落在 workspace 内，upload-artifact 才收得到
+        # （默认输出目录是仓库上一层的 dist/android）。
+        run: python3 scripts/pack_android.py --out . --no-sync-release
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: android
+          path: nfrp-android.zip
+          if-no-files-found: error
+
   checksums:
     name: checksums + signature
     runs-on: ubuntu-latest
-    needs: [build, build-mips]
+    needs: [build, build-mips, build-android]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 

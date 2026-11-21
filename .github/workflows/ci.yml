@@ -389,16 +389,22 @@ jobs:
           shellcheck --shell=dash openwrt/etc/init.d/frpc openwrt/etc/init.d/frps \
             scripts/install-openwrt.sh
 
+      # 注意：这里必须用 `|` 块标量。写成 `run: cmd \` 的多行 plain scalar 时，
+      # YAML 会把换行折叠成空格，行尾的 `\` 于是变成"转义空格"，
+      # 参数被拼成 " --bin-dir"（带前导空格），argparse 认不出就报
+      # required: --bin-dir。踩过，见 run 44858127381。
       - name: run e2e in rootfs container
-        run: python3 scripts/e2e_openwrt.py \
-          --bin-dir target-cross/x86_64-unknown-linux-musl/release \
-          --rootfs-image nfrp-openwrt:test
+        run: |
+          python3 scripts/e2e_openwrt.py \
+            --bin-dir target-cross/x86_64-unknown-linux-musl/release \
+            --rootfs-image nfrp-openwrt:test
         timeout-minutes: 15
 
       - name: official frpc <-> NFrp frps interop
         # 官方二进制从 GitHub Release 下载；拉不到就明确跳过，不伪造通过。
-        run: python3 scripts/e2e_openwrt.py \
-          --bin-dir target-cross/x86_64-unknown-linux-musl/release \
-          --rootfs-image nfrp-openwrt:test --official-interop-only
+        run: |
+          python3 scripts/e2e_openwrt.py \
+            --bin-dir target-cross/x86_64-unknown-linux-musl/release \
+            --rootfs-image nfrp-openwrt:test --official-interop-only
         continue-on-error: true
         timeout-minutes: 10

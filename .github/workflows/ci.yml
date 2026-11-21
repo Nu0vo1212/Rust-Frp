@@ -210,10 +210,17 @@ jobs:
   #     seq_lock（不链接 libatomic）；依赖树里 tokio/serde/zerocopy 的
   #     std AtomicU64 全部有 cfg(target_has_atomic="64") 门控，pprof 的
   #     perfmaps feature 未开。因此不需要 -C link-arg=-latomic。
-  #   * 已知硬阻塞：ring 0.17 没有 mips32 的预生成汇编、build.rs 也无
-  #     mips 分支，官方不支持 32 位 MIPS。本 job 大概率在编译 ring 时
-  #     失败；这是 continue-on-error 的实验性 job，红了只告警不拖垮主 CI。
-  #     详见 run/OPENWRT-REPORT.md 第七节。
+  #   * ring 不是阻塞（2026-11-21 翻案）：0.17 的 build.rs 对没命中
+  #     ASM_TARGETS 的架构取 asm_target=None、不生成任何汇编也不 panic，
+  #     而 sources_for_arch() 会把标着 &[] 的纯 C 源无条件编进去，所以
+  #     MIPS 走的是通用 C 回退。实测 run 44556994660 里 `Compiling ring
+  #     v0.17.14` 正常结束、整个 workspace 2m00s 编完并产出 MIPS32 ELF。
+  #     之前写的"ring 无 C 回退"是错的，它让这个 job 长期被当成必红。
+  #   * 真正红过的原因是我们自己的断言：SDK 的 gcc 默认产 PIE 动态链接，
+  #     interpreter 是 /lib/ld-musl-mipsel-sf.so.1，而断言只认
+  #     statically linked|static-pie ⇒ 判死。OpenWrt 官方软件包本身就是
+  #     动态链接 musl，动态才是这里的常规形态。
+  #     详见 run/OPENWRT-REPORT.md 第七节与桌面《NFrp MIPS 支持诉求》。
   # ---------------------------------------------------------------
   cross-build-mips:
     name: openwrt-mips ${{ matrix.target }} (best effort)
@@ -254,6 +261,9 @@ jobs:
           GCC=$(find sdk/staging_dir -type f -name '${{ matrix.gcc_prefix }}-gcc' | head -n1)
           test -n "$GCC" || { echo "SDK 里找不到交叉 gcc"; exit 1; }
           echo "SDK_BIN=$(dirname "$(realpath "$GCC")")" >> "$GITHUB_ENV"
+          # SDK 的 gcc 包装脚本靠 STAGING_DIR 找 sysroot，不设会一直
+          # 打 `environment variable 'STAGING_DIR' not defined` 警告。
+          echo "STAGING_DIR=$PWD/sdk/staging_dir" >> "$GITHUB_ENV"
 
       - name: build --release (-Zbuild-std)
         env:
@@ -275,8 +285,18 @@ jobs:
             -p nfrp-server -p nfrp-client
           D="target/${{ matrix.target }}/release"
           file "$D/nfrp-server" "$D/nfrp-client"
-          file "$D/nfrp-server" | grep -Eq 'statically linked|static-pie' \
-            || { echo "不是静态链接"; exit 1; }
+          # 只校验"是 32 位 MIPS ELF 且能被 OpenWrt 的 musl 加载"。
+          # 不再强求静态：SDK 的 gcc 默认产 PIE 动态链接，interpreter 是
+          # /lib/ld-musl-<arch>-sf.so.1，这正是 OpenWrt 软件包的常态，
+          # 而 OpenWrt 系统本身一定带这个 ld.so。之前那条
+          # `statically linked|static-pie` 断言把正常产物判成了失败。
+          for b in nfrp-server nfrp-client; do
+            F=$(file -b "$D/$b")
+            echo "$F" | grep -Eq 'ELF 32-bit .*MIPS' \
+              || { echo "$b 不是 32 位 MIPS ELF: $F"; exit 1; }
+            echo "$F" | grep -Eq 'statically linked|static-pie|interpreter /lib/ld-musl-' \
+              || { echo "$b 既不是静态也不是 musl 动态: $F"; exit 1; }
+          done
 
       - name: qemu 冒烟（frps/frpc -v 必须是裸 0.71.0）
         run: |
@@ -288,8 +308,27 @@ jobs:
                    mips-*)   echo qemu-mips-static ;;
                  esac)
           D="target/${{ matrix.target }}/release"
+          # 产物是动态链接到 /lib/ld-musl-<arch>-sf.so.1 的（OpenWrt 常态），
+          # 所以 qemu 必须用 -L 指到一个真能提供这个 loader 的 sysroot 前缀。
+          # toolchain-* 和 target-*/root-* 两种位置都试，找不到就报出来，
+          # 不猜也不退化成"跳过"。
+          SYSROOT=""
+          for cand in sdk/staging_dir/toolchain-*/ sdk/staging_dir/target-*/root-*/; do
+            [ -e "$cand" ] || continue
+            if ls "$cand"lib/ld-musl-* >/dev/null 2>&1; then
+              SYSROOT="$cand"
+              break
+            fi
+          done
+          if [ -z "$SYSROOT" ]; then
+            echo "SDK 里找不到 ld-musl 加载器，动态链接的产物无法运行" >&2
+            find sdk/staging_dir -name 'ld-musl-*' 2>/dev/null | head -n 10 >&2
+            exit 1
+          fi
+          echo "qemu sysroot = $SYSROOT"
+          ls -l "$SYSROOT"lib/ld-musl-* | head -n 3
           for b in nfrp-server nfrp-client; do
-            V=$("$QEMU" -L sdk/staging_dir/toolchain-*/ "$D/$b" -v)
+            V=$("$QEMU" -L "$SYSROOT" "$D/$b" -v)
             echo "$b -v -> [$V]"
             test "$V" = "0.71.0" || { echo "-v 必须输出裸 0.71.0"; exit 1; }
           done

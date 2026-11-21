@@ -198,6 +198,16 @@ cat "$LOG"
     dexec("mkdir", "-p", "/etc/frp")
     for name in ("frpc", "frps"):
         dexec("sh", "-c", f"printf 'log_level = \"info\"\\n' > /etc/frp/{name}.toml")
+        # ★ init 脚本第一道门是 `[ -x "$BIN" ]`，BIN 是 /usr/bin/frpc|frps。
+        # 之前这里只造了配置、没造二进制，于是 start_service 在第一个分支
+        # 就 `return 1` 了 —— 后面那些 procd_set_param 一个都没执行，测试
+        # 永远报「缺少 respawn/stdout/stderr」，看着像 init 脚本写错。
+        # 这里放一个占位可执行文件即可：本项只验证 procd 参数有没有设，
+        # 二进制能不能真跑由后面的 tcp 端到端那一项负责。
+        dexec(
+            "sh", "-c",
+            f"printf '#!/bin/sh\\nexit 0\\n' > /usr/bin/{name} && chmod +x /usr/bin/{name}",
+        )
     for name in ("frpc", "frps"):
         local = Path(tempfile.gettempdir()) / f"mock-procd-{name}.sh"
         local.write_text(script, encoding="utf-8", newline="\n")

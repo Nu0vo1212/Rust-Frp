@@ -106,10 +106,13 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
+            asset: linux-amd64
           - target: aarch64-unknown-linux-musl
+            asset: linux-arm64
           # OpenWrt arm_cortex-a*_vfp 设备（linux-arm-hf）用这个产物。
           # cross 的官方镜像自带 musl-gcc，ring 的 C 代码能编过。
           - target: armv7-unknown-linux-musleabihf
+            asset: linux-arm-hf
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
@@ -141,6 +144,17 @@ jobs:
           CROSS_CONTAINER_OPTS: --platform linux/amd64
         run: cross build --release --workspace --target ${{ matrix.target }}
         timeout-minutes: 30
+
+      # 上传构建产物，发版时直接从 CI 取，避免本地再交叉编一遍。
+      # 名字与 Release 里的包名对齐（nfrp-<asset>），打包脚本按名下载即可。
+      - name: upload binaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nfrp-${{ matrix.asset }}
+          path: |
+            target-cross/${{ matrix.target }}/release/nfrp-server
+            target-cross/${{ matrix.target }}/release/nfrp-client
+          if-no-files-found: error
 
   # ---------------------------------------------------------------
   # 端到端冒烟：真跑一次 frps + frpc，验证 TCP / HTTP / stcp 转发能用
@@ -236,12 +250,14 @@ jobs:
             sdk_sha: d3fc656e5ecc5099f16379860582c22fd57b9e03a81521b17c9ad31034cde1c0
             gcc_prefix: mipsel-openwrt-linux-musl
             openwrt_arch: mipsel_24kc
+            asset: linux-mipsle
           # mips_24kc（大端）：ath79/generic。
           - target: mips-unknown-linux-musl
             sdk_url: https://downloads.openwrt.org/releases/23.05.5/targets/ath79/generic/openwrt-sdk-23.05.5-ath79-generic_gcc-12.3.0_musl.Linux-x86_64.tar.xz
             sdk_sha: dc2ffaf036929630e3de601be2006829d57ed30d018ed4e9e71496bd75d9cbb6
             gcc_prefix: mips-openwrt-linux-musl
             openwrt_arch: mips_24kc
+            asset: linux-mips
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -336,7 +352,7 @@ jobs:
       - name: upload mips artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: nfrp-linux-${{ matrix.openwrt_arch }}
+          name: nfrp-${{ matrix.asset }}
           path: |
             target/${{ matrix.target }}/release/nfrp-server
             target/${{ matrix.target }}/release/nfrp-client

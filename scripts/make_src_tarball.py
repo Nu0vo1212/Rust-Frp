@@ -41,6 +41,11 @@ EXCLUDE_DIRS = {
     "node_modules",
     "tmp",
 }
+# ★★ 光排除 `target` 不够：交叉编译会造出 `target-linux/`、`target-android/`
+# `target-cross/` 这类**同级目录**，2026-11-19 就是这么把源码包打成 209 MB 的
+# （`target-linux` 里的 rlib/rmeta 全进去了，2748 个条目里 2000+ 是构建产物）。
+# ⇒ 任何以 `target` 开头的目录名都当构建目录丢掉。
+EXCLUDE_DIR_PREFIXES = ("target",)
 EXCLUDE_SUFFIX = (".pyc", ".log", ".bak", ".exe", ".crate")
 EXCLUDE_NAMES = {"release.key"}
 
@@ -91,7 +96,11 @@ def collect() -> list[pathlib.Path]:
 
 def os_walk(base: pathlib.Path):
     for root, dirs, files in base.walk():
-        dirs[:] = sorted(d for d in dirs if d not in EXCLUDE_DIRS)
+        dirs[:] = sorted(
+            d
+            for d in dirs
+            if d not in EXCLUDE_DIRS and not d.startswith(EXCLUDE_DIR_PREFIXES)
+        )
         yield root, dirs, files
 
 
@@ -133,7 +142,15 @@ def main() -> int:
     # 再核一遍：包里不含私钥 / 不含构建产物
     with tarfile.open(out, "r:gz") as tar:
         names = tar.getnames()
-    bad = [n for n in names if "release.key" in n or "/target/" in n or n.endswith(".pyc")]
+    bad = [
+        n
+        for n in names
+        if "release.key" in n
+        or n.endswith(".pyc")
+        or any(
+            seg == "target" or seg.startswith("target-") for seg in n.split("/")[1:2]
+        )
+    ]
     if bad:
         raise SystemExit(f"源码包里混进了不该有的东西：{bad[:5]}")
     print(f"内容自检  : 通过（{len(names)} 个条目，无私钥/无 target）")

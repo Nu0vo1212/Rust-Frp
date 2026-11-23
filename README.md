@@ -268,7 +268,7 @@ wire format is then byte-for-byte identical to 0.6.x.
 
 ### Engineering quality
 
-1010 automated tests, including real QUIC stack handshakes, end-to-end
+1014 automated tests, including real QUIC stack handshakes, end-to-end
 integration, and decryption regressions against ciphertext captured from
 official frpc/frps; `cargo audit` reports zero hits; release artifacts ship
 with `SHA256SUMS` and an Ed25519 signature. The repository also carries four
@@ -471,7 +471,7 @@ Other things to note:
 ```bash
 cargo fmt --all -- --check                              # formatting
 cargo clippy --workspace --all-targets -- -D warnings   # static analysis, 0 warnings
-cargo test --workspace                                  # 1010 passed / 0 failed / 13 ignored
+cargo test --workspace                                  # 1014 passed / 0 failed / 13 ignored
 ```
 
 The 13 `#[ignore]`d tests all **need real hardware or administrator

@@ -13,7 +13,7 @@
 ```bash
 cargo fmt --all -- --check                 # 格式
 cargo clippy --workspace --all-targets -- -D warnings   # 静态检查，当前 0 告警
-cargo test --workspace                     # 1010 个测试通过
+cargo test --workspace                     # 1014 个测试通过
 ```
 
 三项全绿才算过。CI 上跑的是同一组命令，参数一致，不存在"本地过了 CI 不过"。
@@ -30,13 +30,13 @@ cargo test --workspace                     # 1010 个测试通过
 | `nfrp-client` 开机自启端到端（真进程） | 2 |  |
 | `nfrp-common` 单元测试（lib） | 504 | 3（Wintun 真机） |
 | `nfrp-common` 集成测试（OIDC） | 9 |  |
-| `nfrp-server` 单元测试（lib） | 293 |  |
+| `nfrp-server` 单元测试（lib） | 297 |  |
 | `nfrp-server` 单元测试（bin） | 17 |  |
 | `nfrp-server` 端到端集成测试 | 26 |  |
 | `nfrp-server` NLink 端到端 | 16 |  |
 | 文档测试（common） | 2 | 5 |
 | 文档测试（server） | 0 | 5 |
-| **合计** | **1010** | **13** |
+| **合计** | **1014** | **13** |
 
 **关于 13 条 `#[ignore]`**：3 条是**需要真机硬件或管理员权限**的 Windows Wintun
 设备面测试，另外 10 条是文档示例里明确标注 `ignore` 的代码块（不是失败/被跳过

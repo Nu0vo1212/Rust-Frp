@@ -1,0 +1,10 @@
+serverAddr = "127.0.0.1"
+serverPort = 7000
+token = "test-token"
+
+[[proxies]]
+name = "demo"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8080
+remotePort = 18080

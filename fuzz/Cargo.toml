@@ -1,0 +1,49 @@
+[package]
+name = "nfrp-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nfrp-common = { path = "../common" }
+toml = "0.8"
+serde_json = "1.0"
+futures = "0.3"
+
+[[bin]]
+name = "config_toml"
+path = "fuzz_targets/config_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_head"
+path = "fuzz_targets/http_head.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frp_v1_frame"
+path = "fuzz_targets/frp_v1_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frp_v2_frame"
+path = "fuzz_targets/frp_v2_frame.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
+
+# 独立的 workspace：切断与上级 nfrp workspace 的成员关系
+[workspace]

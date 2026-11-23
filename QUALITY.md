@@ -89,10 +89,14 @@ cargo test --workspace                     # 1010 个测试通过
 1. `fmt --check` + `clippy -D warnings`
 2. Linux / Windows / macOS 三系统全量测试
 3. 两个 musl 目标的交叉构建
-4. 端到端冒烟，含三个真二进制 e2e：
+4. 端到端冒烟，含四个真二进制 e2e：
    `e2e_vhost_crypto.py`（加密压缩矩阵）、`e2e_ssh_gateway.py`（SSH 网关数据面）、
-   `e2e_oidc.py`（自建 IdP + RS256 验签）
+   `e2e_oidc.py`（自建 IdP + RS256 验签）、
+   `e2e_interop_reverse.py`（官方 frps 0.71.0 + nfrp frpc，tcp / http）
 5. 文档生成物漂移拦截：`sync_nlink_doc.py --check`
+6. 文档数字一致性：`check-docs-consistency.py`（版本号 + 真实测试总数）
+7. MSRV 门：用 1.75.0 工具链 `cargo build --workspace`
+8. fuzz 冒烟：4 个 `cargo-fuzz` target 各跑 60 秒，崩溃产物作为 artifact
 
 `e2e_nathole_netns.py` 需要 root 与 iproute2/iptables，**不进 CI**，手动跑。
 

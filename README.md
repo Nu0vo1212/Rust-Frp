@@ -271,7 +271,10 @@ wire format is then byte-for-byte identical to 0.6.x.
 1010 automated tests, including real QUIC stack handshakes, end-to-end
 integration, and decryption regressions against ciphertext captured from
 official frpc/frps; `cargo audit` reports zero hits; release artifacts ship
-with `SHA256SUMS` and an Ed25519 signature.
+with `SHA256SUMS` and an Ed25519 signature. The repository also carries four
+reproducible `cargo-fuzz` targets (`config_toml`, `http_head`, `frp_v1_frame`,
+`frp_v2_frame`); CI runs each for 60 seconds per build and uploads crash
+artifacts on failure.
 
 Test distribution, the CI matrix, exactly what dependency security covers, the
 release gate, and the manual checklist all live in **[QUALITY.md](QUALITY.md)**.

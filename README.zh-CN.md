@@ -235,7 +235,9 @@ quic = true
 ### 工程质量
 
 1010 个自动化测试，含真实 QUIC 栈握手、端到端集成、官方抓包密文解密回归；
-`cargo audit` 0 命中；发布产物附 `SHA256SUMS` + Ed25519 签名。
+`cargo audit` 0 命中；发布产物附 `SHA256SUMS` + Ed25519 签名。仓库内有 4 个可复现的
+`cargo-fuzz` target（`config_toml`、`http_head`、`frp_v1_frame`、`frp_v2_frame`），
+CI 每轮每个跑 60 秒，失败时上传崩溃产物。
 
 测试分布、CI 矩阵、依赖安全做到哪一步、发版闸门与人工核对清单，
 统一放在 **[QUALITY.md](QUALITY.md)**。

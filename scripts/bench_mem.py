@@ -315,7 +315,8 @@ def main() -> int:
     linux_only()
 
     try:
-        counts = sorted({int(x) for x in args.tunnels.split(",") if x.strip()})
+        # 固定测一条 N=0（无代理）作为基线，否则每隧道增量会把固定开销算进去。
+        counts = sorted({0} | {int(x) for x in args.tunnels.split(",") if x.strip()})
     except ValueError:
         print(f"--tunnels 解析失败：{args.tunnels}", file=sys.stderr)
         return 2
@@ -367,16 +368,13 @@ def main() -> int:
     finally:
         backend_sock.close()
 
-    base_n = min(counts)
+    base_n = 0
     base = nfrp_rss[base_n]
-    if base_n != 0:
-        print(f"⚠️ 阶梯里没有 0；每隧道增量以 N={base_n} 的 RSS 为基线，"
-              "会低估固定开销的占比")
 
-    def delta(values: dict[int, int], n: int, baseline: int) -> str:
-        if n == baseline:
+    def delta(values: dict[int, int], n: int, baseline_rss: int, baseline_n: int) -> str:
+        if n == baseline_n:
             return "—"
-        return f"{(values[n] - baseline) / (n - baseline):.1f}"
+        return f"{(values[n] - baseline_rss) / (n - baseline_n):.1f}"
 
     print("\n## frps 常驻内存（VmRSS，中位数）\n")
     if official_path:
@@ -386,13 +384,14 @@ def main() -> int:
         for n in counts:
             print(
                 f"| {n} | {nfrp_rss[n]} | {official_rss[n]} | "
-                f"{delta(nfrp_rss, n, base)} | {delta(official_rss, n, base_off)} |"
+                f"{delta(nfrp_rss, n, base, base_n)} | "
+                f"{delta(official_rss, n, base_off, base_n)} |"
             )
     else:
         print("| N | frps RSS (KiB) | 每隧道增量 (KiB) |")
         print("|---:|---:|---:|")
         for n in counts:
-            print(f"| {n} | {nfrp_rss[n]} | {delta(nfrp_rss, n, base)} |")
+            print(f"| {n} | {nfrp_rss[n]} | {delta(nfrp_rss, n, base, base_n)} |")
 
     print("\n说明：每隧道增量 = (RSS(N) - 基线) / (N - 基线N)；"
           f"基线为 N={base_n}。数据为 {args.repeat} 次独立进程采样的中位数。")

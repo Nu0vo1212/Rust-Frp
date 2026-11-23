@@ -66,12 +66,13 @@ fn acl_必须铺满全部数据面入口() {
 
     // server/src 下所有**接收外部连接**的文件 —— 每一个都必须有 check_ip。
     const MUST_HAVE_ACL: &[&str] = &[
-        "serve.rs",        // 控制端口 + TCP 代理 accept
-        "vhost/listen.rs", // HTTP / HTTPS / tcpmux accept
-        "vnet.rs",         // VirtualNet 注册
-        "udp_proxy.rs",    // ★ E9-0：UDP 代理端口
-        "p2p.rs",          // ★ E9-1：xtcp 牵线 UDP
-        "dashboard.rs",    // ★ E9-2：管理面板
+        "serve/conn.rs",     // 控制端口 / frp 握手 ACL
+        "serve/register.rs", // TCP / UDP 代理 accept ACL
+        "vhost/listen.rs",   // HTTP / HTTPS / tcpmux accept
+        "vnet.rs",           // VirtualNet 注册
+        "udp_proxy.rs",      // ★ E9-0：UDP 代理端口
+        "p2p.rs",            // ★ E9-1：xtcp 牵线 UDP
+        "dashboard.rs",      // ★ E9-2：管理面板
     ];
 
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");

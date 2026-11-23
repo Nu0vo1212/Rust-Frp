@@ -621,7 +621,7 @@ mod tests {
     /// 把十六进制串解成字节（测试用）。
     fn hex(s: &str) -> Vec<u8> {
         let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-        assert!(s.len() % 2 == 0, "十六进制串长度必须是偶数");
+        assert!(s.len().is_multiple_of(2), "十六进制串长度必须是偶数");
         (0..s.len() / 2)
             .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).expect("非法十六进制"))
             .collect()

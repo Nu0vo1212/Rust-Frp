@@ -36,10 +36,13 @@ cargo test --workspace                     # 1014 个测试通过
 | `nfrp-server` NLink 端到端 | 16 |  |
 | 文档测试（common） | 2 | 5 |
 | 文档测试（server） | 0 | 5 |
-| **合计** | **1014** | **13** |
+| **合计** | **1014** | **13**（Windows）/ **10**（Linux） |
 
-**关于 13 条 `#[ignore]`**：3 条是**需要真机硬件或管理员权限**的 Windows Wintun
-设备面测试，另外 10 条是文档示例里明确标注 `ignore` 的代码块（不是失败/被跳过
+<!-- test-ignored: windows=13 linux=10 -->
+
+**关于 ignored 数**：3 条是**需要管理员权限与 `wintun.dll`** 的 Windows Wintun
+设备面测试，它们所在的模块是 `#![cfg(target_os = "windows")]`，Linux 根本不编译，
+所以 Linux 只有另外 10 条文档示例里明确标注 `ignore` 的代码块（不是失败/被跳过
 的问题测试）。Wintun 真机测试在有权限的环境里可以用 `cargo test -- --ignored`
 单独跑。
 
@@ -94,8 +97,9 @@ cargo test --workspace                     # 1014 个测试通过
    `e2e_oidc.py`（自建 IdP + RS256 验签）、
    `e2e_interop_reverse.py`（官方 frps 0.71.0 + nfrp frpc，tcp / http）
 5. 文档生成物漂移拦截：`sync_nlink_doc.py --check`
-6. 文档数字一致性：`check-docs-consistency.py`（版本号 + 真实测试总数）
-7. MSRV 门：用 1.75.0 工具链 `cargo build --workspace`
+6. 文档数字一致性：`check-docs-consistency.py --test-output`（读 test job 报告，
+   不重跑测试；版本号 + 真实测试总数 + 按平台的 ignored 数）
+7. MSRV 门：用 1.89.0 工具链 `cargo build --workspace`
 8. fuzz 冒烟：4 个 `cargo-fuzz` target 各跑 60 秒，崩溃产物作为 artifact
 
 `e2e_nathole_netns.py` 需要 root 与 iproute2/iptables，**不进 CI**，手动跑。

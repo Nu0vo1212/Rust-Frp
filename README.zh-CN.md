@@ -253,7 +253,7 @@ cargo build --release
 # `.cargo/config.toml` 时，产物就不在 ./target 下
 ```
 
-需要 Rust 1.75+。Windows 用 MSVC toolchain。
+需要 Rust 1.89+。Windows 用 MSVC toolchain。
 
 也可以直接下载发布包，包内二进制名为 `frps` / `frpc`（与官方一致）。
 
@@ -393,14 +393,16 @@ NFrp 可运行在官方 frp 的任一侧，双向实测通过：
 
 ## 质量保障
 
+<!-- test-ignored: windows=13 linux=10 -->
 ```bash
 cargo fmt --all -- --check                              # 格式
 cargo clippy --workspace --all-targets -- -D warnings   # 静态检查，0 告警
-cargo test --workspace                                  # 1014 通过 / 0 失败 / 13 ignored
+cargo test --workspace                                  # 1014 通过 / 0 失败 / 13 ignored（Windows）/ 10（Linux）
 ```
 
-那 13 条 `#[ignore]` 全是**需要真机硬件或管理员权限**的设备面测试
-（Windows Wintun 网卡、Linux TUN 设备），不是被跳过的问题测试。
+ignored 数按平台不同：Windows 13 条（3 条需要管理员权限与 `wintun.dll` 的
+Wintun 设备测试，外加 10 条标了 `ignore` 的文档示例），Linux 10 条（只有文档
+示例）。都不是被跳过的问题测试。
 
 CI 在每次 push / PR 上跑同样的三道门，外加三系统全量测试、两个 musl 目标交叉构建
 与端到端冒烟。

@@ -290,7 +290,7 @@ cargo build --release
 # `.cargo/config.toml` is set, artifacts are not under ./target
 ```
 
-Requires Rust 1.75+. Windows uses the MSVC toolchain.
+Requires Rust 1.89+. Windows uses the MSVC toolchain.
 
 You can also download a release package; the binaries inside are named `frps` /
 `frpc`, matching upstream.
@@ -468,15 +468,16 @@ Other things to note:
 
 ## Quality assurance
 
+<!-- test-ignored: windows=13 linux=10 -->
 ```bash
 cargo fmt --all -- --check                              # formatting
 cargo clippy --workspace --all-targets -- -D warnings   # static analysis, 0 warnings
-cargo test --workspace                                  # 1014 passed / 0 failed / 13 ignored
+cargo test --workspace                                  # 1014 passed / 0 failed / 13 ignored (Windows) / 10 (Linux)
 ```
 
-The 13 `#[ignore]`d tests all **need real hardware or administrator
-privileges** (Windows Wintun adapters, Linux TUN devices); they are not broken
-tests that were skipped.
+The ignored count differs by platform: Windows has 13 (3 Wintun device tests
+that need administrator rights and `wintun.dll`, plus 10 doc examples marked
+`ignore`), Linux has 10 (the doc examples only). None of them are broken tests.
 
 CI runs the same three gates on every push / PR, plus the full test suite on
 three operating systems, cross-builds for two musl targets, and an end-to-end

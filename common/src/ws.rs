@@ -965,7 +965,7 @@ mod tests {
                 v.extend_from_slice(&(len as u64).to_be_bytes());
             }
             v.extend_from_slice(&[0, 0, 0, 0]); // 掩码键
-            v.extend(std::iter::repeat(0u8).take(len));
+            v.extend(std::iter::repeat_n(0u8, len));
             v
         };
 

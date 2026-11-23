@@ -120,9 +120,8 @@ impl Plugin {
             // 桥接类插件（http2*/https2*/tls2raw）失败多半是**用户配错了**：
             // 拿明文 HTTP 去连 https2http、或上游没起。工作连接收尾只按 debug
             // 记一笔，默认看不见，所以这里额外补一条 warn。
-            Plugin::Bridge(b) => b.serve(stream, leftover, ctx).await.map_err(|e| {
-                crate::plugin_bridge::log_failure(ctx.proxy_name, &e);
-                e
+            Plugin::Bridge(b) => b.serve(stream, leftover, ctx).await.inspect_err(|e| {
+                crate::plugin_bridge::log_failure(ctx.proxy_name, e);
             }),
             #[cfg(unix)]
             Plugin::UnixSocket(path) => {

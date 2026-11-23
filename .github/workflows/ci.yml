@@ -62,12 +62,9 @@ jobs:
           python3 -m py_compile scripts/e2e_openwrt.py scripts/test_e2e_openwrt.py
           python3 scripts/test_e2e_openwrt.py
 
-      # 文档数字一致性：Cargo.toml / 四份 README / docs 站 / QUALITY.md 的
-      # 版本号与测试总数必须一致，测试总数由真实 `cargo test --workspace`
-      # 输出解析得出，不靠人手抄。任何一处漂移直接红。
-      - name: docs numbers are consistent
-        run: python3 scripts/check-docs-consistency.py
-        timeout-minutes: 30
+      # 文档数字一致性不在这里跑：它需要 `cargo test --workspace` 的真实输出。
+      # 放在 test job 里读那份报告（见 unit tests），避免 lint 与 test 各跑一遍
+      # 整套测试、把 CI 机时翻倍。
 
       # 依赖漏洞门禁。
       #
@@ -97,9 +94,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
+      # 用 --workspace（含文档测试），与 README/QUALITY 里对外公布的数字同源。
+      # 输出同时落盘给下面的文档一致性检查读取，不再重跑第二遍。
       - name: cargo test
-        run: cargo test --workspace --all-targets
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --workspace 2>&1 | tee test-output.txt
         timeout-minutes: 20
+
+      # 文档数字一致性：Cargo.toml / 四份 README / docs 站 / QUALITY.md 的
+      # 版本号与测试总数必须一致。测试总数直接解析上面那份报告，不重跑。
+      # ignored 数按平台取参考值（Linux 10 / Windows 13）。
+      - name: docs numbers are consistent
+        if: runner.os == 'Linux'
+        run: python3 scripts/check-docs-consistency.py --test-output test-output.txt
+        timeout-minutes: 5
 
   # ---------------------------------------------------------------
   # 交叉编译发布包（只做产物校验，不上传）
@@ -227,20 +237,22 @@ jobs:
           ./target/release/nfrp-client --print-example > /dev/null
 
   # ---------------------------------------------------------------
-  # MSRV 门：Cargo.toml 声明 rust-version = "1.75"，这里用真 1.75.0 编译
+  # MSRV 门：Cargo.toml 声明 rust-version = "1.89"，这里用真 1.89.0 编译
   # 整个 workspace。依赖 MSRV 抬高时这一步会红，不允许偷偷改声明。
+  # 1.75 已被依赖树否证：time 0.3.55 要求 1.88，aead/cmov 等用 edition2024
+  # （需要 1.85+），锁文件里最高声明 1.89。
   # ---------------------------------------------------------------
   msrv:
-    name: msrv 1.75.0
+    name: msrv 1.89.0
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # 1.75.0
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # 1.89.0
         with:
-          toolchain: "1.75.0"
+          toolchain: "1.89.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          key: msrv-1.75.0
+          key: msrv-1.89.0
       - name: cargo build --workspace
         run: cargo build --workspace
         timeout-minutes: 25
@@ -252,6 +264,12 @@ jobs:
   fuzz-smoke:
     name: fuzz smoke (nightly)
     runs-on: ubuntu-latest
+    env:
+      # ASan 不能和静态链接的 libc 共存。CI 上 cargo fuzz 解析到
+      # x86_64-unknown-linux-musl 时会直接报
+      # "sanitizer is incompatible with statically linked libc"，
+      # 因此显式固定 gnu 目标；仓库里没有 .cargo/config.toml 设置这个目标。
+      CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # nightly

@@ -287,11 +287,11 @@ pub fn icmp_echo_reply(pkt: &[u8]) -> Option<Vec<u8>> {
 /// 而 ping 只会静静地不回包，非常难查。
 pub fn checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
-    let mut chunks = data.chunks_exact(2);
-    for c in &mut chunks {
-        sum += u32::from(u16::from_be_bytes([c[0], c[1]]));
+    let (chunks, remainder) = data.as_chunks::<2>();
+    for c in chunks {
+        sum += u32::from(u16::from_be_bytes(*c));
     }
-    if let [last] = chunks.remainder() {
+    if let [last] = remainder {
         sum += u32::from(u16::from_be_bytes([*last, 0]));
     }
     while sum >> 16 != 0 {

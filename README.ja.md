@@ -282,7 +282,7 @@ cargo build --release
 # `.cargo/config.toml` を設定している場合、成果物は ./target 配下ではない
 ```
 
-Rust 1.75 以上が必要です。Windows では MSVC ツールチェーンを使います。
+Rust 1.89 以上が必要です。Windows では MSVC ツールチェーンを使います。
 
 リリースパッケージをダウンロードすることもできます。内部のバイナリ名は
 `frps` / `frpc` で公式と同じです。
@@ -459,15 +459,17 @@ wire magic とバージョン文字列、パッケージ内の `frps` / `frpc` �
 
 ## 品質保証
 
+<!-- test-ignored: windows=13 linux=10 -->
 ```bash
 cargo fmt --all -- --check                              # フォーマット
 cargo clippy --workspace --all-targets -- -D warnings   # 静的解析、警告 0
-cargo test --workspace                                  # 1014 通過 / 0 失敗 / 13 ignored
+cargo test --workspace                                  # 1014 通過 / 0 失敗 / 13 ignored（Windows）/ 10（Linux）
 ```
 
-`#[ignore]` の 13 件はすべて**実機ハードウェアまたは管理者権限を必要とする**
-ものです（Windows の Wintun アダプター、Linux の TUN デバイス）。壊れたテストを
-飛ばしているのではありません。
+ignored の件数はプラットフォームで異なります。Windows は 13 件（管理者権限と
+`wintun.dll` が必要な Wintun テスト 3 件 + `ignore` 指定のドキュメント例 10 件）、
+Linux は 10 件（ドキュメント例のみ）です。壊れたテストを飛ばしているのでは
+ありません。
 
 CI は push / PR のたびに同じ 3 つのゲートを実行し、さらに 3 つの OS での
 全テスト、2 つの musl ターゲットへのクロスビルド、エンドツーエンドの

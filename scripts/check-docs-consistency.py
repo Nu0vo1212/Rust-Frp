@@ -12,16 +12,22 @@
        > （例如 “自 v0.7.4 起提供”），不是“当前版本”声明，因此不做全量
        > 正则扫描，只认上面这些明确的当前版本位点。
     2. 测试总数
-       - 真实执行 `cargo test --workspace`，汇总所有
-         `test result: ok. X passed; Y failed; Z ignored` 的 X / Y / Z
+       - 真实执行 `cargo test --workspace`（或读取 test job 产出的报告），
+         汇总所有 `test result: ok. X passed; Y failed; Z ignored` 的 X / Y / Z
          （**不估算**；构建/测试失败直接非零退出）
        - 与 QUALITY.md 的命令注释、合计行、四份 README 的命令注释与正文比对
-    3. 忽略测试数（`ignored`）
+    3. 忽略测试数（`ignored`），按平台取参考值
+       - 参考值来自机器可读锚点 `<!-- test-ignored: windows=13 linux=10 -->`，
+         分别写在 QUALITY.md 与四份 README 里
+       - Linux 不编译 `cfg(target_os = "windows")` 的 Wintun 模块，因此是 10；
+         Windows 是 13。只按当前平台比对，不要求两边相同
     4. 四份 README 都写到的常驻内存数字（本仓库实际存在的“体积/占用”数字）
 
 用法：
     python scripts/check-docs-consistency.py
-    python scripts/check-docs-consistency.py --skip-tests   # 不跑测试，用 QUALITY.md 现有值做语法校验
+    python scripts/check-docs-consistency.py --test-output test-output.txt  # 读 CI test job 的报告，不重跑
+    python scripts/check-docs-consistency.py --platform linux              # 在 Windows 上校验 Linux 报告时指定
+    python scripts/check-docs-consistency.py --skip-tests                  # 不跑测试，只做语法校验
 
 退出码：
     0 全部一致（打印 OK）
@@ -110,16 +116,26 @@ def version_claims() -> list[Claim]:
     return claims
 
 
-def parse_test_claims() -> tuple[list[Claim], list[Claim]]:
-    """返回 (测试总数 claims, ignored claims)。"""
+IGNORED_ANCHOR_RE = re.compile(
+    r"test-ignored:\s*windows=(\d+)\s+linux=(\d+)"
+)
+
+
+def parse_test_claims() -> tuple[list[Claim], dict[str, list[Claim]]]:
+    """返回 (测试总数 claims, 按平台分组的 ignored claims)。
+
+    ignored 不能只认一个数：3 条 Wintun 测试在
+    `#![cfg(target_os = "windows")]` 模块里，Linux 不编译。
+    因此参考值写在机器可读锚点 `<!-- test-ignored: windows=13 linux=10 -->`，
+    由当前平台选择对应值比对。
+    """
     total: list[Claim] = []
-    ignored: list[Claim] = []
+    ignored: dict[str, list[Claim]] = {"windows": [], "linux": []}
 
     q = ROOT / "QUALITY.md"
     if q.is_file():
         total += collect(q, r"cargo test --workspace\s+#\s*(\d+)\s*个测试通过", "tests", "QUALITY 命令注释")
         total += collect(q, r"\*\*合计\*\*\s*\|\s*\*\*(\d+)\*\*\s*\|\s*\*\*(\d+)\*\*", "tests", "QUALITY 合计行")
-        ignored += collect(q, r"\*\*合计\*\*\s*\|\s*\*\*\d+\*\*\s*\|\s*\*\*(\d+)\*\*", "ignored", "QUALITY 合计行 ignored")
 
     patterns = {
         "README.md": (r"(\d+)\s+automated tests", r"#\s*(\d+)\s+passed\s*/\s*(\d+)\s+failed\s*/\s*(\d+)\s+ignored"),
@@ -134,10 +150,18 @@ def parse_test_claims() -> tuple[list[Claim], list[Claim]]:
         text = read(p)
         total += collect(p, prose_re, "tests", "正文测试数")
         total += collect(p, cmd_re, "tests", "测试命令注释")
-        # 同一条命令注释里的第 3 组是 ignored 计数
-        for m in re.finditer(cmd_re, text):
+
+    for name in ["QUALITY.md", *README_FILES]:
+        p = ROOT / name
+        if not p.is_file():
+            continue
+        text = read(p)
+        for m in IGNORED_ANCHOR_RE.finditer(text):
             ln = line_of(text, m.start())
-            ignored.append(Claim("ignored", f"{name}:{ln} 测试命令注释", m.group(3), ln))
+            ignored["windows"].append(
+                Claim("ignored", f"{name}:{ln} ignored 锚点", m.group(1), ln))
+            ignored["linux"].append(
+                Claim("ignored", f"{name}:{ln} ignored 锚点", m.group(2), ln))
     return total, ignored
 
 
@@ -166,6 +190,22 @@ RESULT_RE = re.compile(
 )
 
 
+def summarize_test_output(out: str, origin: str) -> tuple[int, int, int]:
+    matches = RESULT_RE.findall(out)
+    if not matches:
+        print("\n--- 测试输出（尾） ---")
+        print(out[-4000:])
+        raise RuntimeError(f"{origin} 里没有任何 'test result:' 行，无法汇总")
+    passed = sum(int(m[1]) for m in matches)
+    failed = sum(int(m[2]) for m in matches)
+    ignored = sum(int(m[3]) for m in matches)
+    print(f"{origin}：{passed} passed / {failed} failed / {ignored} ignored"
+          f"（{len(matches)} 个 test target）")
+    if failed:
+        raise RuntimeError(f"{origin} 有 {failed} 个失败")
+    return passed, failed, ignored
+
+
 def run_cargo_tests() -> tuple[int, int, int]:
     print("运行 cargo test --workspace（解析真实输出，不估算）…", flush=True)
     p = subprocess.run(
@@ -181,19 +221,15 @@ def run_cargo_tests() -> tuple[int, int, int]:
         print("\n--- cargo test 输出（尾） ---")
         print(out[-4000:])
         raise RuntimeError(f"cargo test --workspace 失败，退出码 {p.returncode}")
-    matches = RESULT_RE.findall(out)
-    if not matches:
-        print("\n--- cargo test 输出（尾） ---")
-        print(out[-4000:])
-        raise RuntimeError("cargo test 输出里没有任何 'test result:' 行，无法汇总")
-    passed = sum(int(m[1]) for m in matches)
-    failed = sum(int(m[2]) for m in matches)
-    ignored = sum(int(m[3]) for m in matches)
-    print(f"cargo test 结果：{passed} passed / {failed} failed / {ignored} ignored"
-          f"（{len(matches)} 个 test target）")
-    if failed:
-        raise RuntimeError(f"cargo test 有 {failed} 个失败")
-    return passed, failed, ignored
+    return summarize_test_output(out, "cargo test --workspace")
+
+
+def load_test_output(path: Path) -> tuple[int, int, int]:
+    """读取 test job 保存的报告，不重跑测试。"""
+    if not path.is_file():
+        raise RuntimeError(f"找不到测试报告：{path}")
+    out = path.read_text(encoding="utf-8", errors="replace")
+    return summarize_test_output(out, f"{path}（test job 报告）")
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +255,13 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="文档数字一致性门禁")
     ap.add_argument("--skip-tests", action="store_true",
                     help="不跑 cargo test，只用 QUALITY.md 现有值做语法校验")
+    ap.add_argument("--test-output", type=Path, metavar="FILE",
+                    help="读取 test job 产出的报告，而不是重跑 cargo test")
+    ap.add_argument("--platform", choices=["windows", "linux"],
+                    help="校验 ignored 时使用的平台（默认按当前系统推断）")
     args = ap.parse_args()
+
+    platform = args.platform or ("windows" if sys.platform.startswith("win") else "linux")
 
     try:
         version = workspace_version()
@@ -227,7 +269,8 @@ def main() -> int:
         print(f"❌ 无法解析 Cargo.toml 版本：{e}", file=sys.stderr)
         return 2
 
-    test_claims, ignored_claims = parse_test_claims()
+    test_claims, ignored_by_platform = parse_test_claims()
+    ignored_claims = ignored_by_platform[platform]
 
     actual_passed = actual_ignored = None
     if args.skip_tests:
@@ -250,20 +293,25 @@ def main() -> int:
         print("⚠️ --skip-tests：没有运行 cargo test，测试数只做语法校验，不构成「已验证」")
     else:
         try:
-            actual_passed, _, actual_ignored = run_cargo_tests()
+            if args.test_output:
+                actual_passed, _, actual_ignored = load_test_output(args.test_output)
+                origin = f"{args.test_output}（test job 报告，未重跑测试）"
+            else:
+                actual_passed, _, actual_ignored = run_cargo_tests()
+                origin = "cargo test --workspace 真实输出"
         except Exception as e:  # noqa: BLE001
             print(f"\n❌ {e}", file=sys.stderr)
             return 2
         tests_ref = str(actual_passed)
-        tests_ref_desc = "cargo test --workspace 真实输出"
+        tests_ref_desc = origin
         ignored_ref = str(actual_ignored)
-        ignored_ref_desc = "cargo test --workspace 真实输出"
+        ignored_ref_desc = f"{origin}，平台 {platform}"
 
     mismatches: list[str] = []
     mismatches += check_group("版本号", version_claims(), version, "Cargo.toml [workspace.package]")
     mismatches += check_group("测试总数", test_claims, tests_ref, tests_ref_desc)
     if ignored_ref is not None:
-        mismatches += check_group("忽略测试数", ignored_claims, ignored_ref, ignored_ref_desc)
+        mismatches += check_group(f"忽略测试数（{platform}）", ignored_claims, ignored_ref, ignored_ref_desc)
 
     mem = memory_claims()
     if mem:

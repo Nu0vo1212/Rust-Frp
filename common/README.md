@@ -93,7 +93,7 @@ assert_eq!(key.len(), 16); // AES-128
 
 * 与官方 frp **0.71.0** 实测互通（v1 / v2 双版本）
 * Windows / Linux 行为一致（平台特定代码全部在 `cfg` 之下）
-* MSRV：**1.75**
+* MSRV：**1.89**
 * CI 里 `cargo audit` 作为门禁，依赖 CVE 会被拦下
 
 ## 许可

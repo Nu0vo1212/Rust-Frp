@@ -62,6 +62,13 @@ jobs:
           python3 -m py_compile scripts/e2e_openwrt.py scripts/test_e2e_openwrt.py
           python3 scripts/test_e2e_openwrt.py
 
+      # 文档数字一致性：Cargo.toml / 四份 README / docs 站 / QUALITY.md 的
+      # 版本号与测试总数必须一致，测试总数由真实 `cargo test --workspace`
+      # 输出解析得出，不靠人手抄。任何一处漂移直接红。
+      - name: docs numbers are consistent
+        run: python3 scripts/check-docs-consistency.py
+        timeout-minutes: 30
+
       # 依赖漏洞门禁。
       #
       # v0.5.1 发版时锁的 rustls 0.23.44 带着 RUSTSEC-2026-0285
@@ -206,12 +213,79 @@ jobs:
           python3 scripts/e2e_oidc.py --bin-dir target/release
         timeout-minutes: 8
 
+      # 反向互通：官方 frps 0.71.0 + nfrp frpc，tcp / http 各一条。
+      # 下载失败必须红，不允许 SKIP 后当通过。
+      - name: official frps <-> nfrp frpc interop
+        run: python3 scripts/e2e_interop_reverse.py --bin-dir target/release
+        timeout-minutes: 10
+
       - name: check --gen-config works and produced config reloads
         run: |
           ./target/release/nfrp-server --gen-config /tmp/frps.toml
           ./target/release/nfrp-client --gen-config /tmp/frpc.toml
           ./target/release/nfrp-server --check -c /tmp/frps.toml
           ./target/release/nfrp-client --print-example > /dev/null
+
+  # ---------------------------------------------------------------
+  # MSRV 门：Cargo.toml 声明 rust-version = "1.75"，这里用真 1.75.0 编译
+  # 整个 workspace。依赖 MSRV 抬高时这一步会红，不允许偷偷改声明。
+  # ---------------------------------------------------------------
+  msrv:
+    name: msrv 1.75.0
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # 1.75.0
+        with:
+          toolchain: "1.75.0"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: msrv-1.75.0
+      - name: cargo build --workspace
+        run: cargo build --workspace
+        timeout-minutes: 25
+
+  # ---------------------------------------------------------------
+  # fuzz 冒烟：4 个 target 各跑固定时长。崩溃/超时即红，产物作为 artifact。
+  # 与主流程并行，不阻塞构建与发版。
+  # ---------------------------------------------------------------
+  fuzz-smoke:
+    name: fuzz smoke (nightly)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # nightly
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: "fuzz -> fuzz/target"
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: cargo-fuzz
+
+      - name: build fuzz targets
+        working-directory: fuzz
+        run: cargo fuzz build
+        timeout-minutes: 15
+
+      - name: run each target 60s
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+          for t in config_toml http_head frp_v1_frame frp_v2_frame; do
+            echo "== $t =="
+            cargo fuzz run "$t" -- -max_total_time=60 -rss_limit_mb=4096
+          done
+        timeout-minutes: 15
+
+      - name: upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-crash-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
 
   # ---------------------------------------------------------------
   # OpenWrt MIPS（mips / mipsel，24kc）：Tier 3 目标，没有预编译 std。

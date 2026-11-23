@@ -81,9 +81,11 @@
    - 依赖树里 tokio / serde / zerocopy 的 `AtomicU64` 都有
      `cfg(target_has_atomic = "64")` 门控，32 位目标下根本不编译那段；
    - pprof 的 `perfmaps` 特性没开，不会引入 64 位原子。
-   真正的硬阻塞是 `ring 0.17.14`：没有 mips32 的预生成汇编，`build.rs` 也没有
+   ~~真正的硬阻塞是 `ring 0.17.14`：没有 mips32 的预生成汇编，`build.rs` 也没有
    mips 分支，官方不把 32 位 MIPS 列为支持目标。这是 CI 里 MIPS job
-   大概率失败的原因（详见第七节）。
+   大概率失败的原因（详见第七节）。~~
+   **已于 v0.7.10 更正：ring 不是阻塞，MIPS 自 v0.7.10 起正式出包；
+   以文首更正与第七节为准，上面这段只作历史记录保留。**
    排查过 u64→usize 截断：源码里的 `as usize` 来源是 u16/u32 或带 clamp，32 位安全；
    `conn.rs:1636` 的 `i64 as usize` 在测试辅助函数里且长度恒为正，无实际问题。
 

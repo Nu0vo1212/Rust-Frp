@@ -63,7 +63,7 @@ pub async fn add_proxy(
         ));
     }
 
-    // ★★ v0.5.5 修（第四轮 D-AUTH-02）：**面板路径也必须过 RBAC 的逐条代理检查**。
+    // **面板路径也必须过 RBAC 的逐条代理检查**。
     //
     // `sec.check_proxy()`（角色允许的代理类型 / 端口范围 / maxProxies）
     // 原先全仓**唯一**的调用点是客户端发 `NewProxy` 的那条路
@@ -77,10 +77,10 @@ pub async fn add_proxy(
     //   * 面板发 `tcp:12347/12348/12349` ⇒ **三条全部生效**。
     // 即：面板可达时，任何被角色刻意收紧的客户端都能被越权开端口。
     //
-    // 这与第四轮 H1 是**同一类**：同一个语义（"这个客户端能不能注册这条代理"）
+    // 这与 H1 是**同一类**：同一个语义（"这个客户端能不能注册这条代理"）
     // 在两条路径上用了两套规则。修法就是把闸门补到这条路径上。
     //
-    // ★ 放在最前面（问客户端之前）：先拦下来才不会有"客户端已经认下、
+    // 放在最前面（问客户端之前）：先拦下来才不会有"客户端已经认下、
     //   服务端却拒绝"的半成品状态。
     let sec = registry.security();
     let role = sec
@@ -121,7 +121,7 @@ pub async fn add_proxy(
             }
             let remote = outcome.remote_addr;
             tracing::info!(%run_id, proxy = %name, remote = %remote, "面板新增代理成功");
-            // ★★ v0.6.1 修（Shannon 审计）：**面板下发的增删也要进审计链**。
+            // **面板下发的增删也要进审计链**。
             // 原先只有 `serve.rs` 里"客户端自己注册"那条记 `PROXY_ADD`，
             // 面板这条路（走 `ServerCmd`）一条都没记 —— 审计里看不到管理操作。
             registry.audit().record(
@@ -169,7 +169,7 @@ pub async fn remove_proxy(registry: &Arc<Registry>, run_id: &str, name: &str) ->
 
     // 服务端这侧：端口 / 域名 / visitor 全摘掉（与客户端主动 CloseProxy 同款清理）
     //
-    // ★★ v0.5.6 修（审计总报告 M5，中危）：**前缀必须幂等**（strip 再 add）。
+    // **前缀必须幂等**（strip 再 add）。
     //
     // 面板传进来的 `name` 是**线上全名**（带 `{user}.` 前缀，因为它是从
     // `/api/status` / `/api/v2/proxies` 列表里读出来的，那些地方展示的就是全名）。
@@ -184,18 +184,18 @@ pub async fn remove_proxy(registry: &Arc<Registry>, run_id: &str, name: &str) ->
     // * 但**客户端侧**用的是原始名（下面发的是 `name`）⇒ 客户端**真的删成功了**；
     // * 返回文案还说"已移除" —— 与真实状态不符。
     //
-    // ★ 服务端直连那条路径（`serve.rs` 的 `NewProxy` 处理）一直是
+    // 服务端直连那条路径（`serve.rs` 的 `NewProxy` 处理）一直是
     //   `add_user_prefix(user, strip_user_prefix(user, name))` 的幂等写法，
     //   面板这条路漏了那半截。现在抽成 `canonical_wire_name()` 让两处共用。
     let wire_name = nfrp_common::util::canonical_wire_name(&client.user, name);
-    // ★ v0.5.5（第四轮 B-1）：同样带上归属，避免误删其它租户的同名 visitor 记录。
+    // 同样带上归属，避免误删其它租户的同名 visitor 记录。
     registry.visitors.remove(&client, &wire_name);
     if let Some(t) = registry.vhosts() {
-        // ★ v0.5.5（第四轮 H1）：带上是**哪个客户端**的代理 ——
+        // 带上是**哪个客户端**的代理 ——
         //   只按名字摘会误删其它租户的同名路由。
         t.remove_proxy(&client, &wire_name);
     }
-    // ★★ v0.5.6 修（审计总报告 M8，中危）：`proxies_active.dec()` 必须**只在本客户端
+    // `proxies_active.dec()` 必须**只在本客户端
     //   确实持有这条代理时**执行。
     //
     // 原先它是无条件执行的 —— 于是任何客户端反复发 `CloseProxy`（或面板反复删
@@ -211,7 +211,7 @@ pub async fn remove_proxy(registry: &Arc<Registry>, run_id: &str, name: &str) ->
     // 客户端那侧：失败也只是它表里多留一条（服务端已经不放流量进来了），
     // 所以这里只告警、不回滚
     //
-    // ★ v0.5.8 修（第八轮审计 F8-L2，低危）：下发给客户端的是**本地名**。
+    // 下发给客户端的是**本地名**。
     //
     // 面板列表（`/api/status`、`/api/v2/proxies`）展示的是线上全名
     // `{user}.{name}`，管理员照抄列表里的全名来删是最自然的用法。原先这里
@@ -238,7 +238,7 @@ pub async fn remove_proxy(registry: &Arc<Registry>, run_id: &str, name: &str) ->
     {
         Ok(()) => {
             tracing::info!(%run_id, proxy = %name, "面板移除代理成功");
-            // ★★ v0.6.1 修（Shannon 审计）：面板下发的删除也进审计链（同上）。
+            // 面板下发的删除也进审计链（同上）。
             registry.audit().record(
                 crate::audit::AuditEvent::new(crate::audit::kind::ADMIN_ACTION, true)
                     .client(run_id.to_string())
@@ -258,7 +258,7 @@ pub async fn kick(registry: &Arc<Registry>, run_id: &str, reason: &str) -> Admin
     // 先查 allowManage 再 remove —— `remove` 会把客户端从名册里摘掉，
     // 摘掉之后就再也查不到它属于哪个角色了。
     //
-    // ★ 这一条尤其要紧：`kick` 不像 `add_proxy` / `remove_proxy` 那样要经
+    // 这一条尤其要紧：`kick` 不像 `add_proxy` / `remove_proxy` 那样要经
     // 客户端回执，它**无条件生效**。面板零鉴权的配置下，匿名者能踢掉任意
     // 客户端（含官方 frpc），是共享 frps 上的直接 DoS，所以这层角色闸门
     // 必须在最前面。
@@ -277,7 +277,7 @@ pub async fn kick(registry: &Arc<Registry>, run_id: &str, reason: &str) -> Admin
     client.stop();
     registry.release_ports_of(&client);
     tracing::warn!(%run_id, %reason, "面板踢出客户端");
-    // ★★ v0.6.1 修（Shannon 审计，低危）：**踢人必须进审计链**。
+    // **踢人必须进审计链**。
     //
     // 原先只有 `tracing::warn!` —— 日志和审计是两条不同的链：
     // 日志会轮转/被删，审计是 `[audit]` 配置下独立的 JSONL，用于事后追责。
@@ -403,7 +403,7 @@ mod tests {
         assert!(kick(&r, "c1", "").await.is_err());
     }
 
-    /// ★★ v0.6.1 回归（Shannon 审计，低危）：**踢人必须写进审计链。**
+    /// **踢人必须写进审计链。**
     ///
     /// # 原先的问题
     ///
@@ -472,7 +472,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 第四轮 D-AUTH-02：面板路径也要过 RBAC
+    // -02：面板路径也要过 RBAC
     // ------------------------------------------------------------------
 
     /// 造一个"角色把类型收紧到只允许 http"的注册表。
@@ -493,7 +493,7 @@ maxProxies = 1
         r
     }
 
-    /// ★★ D-AUTH-02 回归：**面板下发**同样受 RBAC 的类型限制。
+    /// D-AUTH-02 回归：**面板下发**同样受 RBAC 的类型限制。
     ///
     /// 修复前 `sec.check_proxy` 只在客户端 `NewProxy` 那条路上调用，
     /// 面板路径只查 `allow_manage` ⇒ 角色收紧的客户端可被面板越权开端口
@@ -522,7 +522,7 @@ maxProxies = 1
         );
     }
 
-    /// ★★ D-AUTH-02 回归：**面板下发**同样受 RBAC 的端口范围限制。
+    /// D-AUTH-02 回归：**面板下发**同样受 RBAC 的端口范围限制。
     #[tokio::test]
     async fn 面板下发必须受_rbac_端口范围限制() {
         let r = registry_with_guest_role();
@@ -544,7 +544,7 @@ maxProxies = 1
         assert!(!e.is_empty(), "应当给出拒绝理由：{e}");
     }
 
-    /// ★ v0.5.8（第八轮审计 F8-L2，低危）回归：面板传**线上全名**时，
+    /// 面板传**线上全名**时，
     /// 下发给客户端的必须剥成**本地名**。
     ///
     /// 客户端按本地表（键 = 配置/动态添加时的原始名）查名字，收到

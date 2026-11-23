@@ -235,7 +235,7 @@ async fn handshake_once(
     let declared = msg::NfrpCaps {
         udp_binary: cfg.private_caps,
         server_cmd: cfg.private_caps,
-        // ★ v0.5.5（第四轮 A-1）：**无条件**声明"我的工作连接会带凭证"。
+        // **无条件**声明"我的工作连接会带凭证"。
         //
         // 这不是一个可选优化，而是客户端**真实行为**的声明：客户端
         // 一直都在工作连接上发 `auth_key(token, ts)`（`conn.rs` 的
@@ -312,7 +312,7 @@ pub(crate) async fn run_session(deps: SessionDeps) -> Result<()> {
     let handshake = async {
         match handshake_once(&cfg, &link, &token_source, &nlink, true).await {
             Ok(v) => Ok(v),
-            // ★ 自动回退：对端不认 preamble 时（官方 frps 会把 `NFRPLNK1` 当成
+            // 自动回退：对端不认 preamble 时（官方 frps 会把 `NFRPLNK1` 当成
             //   v1 消息头直接报错），立刻用标准模式重连一次。用户只会在日志里
             //   看到一行 warn，隧道照常工作。
             Err(e) if nlink.want_preamble() => {
@@ -414,7 +414,7 @@ pub(crate) async fn run_session(deps: SessionDeps) -> Result<()> {
     // 重建会把界面上刚加进去的代理抹掉。
     for p in &cfg.proxies {
         let mut msg = NewProxy::from_config(p, &cfg.user);
-        // ★ 官方语义：`[transport].useEncryption` 是**客户端级**开关，作用于所有代理。
+        // 官方语义：`[transport].useEncryption` 是**客户端级**开关，作用于所有代理。
         // 代理级字段是 NFRP 的扩展（允许单条代理单独开），两者取或。
         // 服务端就是按这个字段决定要不要解密/解压的，漏传会导致"客户端加密、
         // 服务端明文透传"—— 用户看到的是能连上但数据全乱。

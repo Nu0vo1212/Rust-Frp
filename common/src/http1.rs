@@ -26,7 +26,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// 超过就当这条请求已经读完 —— 真发这么大的头，多半是打错了协议或者在被扫描，
 /// 没必要为了把它读完而吃内存。
 ///
-/// ★★ v0.5.6 修（审计总报告 L8，低危）：**不再单独定义**，改为复用
+/// **不再单独定义**，改为复用
 /// [`crate::http_relay::MAX_HEAD`]。
 ///
 /// 原先这里是 `32 * 1024`，而 `http_relay::MAX_HEAD` 是 `64 * 1024` ——
@@ -63,7 +63,7 @@ impl Request {
         header_in_head(&self.head, name)
     }
 
-    /// 取某个头的**全部**同名值（v0.5.4，L7）。
+    /// 取某个头的**全部**同名值。
     ///
     /// `header()` 只返回第一个。凡是"必须逐条校验"的语义（比如 `Origin`）
     /// 都要用这个 —— 否则攻击者发两个同名头、中间层取后一个时，
@@ -98,7 +98,7 @@ fn header_in_head(head: &str, name: &str) -> Option<String> {
     None
 }
 
-/// 取某个头的**全部**同名值（v0.5.4，L7）。顺序与报文中出现的一致。
+/// 取某个头的**全部**同名值。顺序与报文中出现的一致。
 fn headers_all_in_head(head: &str, name: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in head.split("\r\n").skip(1) {
@@ -491,7 +491,7 @@ mod tests {
         writer.await.unwrap();
     }
 
-    /// ★★ v0.5.4 回归（L7）：必须能枚举**全部**同名头。
+    /// （L7）：必须能枚举**全部**同名头。
     ///
     /// `header()` 只返回第一个。若某处只查第一个 `Origin`，攻击者发两个
     /// （一个本机、一个跨站）就可能让"我们放行、对方认为是跨站"。
@@ -536,7 +536,7 @@ mod tests {
 
 #[cfg(test)]
 mod max_head_tests {
-    /// ★★ v0.5.6 回归（审计总报告 L8）：`MAX_HEAD` **只能有一个真源**。
+    /// `MAX_HEAD` **只能有一个真源**。
     ///
     /// 修复前这里是独立的 `32 * 1024`，而 `http_relay::MAX_HEAD` 是 `64 * 1024`
     /// —— **同名、同语义、两处取值不同**。虽然两条路径无交叉（不构成绕过），

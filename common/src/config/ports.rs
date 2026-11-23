@@ -70,7 +70,7 @@ impl std::fmt::Display for PortRange {
 /// 命令行 `--allow_ports` 里出现。这里两种都收 —— 用户把
 /// `allow_ports = 1000-2000,3000` 从 frps.ini 抄到 frps.toml 时不会撞墙。
 ///
-/// ★ 每一项用 [`PortSpec`]（自己实现 `deserialize_any`）而**不是**
+/// 每一项用 [`PortSpec`]（自己实现 `deserialize_any`）而**不是**
 ///   `#[serde(untagged)]`：untagged 会把内层错误整个吞掉，只留下一句
 ///   "data did not match any variant"，于是"区间反了"这种能一句话说清的
 ///   配置错误，用户要查半天。自实现 visitor 后错误信息可以原样透出。

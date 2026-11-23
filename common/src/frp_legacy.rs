@@ -168,7 +168,7 @@ fn split_key_value(line: &str) -> Option<(&str, &str)> {
 /// 判定规则与 `pkg/config/load.go: DetectLegacyINIFormat` **完全一致**：
 /// 能被 INI 解析，且存在 `[common]` 段。
 ///
-/// ★ 注意官方是**先嗅探 INI、再考虑 TOML**（`LoadClientConfigResult` 里第一个分支
+/// 注意官方是**先嗅探 INI、再考虑 TOML**（`LoadClientConfigResult` 里第一个分支
 /// 就是它），所以一份"恰好有 `[common]` 段"的 TOML 也会被当成 INI —— 我们保持
 /// 同样的顺序，不做"更聪明"的判断，否则两边行为会分叉。
 pub fn is_legacy_ini(text: &str) -> bool {
@@ -193,7 +193,7 @@ pub fn parse_ini(text: &str) -> Option<Ini> {
             if name.is_empty() {
                 return None;
             }
-            // ★★ v0.5.6 修（审计总报告 M4，中危）：**段名统一小写**。
+            // **段名统一小写**。
             //
             // 官方 frp 用 `go-ini` 解析，它把段名与键名都做了 `strings.ToLower`
             // （见 `ini.LoadSources` 的 `strings.ToLower(k)`）。而这里原先
@@ -221,20 +221,20 @@ pub fn parse_ini(text: &str) -> Option<Ini> {
             return None;
         }
 
-        // ★★ v0.5.6 修（审计总报告 M4，中危）：**键名统一小写**。
+        // **键名统一小写**。
         //
         // 同段名那条：官方 `go-ini` 对键名也做 `strings.ToLower`。
         // 而这里原先严格区分大小写，于是 `admin_addr` / `Admin_Addr` /
         // `ADMIN_ADDR` 只有一种写法能生效。
         //
-        // ★ 特别注意**安全键**：`authentication_method`、`privilege_token`、
+        // 特别注意**安全键**：`authentication_method`、`privilege_token`、
         //   `tls_enable` 这些键名写错大小写时，取值返回 `None` ⇒
         //   落到各自的默认值 ⇒ **安全配置静默失效**，而配置看起来"配了"。
         //   这与 TOML 路径的 `deny_unknown_fields`（拼错就报错）
         //   形成鲜明对比 —— INI 路径既大小写敏感、又不报未知键，
         //   两个特性叠加就成了"静默失效"的温床。
         //
-        // ★ 段名与键名现在都小写；`.truncate` 前的 `key` 已由
+        // 段名与键名现在都小写；`.truncate` 前的 `key` 已由
         //   `split_key_value` 做过 trim。这里再做一次 `to_ascii_lowercase`
         //   是幂等的，对已是小写的输入零影响。
         let key = key.to_ascii_lowercase();
@@ -382,7 +382,7 @@ fn common_section_to_table(sec: &IniSection, out: &mut toml::Table) -> Result<()
     put_int(out, sec, "heartbeat_interval", "heartbeat_interval")?;
     put_int(out, sec, "heartbeat_timeout", "heartbeat_timeout")?;
     put_int(out, sec, "reconnect_interval", "reconnect_interval")?;
-    // 连接服务端的超时与本机出口绑定（限制①批次1 实现；官方 legacy 同名键，
+    // 连接服务端的超时与本机出口绑定（官方 legacy 同名键，
     // 见 `legacy/conversion.go` 的 `out.Transport.DialServerTimeout` /
     // `ConnectServerLocalIP` 两行）。
     put_int(out, sec, "dial_server_timeout", "dial_server_timeout")?;
@@ -392,7 +392,7 @@ fn common_section_to_table(sec: &IniSection, out: &mut toml::Table) -> Result<()
         "connect_server_local_ip",
         "connect_server_local_ip",
     );
-    // TCP keepalive / yamux 保活（限制①批次2 实现；官方 legacy 同名键，
+    // TCP keepalive / yamux 保活（官方 legacy 同名键，
     // 见 `legacy/conversion.go` 的 `out.Transport.DialServerKeepAlive` /
     // `TCPMuxKeepaliveInterval` 两行）。
     put_int(out, sec, "dial_server_keepalive", "dial_server_keepalive")?;
@@ -419,12 +419,12 @@ fn common_section_to_table(sec: &IniSection, out: &mut toml::Table) -> Result<()
     // NFrp 叫 `transport_protocol`（只实现了 tcp / quic）。
     put_str(out, sec, "protocol", "transport_protocol");
 
-    // ★ frp legacy 的 `tls_enable` 默认 **true**（v0.50 起），NFrp 自身默认 false。
+    // frp legacy 的 `tls_enable` 默认 **true**（v0.50 起），NFrp 自身默认 false。
     //   缺省时必须显式补 true，否则樱花那种不写 tls_enable 的配置会变成明文握手。
     let tls_enable = bool_or(sec, "tls_enable", true)?;
     out.insert("tls_enable".to_string(), Value::Boolean(tls_enable));
 
-    // ★ `disable_custom_tls_first_byte` 默认 true，而 NFrp 的
+    // `disable_custom_tls_first_byte` 默认 true，而 NFrp 的
     //   `tls_custom_first_byte` **语义相反**，所以取反后写。
     let disable_first_byte = bool_or(sec, "disable_custom_tls_first_byte", true)?;
     out.insert(
@@ -766,7 +766,7 @@ pub fn legacy_client_to_value(text: &str) -> Result<Value> {
     for sec in &sections {
         // `DEFAULT`（段前裸键）与 `common` 不是代理；`range:` 已被展开
         //
-        // ★ v0.5.6（M4）：段名从本版起统一小写，所以这里必须用小写的
+        // 段名从本版起统一小写，所以这里必须用小写的
         //   `"default"` —— 否则段前的裸键会被**当成一个代理**去加载。
         if sec.name == "common" || sec.name == "default" || sec.name.starts_with("range:") {
             continue;
@@ -819,7 +819,7 @@ pub fn legacy_server_to_value(text: &str) -> Result<Value> {
     let out = &mut root;
 
     put_str(out, common, "bind_addr", "bind_addr");
-    // 数据面监听地址（限制①批次1；官方 `conversion.go:111`：
+    // 数据面监听地址（官方 `conversion.go:111`：
     // `out.ProxyBindAddr = conf.ProxyBindAddr`）。
     put_str(out, common, "proxy_bind_addr", "proxy_bind_addr");
     put_int(out, common, "bind_port", "bind_port")?;
@@ -830,11 +830,11 @@ pub fn legacy_server_to_value(text: &str) -> Result<Value> {
     put_str(out, common, "subdomain_host", "subdomain_host");
     put_bool(out, common, "tcp_mux", "tcp_mux")?;
     put_int(out, common, "heartbeat_timeout", "heartbeat_timeout")?;
-    // 等用户连接配工作连接的超时 + 单客户端空闲池上限（限制①批次1；
+    // 等用户连接配工作连接的超时 + 单客户端空闲池上限（
     // 官方 `conversion.go:140/147`）。
     put_int(out, common, "user_conn_timeout", "user_conn_timeout")?;
     put_int(out, common, "max_pool_count", "max_pool_count")?;
-    // yamux 保活间隔 + 主端口 TCP keepalive（限制①批次2；
+    // yamux 保活间隔 + 主端口 TCP keepalive（
     // 官方 `conversion.go:145/146`）。
     put_int(
         out,
@@ -849,7 +849,7 @@ pub fn legacy_server_to_value(text: &str) -> Result<Value> {
     // ---- 虚拟主机 ----
     put_int(out, common, "vhost_http_timeout", "vhost_http_timeout")?;
     put_str(out, common, "custom_404_page", "custom_404_page");
-    // tcpmux：★ INI 里的键是 `tcpmux_httpconnect_port`（`http` 与 `connect`
+    // tcpmux： INI 里的键是 `tcpmux_httpconnect_port`（`http` 与 `connect`
     // 之间**没有**下划线），照 TOML 的 `tcpmux_http_connect_port` 去查会一个都
     // 匹配不到 —— 于是老 frps.ini 的 tcpmux 端口被静默丢掉，tcpmux 代理全部注册失败。
     put_int(
@@ -862,7 +862,7 @@ pub fn legacy_server_to_value(text: &str) -> Result<Value> {
 
     // ---- 端口管控（安全相关）----
     //
-    // ★ 官方这里写的是 `out.AllowPorts, _ = types.NewPortsRangeSliceFromString(...)`
+    // 官方这里写的是 `out.AllowPorts, _ = types.NewPortsRangeSliceFromString(...)`
     //   —— 解析错误被**吞掉**，AllowPorts 变成空集合，语义正好是"所有端口都允许"。
     //   一份把 `allow_ports = 22,3306` 写错一个字符的 frps.ini，在官方那边会
     //   **静默放开全部端口**。这里反过来：解析失败直接报错，绝不降级成"不限制"。
@@ -930,7 +930,7 @@ mod tests {
     use super::*;
     use crate::config::{parse_client, parse_client_toml, parse_server};
 
-    /// 限制①批次1：legacy INI 里的新字段（官方同名键）要能搬进来 ——
+    /// legacy INI 里的新字段（官方同名键）要能搬进来 ——
     /// 客户端 `dial_server_timeout` / `connect_server_local_ip` /
     /// `disable_log_color`，服务端 `proxy_bind_addr` / `user_conn_timeout` /
     /// `max_pool_count` / `disable_log_color`。
@@ -962,7 +962,7 @@ disable_log_color = true
         assert!(cfg.disable_print_color);
     }
 
-    /// 限制①批次2：keepalive 组在 legacy INI 里的同名键也要能搬进来 ——
+    /// keepalive 组在 legacy INI 里的同名键也要能搬进来 ——
     /// 客户端 `dial_server_keepalive` / `tcp_mux_keepalive_interval`，
     /// 服务端 `tcp_mux_keepalive_interval` / `tcp_keepalive`。
     #[test]
@@ -1030,7 +1030,7 @@ remote_port = 27064
 
         assert_eq!(cfg.proxies.len(), 1);
         let p = &cfg.proxies[0];
-        // ★ v0.5.6（审计总报告 M4）：段名现在**统一小写**。
+        // 段名现在**统一小写**。
         //
         // 这份 INI 里写的是 `[MCCC]`，而官方 frp 用 `go-ini` 解析 ——
         // go-ini 对段名做 `strings.ToLower`，`SectionStrings()` 返回的就是
@@ -1044,7 +1044,7 @@ remote_port = 27064
         assert_eq!(p.remote_port, 27064);
     }
 
-    /// ★★ v0.5.6 回归（审计总报告 M4）：INI 的**段名与键名必须大小写不敏感**。
+    /// INI 的**段名与键名必须大小写不敏感**。
     ///
     /// 官方 `go-ini` 对两者都做 `strings.ToLower`，而 NFrp 原先严格区分大小写
     /// ⇒ 同一份配置在两个实现里行为不同，而且是**静默失效**
@@ -1071,7 +1071,7 @@ remote_port = 27064
             assert_eq!(cfg.proxies[0].name, "proxy", "代理名统一小写");
         }
 
-        // ★ 安全键的拼写变体：`tls_enable` 写错大小写时原先会静默走默认值
+        // 安全键的拼写变体：`tls_enable` 写错大小写时原先会静默走默认值
         let text = "[common]\nserver_addr = x\nTLS_Enable = true\n";
         let cfg = parse_client(text).expect("应能解析");
         assert!(cfg.tls_enable, "TLS_Enable 必须等同于 tls_enable");
@@ -1088,7 +1088,7 @@ remote_port = 27064
             cfg.proxies.iter().map(|p| &p.name).collect::<Vec<_>>()
         );
 
-        // ★ 大小写不敏感的核心价值：**同一份配置在官方与 NFrp 上行为一致**。
+        // 大小写不敏感的核心价值：**同一份配置在官方与 NFrp 上行为一致**。
         //   下面这份是"大小写混写"的真实样子，必须完整可用。
         let mixed = "[Common]\nServer_Addr = frp.example.com\nServer_Port = 7000\nLogin_Fail_Exit = false\n\n[Web01]\nTYPE = tcp\nLocal_IP = 127.0.0.1\nLocal_Port = 80\nRemote_Port = 8080\n";
         let cfg = parse_client(mixed).expect("混写大小写的配置必须能解析");
@@ -1102,7 +1102,7 @@ remote_port = 27064
         assert_eq!(cfg.proxies[0].remote_port, 8080);
     }
 
-    /// ★ 关键默认值：INI 不写 `tls_enable` 时，官方 frpc 是**开 TLS** 的
+    /// 关键默认值：INI 不写 `tls_enable` 时，官方 frpc 是**开 TLS** 的
     /// （v0.50 起默认 true），而 NFrp 自身默认 false。
     /// 不显式补这一项，樱花这种配置就会明文握手、被服务端拒掉。
     #[test]

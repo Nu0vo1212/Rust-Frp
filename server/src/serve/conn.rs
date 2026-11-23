@@ -48,7 +48,7 @@ const YAMUX_VERSION_BYTE: u8 = 0x00;
 /// 探测首字节的超时时间。
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// **整个登录握手**的总超时（v0.5.4，M6）。
+/// **整个登录握手**的总超时。
 ///
 /// `PROBE_TIMEOUT` 只作用在每次 `read` 上 ⇒ 对端每 9 秒发一个字节就能
 /// 无限期挂住一条**未认证**的连接（slowloris）。而 `max_clients` 要等登录
@@ -188,7 +188,7 @@ pub(super) async fn handle_stream(
         if first[0] == YAMUX_VERSION_BYTE {
             // yamux 会话：每个 stream 都是一条独立的 frp 连接
             let session_authed: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
-            // yamux 保活（限制①批次2，官方 `tcpMuxKeepaliveInterval`）：0 = 关闭。
+            // yamux 保活：0 = 关闭。
             let mut acceptor = frp::mux::serve(
                 Box::pin(PrefixedStream::new(vec![first[0]], stream)),
                 frp::mux::MuxKeepalive::from_secs(cfg.tcp_mux_keepalive_interval),
@@ -217,7 +217,7 @@ pub(super) async fn handle_stream(
                     });
                     continue;
                 }
-                // ★★ C9-3 复验补强：**未认证会话先取名额、再 spawn**。
+                // C9-3 复验补强：**未认证会话先取名额、再 spawn**。
                 //
                 // spawn 那一刻就按 future 大小分配内存（实测 ~9 KiB/条）——
                 // 第一版闸门放在任务体内，攻击者 11264 条流照样全量 spawn，
@@ -284,7 +284,7 @@ pub(super) async fn handle_frp_stream(
         anyhow::bail!("连接被拒绝");
     }
 
-    // (1.5) 未认证握手的全局并发闸（第九轮 C9-3）。
+    // (1.5) 未认证握手的全局并发闸。
     //
     // 放在 ACL 之后：被白黑名单拒掉的连接不该占名额；
     // 放在握手之前：让"读 Login 前的缓冲 + 任务"也计入闸门。
@@ -320,11 +320,11 @@ pub(super) async fn handle_frp_stream(
             e.to_string()
         })
     };
-    // ★ 取一份当前认证校验器传给握手（`sec.auth()` 是短锁读快照）——
+    // 取一份当前认证校验器传给握手（`sec.auth()` 是短锁读快照）——
     //   OIDC 的 JWKS 可能是启动后才刷新成功的，不能在这里缓存旧值。
     let auth_snapshot = sec.auth();
 
-    // ★★ v0.5.4 修 M6：给**整个握手**加总超时，而不只是探测阶段。
+    // 给**整个握手**加总超时，而不只是探测阶段。
     //
     // 原先只有 `PROBE_TIMEOUT`（10s）作用在**每次 read** 上，而握手本身
     // （读 Login → 认证 → 回 LoginResp）没有任何总时限。攻击者只要每 9 秒
@@ -335,7 +335,7 @@ pub(super) async fn handle_frp_stream(
     // 取 30s：正常客户端握手是毫秒级（本地实测 ~2ms），30s 足够覆盖
     // 高延迟链路 + OIDC 首次验签（JWKS 已在启动时预热）。超时即断开，
     // 对合法用户无任何可感知影响。
-    // ★ v0.5.6（M3）：把登录时间戳窗口传进握手（0 = 关闭校验）。
+    // 把登录时间戳窗口传进握手（0 = 关闭校验）。
     let plugins = registry.plugins();
     let nlink_mask = registry.nlink().enabled_mask();
     let handshake = conn::server_handshake_authz_ext(
@@ -349,7 +349,7 @@ pub(super) async fn handle_frp_stream(
         nlink_mask,
     );
     let hs_result = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await;
-    // ★ C9-3：认证阶段到此结束（成功/失败/超时都算），立刻释放未认证名额 ——
+    // 认证阶段到此结束（成功/失败/超时都算），立刻释放未认证名额 ——
     //   之后的会话流量不计入闸门；免闸门（Bypassed）时本来就没有名额可释放。
     drop(preauth_permit);
     match hs_result {
@@ -371,7 +371,7 @@ pub(super) async fn handle_frp_stream(
                 udp_binary,
                 caps,
             }) => {
-                // ★ C9-3 复验补强：认证通过 ⇒ 本 mux 会话标记"已认证"，
+                // C9-3 复验补强：认证通过 ⇒ 本 mux 会话标记"已认证"，
                 //   其后续工作流不再占用未认证并发名额（每条仍各自握手）。
                 if let Some(f) = &session_authed {
                     f.store(true, Ordering::Relaxed);
@@ -425,7 +425,7 @@ pub(super) async fn handle_frp_stream(
                 }
                 debug!("握手失败：{e:#}");
 
-                // ★★ v0.5.6 修（审计总报告 L10，低危）：**登录失败时重试拉 JWKS**。
+                // **登录失败时重试拉 JWKS**。
                 //
                 // `guard.rs` 的 `refresh_oidc` 文档一直承诺"之后每次登录失败都会
                 // 重新尝试拉取（见 serve.rs 的登录失败路径）"—— 但**那句承诺是假的**：
@@ -436,7 +436,7 @@ pub(super) async fn handle_frp_stream(
                 // 而且**永远不会自愈** —— 即使 IdP 几秒后就恢复了，
                 // 也必须重启服务端。运维看到的是"IdP 明明好的，就是登不上"。
                 //
-                // ★ 只在 OIDC 未就绪时才尝试（`refresh_oidc` 自身是幂等的，
+                // 只在 OIDC 未就绪时才尝试（`refresh_oidc` 自身是幂等的，
                 //   已是 Oidc 状态会立刻返回）。放在这里而不是每条连接都试，
                 //   是因为"登录失败"才是"可能需要刷新"的信号。
                 if matches!(

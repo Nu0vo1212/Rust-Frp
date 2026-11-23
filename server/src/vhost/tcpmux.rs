@@ -141,7 +141,7 @@ pub(super) async fn handle_tcpmux(
     };
 
     if !route.http_user.is_empty() {
-        // ★ 常量时间比较（v0.5.3 修）。
+        // 常量时间比较。
         //
         // 这里原来写的是 `user.as_deref() == Some(...)` —— 与同文件 815 行那段
         // HTTP 路径的口径不一致，是上一轮「凭据一律常量时间比较」修复**唯一漏掉**的一处。
@@ -198,7 +198,7 @@ pub(super) async fn handle_tcpmux(
         io.stream.write_all(CONNECT_OK).await?;
         io.stream.flush().await?;
     }
-    // ★ 关键：客户端**没等 200 就把数据发过来**时（curl 之外不少客户端会这样），
+    // 关键：客户端**没等 200 就把数据发过来**时（curl 之外不少客户端会这样），
     //   这些字节已经被 `read_head` 预读进缓冲了。下一步是直接对着底层流对拷，
     //   不会再经过缓冲，所以必须显式补到上游 —— 官方在非透传模式下会丢掉它们。
     let prefetched = io.take_buffered();
@@ -251,13 +251,13 @@ mod tests {
         );
     }
 
-    /// ★ 回归：兜底路由（没配 `routeByHTTPUser`）不能盖掉精确用户名匹配的路由。
+    /// 回归：兜底路由（没配 `routeByHTTPUser`）不能盖掉精确用户名匹配的路由。
     ///
     /// 官方 tcpmux 的 "Route by HTTP user" 用例就是这个拓扑：同一个域名上挂
     /// `user1` / `user2` 两条精确路由 + 一条兜底路由。早先 `lookup` 只按
     /// "最长前缀、平手取先注册" 选，兜底路由只要先注册就会把两条精确路由全吃掉。
     ///
-    /// ★ v0.5.6（审计总报告 M1）：三条路由必须同属**一个客户端** ——
+    /// 三条路由必须同属**一个客户端** ——
     ///   跨租户的多作用域现在一律算冲突（服务端分辨不出合法多作用域与寄生劫持）。
     #[test]
     fn tcpmux_兜底路由不能盖掉精确用户名路由() {

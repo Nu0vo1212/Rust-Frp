@@ -160,7 +160,7 @@ impl Tun {
             return Err(e);
         }
 
-        // ★ v0.6.4：`AsyncFd::new` 在 tokio 1.54 起被标记为 **deprecated**，
+        // `AsyncFd:new` 在 tokio 1.54 起被标记为 **deprecated**，
         //   理由是「unsound due to lack of I/O safety」（tokio PR #8587）。
         //
         //   官方替代品是 `unsafe fn register`。为什么它是 unsafe：
@@ -431,7 +431,7 @@ impl AsyncWrite for Tun {
 /// ⇒ `0x400454ca`。直接写常量而不是引 `libc` 的宏，是因为 libc 里这个宏
 /// 在部分架构上被定义成函数式的，取值反而更绕。
 ///
-/// ★ **返回类型必须是 `libc::Ioctl`，不能写死 `c_ulong`**：libc 的
+/// **返回类型必须是 `libc::Ioctl`，不能写死 `c_ulong`**：libc 的
 /// `ioctl(fd: c_int, request: Ioctl, ...)` 里 `Ioctl` 是按目标 libc 分的
 /// —— glibc / uclibc 是 `c_ulong`(u64)，**musl 与 android 是 `c_int`(i32)**
 /// （见 libc `unix/linux_like/linux/musl/mod.rs`）。写死 `c_ulong` 时
@@ -503,7 +503,7 @@ mod tests {
     /// 没有 root / 没有 /dev/net/tun 时必须是**清晰的报错**，
     /// 而不是 panic 或者返回一个不能用的设备。
     ///
-    /// ★ 必须开 tokio runtime：有权限的环境（例如云端 root + /dev/net/tun）
+    /// 必须开 tokio runtime：有权限的环境（例如云端 root + /dev/net/tun）
     ///   会一路走到 `AsyncFd::new`，没有 reactor 时那里会直接 panic ——
     ///   这正是这台云机（root）把这颗测试跑红的原因。
     #[tokio::test]

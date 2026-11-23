@@ -254,7 +254,7 @@ pub(super) const SUPPORTED_PROXY_TYPES: &[&str] = &[
 /// 访客类代理的类型清单（**唯一真源** —— 判定请用 [`is_visitor_type`]）。
 pub const SUPPORTED_VISITOR_TYPES: &[&str] = &["stcp", "xtcp", "sudp"];
 
-/// **唯一真源**：这个代理类型是不是"访客类"（v0.5.6 修审计总报告 H3）。
+/// **唯一真源**：这个代理类型是不是"访客类"。
 ///
 /// # 为什么必须抽出来
 ///
@@ -358,7 +358,7 @@ pub fn parse_server_toml(raw: &str) -> Result<ServerConfig> {
     let mut value: toml::Value = toml::from_str(raw)?;
     // 与客户端同理：必须在 normalize **之前**扫（normalize 会改键名）。
     let unsupported = crate::frp_config::unsupported_server_fields(&value);
-    // ★ v0.5.4（M4）：在 normalize **之前**记录"用户有没有显式写过 bind_addr"。
+    // 在 normalize **之前**记录"用户有没有显式写过 bind_addr"。
     //
     // normalize 会把官方键名（`bindAddr` 之类）搬成规范名，所以要在它之前看。
     // 两种写法都算"显式写过"。

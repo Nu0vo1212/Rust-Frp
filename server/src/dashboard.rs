@@ -37,7 +37,7 @@ pub const HEALTHZ_PATH: &str = "/api/healthz";
 /// Prometheus 指标名前缀。
 const METRIC_PREFIX: &str = "nfrp";
 
-/// 面板所有响应都会带的**安全响应头**（v0.6.4，渗透测试 PT-05）。
+/// 面板所有响应都会带的**安全响应头**。
 ///
 /// # 为什么加
 ///
@@ -91,7 +91,7 @@ const MAX_LINE: usize = 8 * 1024;
 /// 取 128 是个很松的值：正常永远碰不到，但足以挡住洪水式连接。
 const MAX_DASHBOARD_CONNS: usize = 128;
 
-/// 读完整请求头的总超时（v0.5.4，L1）。
+/// 读完整请求头的总超时。
 ///
 /// 没有它的话，128 个连接各发一个字节就能长期占满上面那道并发闸门
 /// （slowloris）—— 而面板与业务同进程，会连带拖累业务。
@@ -127,7 +127,7 @@ pub async fn run_with_tls(
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
-                // ★★ v0.5.9 修（第九轮审计 **E9-2**，低危）：**面板也要过 ACL**。
+                // **面板也要过 ACL**。
                 //
                 // # 原先为什么错了
                 //
@@ -158,7 +158,7 @@ pub async fn run_with_tls(
                 // 所以这不是认证绕过，而是**纵深防御缺失**：
                 // 管理员若用 `[acl]` 表达"只允许办公网访问面板"，这个意图会静默落空。
                 //
-                // ★ 与 UDP 那条（E9-0，中危）的区别正在于此：
+                // 与 UDP 那条（E9-0，中危）的区别正在于此：
                 //   **UDP 代理没有别的防线**，面板**有**。
                 //
                 // # 关于 `/api/healthz`（免鉴权探针端点）
@@ -243,7 +243,7 @@ where
     //   鉴权失败的 POST 就正好卡在这条上：面板明明回了 401，客户端却看不到。
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
-    // ★★ v0.5.4 修（L1）：读头阶段加**整体超时**。
+    // 读头阶段加**整体超时**。
     //
     // 原先这个循环没有任何时限 —— 128 个连接各发一个字节就能长期占满
     // 面板的并发闸门（`MAX_DASHBOARD_CONNS`），构成 slowloris。
@@ -287,11 +287,11 @@ where
     let body = body_of(&req);
     let query = query_of(&req);
 
-    // v0.6.4（渗透测试 PT-03）：`HEAD` 只回响应头，不回 body。
+    // `HEAD` 只回响应头，不回 body。
     // 见 [`send`] 的 `head_only` 参数说明。
     let head_only = method == "HEAD";
 
-    // ★ NFRP-13：安全相关头必须唯一。出现两个以上 Authorization
+    // 安全相关头必须唯一。出现两个以上 Authorization
     // 直接当畸形请求拒掉，而不是“取第一个”——否则与前置代理 / WAF 的
     // 取值口径一旦相反，就是鉴权差异（请求走私类问题的典型前提）。
     if unique_header(&req, "authorization").is_err() {
@@ -344,12 +344,12 @@ where
     // 必须比对完整的 `user:password` —— 只比用户名等于把面板敞开，
     // 这里用定长比较，避免通过响应耗时逐字节猜密码。
     //
-    // ★★ v0.5.6 修（审计总报告 H1，纵深防御）：**用户名非空但密码为空
+    // **用户名非空但密码为空
     //   一律按"没有凭据"处理**（`expected` 视为 None）⇒ 走下面的拒绝分支。
     //
     //   为什么不能去比 `"admin:"`：那等于"知道用户名就能进"，
     //   攻击者随手构造一个 `Authorization: Basic YWRtaW46` 就通过了。
-    //   这正是 H1 攻击链的第 ⑤⑥ 步。
+    // 这正是 H1 攻击链的第 ⑤⑥ 步。
     //
     //   注意这条是**纵深防御**：真正的闸门在启动校验与热重载闸门
     //   （它们已经用 `has_dashboard_creds()` 拦住了这种配置）。
@@ -454,7 +454,7 @@ where
             return Ok(());
         }
 
-        // ★ v0.6.4（渗透测试 PT-07）：**未匹配的 POST 一律 405**。
+        // **未匹配的 POST 一律 405**。
         //
         // 旧行为是落进下面的 `match path`，于是 `POST /api/status` 会命中
         // `"/api/status"` 分支、返回 200 + 完整状态 JSON。那既违反直觉
@@ -566,7 +566,6 @@ where
             }
         }
         "/metrics" => {
-            // ★ v0.6.5（对齐官方 frps 的 `enablePrometheus`）：
             //   官方默认**不开**这个端点，配了 `enablePrometheus = true` 才有
             //   （`server.go`："EnablePrometheus will export prometheus metrics
             //   on {dashboard_addr}:{dashboard_port}"）。
@@ -614,7 +613,6 @@ where
             .await?;
         }
         "/" | "/index.html" | "/dashboard" => {
-            // ★ v0.6.6（对齐官方 frps 的 `webServer.assetsDir`）：
             // 配了目录就优先用里面的 index.html，否则用内嵌的那份。
             match load_asset(cfg.effective_assets_dir(), "index.html") {
                 Some((body, ctype)) => {
@@ -768,11 +766,11 @@ fn query_of(req: &str) -> String {
 }
 
 fn header_value(req: &str, name: &str) -> Option<String> {
-    // ★ v0.5.8 修（第八轮审计 F8-L1，低危）：只看**头区**，body 行不得参与解析。
+    // 只看**头区**，body 行不得参与解析。
     //
     // `req` 是整个读缓冲的转码（见 `handle` 里的读循环）—— 与请求头同一批
     // 到达的请求体字节也在里面。原先逐行扫描整个缓冲，于是写在 body 里的
-    // `Authorization: Basic ...` 会被当成头参与鉴权（第八轮实测：同段发送
+    // `Authorization: Basic ...` 会被当成头参与鉴权（实测：同段发送
     // 时 control=401 / body 行=200）。这与标准 HTTP 语义、以及上游中间件
     // （反代/WAF/网关只按头区判定）的口径不一致，属解析卫生问题；
     // 按纵深防御收紧到头区（`\r\n\r\n` 之前）。
@@ -787,7 +785,7 @@ fn header_value(req: &str, name: &str) -> Option<String> {
     None
 }
 
-/// 安全相关头：**必须唯一**。重复即为畸形请求（NFRP-13）。
+/// 安全相关头：**必须唯一**。重复即为畸形请求。
 ///
 /// 为什么不能“取第一个就算了”：面板前面经常挂 Nginx / WAF / SSO 网关，
 /// 上游与 NFrp 对“哪个 `Authorization` 生效”理解一旦相反，就是鉴权差异，
@@ -864,7 +862,7 @@ const fn concat_headers_allow() -> [(&'static str, &'static str); SEC_HEADERS.le
 
 /// 写一个完整的 HTTP 响应。
 ///
-/// # `head_only`（v0.6.4，渗透测试 PT-03）
+/// # `head_only`
 ///
 /// `HEAD` 请求**必须只回头、不回头**（RFC 9110 §9.3.2）。
 /// 早先这里无差别地写 body，于是一个 `HEAD /` 会回 10368 字节 HTML。
@@ -925,7 +923,7 @@ where
 // ---------------------------------------------------------------------------
 
 fn status_json(registry: &Registry, snap: &Snapshot) -> String {
-    // ★★ NFRP-05（P0）：不能用 `format!` + `{:?}` 拼 JSON。
+    // （P0）：不能用 `format!` + `{:?}` 拼 JSON。
     //
     // Rust 的 `Debug` 对控制字符输出 **`\u{1}`**（Rust 语法），
     // 而 JSON 只接受 **`\u0001`**（4 位十六进制）。
@@ -1156,7 +1154,6 @@ const KB = 1024, MB = 1024*1024, GB = 1024*1024*1024;
 function bytes(n){ if(n>=GB) return (n/GB).toFixed(2)+' GB'; if(n>=MB) return (n/MB).toFixed(2)+' MB';
   if(n>=KB) return (n/KB).toFixed(1)+' KB'; return n+' B'; }
 function card(k,v){ return `<div class="card"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`; }
-// ★★ v0.5.6 修（审计总报告 H4，高危 · 存储型 XSS）：
 //   `table()` 原先**直接插值单元格**，而单元格里装着攻击者可控的字符串 ——
 //   低权限客户端注册一个名字为 `<img src=x onerror=...>` 的代理，
 //   管理员一打开面板就在**管理员会话**里执行攻击者的脚本
@@ -1199,7 +1196,7 @@ async function refresh(){
       ['客户端', 'user', '代理', '排队', '空闲', '管理'],
       (s.clients||[]).map(c=>[c.client_id, c.user||'-', (c.proxies||[]).join(', ')||'-',
         c.backlog, c.idle_work_conns,
-        // ★ H4：这是**唯一**需要嵌 HTML 的单元格 ⇒ 用 raw() 显式标记，
+        // 这是**唯一**需要嵌 HTML 的单元格 ⇒ 用 raw() 显式标记，
         //   否则会被 esc() 转义成文本、按钮显示不出来。
         //   注意里面的 run_id 仍然要 esc()（它进了 HTML 属性）。
         raw('<button data-kick="'+esc(c.run_id)+'">踢出</button>')]));
@@ -1215,9 +1212,9 @@ async function refresh(){
       ['代理名', '类型', 'provider 用户', 'allow_users'],
       (s.visitors||[]).map(v=>[v.proxy_name, v.type, v.provider_user||'-', (v.allow_users||[]).join(', ')||'同 user']));
   } catch(e) {
-    // ★★ v0.6.1 修（Shannon 审计，加固）：`e` 也要过 `esc()`。
+    // `e` 也要过 `esc()`。
     //
-    // 第五轮 H4 修了 `table()` / `card()` 的转义，**唯独漏了这条 catch 分支**
+    // 修了 `table()` / `card()` 的转义，**唯独漏了这条 catch 分支**
     // —— 又是"防线没铺满"那个模式。
     //
     // # 今天为什么不可利用（如实记录）
@@ -1310,7 +1307,7 @@ mod tests {
         http_req(addr, "GET", path, auth).await
     }
 
-    /// 通用请求（v0.6.4）：可以指定方法，用于测 HEAD / POST 的语义。
+    /// 通用请求：可以指定方法，用于测 HEAD / POST 的语义。
     async fn http_req(
         addr: SocketAddr,
         method: &str,
@@ -1416,7 +1413,7 @@ mod tests {
         assert_eq!(header_value(req, "missing"), None);
     }
 
-    /// ★ v0.5.8（第八轮审计 F8-L1，低危）回归：**body 行不得参与头解析/鉴权**。
+    /// **body 行不得参与头解析/鉴权**。
     ///
     /// 修复前：`Authorization: Basic ...` 只要和请求头**同段到达**（LAN/localhost
     /// 常规如此），即使写在 `Content-Length` 声明的请求体里也会被当成头 →
@@ -1526,17 +1523,17 @@ Authorization: Basic ",
     }
 
     // ==================================================================
-    // v0.5.6 回归（审计总报告 H4）：面板表格必须转义单元格
+    // 面板表格必须转义单元格
     // ==================================================================
 
-    /// ★★ H4 核心回归：`table()` 必须逐个单元格走 `cell()`（默认 `esc()`）。
+    /// H4 核心回归：`table()` 必须逐个单元格走 `cell()`（默认 `esc()`）。
     ///
     /// 修复前它直接 `<td>${c}</td>` 插值，而单元格里装着**攻击者可控**的
     /// 代理名 / 用户名 ⇒ 低权限客户端注册一个名字为
     /// `<img src=x onerror=...>` 的代理，管理员一开面板就在**管理员会话**里
     /// 执行攻击者的脚本（存储型 XSS）⇒ 越权调 `/api/*`。
     ///
-    /// ★ 这里断言的是"接线"，不是"运行时行为"（面板 JS 不在 Rust 测试里跑）。
+    /// 这里断言的是"接线"，不是"运行时行为"（面板 JS 不在 Rust 测试里跑）。
     ///   但接线正是本 bug 的全部内容 —— `esc()` 一直存在，
     ///   只是 `table()` 这条路径没接上。
     #[test]
@@ -1552,7 +1549,7 @@ Authorization: Basic ",
             html.contains("r.map(c=>`<td>${cell(c)}</td>`)"),
             "单元格必须走 cell()（内部默认 esc）"
         );
-        // ★ 反向：绝不能残留"直接插值"的旧写法
+        // 反向：绝不能残留"直接插值"的旧写法
         assert!(
             !html.contains("r.map(c=>`<td>${c}</td>`)"),
             "不得残留未转义的单元格插值（H4）"
@@ -1574,9 +1571,9 @@ Authorization: Basic ",
         // 按钮里的 run_id 自己仍然要转义（它进了 HTML 属性）
         assert!(html.contains("esc(c.run_id)"), "属性里的 run_id 仍须转义");
 
-        // ★★ v0.6.1（Shannon 审计，加固）：**catch 分支里的 `e` 也必须转义**。
+        // **catch 分支里的 `e` 也必须转义**。
         //
-        // 第五轮 H4 修了 `table()` / `card()`，**唯独漏了这条 catch 分支** ——
+        // 修了 `table()` / `card()`，**唯独漏了这条 catch 分支** ——
         // 又是"防线没铺满"那个模式。
         //
         // 今天不可利用（`e` 是本地 JS 的 Error，不是服务端文本），
@@ -1609,7 +1606,7 @@ Authorization: Basic ",
         assert!(out.contains("# TYPE nfrp_conns_active gauge"));
     }
 
-    /// ★ v0.6.5：`enablePrometheus` **默认关闭**（对齐官方 frps）。
+    /// `enablePrometheus` **默认关闭**（对齐官方 frps）。
     ///
     /// 这条防的是"以后有人图方便把默认改回 true"—— 那会重新变成
     /// "只想开面板却默认多暴露一份业务指标"。
@@ -1640,7 +1637,7 @@ Authorization: Basic ",
     }
 
     // ==================================================================
-    // v0.6.4（渗透测试 PT-03 / PT-05 / PT-07）：HTTP 语义与安全响应头
+    // HTTP 语义与安全响应头
     // ==================================================================
 
     /// 起一个真实面板，返回监听地址。测完不用管，测试进程退出即回收。
@@ -1648,7 +1645,7 @@ Authorization: Basic ",
         spawn_dashboard_cfg(ServerConfig::default()).await
     }
 
-    /// 同上，但可以指定 `enable_prometheus`（v0.6.5）。
+    /// 同上，但可以指定 `enable_prometheus`。
     async fn spawn_dashboard_with(prometheus: bool) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         spawn_dashboard_cfg(ServerConfig {
             enable_prometheus: prometheus,
@@ -1657,7 +1654,7 @@ Authorization: Basic ",
         .await
     }
 
-    /// 起一个配了 `assets_dir` 的面板（v0.6.6）。
+    /// 起一个配了 `assets_dir` 的面板。
     async fn spawn_dashboard_with_assets(
         assets_dir: &str,
     ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
@@ -1742,7 +1739,7 @@ Authorization: Basic ",
     }
 
     // ==================================================================
-    // NFRP-05：`/api/status` 必须是合法 JSON
+    // `/api/status` 必须是合法 JSON
     // ==================================================================
 
     /// 远端可控字段带控制字符时，输出**仍然必须是合法 JSON**。
@@ -1794,7 +1791,7 @@ Authorization: Basic ",
     }
 
     // ==================================================================
-    // NFRP-13：重复 Authorization 必须拒绝
+    // 重复 Authorization 必须拒绝
     // ==================================================================
 
     #[test]
@@ -1854,7 +1851,7 @@ Authorization: Basic ",
     }
 
     // ==================================================================
-    // v0.6.6：`assetsDir`（面板静态资源目录）
+    // `assetsDir`（面板静态资源目录）
     // ==================================================================
 
     /// 造一个临时资源目录。
@@ -1898,7 +1895,7 @@ Authorization: Basic ",
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// ★ 目录穿越必须被挡：`../`、绝对路径、盘符一律拒。
+    /// 目录穿越必须被挡：`../`、绝对路径、盘符一律拒。
     #[test]
     fn assets_dir_挡住目录穿越() {
         let d = tmp_assets("trav");
@@ -1962,7 +1959,7 @@ Authorization: Basic ",
         let _ = std::fs::remove_dir_all(&empty);
     }
 
-    /// ★ v0.6.5：`/metrics` 默认关闭时返回 404，并提示怎么开。
+    /// `/metrics` 默认关闭时返回 404，并提示怎么开。
     #[tokio::test]
     async fn metrics_default_is_disabled() {
         let (addr, _h) = spawn_dashboard().await;
@@ -2001,7 +1998,7 @@ Authorization: Basic ",
         );
     }
 
-    /// ★ PT-03：`HEAD` **不得**返回响应体（RFC 9110 §9.3.2）。
+    /// PT-03：`HEAD` **不得**返回响应体（RFC 9110 §9.3.2）。
     ///
     /// 修复前：`HEAD /` 会回 10368 字节 HTML，`HEAD /api/status` 回 659 字节。
     /// 但 `Content-Length` **必须照常是真实 body 长度** —— 那正是 HEAD 的语义。
@@ -2009,7 +2006,7 @@ Authorization: Basic ",
     async fn head_returns_headers_without_body() {
         let (addr, _h) = spawn_dashboard().await;
 
-        // ★ v0.6.5：`/metrics` 已改为默认关闭（`enablePrometheus`），
+        // `/metrics` 已改为默认关闭（`enablePrometheus`），
         //   spawn_dashboard() 用的是默认配置，所以这里不能再断言它 200。
         //   它的 HEAD 语义由 `head_works_on_metrics_when_enabled` 覆盖。
         for path in ["/", "/api/status", "/api/healthz"] {
@@ -2050,7 +2047,7 @@ Authorization: Basic ",
         assert!(body.contains("<html"), "GET / 应当是 HTML 页面");
     }
 
-    /// ★ PT-07：只读端点**不接受 POST**，必须回 405。
+    /// PT-07：只读端点**不接受 POST**，必须回 405。
     ///
     /// 修复前 `POST /api/status` 会落进 `match path` 的只读分支，返回
     /// 200 + 完整状态 JSON —— 只按"200 就算成功"的客户端会误判。
@@ -2079,7 +2076,7 @@ Authorization: Basic ",
         );
     }
 
-    /// ★ PT-05：所有响应都要带安全头。
+    /// PT-05：所有响应都要带安全头。
     #[tokio::test]
     async fn security_headers_on_every_response() {
         let (addr, _h) = spawn_dashboard().await;

@@ -28,7 +28,7 @@ use crate::{
     registry::Registry,
 };
 
-/// 活跃转发连接的**计数守卫**（v0.5.6 修审计总报告 M7）。
+/// 活跃转发连接的**计数守卫**。
 ///
 /// # 为什么用 RAII 而不是手工 `dec()`
 ///
@@ -45,12 +45,12 @@ use crate::{
 /// **单调上涨**（指标不可信，削弱管理员发现异常的能力；**不构成配额绕过**，
 /// 配额走信号量）。
 ///
-/// ★ 关键洞察：这四处**不是四个 bug，是同一个 bug 的四个表现** ——
+/// 关键洞察：这四处**不是四个 bug，是同一个 bug 的四个表现** ——
 ///   "配对的 +1 与结束的 -1 分散在两处，中间任何一条提前返回都会漏掉 -1"。
 ///   手工在每个返回点补 `dec()` 只会把"四处"变成"更多处"，下次加一个
 ///   `?` 又漏。**用 Drop 把 -1 绑到作用域上，就再也不可能漏**。
 ///
-/// ★ 用法：**配对成功那一刻**创建守卫，之后函数怎么返回都无所谓：
+/// 用法：**配对成功那一刻**创建守卫，之后函数怎么返回都无所谓：
 ///
 /// ```ignore
 /// let _guard = ConnGuard::new(&registry);   // +1
@@ -138,7 +138,7 @@ pub async fn bridge(user: PendingUser, work: WorkItem, registry: &Arc<Registry>)
     } = user;
     let mut work_conn = work.conn;
 
-    // ★★ v0.5.6（M7）：**配对成功这一刻**建守卫 ⇒ +1，且保证**只有一次**。
+    // **配对成功这一刻**建守卫 ⇒ +1，且保证**只有一次**。
     //   于是 `admit_user` 与 `handle_work` 里那两处 inc 都不需要了
     //   （它们分别在"用户到达"和"工作连接配对"时各加一次，导致 +2/-1）。
     let guard = ConnGuard::new(registry);
@@ -157,7 +157,7 @@ pub async fn bridge(user: PendingUser, work: WorkItem, registry: &Arc<Registry>)
 
     let (work_stream, leftover) = work_conn.into_stream();
 
-    // ★★ leftover 是 frpc → frps 方向多读到的字节。明文时它就是响应的
+    // leftover 是 frpc → frps 方向多读到的字节。明文时它就是响应的
     // 开头，直接写给用户是对的；但**开了加密/压缩时它是密文前缀**，
     // 直接写给用户会把响应破坏成乱码（实测：用户收到的
     // HTTP 响应长度对不上 / 完全超时）。
@@ -181,7 +181,7 @@ pub async fn bridge(user: PendingUser, work: WorkItem, registry: &Arc<Registry>)
 
     // 无论成功、失败、还是上面某个 `?` 提前返回，`guard` 都会在作用域结束时
     // 归还计数 —— 这就是 RAII 修法的全部价值。
-    // ★ v0.6.6：数据面解密 / 解压（官方 transport.useEncryption / useCompression）
+    // 数据面解密 / 解压（官方 transport.useEncryption / useCompression）
     //
     // 与客户端对称：包在**工作连接**这一侧（work_stream = 到 frpc 的那条），
     // 用户连接（user_stream）保持明文。
@@ -268,12 +268,12 @@ async fn sudp_bridge(
 ) -> Result<()> {
     let mut provider_conn = work.conn;
 
-    // ★★ v0.5.6（M7）：配对成功这一刻建守卫 ⇒ +1，且离开作用域必然 -1。
+    // 配对成功这一刻建守卫 ⇒ +1，且离开作用域必然 -1。
     //   原先 `finish_conn` 只在最后一行调用，而下面 `?` 提前返回时会漏掉
     //   （审计报告指出的 `:1905` / `:1913` 两处）。
     let guard = ConnGuard::new(registry);
 
-    // ★ 与官方 frps 一致：拿到工作连接后**先**发 `StartWorkConn` 告诉客户端
+    // 与官方 frps 一致：拿到工作连接后**先**发 `StartWorkConn` 告诉客户端
     //   "这条连接服务哪个代理"，之后才谈业务帧。
     //   少了这一步，客户端的 `client_work_conn` 还停在等 StartWorkConn，
     //   收到我们的 UdpPacket 只会报"期望 StartWorkConn"并关掉连接 ——
@@ -287,7 +287,7 @@ async fn sudp_bridge(
         .await
         .context("发送 StartWorkConn 失败")?;
 
-    // ★ UDP 编码用每条连接**自己**协商出来的值：visitor 连接在握手时定，
+    // UDP 编码用每条连接**自己**协商出来的值：visitor 连接在握手时定，
     //   provider 工作连接在 `handle_work` 里已从控制会话继承。这里再覆盖一次
     //   （哪怕是"正确"的值）都会与官方 frpc 分叉——它只认协商结果。
     //

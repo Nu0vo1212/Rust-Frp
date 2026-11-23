@@ -37,7 +37,7 @@ use crate::nlink;
 /// 缓冲区上限，避免对端恶意灌数据。
 const MAX_BUFFER: usize = 8 * 1024 * 1024;
 
-/// 解密后明文的缓冲上限（v0.5.4，M6）。
+/// 解密后明文的缓冲上限。
 ///
 /// 与 [`MAX_BUFFER`] 同量级：`plain` 是"已解密、还没被上层取走"的字节，
 /// 正常运行时它几乎是空的（上层每条消息都会取走）。真堆到这个量级
@@ -366,7 +366,7 @@ impl FrpConn {
             writer: AeadWriter::new(&write_key)?,
             reader: AeadReader::new(&read_key)?,
         }));
-        // ★ 已经把**密文**读进 `raw` 的那部分，必须当场解出来。
+        // 已经把**密文**读进 `raw` 的那部分，必须当场解出来。
         //
         // 典型场景：服务端回完 LoginResp（明文）后立刻推数据（NLink 的身份令牌、
         // 续传回执、批量申请）。两次 `write` 经常被合进同一个 TCP 段，于是
@@ -385,7 +385,7 @@ impl FrpConn {
             ControlCrypto::V1(c) => {
                 // v1 是流密码：把缓冲区里所有能解的字节都解出来
                 let pt = c.decrypt(&mut self.raw);
-                // ★★ v0.5.4 修 M6：`plain` 也必须有自己的硬顶。
+                // `plain` 也必须有自己的硬顶。
                 //
                 // 原先只卡了 `raw`（`fill` 里的 MAX_BUFFER），`plain` 完全没有上限。
                 // 后果：**未认证**的连接就能让对端不断喂数据，把已解密明文堆到
@@ -716,7 +716,7 @@ fn build_login(
         arch: std::env::consts::ARCH.to_string(),
         // 官方 frps 用 Login.User 匹配 stcp/xtcp 的 allow_users 白名单
         user: user.to_string(),
-        // ★ 两种认证方式的 privilege_key 语义完全不同：
+        // 两种认证方式的 privilege_key 语义完全不同：
         // token = hex(md5(secret+ts))，OIDC = 原样的 access token。
         // 统一走 Credential 生成，别在这里手写。
         privilege_key: cred.wire_value(ts),
@@ -990,7 +990,7 @@ pub enum ServerAccept {
 /// 服务端握手。**自动探测**对端是 v1 还是 v2（与官方 frps 一致）。
 ///
 /// * `run_id` —— 本次会话的标识，会写进 LoginResp 下发给客户端。
-/// * `max_clock_skew_secs` —— 登录时间戳允许的偏差（0 = 不校验，v0.5.6 M3）。
+/// * `max_clock_skew_secs` —— 登录时间戳允许的偏差（0 = 不校验）。
 pub async fn server_handshake(
     stream: BoxStream,
     auth: &crate::security::AuthProvider,
@@ -1219,7 +1219,7 @@ where
         }
     }
 
-    // ★★ v0.5.6 修（审计总报告 M3，中危）：**先校验时间戳新鲜性**，
+    // **先校验时间戳新鲜性**，
     //   再比凭证。
     //
     // 顺序有讲究：先判时间成本更低，而且能让"过期"与"凭证错"两种失败
@@ -1234,7 +1234,7 @@ where
     // 官方 frpc 的 `Login.Timestamp` 就是发报文时的 unix 时间，
     // 默认 ±300 秒窗口对它**零感知**。
     //
-    // ★★ v0.5.7（第六轮审计 G-1，高危）：**这一步不再单独调用** ——
+    // **这一步不再单独调用** ——
     //   新鲜性校验已经并进 `verify_login` 内部（见那里的长注释）。
     //
     //   为什么并进去：原先它是**独立的一步**，于是"想校验凭证就顺手调一下"
@@ -1292,7 +1292,7 @@ where
     if declared.server_cmd {
         caps.server_cmd = true;
     }
-    // ★ v0.5.5（第四轮 A-1）：回显"工作连接必须带凭证"。
+    // 回显"工作连接必须带凭证"。
     //
     // 这是**服务端对这条会话的期待**，由客户端自己在 Login 里声明
     // （NFrp ≥ 0.5.5 恒声明）。回显之后服务端就知道：这条会话的
@@ -1392,7 +1392,7 @@ pub async fn client_work_conn_with(
     stream: BoxStream,
     version: WireVersion,
     run_id: &str,
-    // ★ 这里必须是 `Credential` 而不是 `&str`：
+    // 这里必须是 `Credential` 而不是 `&str`：
     //   token 模式发 `auth_key(token, ts)` 派生值，OIDC 模式必须发**原始 JWT**
     //   （服务端 OIDC 分支要解析签名与 sub）。0.7.6 及以前固定发派生值，
     //   导致 OIDC 部署下所有工作连接被服务端以「不是合法的 JWT」拒掉 ——
@@ -1769,7 +1769,7 @@ mod tests {
         // ---- v2：首字节是魔术字 ----
         let (mut client, server) = tokio::io::duplex(4096);
         client.write_all(MAGIC_V2).await.unwrap();
-        // ★ 探测要读 max(MAGIC_V2.len(), nlink::MAGIC.len()) = 8 字节，
+        // 探测要读 max(MAGIC_V2.len(), nlink::MAGIC.len()) = 8 字节，
         //   而 MAGIC_V2 只有 7 字节 —— 这里必须补足第 8 字节，否则
         //   `detect_version` 会一直等下一条永远不会来的数据（测试挂死）。
         //   识别只看前 7 字节，所以补什么都行；真机上这字节是帧头第一个字节。
@@ -1971,7 +1971,7 @@ mod tests {
         )
     }
 
-    /// ★★ v0.5.4 回归（M6）：解密缓冲（`plain`）必须有硬顶。
+    /// （M6）：解密缓冲（`plain`）必须有硬顶。
     ///
     /// 原先只卡了 `raw`（8 MiB），`plain` 完全没有上限 ⇒ 一条**未认证**的连接
     /// 就能让对端把已解密明文堆到任意大小，约 1000 条连接即可吃掉数 GB 内存。

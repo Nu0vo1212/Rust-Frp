@@ -30,7 +30,7 @@ use crate::audit::AuditLog;
 
 /// 认证校验器，可**在运行期被替换**。
 ///
-/// ★ v0.5.3 修：这里原来是裸的 `AuthProvider`（普通字段 + 外层 `Arc<SecurityContext>`），
+/// 这里原来是裸的 `AuthProvider`（普通字段 + 外层 `Arc<SecurityContext>`），
 /// 于是 `refresh_oidc(&self)` 拿不到 `&mut`，**拉到的 JWKS 根本没法回填** ——
 /// 旧代码在 `refresh_oidc` 里新建一个 verifier、拉完就让它随函数结束被 drop，
 /// `self.auth` 永远是 `OidcUnavailable`。后果是配了 `method = "oidc"` 的服务端
@@ -50,7 +50,7 @@ pub struct SecurityContext {
     pub audit: Arc<AuditLog>,
     /// 凭证时间戳允许的偏差秒数（0 = 显式关闭）。
     ///
-    /// ★ v0.5.7（第六轮审计 G-1）：放在这里而不是每个调用点各传一次 ——
+    /// 放在这里而不是每个调用点各传一次 ——
     ///   让"校验凭证"与"查新鲜性"用**同一个**来源，调用方没有机会漏。
     max_clock_skew_secs: u64,
 }
@@ -138,7 +138,7 @@ impl SecurityContext {
 
         // token 为空又开着 OIDC？那 OIDC 才是实际生效的，不用说"没有认证"。
         //
-        // ★ v0.5.6（审计总报告 M6）：改用唯一真源 `ServerConfig::has_no_auth()`。
+        // 改用唯一真源 `ServerConfig:has_no_auth()`。
         //   原先这里是就地写的一套口径（`auth.method() == Token &&
         //   cfg.effective_auth().token.is_empty()`），而 `main.rs` 那边用的是
         //   裸的 `cfg.token.is_empty()` —— **两套口径必然漂移一处**：
@@ -169,7 +169,6 @@ impl SecurityContext {
     /// （见 [`Self::refresh_oidc`] 自身的幂等性 + `serve.rs` 的登录失败路径），
     /// IdP 恢复后自动可用。
     ///
-    /// ★★ v0.5.3 修（这是一个真实的功能性缺陷）：
     ///
     /// 旧实现是：
     /// ```ignore
@@ -210,7 +209,7 @@ impl SecurityContext {
         };
         verifier.refresh().await?;
 
-        // ★ 关键：把拉好的 verifier 写回去，否则这次刷新等于白做
+        // 关键：把拉好的 verifier 写回去，否则这次刷新等于白做
         match self.auth.write() {
             Ok(mut g) => *g = AuthProvider::Oidc(verifier),
             Err(e) => *e.into_inner() = AuthProvider::Oidc(verifier),
@@ -226,7 +225,7 @@ impl SecurityContext {
 
     /// ② 认证。返回身份（OIDC 的 `sub`，token 方式为空）。
     ///
-    /// `run_id` 会把 OIDC 的 subject 绑定到本会话（v0.5.3）。
+    /// `run_id` 会把 OIDC 的 subject 绑定到本会话。
     pub fn verify_login(&self, cred: &str, ts: i64, run_id: &str) -> anyhow::Result<String> {
         // 取一份当前快照（短锁），避免在验签（可能很贵）期间占着读锁。
         let auth = self.auth();
@@ -249,7 +248,7 @@ impl SecurityContext {
     /// `auth_key(token, ts)` 比对的，不适合整体改走 `verify_login`
     /// （那条路径还要处理"空 token / 空凭证 / 能力位"三种兼容形态）。
     ///
-    /// ★ 但"忘了调它"这件事本身是 G-1 的成因，所以：
+    /// 但"忘了调它"这件事本身是 G-1 的成因，所以：
     ///   1. 工作连接那处**已经改成调用 `verify_login`**，本函数目前只作为
     ///      纵深防御与测试入口保留；
     ///   2. 新增的 `visitor` / `p2p` 两处走
@@ -326,8 +325,8 @@ mod tests {
         assert!(!ctx.audit.is_enabled());
         // 默认 token 为空 = 不校验（与官方 frps 一致）
         //
-        // ★ v0.5.7：时间戳要用**当前时间** —— `verify_login` 现在自带
-        //   新鲜性校验（G-1 修复），传 0（1970）会被窗口先拦下，
+        // 时间戳要用**当前时间** —— `verify_login` 现在自带
+        // 新鲜性校验（G-1 修复），传 0（1970）会被窗口先拦下，
         //   那样就测不到"空 token 不校验凭证"这件事了。
         assert!(ctx
             .verify_login("随便", nfrp_common::util::now_unix_secs() as i64, "run-x")
@@ -394,7 +393,7 @@ mod tests {
 
         // ② 认证：正确的 md5 才过
         //
-        // ★ v0.5.7：用**当前时间**（原先写死 1700000000 = 2023-11-14）。
+        // 用**当前时间**（原先写死 1700000000 = 2023-11-14）。
         //   `verify_login` 现在自带新鲜性校验，写死的时间戳会被窗口拦下，
         //   于是这条测试会"因为过期而失败"而不是"因为凭证对而通过"。
         let ts = nfrp_common::util::now_unix_secs() as i64;
@@ -402,7 +401,7 @@ mod tests {
         assert!(ctx.verify_login(&good, ts, "run-1").is_ok());
         assert!(ctx.verify_login("wrong", ts, "run-1").is_err());
 
-        // ★ 新增（G-1 回归）：**同一个正确凭证、换成过期的时间戳必须被拒**。
+        // **同一个正确凭证、换成过期的时间戳必须被拒**。
         //   这是漏洞的核心：原先"凭证对"就放行，不看有多旧。
         let stale_ts = ts - 365 * 24 * 3600; // 一年前
         let stale_good = nfrp_common::frp::msg::auth_key("s3cret", stale_ts);
@@ -433,7 +432,7 @@ mod tests {
         let ctx = SecurityContext::from_config(&c).unwrap();
         // JWKS 还没拉：必须拒绝。**绝不能**因为"验不了"就放行。
         //
-        // ★ v0.5.7：时间戳要用当前时间 —— `verify_login` 现在先判新鲜性，
+        // 时间戳要用当前时间 —— `verify_login` 现在先判新鲜性，
         //   传 0 会先撞上"时间戳超出偏差"，就测不到"OIDC 未就绪必须拒绝"了。
         //   两种失败**都拒绝**（都是 fail-closed），但这条测试要盯的是后者。
         let e = ctx
@@ -448,7 +447,7 @@ mod tests {
         assert!(ctx.auth_method() == nfrp_common::security::AuthMethod::Oidc);
     }
 
-    /// ★★ v0.5.3 回归：**认证槽必须可被写回** —— 这是 C 那个缺陷的锁定测试。
+    /// **认证槽必须可被写回** —— 这是 C 那个缺陷的锁定测试。
     ///
     /// 旧实现把 `auth` 做成不可变字段，`refresh_oidc` 拉到的 JWKS **没有任何
     /// 地方能存**，函数一结束 verifier 就被 drop，`self.auth` 永远停在

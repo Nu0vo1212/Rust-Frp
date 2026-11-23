@@ -54,7 +54,7 @@ pub(crate) async fn nlink_quic_server_addr(cfg: &ClientConfig) -> Result<std::ne
         .with_context(|| format!("解析 NLink QUIC 地址 {s} 失败（检查 [nlink] quic_addr）"))
 }
 
-/// 带 `dialServerTimeout` / `connectServerLocalIP` 的拨号（限制①批次1）。
+/// 带 `dialServerTimeout` / `connectServerLocalIP` 的拨号。
 ///
 /// 官方语义（`pkg/config/v1/connector.go` 的建连路径）：
 /// * `dialServerTimeout`（默认 10 秒）—— 建连超时，**控制连接与每条新拨的
@@ -99,7 +99,7 @@ async fn dial_server(cfg: &ClientConfig, addr: std::net::SocketAddr) -> Result<T
         })?
     }?;
 
-    // TCP keepalive（限制①批次2，官方 `dialServerKeepalive`）：官方挂在拨号器
+    // TCP keepalive：官方挂在拨号器
     // （`libnet.WithKeepAlive`）上，控制连接与每条新拨的工作连接都过这里，
     // 所以放在 `dial_server` 出口处一次覆盖。`0` = 不打开（项目约定）。
     if cfg.dial_server_keepalive > 0 {
@@ -160,7 +160,7 @@ pub(crate) async fn raw_connect(cfg: &ClientConfig) -> Result<BoxStream> {
         return kcp_connect(cfg).await;
     }
     let server = format!("{}:{}", cfg.server_addr, cfg.server_port);
-    // ★ v0.6.6：配了 `dnsServer` 就用它解析服务端域名；
+    // 配了 `dnsServer` 就用它解析服务端域名；
     // 没配就走系统 resolver（原路径，行为不变）。
     let addr = if cfg.dns_server.trim().is_empty() {
         util::resolve_addr(&server)
@@ -176,7 +176,7 @@ pub(crate) async fn raw_connect(cfg: &ClientConfig) -> Result<BoxStream> {
                 )
             })?
     };
-    // ★ v0.6.6：`transport.proxyURL` —— 走出站代理时直接拿到一条已建好的隧道流；
+    // `transport.proxyURL` —— 走出站代理时直接拿到一条已建好的隧道流；
     // 不走代理时保持原样（TcpStream + nodelay）——零回归。
     //
     // 为什么代理路径跳过 `set_nodelay`：那个方法只在 `TcpStream` 上有，
@@ -212,7 +212,7 @@ pub(crate) async fn raw_connect(cfg: &ClientConfig) -> Result<BoxStream> {
     // `protocol = "wss"` 自带 TLS，不用再写一遍 `transport.tls.enable`。
     let tls_on = cfg.tls_enable || cfg.websocket_tls();
 
-    // ★★ v0.5.8 修（第七轮审计 **B-2**，中危）：**`verifyServerCert = true`
+    // **`verifyServerCert = true`
     //    但 TLS 没开时必须显著告警** —— 否则这是"安全配置静默失效"。
     //
     // # 原先为什么危险
@@ -239,7 +239,7 @@ pub(crate) async fn raw_connect(cfg: &ClientConfig) -> Result<BoxStream> {
     // ```
     // 而 `privilege_key = md5(token + timestamp)` —— 拿到它**可以直接重放登录**。
     //
-    // ★ 这一条还叠加了第二个坑：**同一结构体里命名风格混用**
+    // 这一条还叠加了第二个坑：**同一结构体里命名风格混用**
     //   （`config.rs`）：`tls_verify_server_cert` 的 serde 名是驼峰
     //   `verifyServerCert`，而 `tls_enable` **没有任何 rename**（只能是
     //   `tls_enable`）。用户照着驼峰风格写 `tlsEnable = true`，
@@ -253,7 +253,7 @@ pub(crate) async fn raw_connect(cfg: &ClientConfig) -> Result<BoxStream> {
         );
     }
 
-    // ★ v0.5.6（L16）：`verifyServerCert = true` 时**真正校验**对端证书。
+    // `verifyServerCert = true` 时**真正校验**对端证书。
     //   默认 false ⇒ 与官方 frp 一致（`InsecureSkipVerify = true`），保互通。
     if cfg.tls_verify_server_cert && tls_on {
         info!(
@@ -339,10 +339,10 @@ async fn kcp_connect(cfg: &ClientConfig) -> Result<BoxStream> {
 mod tests {
     use super::*;
 
-    /// 限制①批次2：`dialServerKeepalive > 0` 时拨号成功返回的 socket 必须真的
+    /// `dialServerKeepalive > 0` 时拨号成功返回的 socket 必须真的
     /// 开上 TCP keepalive；`0` 时保持内核默认（不开）。
     ///
-    /// ★★ v0.5.10 修（云端 Linux 实测 `Connection refused (os error 111)`）：
+    /// `）：
     /// 原先的 accept task **只等一次连接就结束** ——
     ///
     /// ```rust
@@ -398,7 +398,7 @@ mod tests {
     }
 
     /// `connectServerLocalIP` 的解析：`IP`、`IP:端口`、带方括号的 IPv6 都要认，
-    /// 垃圾输入要明确报错（限制①批次1）。
+    /// 垃圾输入要明确报错。
     #[test]
     fn connect_server_local_ip_解析() {
         let a = parse_local_bind("192.168.1.5").unwrap();

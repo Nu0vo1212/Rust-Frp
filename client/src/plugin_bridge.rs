@@ -57,7 +57,7 @@ use crate::plugin::Ctx;
 
 /// 连接上游 / 与上游做 TLS 握手的超时。
 ///
-/// ★ v0.5.8 修（第八轮审计 **F8T-1**，低危）：原先这两个 `await` 都没有
+/// 原先这两个 `await` 都没有
 /// 时限 —— 上游 accept 后保持沉默时，`https2https` 会**永久**卡在上游 TLS
 /// 握手上（实测：后端收了 216B ClientHello 后再无动静，frpc 侧 ESTABLISHED
 /// 永不释放，每轮访问留一条、无上界）。
@@ -183,7 +183,7 @@ impl Bridge {
 
     /// 跑一条"底层已经就绪"的连接（TLS 已终止，或本来就没有 TLS），收尾补优雅关闭。
     ///
-    /// ★ **收尾必须显式 `shutdown`**：`https2*` / `tls2raw` 是 frpc 自己当 TLS 服务端，
+    /// **收尾必须显式 `shutdown`**：`https2*` / `tls2raw` 是 frpc 自己当 TLS 服务端，
     /// 处理完直接 drop 掉 rustls 流只会发一个 FIN —— **close_notify 永远发不出去**。
     /// 严格一点的客户端（rustls、Go、node 的 undici）会把这种"没有 close_notify 的
     /// EOF"判成连接被截断，报 `peer closed connection without sending TLS close_notify`；
@@ -208,7 +208,7 @@ impl Bridge {
     /// 返回 `Ok(None)` = 访问侧读到 EOF/出错（访问方走了，别再替它等）；
     /// 返回 `Ok(Some(t))` = 步骤正常完成；步骤自身的错误照常 `Err` 上抛。
     ///
-    /// ★ v0.5.8 修（第八轮审计 **F8T-1**，低危）：上游 accept 后保持沉默时，
+    /// 上游 accept 后保持沉默时，
     /// 原实现只读上游、不感知访问侧 —— 访问方连上来、把请求发完就撤离
     /// （TCP FIN + TLS close_notify）也会被无视，插件替一个已经离开的访问者
     /// 继续等，上游连接**永不释放**；任何能访问该 `remote_port` 的人都可以
@@ -219,9 +219,9 @@ impl Bridge {
     /// 访问侧在此期间读到的字节由 `HttpIo::watch_closed` 存入缓冲，不会丢
     /// （管道化的下一条请求照常处理）；被 `select!` 取消的那支是取消安全的。
     ///
-    /// # ★★ v0.6.7：这里修好了 v0.6.4 记录的那个 Linux 竞态
+    /// 这里修好了此前记录的那个 Linux 竞态
     ///
-    /// 历史：第十五轮实测同一测试在 Linux 上 10 次跑出 **5 通过 / 5 次超时**，
+    /// 实测：同一测试在 Linux 上 10 次跑出 **5 通过 / 5 次超时**，
     /// 超时表现为"插件收到连接却从未把请求转给上游"。根因是 `watch_closed`
     /// 用 `read(&mut chunk)` 读进局部数组，被 `select!` 取消时那批字节消失，
     /// 丢的正是请求体开头。
@@ -248,7 +248,7 @@ impl Bridge {
     {
         let mut fut = std::pin::pin!(fut);
         loop {
-            // ★ 关键顺序：先看缓冲，再进 select!（见上面 v0.6.7 说明）。
+            // 关键顺序：先看缓冲，再进 select!。
             //   缓冲里有数据说明对端活着、且那批字节已经安全落在 io.buf 里，
             //   继续 select! 只会让 watch_closed 立刻返回 ⇒ 忙等。
             if io.available() > 0 {
@@ -292,21 +292,20 @@ impl Bridge {
             let client_keep = wants_keep_alive(&req);
             let upgrading = wants_upgrade(&req);
 
-            // ★★ v0.5.6 修（审计总报告 M2，中危）：**请求侧 framing 校验**。
+            // **请求侧 framing 校验**。
             //
             // 服务端 `vhost.rs` 早就做了这三项（TE+CL 并存 / 重复 CL /
             // 不支持的 TE），而客户端这条路径**一项都没有** ——
             // "同一语义写了两遍、只加固了一遍"的典型。
             //
             // 危害：`relay_request_body` 用的是弱判据 `body_length()`
-            // （v0.5.4 的 H2 已经把它判定为不够用：只取第一个同名头、
+            // （此前的 H2 已经把它判定为不够用：只取第一个同名头、
             // 垃圾值静默变 None）⇒ 客户端与上游对"请求体到哪结束"的认知可能
             // 不一致 ⇒ **请求走私**。
             //
             // ⚠️ 可利用性前提（如实说明，不夸大）：服务端**不解析** plugin 路径的
             //    HTTP（plugin 类型走 TCP 透传），所以服务端不会替这里把关；
-            //   但要触发它，本机用户得**主动**配 `plugin = "http_proxy"` 之类
-            //   （v0.5.5 的 F1 修复已禁止服务端远程下发 plugin，攻击者无法自行制造）。
+            //   但要触发它，本机用户得**主动**配 `plugin = "http_proxy"` 之类。
             //   定级因此是 Medium 而非 High。
             if let Err(e) = nfrp_common::http_relay::validate_request_framing(&req) {
                 debug!(proxy = %ctx.proxy_name, "请求 framing 非法，按走私风险直接拒绝：{e}");
@@ -342,7 +341,7 @@ impl Bridge {
             }
 
             let head = self.rewrite_request(&mut req, ctx, upgrading);
-            // ★ v0.5.8 修（第八轮审计 F8T-1，低危）：连上游、等上游响应这两段
+            // 连上游、等上游响应这两段
             //   都**同时盯着访问侧**（见 `wait_upstream` 的说明）——上游悬挂时
             //   访问方撤离，插件必须立刻收尾，而不是替已经离开的访问者继续等。
             let Some(up) = Self::wait_upstream(&mut io, self.dial_upstream()).await? else {
@@ -376,7 +375,7 @@ impl Bridge {
                 has_no_body(&resp) || is_chunked(&resp) || body_length(&resp).is_some() || switched;
             let keep = client_keep && wants_keep_alive(&resp) && framed;
 
-            // ★★ v0.5.6 修（审计总报告 M2，中危）：**响应侧剥逐跳头**。
+            // **响应侧剥逐跳头**。
             //
             // 原先这里只在两个分支里分别 `set("Connection","close")` /
             // `remove("connection")` —— **只处理了 `Connection` 这一个头**。
@@ -387,7 +386,7 @@ impl Bridge {
             // 服务端 `vhost.rs` 的响应侧早就用 `HOP_BY_HOP + connection_tokens`
             // 全量剥过了 —— 这又是"两条路径只加固了一条"。
             //
-            // ★ 顺序：**先剥、再写我们自己的 `Connection`**（否则刚写的会被剥掉）。
+            // 顺序：**先剥、再写我们自己的 `Connection`**（否则刚写的会被剥掉）。
             nfrp_common::http_relay::strip_hop_by_hop(&mut resp);
             if !keep {
                 resp.set("Connection", "close");
@@ -413,7 +412,7 @@ impl Bridge {
 
     /// 连上游：明文或 TLS（不校验证书，对齐官方的 `InsecureSkipVerify: true`）。
     ///
-    /// ★ v0.5.8 修（第八轮审计 F8T-1，低危）：连接与**上游 TLS 握手**都套
+    /// 连接与**上游 TLS 握手**都套
     /// `UPSTREAM_DIAL_TIMEOUT` —— 悬挂的上游不能把插件永久卡在这里（访问侧
     /// 撤离的即时收尾另由 `wait_upstream` 负责，两道防线互补）。
     async fn dial_upstream(&self) -> Result<BoxStream> {
@@ -496,7 +495,7 @@ impl Bridge {
         } else {
             // http2http：官方不补，等于删掉。
             //
-            // ★★ v0.5.8 修（第七轮审计 **E-3**，低危）：**补上 `Forwarded`**。
+            // **补上 `Forwarded`**。
             //
             // # 归因校正（我先前的理解与 E 组的说法都过于笼统）
             //
@@ -538,7 +537,7 @@ impl Bridge {
             // —— 这 8 个**官方也不删**（它们不在 Go 的那份清单里）。
             // 删它们会**偏离官方语义**：用户的后端/中间件可能正依赖这些头，
             // 而官方 frp 会把它们透传过去。**那是"修得过头"** ——
-            // 第四轮已经因为"修得过头把合法的也拒了"返工过一次，不再犯。
+            // 已经因为"修得过头把合法的也拒了"返工过一次，不再犯。
             //
             // ⇒ 判据是"**与官方一致**"，而不是"我觉得该删哪些"。
             req.remove("forwarded");
@@ -595,7 +594,7 @@ pub fn build(kind: &str, p: &nfrp_common::config::ProxyConfig) -> Result<Bridge>
 
 /// 这三个插件要在 frpc 侧终止 TLS，所以证书是**必须**的。
 ///
-/// 不提前拦的话，用户忘了配 `crtPath` 会看到"读取 PEM 文件  失败"（路径是空的），
+/// 不提前拦的话，用户忘了配 `crtPath` 会看到"读取 PEM 文件失败"（路径是空的），
 /// 完全猜不到是缺配置。
 fn load_inbound_tls(kind: &str, c: &BridgeConfig) -> Result<Arc<rustls::ServerConfig>> {
     if c.crt_path.trim().is_empty() || c.key_path.trim().is_empty() {
@@ -682,14 +681,14 @@ mod tests {
     }
 
     // ==================================================================
-    // v0.5.6 回归（审计总报告 M2）：客户端插件路径补齐服务端已有的防护
+    // 客户端插件路径补齐服务端已有的防护
     //
     // 这组测试盯的是"同一语义写了两遍、只加固了一遍"这个模式：
     // 服务端 `vhost.rs` 早就做了全套 framing 校验与逐跳头剥离，
     // 客户端 `plugin_bridge.rs` 只做了其中一部分。
     // ==================================================================
 
-    /// ★★ M2 之一：**请求 framing 校验**（服务端有、客户端原先一项都没有）。
+    /// **请求 framing 校验**（服务端有、客户端原先一项都没有）。
     ///
     /// 危害是请求走私：`relay_request_body` 用的 `body_length()` 是弱判据
     /// （只取第一个同名头、垃圾值静默变 None），与上游的解读可能不一致。
@@ -717,7 +716,7 @@ mod tests {
             );
         }
 
-        // ★ TE + CL 并存 ⇒ 拒绝（CL.TE 走私）
+        // TE + CL 并存 ⇒ 拒绝（CL.TE 走私）
         let p = parts(&[
             "POST / HTTP/1.1",
             "Host: x",
@@ -726,7 +725,7 @@ mod tests {
         ]);
         assert!(check(&p).is_err(), "TE 与 CL 并存必须拒绝");
 
-        // ★ 重复的 Content-Length ⇒ 拒绝（CL.CL 走私）
+        // 重复的 Content-Length ⇒ 拒绝（CL.CL 走私）
         let p = parts(&[
             "POST / HTTP/1.1",
             "Host: x",
@@ -735,7 +734,7 @@ mod tests {
         ]);
         assert!(check(&p).is_err(), "重复的 Content-Length 必须拒绝");
 
-        // ★ 不支持的 TE 形态 ⇒ 拒绝（TE.TE 走私）
+        // 不支持的 TE 形态 ⇒ 拒绝（TE.TE 走私）
         for bad_te in ["chunked, identity", "xchunked", "chunked, gzip"] {
             let p = parts(&[
                 "POST / HTTP/1.1",
@@ -746,7 +745,7 @@ mod tests {
         }
     }
 
-    /// ★★ M2 之二：**响应侧必须剥掉全部逐跳头**（原先只处理 `connection` 一个）。
+    /// **响应侧必须剥掉全部逐跳头**（原先只处理 `connection` 一个）。
     ///
     /// 实测泄漏场景（审计报告给的复现）：内网服务回
     /// `Connection: keep-alive, x-secret` + `x-secret` + `upgrade` + `keep-alive`，
@@ -817,7 +816,6 @@ mod tests {
         assert!(raw.contains("Connection: close"), "{raw}");
     }
 
-    /// ★★ v0.5.8 回归（第七轮审计 **E-3**，低危）：
     /// **`http2http` 必须删掉官方删除的完整 4 个头 —— 含 `Forwarded`。**
     ///
     /// # 判据来自官方，不是"我觉得该删哪些"
@@ -838,7 +836,7 @@ mod tests {
     /// `X-Real-IP` / `X-Client-IP` / `CF-Connecting-IP` 等 8 个"客户端 IP 类"头
     /// **官方也不删**（不在那份清单里）。删它们会偏离官方语义、
     /// 破坏依赖这些头的后端 —— 那是"**修得过头**"，
-    /// 第四轮已经因为"修得过头把合法的也拒了"返工过一次。
+    /// 已经因为"修得过头把合法的也拒了"返工过一次。
     #[test]
     fn http2http_要删掉官方清单里的全部四个头() {
         let b = bridge("http2http");
@@ -849,7 +847,7 @@ mod tests {
             "X-Forwarded-For: 6.6.6.6",
             "X-Forwarded-Host: evil.example.com",
             "X-Forwarded-Proto: https",
-            // ★ 官方**不删**的两个代表（用来守住"别修得过头"）
+            // 官方**不删**的两个代表（用来守住"别修得过头"）
             "X-Real-IP: 6.6.6.6",
             "CF-Connecting-IP: 6.6.6.6",
         ]);
@@ -1151,7 +1149,7 @@ mod tests {
         (cli, task)
     }
 
-    /// ★ v0.5.8（第八轮审计 **F8T-1**，低危）回归：上游 accept 后悬挂、
+    /// 上游 accept 后悬挂、
     /// 访问方撤离（FIN），插件必须**立刻**释放上游连接 —— 而不是像修复前
     /// 那样替一个已经离开的访问者一直等响应（每轮访问留 1 条 ESTABLISHED，
     /// 公开访问方可反复放大）。
@@ -1177,7 +1175,7 @@ mod tests {
         assert!(r.is_ok(), "访问方撤离应当安静收尾：{r:?}");
     }
 
-    /// ★★★ v0.6.7 的「关门测试」：`wait_upstream` **不许忙等**。
+    /// 的「关门测试」：`wait_upstream` **不许忙等**。
     ///
     /// 前两次修复（第十五 / 十七轮）都栽在这里：改成 `read_buf` 之后，
     /// `loop { select! }` 里总有一路立刻就绪，于是 100% CPU 空转
@@ -1197,7 +1195,7 @@ mod tests {
             type Output = Result<()>;
             fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
                 let n = self.0.fetch_add(1, Ordering::Relaxed) + 1;
-                // ★ 数到 1 万次就**直接 panic**，而不是靠外面那个 200ms 超时：
+                // 数到 1 万次就**直接 panic**，而不是靠外面那个 200ms 超时：
                 //   忙等会把单线程 runtime 占死，连定时器都轮不到，测试会**挂住**
                 //   而不是失败（实测：旧写法跑 60s 还没退出）。挂住的测试在 CI 里
                 //   只是一条超时，看不出原因；这里让它在毫秒级给出明确断言。
@@ -1210,7 +1208,7 @@ mod tests {
 
         let (mut cli, mut srv) = tokio::io::duplex(64);
         let mut io = HttpIo::new(&mut srv);
-        // ★ 关键前提：先把**字节灌进缓冲**，模拟"管道化的下一条请求已经到齐"。
+        // 关键前提：先把**字节灌进缓冲**，模拟"管道化的下一条请求已经到齐"。
         //   这正是前两次翻车的形状 —— 缓冲非空时 `watch_closed` 立刻返回，
         //   `loop { select! }` 就转成了死循环。缓冲空时谁也转不起来，
         //   所以那种测法抓不到忙等（第一版这条测试就写错了）。
@@ -1235,7 +1233,7 @@ mod tests {
         );
     }
 
-    /// ★★ v0.6.7 回归：修之前这条路径在 Linux 上 10 次跑出 5 次 5 秒超时
+    /// 修之前这条路径在 Linux 上 10 次跑出 5 次 5 秒超时
     /// （"插件收到连接却从未把请求转给上游"）。单跑一次抓不住竞态，
     /// 所以连跑 20 次 —— 单次失败概率 50% 时，20 次全过的概率是 1e-6。
     #[tokio::test]
@@ -1266,7 +1264,7 @@ mod tests {
         }
     }
 
-    /// ★ v0.5.8（第八轮审计 **F8T-1**）回归（上游 TLS 握手悬挂）：`https2https`
+    /// （上游 TLS 握手悬挂）：`https2https`
     /// 卡在"与上游握手"时访问方撤离，同样必须**立刻**放弃并释放那条 TCP 连接。
     #[tokio::test]
     async fn 上游tls握手悬挂时访问方撤离必须释放连接() {
@@ -1290,7 +1288,7 @@ mod tests {
         assert!(r.is_ok(), "访问方撤离应当安静收尾：{r:?}");
     }
 
-    /// ★ v0.5.8（第八轮审计 **F8T-1**）回归（上游 TLS 握手无超时）：访问方
+    /// （上游 TLS 握手无超时）：访问方
     /// 还活着、上游 accept 后沉默时，上游 TLS 握手必须**有界**失败 ——
     /// 修复前会永久卡住（连接永不释放）。测试用缩短的超时（800ms）。
     #[tokio::test]

@@ -58,7 +58,7 @@ use tracing::debug;
 pub struct WorkItem {
     pub conn: FrpConn,
     pub at: Instant,
-    /// ★★ v0.5.8（第七轮审计 **C-2**）：这条空闲工作连接占的配额凭证。
+    /// 这条空闲工作连接占的配额凭证。
     ///
     /// 它与其它配额一样靠 **drop 归还** —— 被配对取走、被 `reap` 超时清掉、
     /// 或连接本身断开时，`WorkItem` 一 drop，名额就回到池子里。
@@ -69,7 +69,7 @@ pub struct WorkItem {
 }
 
 impl WorkItem {
-    /// ★ v0.5.8（C-2）：新增构造入口。
+    /// 新增构造入口。
     ///
     /// 之所以不让调用方写结构体字面量：`idle_permit` 是**内部记账**，
     /// 调用方（`serve.rs::handle_work`）不该、也无法正确填它 ——
@@ -103,7 +103,7 @@ pub struct PendingUser {
     pub client_run_id: String,
     /// 数据面是否加密（`NewProxy.use_encryption`）。
     ///
-    /// ★ v0.6.6：随用户连接一起带下来，因为真正做 relay 的
+    /// 随用户连接一起带下来，因为真正做 relay 的
     /// [`crate::serve::bridge`] 拿不到 `ClientState` / `SecurityContext`。
     pub use_encryption: bool,
     /// 数据面是否压缩（`NewProxy.use_compression`）。
@@ -172,7 +172,7 @@ struct ProxyEntry {
     port: Option<u16>,
     /// 数据面是否加密（来自客户端 `NewProxy.use_encryption`）。
     ///
-    /// ★ v0.6.6：服务端必须知道它，否则工作连接的另一端不知道要解密 ——
+    /// 服务端必须知道它，否则工作连接的另一端不知道要解密 ——
     /// 客户端加密、服务端明文透传，用户会得到"能连上、数据全乱"。
     use_encryption: bool,
     /// 数据面是否压缩（来自 `NewProxy.use_compression`）。
@@ -220,7 +220,7 @@ struct PoolState {
 impl PoolState {
     /// 丢弃超时的空闲工作连接与排队用户，避免半开连接无限堆积。
     ///
-    /// 两个超时是**两个不同的量**（限制①批次1 起拆分）：
+    /// 两个超时是**两个不同的量**：
     /// * `work_timeout`（`work_conn_idle_timeout`，nfrp 自有字段）：空闲工作
     ///   连接在池里能躺多久 —— 躺太久说明客户端预建的连接早已失效；
     /// * `user_timeout`（`userConnTimeout`，对齐官方 `GetWorkConn()` 默认 10 秒）：
@@ -293,7 +293,7 @@ pub struct ClientState {
     idle_timeout: Duration,
     /// 用户连接等待工作连接的超时（对应 frp `userConnTimeout`，官方默认 10 秒）。
     ///
-    /// ★ 限制①批次1：替掉三处硬编码 —— visitor 路径等 10s、vhost / UDP 路径
+    /// 替掉三处硬编码 —— visitor 路径等 10s、vhost / UDP 路径
     /// 等 15s、排队用户由 `idle_timeout`（默认 60s）兜底。全部统一到本字段，
     /// 与官方 `GetWorkConn()` 的语义对齐（等不到工作连接就放弃这条用户连接）。
     user_conn_timeout: Duration,
@@ -301,7 +301,7 @@ pub struct ClientState {
     conn_limit: Limit,
     /// 本客户端的排队上限（用户连接排着等工作连接）。
     backlog_limit: Limit,
-    /// ★★ v0.5.8 新增（第七轮审计 **C-2**，中危）：**空闲工作连接池的上限**。
+    /// **空闲工作连接池的上限**。
     ///
     /// # 为什么需要它
     ///
@@ -333,7 +333,7 @@ pub struct ClientState {
     /// 单条成本 ≈ **1.03 个句柄 + 1.6 KB 内存**，200→6000 全部**线性**，
     /// 未观测到拐点。⇒ 任何持合法 token 的租户都能用一条脚本把服务端 fd 耗尽。
     ///
-    /// ★ 第五轮 M15 曾写下"`idle_work_conns` 持续累积、fd/内存缓慢增长"
+    /// 曾写下"`idle_work_conns` 持续累积、fd/内存缓慢增长"
     ///   这句话，但**只修了超时的上界**（`clamp(5,3600)`），
     ///   **从未加过数量上界** ⇒ 该面从未被真正修过。
     ///
@@ -343,7 +343,7 @@ pub struct ClientState {
     /// 空闲工作连接与排队用户是**同一枚硬币的两面**（都在等配对），
     /// 用同一个数封顶最自然。
     ///
-    /// ★ 限制①批次1：再叠加官方 `maxPoolCount`（`ServerConfig::max_pool_count`），
+    /// 再叠加官方 `maxPoolCount`（`ServerConfig:max_pool_count`），
     /// 两者**取更小**（任一为 0 = 该侧不设限；两侧都 0 = 不限制）。官方口径是
     /// "池容量 = min(客户端 poolCount, maxPoolCount) + 10 余量"，这里映射成
     /// 空闲池闸门 —— 默认（都没配）时与原行为完全一致。
@@ -352,7 +352,7 @@ pub struct ClientState {
     proxy_limit: Limit,
     /// 这个客户端的角色是否允许**面板管理**它（RBAC 的 `allowManage`）。
     ///
-    /// ★ 曾经是死字段：`Role::allow_manage` 从配置读进来、编译进角色，
+    /// 曾经是死字段：`Role::allow_manage` 从配置读进来、编译进角色，
     /// 但没有任何生产代码读它 —— 管理员写 `allowManage = false` 以为禁掉了
     /// 面板增删这个客户端代理的能力，实际照做不误。角色在握手期解析一次，
     /// 之后就丢了，所以这里随会话存一份。
@@ -360,7 +360,7 @@ pub struct ClientState {
     /// 用 `AtomicBool` 而不是普通 `bool`：客户端建好之后要由控制连接那边
     /// 补写（角色是在握手函数内部解析出来的，`ClientState::new` 时还拿不到）。
     allow_manage: AtomicBool,
-    /// 控制连接的**源 IP**（v0.5.5，配合 A-1 的互通安全回退）。
+    /// 控制连接的**源 IP**。
     ///
     /// 用途：官方 frpc 在默认配置下**不给工作连接带 `privilege_key`**
     /// （见官方 `pkg/auth/token.go` 的 `SetNewWorkConn`：未配
@@ -418,13 +418,13 @@ impl ClientState {
         proxy_limit: Limit,
         peer_ip: IpAddr,
     ) -> Self {
-        // ★ C-2：空闲工作连接池与排队用户是同一枚硬币的两面（都在等配对），
+        // 空闲工作连接池与排队用户是同一枚硬币的两面（都在等配对），
         //   所以复用 `backlog_limit` 的**上限值**（而不是再引一个配置项）。
         //   注意要取 `max()` 而不是 clone —— `Limit` 内部是共享信号量，
         //   两处共用一个信号量会把"排队"与"空闲池"互相挤占，
         //   而它们是**两种不同的资源**，各自独立计数才对。
         //
-        // ★ 限制①批次1：再叠加官方 `maxPoolCount` —— 两个上限**取更小**；
+        // 再叠加官方 `maxPoolCount` —— 两个上限**取更小**；
         //   任一为 0（该侧不设限）就取另一个；都为 0 = 不限制。
         let backlog_max = backlog_limit.max();
         let idle_cap = match (backlog_max, max_pool_count) {
@@ -898,7 +898,7 @@ impl ClientState {
 
     /// 工作连接到来：有排队的用户就立即配对，否则进池备用并唤醒等待者。
     ///
-    /// ★★ v0.5.8 修（第七轮审计 **C-2**，中危）：**空闲池必须封顶。**
+    /// **空闲池必须封顶。**
     ///
     /// # 原先为什么错了
     ///
@@ -921,7 +921,7 @@ impl ClientState {
     ///   真配了上限的场景下，正常客户端根本不会攒出那么多空闲工作连接
     ///   （每条用户连接配一条工作连接，用完即弃）。
     ///
-    /// ★ 为什么"拒绝工作连接"是安全的：它**只影响那条多余的空闲连接**，
+    /// 为什么"拒绝工作连接"是安全的：它**只影响那条多余的空闲连接**，
     ///   已经在配对中的工作连接不受影响。客户端需要时会再申请
     ///   （`request_work_conn`），不影响任何已建立的转发。
     pub fn submit_work(&self, w: WorkItem) -> Option<PairedBox> {
@@ -931,7 +931,7 @@ impl ClientState {
             match g.users.pop_front() {
                 Some(u) => Some(PairedBox { user: u, work: w }),
                 None => {
-                    // ★ C-2：入池前先取配额。取不到 ⇒ 拒绝入池（返回 None，
+                    // 入池前先取配额。取不到 ⇒ 拒绝入池（返回 None，
                     //   调用方关闭这条工作连接），而不是无条件 push_back。
                     match self.idle_work_limit.try_acquire() {
                         Some(permit) => {
@@ -1200,7 +1200,7 @@ mod tests {
         assert_eq!(c.backlog(), 1, "新来的连接必须留住");
     }
 
-    /// 限制①批次1：`maxPoolCount` 给空闲池封顶 —— 第二条空闲工作连接被拒，
+    /// `maxPoolCount` 给空闲池封顶 —— 第二条空闲工作连接被拒，
     /// 池里的数量保持在 1（不配上限时它会是 2）。
     #[test]
     fn max_pool_count_给空闲池封顶() {
@@ -1235,7 +1235,7 @@ mod tests {
         assert!(matches!(c.submit_user(user("ssh", t)), Submit::Paired(_)));
     }
 
-    /// 限制①批次1：排队用户按 `userConnTimeout` 回收，与工作连接侧的超时分开。
+    /// 排队用户按 `userConnTimeout` 回收，与工作连接侧的超时分开。
     #[test]
     fn 排队用户按_user_conn_timeout_回收() {
         let (tx, rx) = mpsc::unbounded_channel::<CtrlCmd>();
@@ -1300,10 +1300,9 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 第七轮审计 C-2：空闲工作连接池必须有上界
+    // 空闲工作连接池必须有上界
     // -----------------------------------------------------------------------
 
-    /// ★★ v0.5.8 回归（第七轮审计 **C-2**，中危）：
     /// **空闲工作连接池必须封顶**，否则单个合法客户端能刷爆服务端 fd。
     ///
     /// # 原先的洞
@@ -1333,7 +1332,7 @@ mod tests {
         assert!(c.submit_work(work(t)).is_none(), "第 1 条入池");
         assert!(c.submit_work(work(t)).is_none(), "第 2 条入池");
         assert_eq!(c.idle_work_conns(), 2);
-        // ★ 核心：第 3 条必须被拒（返回 None ⇒ 调用方关闭它）
+        // 核心：第 3 条必须被拒（返回 None ⇒ 调用方关闭它）
         assert!(
             c.submit_work(work(t)).is_some() || c.idle_work_conns() <= 2,
             "★ 空闲池达到上限后**不得**继续堆积 —— C-2 的成因正是这里无闸门"

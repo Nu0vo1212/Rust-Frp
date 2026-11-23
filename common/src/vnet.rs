@@ -37,7 +37,7 @@
 //! | 平台 | TUN 后端 | 要求 |
 //! |---|---|---|
 //! | Linux | `/dev/net/tun` | root 或 `CAP_NET_ADMIN` |
-//! | Windows | **Wintun**（v0.6.6 起） | 管理员权限 + `wintun.dll` |
+//! | Windows | **Wintun** | 管理员权限 + `wintun.dll` |
 //! | macOS | 未实现 | 会**明确报错**，不假装成功 |
 //!
 //! Windows 侧走 Wintun（WireGuard 项目的开源 TUN 驱动）：驱动动态加载、
@@ -686,7 +686,7 @@ mod tun_linux;
 #[cfg(target_os = "linux")]
 pub use tun_linux::{open_tun, Tun};
 
-// ★ v0.6.6：Windows 用 Wintun（WireGuard 项目的开源 TUN 驱动）。
+// Windows 用 Wintun（WireGuard 项目的开源 TUN 驱动）。
 //
 // 与 Linux 版走**同一套上层逻辑**（地址分配 / 路由 / 帧编解码都是平台无关的），
 // 只有"打开设备 + 读写 IP 包"这一段是平台特定的。
@@ -996,7 +996,7 @@ mod tests {
         assert_eq!(sw.lookup("net-b", a), Some("bob"));
     }
 
-    /// ★ 回归测试（对应官方 v0.71.1 的 VNet 路由清理）：
+    /// 回归测试（对应官方 v0.71.1 的 VNet 路由清理）：
     /// 旧会话的延迟清理**不得**删掉新会话已经登记的路由。
     ///
     /// 官方 frpc 的 route 以 visitor 名字为键，重连时新 visitor 可能先注册，

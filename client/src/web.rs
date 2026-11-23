@@ -111,7 +111,7 @@ pub struct Hub {
     stop: tokio::sync::watch::Sender<bool>,
     /// 最近一次会话的失败原因（连不上 / 被拒绝 / 注册超时……）。
     ///
-    /// ★ v0.7.6：自启动场景（`frpc.vbs` 隐藏窗口）下没有控制台，进程又按
+    /// 自启动场景（`frpc.vbs` 隐藏窗口）下没有控制台，进程又按
     /// 退避策略**不再退出**，于是失败会完全静默 —— 用户只看到面板里的空列表。
     /// 这里把最后一次错误留在内存里，由 `/api/status` 与页面直接展示。
     last_error: Mutex<String>,
@@ -377,7 +377,7 @@ use nfrp_common::util::is_loopback_addr;
 
 /// 一次管理界面请求的处理结果（不涉及 socket）。
 ///
-/// ★ v0.5.10（照官方 frp 的做法重构）：把 `handle` 里**与 socket 无关**的
+/// 把 `handle` 里**与 socket 无关**的
 /// 判定逻辑抽出来，让测试可以直接调它 —— 与官方
 /// `frp-0.71.0/server/http/controller_v2_test.go` 里的
 /// `resp := httptest.NewRecorder(); handler.ServeHTTP(resp, req)` 同构。
@@ -459,7 +459,7 @@ async fn decide(hub: &Arc<Hub>, req: &http1::Request, peer: SocketAddr) -> Decis
     //    浏览器的 CORS 预检，而本界面**不回应任何预检**，于是跨站
     //    写请求根本发不出来。命令行调用方带一下这个头即可。
     if is_write_method(method) {
-        // ★ v0.5.4 修（L7）：检查**所有** `Origin` 头，而不是只看第一个。
+        // 检查**所有** `Origin` 头，而不是只看第一个。
         //
         // 原先用 `req.header("origin")` —— 它只返回第一个同名头的值。
         // 攻击者发两个 `Origin`（一个本机、一个跨站）时，若某个中间层/浏览器
@@ -845,7 +845,7 @@ fn status_json(hub: &Arc<Hub>) -> String {
             "wire_protocol": wire,
             "proxies": proxies,
             "visitor_count": hub.cfg.visitors.len(),
-            // ★ v0.7.6：最近一次失败原因。自启动（隐藏窗口）时这是唯一能看到
+            // 最近一次失败原因。自启动（隐藏窗口）时这是唯一能看到
             // "为什么列表是空的"的地方。
             "last_error": hub
                 .last_error
@@ -878,7 +878,7 @@ fn proxies_json(hub: &Arc<Hub>) -> String {
         .iter()
         .map(|p| {
             let mut v = proxy_json(hub, p);
-            // ★ v0.5.5（第四轮 F2/F3）：`dynamic` 改用**代理表自己的来源标记**，
+            // `dynamic` 改用**代理表自己的来源标记**，
             // 而不是从 store 的名字列表间接推断。
             //
             // 原先写的是 `hub.store.dynamic_names().contains(&p.name)`：
@@ -909,7 +909,7 @@ fn proxy_json(hub: &Hub, p: &ProxyConfig) -> serde_json::Value {
         "remote_port": p.remote_port,
         "custom_domains": p.custom_domains,
         "healthy": hub.health.is_healthy(&p.name),
-        // ★ v0.7.6：注册结果。`registered = false && error 空` 表示"还没收到
+        // 注册结果。`registered = false && error 空` 表示"还没收到
         // 服务端回应"（注册中 / 控制连接刚断），面板据此区分三种状态。
         "registered": reg.as_ref().map(|r| r.registered).unwrap_or(false),
         "register_error": reg.as_ref().map(|r| r.error.clone()).unwrap_or_default(),
@@ -1069,7 +1069,7 @@ mod tests {
     /// 用真 socket 而不是 duplex：`handle` 的响应是往它自己那条连接写的，
     /// 只有真实连接才能把两个方向都拿到。
     ///
-    /// ★★ v0.5.10 修（云端 Linux 实测，**测试侧**）：**不要在读完响应之前
+    /// **不要在读完响应之前
     /// `shutdown()` 写方向**。
     ///
     /// # 现象
@@ -1113,7 +1113,7 @@ mod tests {
     /// 这既修掉了平台差异，也更贴近真实浏览器的行为（浏览器不会在半路半关）。
     /// 直接在同一进程里跑一次判定，**不碰 socket**。
     ///
-    /// ★★ v0.5.10 重构（照官方 frp 的做法）：原先是 `handle_over_socket` ——
+    /// 原先是 `handle_over_socket` ——
     /// 开真 `TcpListener`、`tokio::spawn` 服务端、客户端再 `connect` 过去。
     ///
     /// 那个写法**自己造了一个竞态**：云端 Linux 实测（时间线插桩）
@@ -1166,7 +1166,7 @@ mod tests {
         assert!(!is_loopback_addr(""));
     }
 
-    /// ★ Origin 校验：只认本机明文来源。
+    /// Origin 校验：只认本机明文来源。
     #[test]
     fn origin_只认本机来源() {
         assert!(origin_is_local("http://127.0.0.1:7400"));
@@ -1184,7 +1184,7 @@ mod tests {
         assert!(!origin_is_local("https://127.0.0.1"));
     }
 
-    /// ★ 写操作判定：GET/HEAD 不算写，不该被防伪头挡住。
+    /// 写操作判定：GET/HEAD 不算写，不该被防伪头挡住。
     #[test]
     fn 写方法判定() {
         assert!(is_write_method("POST"));
@@ -1193,7 +1193,7 @@ mod tests {
         assert!(!is_write_method("HEAD"));
     }
 
-    /// ★ 回归测试：跨站来源的写请求必须被拒。
+    /// 回归测试：跨站来源的写请求必须被拒。
     ///
     /// 原先只看 Basic Auth（`user` 留空时连那层都没有）⇒ 恶意网页可以
     /// 盲打 `POST /api/stop` 把客户端关掉，或用 DNS rebinding 伪装成
@@ -1214,7 +1214,7 @@ mod tests {
         );
     }
 
-    /// ★ 回归测试：写请求缺防伪头必须被拒。
+    /// 回归测试：写请求缺防伪头必须被拒。
     ///
     /// 自定义头会触发 CORS 预检，而本界面不回应预检 ⇒ 网页根本发不出
     /// 带这个头的跨站请求。
@@ -1551,7 +1551,7 @@ mod tests {
         assert!(resp.contains("only supported on"), "{resp}");
     }
 
-    /// ★★ v0.7.6 回归：面板必须能看到「为什么列表是空的」。
+    /// 面板必须能看到「为什么列表是空的」。
     ///
     /// 自启动是隐藏窗口，没有控制台；0.7.5 起进程又不再退出。若面板不暴露
     /// 失败原因与注册结果，用户面对的就只有一个空列表 —— 这正是被报告的问题。

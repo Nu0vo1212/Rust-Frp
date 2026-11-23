@@ -52,7 +52,7 @@ async fn work_conn_flow(
     let stream = link.connect().await?;
 
     let ts = util::now_unix_secs() as i64;
-    // ★ 每次建工作连接都现取一次凭证：OIDC 的 access token 会过期。
+    // 每次建工作连接都现取一次凭证：OIDC 的 access token 会过期。
     //   token 模式 → `auth_key(token, ts)`；OIDC 模式 → 原始 JWT。
     //   0.7.6 及以前这里固定用 `link.cfg.token` 派生，OIDC 部署下服务端
     //   会以「不是合法的 JWT」拒掉每一条工作连接。
@@ -179,7 +179,7 @@ async fn work_conn_flow(
         }
     }
 
-    // ★★ 加密/压缩时 leftover 必须进 ProxyStream，不能直接写给内网服务！
+    // 加密/压缩时 leftover 必须进 ProxyStream，不能直接写给内网服务！
     //
     // leftover 是读 StartWorkConn 时多读到的字节，它属于 **frps → frpc** 方向。
     // 明文时它就是用户请求的开头，直接写给内网服务是对的；
@@ -207,7 +207,7 @@ async fn work_conn_flow(
     // 带宽限流：配了就按令牌桶限速，没配就走原路径（行为完全不变）
     let limit = throttle::parse_bandwidth(&proxy.bandwidth_limit).unwrap_or(0);
 
-    // ★ v0.6.6：数据面加密 / 压缩（官方 transport.useEncryption / useCompression）
+    // 数据面加密 / 压缩（官方 transport.useEncryption / useCompression）
     //
     // 位置很关键：包在**工作连接**这一侧（`work` = 到 frps 的那条连接），
     // 内网服务那一侧（`local_stream`）保持明文 —— 与官方 `GetRealConn` 的
@@ -215,7 +215,7 @@ async fn work_conn_flow(
     //
     // 不配时**一个字节都不多走**：`need_wrap` 为假直接走原路径，
     // 行为与之前完全一致。
-    // ★ 官方语义：客户端级 `[transport]` 开关 + NFRP 的代理级开关，取或。
+    // 官方语义：客户端级 `[transport]` 开关 + NFRP 的代理级开关，取或。
     let eff_enc = proxy.use_encryption || link.cfg.use_encryption;
     let eff_comp = proxy.use_compression || link.cfg.use_compression;
     if eff_enc || eff_comp {

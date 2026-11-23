@@ -38,11 +38,11 @@ use super::{
 };
 
 // ---------------------------------------------------------------------------
-// 路径校验（NFRP-06）
+// 路径校验
 // ---------------------------------------------------------------------------
 /// 请求目标里是否含 `.` / `..` 段（含 `%2e` 编码）。
 ///
-/// # 为什么要拒绝它（NFRP-06）
+/// # 为什么要拒绝它
 ///
 /// `locations` 是**前缀匹配**，而很多后端（nginx / IIS / Apache）
 /// 会把路径做 dot-segment 归一化。于是
@@ -109,7 +109,7 @@ fn custom_response(status: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
 ///   `vhost.NotFoundPagePath` 的语义），`Content-Type: text/html`；
 /// * 没配 → 保持 NFrp 原有的纯文本提示。
 ///
-/// ★ 默认值**有意**不照抄官方那段 "The server is powered by frp" HTML：
+/// 默认值**有意**不照抄官方那段 "The server is powered by frp" HTML：
 ///   排障时"找不到对应的 frp 代理"比一张品牌页有用得多，而官方对
 ///   "默认页长什么样"并没有任何协议层面的约束。
 fn not_found_response(opts: &VhostOpts) -> Vec<u8> {
@@ -206,7 +206,7 @@ where
         let auth_user = basic_auth_user(&req);
         let visitor_keep_alive = wants_keep_alive(&req);
 
-        // ★ NFRP-06：带 dot-segment 的路径直接拒绝。
+        // 带 dot-segment 的路径直接拒绝。
         //
         // `locations` 是前缀匹配，而后端会做归一化：
         // `/public/../admin` 会命中 `/public` 但到后端变成 `/admin`。
@@ -315,7 +315,7 @@ where
 
         // ---- 读请求体（原样保留编码）----
         //
-        // ★ `Transfer-Encoding` 与 `Content-Length` **同时出现时必须拒绝**
+        // `Transfer-Encoding` 与 `Content-Length` **同时出现时必须拒绝**
         // （RFC 7230 §3.3.3：这种情况要么按 TE 处理并移除 CL，要么直接 400）。
         //
         // 原先的写法是"有 TE 就按 chunked 读，否则看 CL"—— 读的方向没错，
@@ -326,7 +326,7 @@ where
         //
         // 直接 400 最省事也最安全：合法客户端不会同时发这两个头。
         let has_te = req.get("transfer-encoding").is_some();
-        // ★ v0.5.4（H2）：`get()` 只返回**第一个**同名头，而 `to_bytes()` 会把
+        // `get()` 只返回**第一个**同名头，而 `to_bytes()` 会把
         //   `headers` 里的**所有**同名头都转发出去 —— "读一个、写两个"正是
         //   CL.CL 请求走私的成因。所以这里用 `count()` 判"有没有/有几个"，
         //   而不是 `get().is_some()`。
@@ -342,7 +342,7 @@ where
                 .await?;
             return Ok(());
         }
-        // ★ v0.5.4（H2）：**重复的 Content-Length 一律拒绝**。
+        // **重复的 Content-Length 一律拒绝**。
         //
         // 哪怕两个值完全相同也拒绝 —— 不同实现对此合并策略不一致
         // （取第一个 / 取最后一个 / 报错），而"只读第一个、转发全部"的组合同样
@@ -359,7 +359,7 @@ where
             return Ok(());
         }
 
-        // ★★ v0.5.5 修（第四轮 C 组 TE.TE 走私）：**只接受"唯一的 chunked"**。
+        // **只接受"唯一的 chunked"**。
         //
         // H2 修的是 CL 侧，**TE 侧没修** —— 这是同一个教训的又一次复现。
         // 原先判定用 `contains("chunked")`（"只要出现就按 chunked 解帧"），
@@ -389,7 +389,7 @@ where
             // `take_buffered()` 显式补到上游。
             Vec::new()
         } else if let Some(te) = req.get("transfer-encoding") {
-            // ★ 复用公共判定（与转发侧同一个口径），不要再写一遍 contains
+            // 复用公共判定（与转发侧同一个口径），不要再写一遍 contains
             if nfrp_common::http_relay::is_chunked(&req) {
                 io.read_chunked().await?
             } else {
@@ -399,7 +399,7 @@ where
                 Vec::new()
             }
         } else if has_cl {
-            // ★ v0.5.4（H2）：严格解析。原先是 `cl.trim().parse().unwrap_or(0)`
+            // 严格解析。原先是 `cl.trim().parse().unwrap_or(0)`
             //   —— **垃圾值静默变 0**（`Content-Length: abc` 被当成"没有请求体"，
             //   而同一个头又原样转发给上游）。现在非法值一律 400。
             let n = match req.content_length_strict() {
@@ -443,7 +443,7 @@ where
             req.remove(&k);
         }
 
-        // ★ v0.5.4（H2 第三层，纵深防御）：**同名头去重**。
+        // **同名头去重**。
         //
         // 上面已经对重复的 Content-Length 直接 400 了，这一步是"即便将来某个
         // 环节漏了检查，也不会把重复头原样送到下游"。它保证一个不变量：
@@ -547,14 +547,14 @@ where
         }
         upstream.flush().await?;
 
-        // ★ v0.5.4 修（L3）：把 `leftover` 喂回预读缓冲，**不要丢掉**。
+        // 把 `leftover` 喂回预读缓冲，**不要丢掉**。
         //
         // `leftover` 是工作连接上已经读进缓冲区、但还没被消费的字节。
         // 原先是 `let _ = leftover;` 直接扔了 —— 若内网服务在握手后立刻
         // 吐了响应（或预读时顺带读到了响应开头），这部分字节就永久丢失，
         // 表现为**响应体被截断**。
         //
-        // ★ v0.7.6：`leftover` 已经由 `wrap_work_stream` 挂成流的**读前缀**，
+        // `leftover` 已经由 `wrap_work_stream` 挂成流的**读前缀**，
         // 这里传空缓冲即可 —— 再传一次会重复消费。
         let mut up = HttpIo::with_prefill(upstream, Vec::new());
 
@@ -585,14 +585,14 @@ where
         };
         let mut resp = HeadParts::parse(&resp_lines)?;
 
-        // ★★ v0.5.8 修（第七轮审计 D7-2，中危）：**响应侧的 framing 校验**。
+        // **响应侧的 framing 校验**。
         //
         // 请求侧早有 `validate_request_framing`（TE+CL / 重复 CL / 不支持的 TE
         // 三项全 400），而响应侧**一项都没有** —— 内网服务回什么就转发什么。
         //
         // 这与 D7-1 是同一条链路上的两个洞：
-        //   * D7-1 = 响应侧的**判定口径**与请求侧不一致（`contains` vs RFC）；
-        //   * D7-2 = 响应侧**根本没有校验**。
+        // * D7-1 = 响应侧的**判定口径**与请求侧不一致（`contains` vs RFC）；
+        // * D7-2 = 响应侧**根本没有校验**。
         //
         // 两者都会导致下游连接去同步（不同实现取不同的响应边界）⇒ 走私/投毒。
         // 修法一致：**失败关闭**，回 502 而不是猜。
@@ -610,7 +610,7 @@ where
             return Ok(());
         }
 
-        // ★★ v0.5.4 修（L2）：**响应侧也要剥逐跳头**。
+        // **响应侧也要剥逐跳头**。
         //
         // 原先只有请求侧剥了（见上面那段加入 `HOP_BY_HOP` 的注释），
         // 响应侧原样转发 ⇒ 内网服务回的 `Connection: keep-alive, X-Secret`
@@ -632,7 +632,7 @@ where
             let no_body =
                 (100..200).contains(&code) || code == 204 || code == 304 || method == "HEAD";
 
-            // ★★ v0.5.8 修（第七轮审计 D7-1，高危）：**响应侧必须用与请求侧同一套
+            // **响应侧必须用与请求侧同一套
             //    RFC 口径判 `Transfer-Encoding`。**
             //
             // # 原先为什么错了
@@ -643,7 +643,7 @@ where
             // [`http_relay::is_chunked`] / [`http_relay::transfer_encoding_is_unsupported`]，
             // `client/src/plugin_bridge.rs` 也用 `is_chunked`。
             // `http_relay.rs:500-522` 的注释里**明确写着** `contains("chunked")`
-            // 正是第四轮 C 组修掉的走私写法。
+            // 正是此前修掉的走私写法。
             //
             // ⇒ 请求侧修了、响应侧没修。**这是"防线没铺满"的教科书案例**，
             //   也是本项目连续多轮出现的同一个模式。
@@ -675,7 +675,6 @@ where
             // 与请求侧**共用同一个判定函数**，而不是在这里再手写一遍 ——
             // 手写就会再次漂移。`is_chunked` 的口径是"最后一个 token 是 chunked
             // 且前面只有 identity"，`identity, chunked` 这种 RFC 合法形态仍被接受
-            // （第四轮专门修过"修得过头把合法的也拒了"）。
             let resp_te_chunked = nfrp_common::http_relay::is_chunked(&resp);
             let framed = if no_body {
                 true
@@ -702,7 +701,7 @@ where
 
             // ---- 转发响应体 ----
             //
-            // ★★ v0.5.8 修（第七轮审计 D7-1，高危）：与上面 `framed` 用**同一个**
+            // 与上面 `framed` 用**同一个**
             //    判定（`resp_te_chunked`），而不是再写一次 `contains("chunked")`。
             //
             // 两处必须完全一致，否则"判 keep-alive 用一个口径、读 body 用另一个口径"
@@ -754,7 +753,7 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
     // ==================================================================
-    // NFRP-06：dot-segment 必须被拒
+    // dot-segment 必须被拒
     // ==================================================================
 
     #[test]
@@ -1031,7 +1030,7 @@ mod tests {
         }
     }
 
-    /// ★ 回归测试：HTTP vhost 的 CONNECT 是**裸隧道**，头后的预读数据不能丢。
+    /// 回归测试：HTTP vhost 的 CONNECT 是**裸隧道**，头后的预读数据不能丢。
     ///
     /// 官方 v0.71.1 修的就是这个：`read_head`/Hijack 只消费到 `\r\n\r\n`，
     /// 客户端没等 200 就发来的隧道数据留在缓冲里，直接 `relay_between`
@@ -1111,7 +1110,7 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
     }
 
-    /// ★ 回归测试：CONNECT 带正 `Content-Length` 或 `Transfer-Encoding` 必须 400。
+    /// 回归测试：CONNECT 带正 `Content-Length` 或 `Transfer-Encoding` 必须 400。
     ///
     /// 这两种头都会让"头后的字节"产生歧义（隧道数据 vs 请求体），官方
     /// `connectHandler` 明确拒绝；这里锁住同样的口径。
@@ -1165,7 +1164,7 @@ mod tests {
         }
     }
 
-    /// ★ 回归测试：`Transfer-Encoding` 与 `Content-Length` 同时出现必须 400。
+    /// 回归测试：`Transfer-Encoding` 与 `Content-Length` 同时出现必须 400。
     ///
     /// 放行的后果是 CL.TE 请求走私：NFrp 按 chunked 解读请求，上游按
     /// `Content-Length` 解读同一串字节，双方对"请求到哪结束"的认知不一致，
@@ -1232,7 +1231,7 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
     }
 
-    /// ★ 回归测试：`Expect: 100-continue` 必须被回应，不能让双方互等。
+    /// 回归测试：`Expect: 100-continue` 必须被回应，不能让双方互等。
     ///
     /// 原先不处理这个头 ⇒ 客户端等 100、服务端等请求体 ⇒ 死锁到
     /// `vhostHTTPTimeout`（默认 60 秒）。单请求就能占住一条工作连接。
@@ -1309,7 +1308,7 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
     }
 
-    /// ★ 回归测试：逐跳头不能原样传给上游。
+    /// 回归测试：逐跳头不能原样传给上游。
     #[tokio::test]
     async fn 逐跳头不会转发给上游() {
         let registry = Arc::new(Registry::unlimited());
@@ -1378,7 +1377,7 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
     }
 
-    /// ★ `vhostHTTPTimeout` 的端到端验证：内网服务**连上了却不回响应头**
+    /// `vhostHTTPTimeout` 的端到端验证：内网服务**连上了却不回响应头**
     /// （进程卡死、死循环）时，不能把用户连接无限期挂着。
     ///
     /// 造法：先往客户端的空闲池里塞一条工作连接（另一端攥在测试手里、
@@ -1617,10 +1616,9 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 第七轮审计 D7-1：响应侧 TE 判定必须与请求侧同口径
+    // -1：响应侧 TE 判定必须与请求侧同口径
     // -----------------------------------------------------------------------
 
-    /// ★★ v0.5.8 回归（第七轮审计 D7-1，**高危**）：
     /// 响应侧必须用**与请求侧同一套**判定，且 `chunked, identity` 必须**不被当作 chunked**。
     ///
     /// # 这条测试的写法经过一次返工（**退回验证抓出来的**）
@@ -1645,9 +1643,9 @@ mod tests {
             HeadParts::parse(&lines).expect("合法响应头")
         };
 
-        // ★★★ 这就是**生产代码里**用来定界响应体的那个表达式
+        // 这就是**生产代码里**用来定界响应体的那个表达式
         //     （`vhost.rs` 的 `let resp_te_chunked = ...`）。
-        //     第七轮 D7-1 之前它是 `te.contains("chunked")`，之后是 `is_chunked`。
+        // -1 之前它是 `te.contains("chunked")`，之后是 `is_chunked`。
         //     断言写在这个表达式上，才能真正守住"用的是 RFC 口径"这件事。
         let production_predicate = |r: &HeadParts| -> bool { is_chunked(r) };
 
@@ -1665,7 +1663,7 @@ mod tests {
 
         // ---- 必须**不**判为 chunked（与 RFC 下游口径一致）----
         //
-        // ★ 这几条正是 D7-1 的实弹形态：旧代码的 `contains("chunked")`
+        // 这几条正是 D7-1 的实弹形态：旧代码的 `contains("chunked")`
         //   会把它们全判成 chunked，从而与 RFC 下游产生分歧 ⇒ 走私。
         for te in [
             "chunked, identity", // ← 实弹用的就是它
@@ -1689,7 +1687,7 @@ mod tests {
                 "{te:?} 属于不支持形态，应当被标记为 unsupported（失败关闭）"
             );
         }
-        // 而 RFC 合法的 `identity, chunked` **不能**被拒（第四轮修过"修得过头"）
+        // 而 RFC 合法的 `identity, chunked` **不能**被拒
         assert!(
             !transfer_encoding_is_unsupported(&resp_with("identity, chunked")),
             "identity, chunked 是 RFC 合法形态，不能被拒 —— \
@@ -1712,7 +1710,7 @@ mod tests {
         );
     }
 
-    /// ★★ 第七轮 D7-1 的**行为级**回归：真实起 vhost，把"走私会不会发生"打出来。
+    /// -1 的**行为级**回归：真实起 vhost，把"走私会不会发生"打出来。
     ///
     /// 与上面那条单测的分工：
     /// * 单测守"用的是哪个判据"（快、能定位）；

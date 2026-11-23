@@ -219,7 +219,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ProxyStream<S> {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
 
-        // ★ 关键：先让压缩器把残余冲刷出来（空写 + flush 会输出未满的块），
+        // 关键：先让压缩器把残余冲刷出来（空写 + flush 会输出未满的块），
         //   否则尾部数据永远发不出去。
         this.encode_into_pending(&[]);
 
@@ -381,7 +381,7 @@ fn decode_available(c: &mut CompState) -> Vec<u8> {
                 if rest.len() < 4 + clen {
                     break; // 数据还没收全
                 }
-                // ★ 规范：data 的前 4 字节是 CRC-32C，之后才是 payload。
+                // 规范：data 的前 4 字节是 CRC-32C，之后才是 payload。
                 //   （不是“负载 + 尾部 crc”，这一点差点就全盘错位。）
                 let payload = &rest[8..4 + clen];
                 if ctype == 0x00 {
@@ -464,14 +464,14 @@ mod tests {
         assert_eq!(roundtrip("tok", true, &p).await, p);
     }
 
-    /// ★ 组合：压缩缓冲 + 加密状态一起跑，尾部必须一个字节都不少。
+    /// 组合：压缩缓冲 + 加密状态一起跑，尾部必须一个字节都不少。
     #[tokio::test]
     async fn 加密加压缩往返一致() {
         let p = b"NFRP both encryption and compression.".repeat(10);
         assert_eq!(roundtrip("tok", true, &p).await, p);
     }
 
-    /// ★ 小数据 + 压缩：`poll_flush` 漏刷残余会被这条抓到。
+    /// 小数据 + 压缩：`poll_flush` 漏刷残余会被这条抓到。
     #[tokio::test]
     async fn 压缩小数据不丢尾巴() {
         let p = b"tiny";
@@ -542,7 +542,7 @@ mod tests {
         assert_ne!(&got[..], &p[..], "换密钥必须解出不同内容");
     }
 
-    /// ★ 双向并发：真实 relay 是同一条连接上两个方向同时跑。
+    /// 双向并发：真实 relay 是同一条连接上两个方向同时跑。
     /// 单向测试覆盖不到「写 pending 与读解压互相影响」的情况。
     #[tokio::test]
     async fn 双向并发加解密压缩() {

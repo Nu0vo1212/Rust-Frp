@@ -68,7 +68,7 @@ pub struct ServerOidcConfig {
     /// 拉 JWKS 时走的代理。
     #[serde(rename = "proxyURL")]
     pub proxy_url: String,
-    /// 允许 `jwks_uri` 使用明文 http（v0.5.6 修审计总报告 M9，纵深防御）。
+    /// 允许 `jwks_uri` 使用明文 http。
     ///
     /// 默认 **false**：discovery 文档里的 `jwks_uri` 必须是 `https://`。
     ///
@@ -80,11 +80,11 @@ pub struct ServerOidcConfig {
 
 /// 客户端 OIDC 配置（对应 frp 的 `auth.oidc`）。
 ///
-/// ★ v0.5.3：手工实现 `Debug`（见下方），`client_secret` 不进日志。
+/// 手工实现 `Debug`（见下方），`client_secret` 不进日志。
 #[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClientOidcConfig {
-    /// ★ 官方 frp 的 JSON tag 就是 `clientID`（不是 `clientId`），
+    /// 官方 frp 的 JSON tag 就是 `clientID`（不是 `clientId`），
     /// 照抄平台的配置时差一个字母都会变成"字段未知"。
     #[serde(rename = "clientID")]
     pub client_id: String,
@@ -106,7 +106,7 @@ pub struct ClientOidcConfig {
 }
 
 impl std::fmt::Debug for ClientOidcConfig {
-    /// ★ v0.5.3：`client_secret` 永不进日志。
+    /// `client_secret` 永不进日志。
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let secret = if self.client_secret.is_empty() {
             "<empty>".to_string()
@@ -301,7 +301,7 @@ pub struct OidcVerifier {
     /// 拼 `<issuer>/.well-known/jwks.json`。
     jwks_uri: RwLock<Option<String>>,
     jwks: RwLock<Option<Arc<Jwks>>>,
-    /// ★ v0.5.3：登录成功过的 **subject → run_id** 绑定表。
+    /// 登录成功过的 **subject → run_id** 绑定表。
     ///
     /// 原来这里是一个**只增不减的全局 `HashSet<String>`**（对应官方的
     /// `subjectsFromLogin`），于是 `verify_post_login` 只检查
@@ -382,7 +382,7 @@ impl OidcVerifier {
             Ok(r) if (200..300).contains(&r.status) => {
                 let v = r.json()?;
                 if let Some(u) = v.get("jwks_uri").and_then(|x| x.as_str()) {
-                    // ★★ v0.5.6 修（审计总报告 M9，纵深防御）：`jwks_uri`
+                    // `jwks_uri`
                     //   是从**远端文档**里读来的，原先**原样信任、无 scheme 校验**。
                     //
                     // 它是 M9 那条链的"远端可控入口"：被劫持或恶意的 IdP 可以在这里
@@ -499,7 +499,7 @@ impl OidcVerifier {
 
     /// 校验 `iss` / `aud` / `exp` / `nbf`。
     ///
-    /// ★★ v0.5.5 修（第四轮 G-8）：原先时间字段的写法是
+    /// 原先时间字段的写法是
     ///
     /// ```ignore
     /// if let Some(exp) = payload.get("exp").and_then(|x| x.as_i64()) {
@@ -556,7 +556,7 @@ impl OidcVerifier {
             // ---- exp：**必须存在且必须是数值** ----
             let exp = match payload.get("exp") {
                 // 存在但不是数值（字符串 / null / 数组 / 对象）⇒ 拒绝。
-                // ★ 这里绝不能"当作没有" —— 那正是原来的漏洞。
+                // 这里绝不能"当作没有" —— 那正是原来的漏洞。
                 Some(v) => v.as_i64().ok_or_else(|| {
                     anyhow!(
                         "token 的 exp 不是数值（实际是 {}）—— 无法判断有效期，拒绝",
@@ -610,13 +610,13 @@ impl OidcVerifier {
         g.remove(run_id);
     }
 
-    /// ★ v0.6.1：**仅测试用** —— 直接往绑定表里塞一条，模拟"该会话登录成功过"。
+    /// **仅测试用** —— 直接往绑定表里塞一条，模拟"该会话登录成功过"。
     ///
     /// `subjects` 是私有字段，而验证"会话退出时绑定被清掉"需要先人为建立绑定。
     /// 走 `verify_token` 造不出一条合法 token（要真的签名 + JWKS），
     /// 所以开这个后门。
     ///
-    /// ★ 不加 `#[cfg(test)]`：`server` crate 的测试也要用它
+    /// 不加 `#[cfg(test)]`：`server` crate 的测试也要用它
     ///   （验证 `ClientGuard::drop` 确实调了 `forget_session`）。
     ///   名字带 `_for_test` 表明意图，生产代码不该调用。
     pub fn bind_subject_for_test(&self, run_id: &str, sub: &str) {
@@ -627,7 +627,7 @@ impl OidcVerifier {
     /// 校验"登录之后"的 token：必须验签通过，且 subject 与**本会话**
     /// （该 run_id）登录时用过的那个一致。
     ///
-    /// ★ v0.5.3：判据从"全局 subject 集合里有没有"改成
+    /// 判据从"全局 subject 集合里有没有"改成
     /// "**这个 run_id 绑定的 subject** 是否等于 token 里的 sub"。
     /// 旧写法让"曾在任意连接上登录过的 sub"可以给任何 run_id 开工作连接。
     pub fn verify_post_login(&self, token: &str, what: &str, run_id: &str) -> Result<String> {
@@ -741,7 +741,7 @@ fn verify_signature(jwk: &Jwk, alg: &str, message: &[u8], sig: &[u8]) -> Result<
 
 /// 按 JWK 类型与 alg 选 ring 的验签算法。
 ///
-/// ★★ v0.5.5（第四轮 G-2）：**这些算法要的密钥编码各有不同**，
+/// **这些算法要的密钥编码各有不同**，
 /// 必须与 [`jwk_to_ring_key`] 产出的格式严格配对，否则验签**恒失败**：
 ///
 /// | 算法 | ring 期望的密钥编码 |
@@ -761,7 +761,6 @@ fn pick_algorithm(
         ("RSA", "PS256") => &s::RSA_PSS_2048_8192_SHA256,
         ("RSA", "PS384") => &s::RSA_PSS_2048_8192_SHA384,
         ("RSA", "PS512") => &s::RSA_PSS_2048_8192_SHA512,
-        // ★★ v0.6.5 修（真实 IdP e2e 发现，**高危可用性**）：
         //   ES256 / ES384 原先用 `*_ASN1`，而 JWS 的签名格式**不是 DER**。
         //
         //   RFC 7518 §3.4 写得很明确：
@@ -790,7 +789,7 @@ fn pick_algorithm(
 
 /// 把 JWK 转成 **ring 期望的**公钥编码（DER / 点）。
 ///
-/// ★★ v0.5.5 修（第四轮 G-2，高危可用性）：本函数原名叫 `jwk_to_spki`，
+/// 本函数原名叫 `jwk_to_spki`，
 /// **注释还写着"ring 需要这个格式"，但对 RSA 恰恰相反** ——
 /// ring 的 `RSA_PKCS1_2048_8192_SHA256`（以及 `RSA_PSS_*`）要的是
 /// **裸的 PKCS#1 `RSAPublicKey`**，而不是外面又包了一层 `AlgorithmIdentifier`
@@ -807,7 +806,7 @@ fn pick_algorithm(
 /// PKCS#1 (ring 期望的格式)  : 被 ring 接受（且签名有效）
 /// ```
 ///
-/// ★ 之所以一直没被发现，是因为测试只覆盖了"验不过要拒绝"这个方向，
+/// 之所以一直没被发现，是因为测试只覆盖了"验不过要拒绝"这个方向，
 ///   **没有一条测试断言"合法的签名要验得过"** —— 典型的"绿得不真实"。
 ///   本函数修完后，下面 `oidc_verify_roundtrip` 补上了正向用例。
 fn jwk_to_ring_key(jwk: &Jwk) -> Result<Vec<u8>> {
@@ -815,7 +814,7 @@ fn jwk_to_ring_key(jwk: &Jwk) -> Result<Vec<u8>> {
         "RSA" => {
             let n = b64url(&jwk.n).context("JWK 的 n 不是合法 base64url")?;
             let e = b64url(&jwk.e).context("JWK 的 e 不是合法 base64url")?;
-            // ★ 只返回 PKCS#1 的 `SEQUENCE { n INTEGER, e INTEGER }`，
+            // 只返回 PKCS#1 的 `SEQUENCE { n INTEGER, e INTEGER }`，
             //   **不再**套 `AlgorithmIdentifier` + `BIT STRING` 那层 SPKI。
             Ok(der::seq(&[&der::int(&n), &der::int(&e)]))
         }
@@ -835,7 +834,7 @@ fn jwk_to_ring_key(jwk: &Jwk) -> Result<Vec<u8>> {
                     y.len()
                 );
             }
-            // ★ 只返回**未压缩点** `0x04 ‖ X ‖ Y`，不套 SPKI。
+            // 只返回**未压缩点** `0x04 ‖ X ‖ Y`，不套 SPKI。
             let mut point = Vec::with_capacity(1 + x.len() + y.len());
             point.push(0x04);
             point.extend_from_slice(&x);
@@ -895,7 +894,7 @@ mod der {
 
     /// OBJECT IDENTIFIER：点分十进制 → DER。
     ///
-    /// ★ v0.5.5（G-2）：修完 SPKI/PKCS#1 的格式错配后，生产路径**不再构造
+    /// 修完 SPKI/PKCS#1 的格式错配后，生产路径**不再构造
     /// SPKI**，于是本函数只被它自己的编码测试用到。留着是为了那个"DER 编码
     /// 是否正确"的回归价值（将来若有人真要拼 SPKI，别再踩一遍）；
     /// 用 `#[cfg(test)]` 明确标注它不在生产路径上，避免又变成"看起来在用"的死代码。
@@ -1065,7 +1064,7 @@ mod tests {
     }
 
     // ==================================================================
-    // G-8 回归（v0.5.5）：时间字段的**缺失**与**类型不对**都必须拒绝
+    // G-8 回归：时间字段的**缺失**与**类型不对**都必须拒绝
     //
     // 原先的写法 `payload.get("exp").and_then(|x| x.as_i64())` 把
     // "字段不存在" 和 "类型不对" 都变成 `None` ⇒ 整个时间校验被**静默跳过**，
@@ -1084,7 +1083,7 @@ mod tests {
         .unwrap()
     }
 
-    /// ★★ 核心：**完全没有 `exp`** 的 token 必须被拒（否则永不过期）。
+    /// 核心：**完全没有 `exp`** 的 token 必须被拒（否则永不过期）。
     #[test]
     fn 缺_exp_必须被拒() {
         let v = verifier_for_claims();
@@ -1097,7 +1096,7 @@ mod tests {
         );
     }
 
-    /// ★★ 核心：`exp` 类型不对（字符串 / null / 数组 / 布尔）都必须被拒。
+    /// 核心：`exp` 类型不对（字符串 / null / 数组 / 布尔）都必须被拒。
     ///
     /// 这几种在修复前全部被**静默放行**（`as_i64()` 返回 None ⇒ 跳过检查）。
     #[test]
@@ -1261,7 +1260,7 @@ mod tests {
         assert!(g.get("no-such-run").is_none());
     }
 
-    /// ★★ v0.5.3 回归：**subject 必须绑定到会话**，不能"登录过一次就到处通用"。
+    /// **subject 必须绑定到会话**，不能"登录过一次就到处通用"。
     ///
     /// 旧实现用一个只增不减的全局 `HashSet<String>` 存 subject，
     /// `verify_post_login` 只问"这个 sub 曾经在**某个**连接上登录过吗"。
@@ -1314,7 +1313,7 @@ mod tests {
     }
 
     // ==================================================================
-    // G-2 回归（v0.5.5）：**合法的签名必须验得过**
+    // G-2 回归：**合法的签名必须验得过**
     //
     // 这是本轮补上的**正向**用例。原先只有"验不过要拒绝"的测试，
     // 于是 `jwk_to_spki` 把 RSA 公钥拼成 SPKI（而 ring 要 PKCS#1）
@@ -1355,7 +1354,7 @@ mod tests {
     /// P-256 的 JWK 坐标。
     const VEC_EC_X: &str = "LQ07yi77_AzxmnDTa6hYdUxVGwJAxi9GZqfrwaYCgrw";
     const VEC_EC_Y: &str = "WHENFL6u1OIYLFdj9b0KoMQP1tNetbIwvRkpJDRUcGM";
-    // ★ v0.6.5：原 `VEC_EC_SIG` 已删除。
+    // 原 `VEC_EC_SIG` 已删除。
     //
     //   它以 `0x30 0x44 0x02 0x20` 开头 —— 是 **DER 编码的
     //   `SEQUENCE{r INTEGER, s INTEGER}`**，而 JWS 的 ES256 签名是
@@ -1422,7 +1421,7 @@ mod tests {
 
     /// 核心：ES256 的真签名必须验得过。
     ///
-    /// ★★ v0.6.5：**改用 RFC 7515 附录 A.3 的官方测试向量**。
+    /// **改用 RFC 7515 附录 A.3 的官方测试向量**。
     ///
     /// 原来的向量 `VEC_EC_SIG` 以 `0x30 0x44 0x02 0x20` 开头 —— 那是
     /// **DER 编码的 `SEQUENCE{r INTEGER, s INTEGER}`**。它之所以"能验过"，

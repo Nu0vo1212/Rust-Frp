@@ -96,7 +96,7 @@ impl Store {
                                 if p.name.is_empty() {
                                     continue;
                                 }
-                                // ★★ v0.5.4 修 H3：store 里的内容**同样不可信**，
+                                // store 里的内容**同样不可信**，
                                 //    必须与 `ServerCmd` 路径跑同一道闸门。
                                 //
                                 // 为什么 store 也算远程来源：这个文件的用途就是
@@ -108,7 +108,6 @@ impl Store {
                                 //     {"plugin":"static_file","plugin_local_path":"/etc"}
                                 //   重启后**直接生效** ⇒ 任意文件读取，
                                 //   而且绕过了为拦截它专门写的那道 `validate_remote_proxy`
-                                //   （威胁模型与第一轮修复 #2 完全相同，只是换了扇门进来）。
                                 //
                                 // 处理策略：**跳过该条目并 WARN**，而不是整份拒绝。
                                 // 理由：store 里可能同时躺着别的合法代理，
@@ -212,7 +211,7 @@ impl Store {
         let body = serde_json::to_vec_pretty(&file).context("序列化 store 失败")?;
 
         let tmp = path.with_extension("tmp");
-        // ★ 这份文件里装着**完整的代理配置**：`secret_key`、插件密码、
+        // 这份文件里装着**完整的代理配置**：`secret_key`、插件密码、
         // `http_pwd` 都在里面。`logfile.rs` 早就按 0600 落盘（注释里也写了
         // "日志里可能有 token"），这里一直漏了 —— 同机其他用户可直接读走密钥。
         //
@@ -229,7 +228,7 @@ impl Store {
             o.write(true).create_new(true).mode(0o600);
             o
         };
-        // ★★ v0.5.6 修（审计总报告 M12，中危）：**Windows 也要收紧权限**。
+        // **Windows 也要收紧权限**。
         //
         // 原先 Windows 分支只是 `create_new`，注释说"靠父目录 ACL"——
         // 这个假设**不成立**：文件默认继承父目录的继承 ACE，而用户目录
@@ -240,12 +239,12 @@ impl Store {
         // 修法：建好文件后用 `icacls` 把继承**断开**，只留当前用户
         // （`/inheritance:r` 清掉继承来的 ACE，`/grant:r` 只授当前用户）。
         //
-        // ★ 为什么用 `icacls` 而不是 `SetSecurityInfo`：后者要引
+        // 为什么用 `icacls` 而不是 `SetSecurityInfo`：后者要引
         //   `windows-sys` 并手写 ACL 结构（几十行 unsafe），而 `icacls`
         //   是每台 Windows 都有的系统命令、语义明确、失败可见。
         //   这里是**低频**操作（只在 store 变化时落盘），起进程的开销可忽略。
         //
-        // ★ 失败处理：**不让它阻断落盘**，但要 warn —— 落盘本身是功能，
+        // 失败处理：**不让它阻断落盘**，但要 warn —— 落盘本身是功能，
         //   权限收紧是加固；因为加固失败就丢掉用户的动态代理更糟。
         #[cfg(windows)]
         let opt = {
@@ -269,7 +268,7 @@ impl Store {
             f.sync_all().ok();
         }
 
-        // ★ v0.5.6（M12）：Windows 上断开继承、只留当前用户。
+        // Windows 上断开继承、只留当前用户。
         #[cfg(windows)]
         {
             let user = std::env::var("USERNAME").unwrap_or_default();
@@ -332,7 +331,7 @@ impl std::fmt::Debug for Store {
 /// 而且从配置文件里删掉一条隧道时，用户期待的是它真的消失
 /// （如果让 store 优先，它会被 store 里的旧副本复活，且无处可查）。
 ///
-/// ★ v0.5.4（H3 纵深防御）：这里对 `stored` 再做一遍 `validate_remote_proxy`。
+/// 这里对 `stored` 再做一遍 `validate_remote_proxy`。
 /// `Store::from_config` 才是主入口（已经拦了），但本函数是 public 的、
 /// 也是"配置 + 动态"合流的唯一汇聚点 —— 在这儿再挡一次，
 /// 保证**任何**未来新增的调用点都不会把未校验的条目送进运行态。
@@ -348,7 +347,7 @@ pub fn merge_initial(config: &[ProxyConfig], stored: Vec<ProxyConfig>) -> Vec<Pr
             );
             continue;
         }
-        // ★ 与 `ServerCmd` / 配置文件同口径的安全校验（store 内容不可信）
+        // 与 `ServerCmd` / 配置文件同口径的安全校验（store 内容不可信）
         if p.name.is_empty() {
             continue;
         }
@@ -468,16 +467,16 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // H3（v0.5.4）：store 恢复路径必须走 validate_remote_proxy
+    // H3：store 恢复路径必须走 validate_remote_proxy
     // ------------------------------------------------------------------
 
-    /// ★★ H3 核心回归：store 里的危险字段**必须在恢复时被拦下**。
+    /// H3 核心回归：store 里的危险字段**必须在恢复时被拦下**。
     ///
     /// 威胁模型：store 文件的用途是持久化"服务端面板增删过的代理"，
     /// 所以它的内容与服务端下发的 ServerCmd 属于**同一信任级别**。
     /// 早先这里只查 `name` 非空，于是一份写着
     /// `{"plugin":"static_file","plugin_local_path":"/etc"}` 的 store 文件
-    /// 重启后直接生效 ⇒ 任意文件读取，且绕过了第一轮专门为此写的闸门。
+    /// 重启后直接生效 ⇒ 任意文件读取，且绕过了此前专门为此写的闸门。
     #[test]
     fn store_里的危险字段必须在恢复时被拦下() {
         let dir = std::env::temp_dir().join(format!("nfrp-store-h3-{}", std::process::id()));
@@ -487,8 +486,8 @@ mod tests {
 
         // 手工构造一份含危险字段的 store（模拟被写入/被篡改）
         //
-        // ★ 字段名必须是 **snake_case** —— `ProxyConfig` 的 serde 没加 rename。
-        // ★ `local_addr` 是 ProxyConfig 的**必填字段**（没有 serde default）：
+        // 字段名必须是 **snake_case** —— `ProxyConfig` 的 serde 没加 rename。
+        // `local_addr` 是 ProxyConfig 的**必填字段**（没有 serde default）：
         //   漏了它会让**整份文件**反序列化失败、落到"解析失败已忽略"分支，
         //   于是条目压根没进内存 —— 测试就会因为这个原因假通过，
         //   而不是因为校验真的拦住了它。我第一版正是这么写错的，
@@ -545,7 +544,7 @@ mod tests {
 
         for (field, line) in cases {
             let path = dir.join(format!("store-{field}.json"));
-            // ★ 必须带齐必填字段（`local_addr`），否则整份文件解析失败 ⇒ 假通过
+            // 必须带齐必填字段（`local_addr`），否则整份文件解析失败 ⇒ 假通过
             let content = format!(
                 "{{\"version\":1,\"proxies\":[{{\"name\":\"e\",\"type\":\"tcp\",\
                   \"local_addr\":\"127.0.0.1:9999\",{line}}}]}}"

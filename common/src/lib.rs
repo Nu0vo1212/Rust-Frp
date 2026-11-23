@@ -38,7 +38,7 @@
 //!
 //! ## 示例：解析一份 frps 配置
 //!
-//! ★ `ServerConfig` 用的是 **snake_case**（`bind_port`），与原版 frp 的
+//! `ServerConfig` 用的是 **snake_case**（`bind_port`），与原版 frp 的
 //!   `bindPort` 不同 —— 后者由 [`frp_config`] 那一层负责兼容。
 //!
 //! ```

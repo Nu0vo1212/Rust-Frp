@@ -128,7 +128,7 @@ pub struct ProxyConfig {
     // ---- 代理级元数据 ----
     /// 随 `NewProxy` 消息带给服务端的键值对（官方 frp 的 `metadatas`）。
     ///
-    /// ★ 和顶层 `[metadatas]` 不是一回事：
+    /// 和顶层 `[metadatas]` 不是一回事：
     /// - 顶层 `[metadatas]` → `Login.metas`，登录时就发了，平台靠它认账号/隧道；
     /// - 这里的 `[proxies.metadatas]` → `NewProxy.metas`，注册单条代理时才发。
     ///
@@ -146,7 +146,7 @@ pub struct ProxyConfig {
     ///
     /// 用 `Option<bool>` 而不是 `bool` + `serde(default = "true")`：
     /// `ProxyConfig` 有 `#[derive(Default)]`，bool 版本会让"程序内构造"与
-    /// "从配置反序列化"得到**两个不同的默认值**（v0.5.6 修 L1 的教训）。
+    /// "从配置反序列化"得到**两个不同的默认值**。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
 
@@ -181,7 +181,7 @@ pub struct ProxyConfig {
     /// - `"v1"`：文本格式 `PROXY TCP4 <src> <dst> <sport> <dport>`；
     /// - `"v2"`：二进制格式，支持 TLV 扩展、必须能塞进一个 TCP 段。
     ///
-    /// ★ **后端必须支持它**（Nginx `proxy_protocol`、HAProxy `accept-proxy`、
+    /// **后端必须支持它**（Nginx `proxy_protocol`、HAProxy `accept-proxy`、
     /// MySQL 8.0.29+ 等）。后端不认识时会把这段头当业务数据处理 ——
     /// 表现是"连上了但协议报错"，所以两端要一起改。
     #[serde(
@@ -362,7 +362,7 @@ pub struct VisitorConfig {
     pub secret_key: String,
     /// 本地监听地址。
     ///
-    /// ★★ v0.5.6 修（审计总报告 L1，低危）：默认值改为 **`127.0.0.1`**。
+    /// 默认值改为 **`127.0.0.1`**。
     ///
     /// 原先这里复用了服务端的 `DEFAULT_BIND_ADDR`（`"0.0.0.0"`），
     /// 于是同一份配置出现**三个口径、两个答案**：
@@ -381,14 +381,14 @@ pub struct VisitorConfig {
     /// 都要过服务端签名校验 ⇒ 未持密钥者用不了这条隧道。
     /// 残余风险是"不必要地暴露端口 + 可被指纹识别 + DoS 面"。
     ///
-    /// ★ 与 INI 路径对齐后，"TOML 不写 bind_addr"与"INI 不写"行为一致。
+    /// 与 INI 路径对齐后，"TOML 不写 bind_addr"与"INI 不写"行为一致。
     #[serde(default = "default_visitor_bind_addr")]
     pub bind_addr: String,
     /// 本地监听端口。
     ///
     /// **`<= 0` 表示不监听本地端口**（仅用于给别的 visitor 做 fallback 目标）。
     ///
-    /// ★ 这里必须是**有符号**类型。官方 frp 的文档与自带示例都用 `-1` 表达同一件事
+    /// 这里必须是**有符号**类型。官方 frp 的文档与自带示例都用 `-1` 表达同一件事
     /// （`conf/frpc_full_example.toml` 的 `vnet-visitor` 就是 `bindPort = -1`），
     /// 官方代码的判据是 `if cfg.BindPort > 0 { listen }` —— 写成 `u16` 会让整份
     /// 官方配置在解析阶段就 `invalid value: integer -1, expected u16` 直接失败。
@@ -411,7 +411,7 @@ impl Default for VisitorConfig {
             server_name: String::new(),
             server_user: String::new(),
             secret_key: String::new(),
-            // ★ v0.5.6（L1）：与 serde 的 `#[serde(default)]` 保持一致 ——
+            // 与 serde 的 `#[serde(default)]` 保持一致 ——
             //   两处都必须用 visitor 专用的默认值，否则"不写 bind_addr"
             //   在 `Default::default()` 与反序列化两条路径下会得到不同结果。
             bind_addr: default_visitor_bind_addr(),

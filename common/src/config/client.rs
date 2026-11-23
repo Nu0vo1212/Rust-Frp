@@ -28,7 +28,7 @@ use super::proxy::{ProxyConfig, VisitorConfig};
 
 /// 客户端配置，对应 `client.toml`。
 ///
-/// ★ v0.5.3：手工实现 `Debug`（见文件下方），`token` 与各代理的
+/// 手工实现 `Debug`（见文件下方），`token` 与各代理的
 /// `secret_key` / `http_pwd` 一律脱敏。
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
@@ -90,7 +90,7 @@ pub struct ClientConfig {
 
     /// **首次**登录被服务端**明确拒绝**后是否直接退出（对应 frp 的 `loginFailExit`，默认 `true`）。
     ///
-    /// # 与官方 0.71 的差异（v0.7.5 起，针对开机自启）
+    /// # 与官方 0.71 的差异（针对开机自启）
     ///
     /// 官方实现里"连不上"和"认证被拒"都算登录失败，`loginFailExit = true` 时
     /// 第一次失败就退出。开机自启时网络、`proxyURL` 代理、KCP(UDP) 通道往往比
@@ -127,7 +127,7 @@ pub struct ClientConfig {
     ///
     /// 与 frp 一致：默认不校验服务端证书（自签名即可）。
     ///
-    /// ★★ v0.5.8 修（第七轮审计 **B-2**，中危）：**加 `tlsEnable` 别名。**
+    /// **加 `tlsEnable` 别名。**
     ///
     /// # 原先为什么是个陷阱
     ///
@@ -169,7 +169,7 @@ pub struct ClientConfig {
     #[serde(default)]
     pub tls_server_name: String,
 
-    /// 是否**校验服务端证书**（v0.5.6 修审计总报告 L16，低危）。
+    /// 是否**校验服务端证书**。
     ///
     /// 默认 **false** —— 与官方 frp 一致（`InsecureSkipVerify = true`），
     /// 改默认会破坏"官方 frpc 零配置直连"这条承诺。
@@ -242,7 +242,7 @@ pub struct ClientConfig {
     pub transport_protocol: String,
     /// 数据面加密（官方客户端级 `[transport].useEncryption`）。
     ///
-    /// ★ 官方 `GetRealConn` 读的是 `pxy.baseCfg.Transport.UseEncryption`，
+    /// 官方 `GetRealConn` 读的是 `pxy.baseCfg.Transport.UseEncryption`，
     /// `baseCfg` 就是 `ClientCommonConfig` —— 所以这个开关在**客户端级**，
     /// 作用于该客户端的**所有**代理。这一点用真实 e2e 验证过：
     /// 官方 frpc 0.71 只有写在 `[transport]` 下才真的加密数据面。
@@ -295,7 +295,7 @@ pub struct ClientConfig {
     /// （两边同源：官方在 client connector 与 server service 上设置同一个值）。
     /// 客户端侧的不同点：`tcp_mux = false` 时没有 yamux 会话，这一项无意义。
     ///
-    /// `0` = 关闭看门狗（行为回到 v0.5.10 基线）。
+    /// `0` = 关闭看门狗。
     #[serde(default = "default_tcp_mux_keepalive_interval")]
     pub tcp_mux_keepalive_interval: u64,
 
@@ -365,7 +365,7 @@ pub struct ClientConfig {
     ///    `visitors`**，追加到主配置的对应列表；
     /// 4. 各文件的其它字段（`serverAddr` / `token`…）**一律忽略**。
     ///
-    /// ★ 第 4 点最容易误解：`includes` 不是"配置继承/覆盖"，而是**批量追加
+    /// 第 4 点最容易误解：`includes` 不是"配置继承/覆盖"，而是**批量追加
     ///   代理定义**。用一个 `[proxies]` 都没写的文件配进 includes 等于什么也
     ///   不做。
     ///
@@ -382,7 +382,7 @@ pub struct ClientConfig {
     /// xtcp 打洞前用来探测公网映射地址的 STUN 服务器（官方 frpc 的
     /// `natHoleStunServer`）。
     ///
-    /// ★ v0.6.6：官方先做 `nathole.Prepare([stun], ...)` 拿到自己的
+    /// 官方先做 `nathole.Prepare([stun], ...)` 拿到自己的
     /// `XOR-MAPPED-ADDRESS`，再把它填进 `NatHoleVisitor.mapped_addrs`
     /// 交给服务端撮合。没有它只能靠"服务端看到的源地址"猜映射 —
     /// 锥形 NAT 下够用，对称 NAT / 多出口时会给错地址，打洞必然失败。
@@ -397,7 +397,7 @@ pub struct ClientConfig {
 
     /// 解析服务端域名时用的 DNS 服务器（官方 frpc 的 `dnsServer`）。
     ///
-    /// ★ v0.6.6：只影响**本进程**解析服务端地址时用哪个 DNS，
+    /// 只影响**本进程**解析服务端地址时用哪个 DNS，
     /// 不动系统设置（官方注释："If this value is empty, the system default
     /// will be used"）。
     ///
@@ -414,7 +414,7 @@ pub struct ClientConfig {
 
     /// 连服务端时走的出站代理（官方 frpc 的 `transport.proxyURL`）。
     ///
-    /// ★ v0.6.6：支持 `http://` / `https://` / `socks5://` / `socks5h://`，
+    /// 支持 `http://` / `https://` / `socks5://` / `socks5h://`，
     /// 可带 `user:pass@`（HTTP Basic 或 SOCKS5 用户名密码）。
     ///
     /// 作用于**客户端 → 服务端**方向（控制连接与每条工作连接）——
@@ -442,7 +442,7 @@ pub struct ClientConfig {
     )]
     pub udp_packet_size: usize,
 
-    // ================= 以下为 v0.3.4 新增 =================
+    // ================= 扩展配置 =================
     // 同样全部默认关闭，老的 client.toml 行为不变。
     /// 认证配置（`[auth]`）：`method = "token" | "oidc"` + `auth.oidc.*`。
     #[serde(default)]
@@ -507,7 +507,7 @@ impl Default for ClientConfig {
             tcp_mux: true,
             tls_enable: false,
             tls_server_name: String::new(),
-            // ★ v0.5.6（L16）：默认**不校验**（与官方 frp 一致，保互通）；
+            // 默认**不校验**（与官方 frp 一致，保互通）；
             //   想要校验的用户显式开 verifyServerCert。
             tls_verify_server_cert: false,
             tls_trusted_ca_file: String::new(),
@@ -568,8 +568,8 @@ pub struct StoreConfig {
 /// Web 管理界面 TLS 配置（`[webServer.tls]`）。
 ///
 /// 官方 frp 在服务端面板（frps `webServer`）和客户端本地面板（frpc
-/// `webServer`）都接受同一组字段。NFrp 旧版只识别但明确报“未实现”；从
-/// v0.6.7 起真正加载证书并启动 HTTPS listener。
+/// `webServer`）都接受同一组字段。NFrp 旧版只识别但明确报“未实现”；现在
+/// 真正加载证书并启动 HTTPS listener。
 ///
 /// `trustedCaFile` / `serverName` 也一并接受，保证官方 TOML 能直接解析；
 /// 当前 Web 面板不做客户端证书认证，因此这两个字段不参与服务端监听。
@@ -653,7 +653,7 @@ pub struct WebServerConfig {
 
     /// 静态资源目录（官方 frpc 的 `webServer.assetsDir`）。
     ///
-    /// ★ 官方支持、nfrp **未实现**：声明它只是为了"官方配置能解析通过"——
+    /// 官方支持、nfrp **未实现**：声明它只是为了"官方配置能解析通过"——
     /// 本结构开了 `deny_unknown_fields`，不声明的话官方配置会**直接解析失败**。
     /// 值不会被使用（NFrp 用内置页面），启动时会明确告警。
     #[serde(default, alias = "assetsDir", alias = "AssetsDir", alias = "ASSETSDIR")]
@@ -682,7 +682,7 @@ pub struct WebServerConfig {
 }
 
 impl std::fmt::Debug for WebServerConfig {
-    /// ★ v0.5.3：`password` 脱敏（本地管理界面的 Basic Auth 口令）。
+    /// `password` 脱敏（本地管理界面的 Basic Auth 口令）。
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let pwd = if self.password.is_empty() {
             "<empty>".to_string()
@@ -723,7 +723,7 @@ impl WebServerConfig {
 }
 
 impl std::fmt::Debug for ClientConfig {
-    /// ★ v0.5.3：所有凭据字段脱敏。
+    /// 所有凭据字段脱敏。
     ///
     /// 客户端配置里含 `token`（顶层）、`webServer.password`，
     /// 以及每条代理的 `secret_key` / `http_pwd`。原来 `#[derive(Debug)]`
@@ -787,7 +787,7 @@ impl ClientConfig {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let raw = std::fs::read_to_string(path.as_ref()).map_err(crate::error::Error::Io)?;
         let mut cfg = parse_client(&raw)?;
-        // ★ v0.6.5：`includes` 合并（官方 `LoadAdditionalClientConfigs`）
+        // `includes` 合并（官方 `LoadAdditionalClientConfigs`）
         cfg.merge_includes(path.as_ref())?;
         Ok(cfg)
     }

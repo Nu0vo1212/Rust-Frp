@@ -27,7 +27,7 @@ pub struct Ctx<'a> {
     pub proxy_name: &'a str,
     /// 真实客户端的地址，来自服务端下发的 `StartWorkConn.src_addr` / `src_port`。
     ///
-    /// ★ 只有它才配写进 `X-Forwarded-For`。工作连接的对端是 **frps 自己**，
+    /// 只有它才配写进 `X-Forwarded-For`。工作连接的对端是 **frps 自己**，
     /// 拿它当客户端 IP 会让后端看到一屋子 `127.0.0.1`，按 IP 做的限流 / 风控全失效。
     /// 服务端没下发（比如老版本）时为 `None`。
     pub src: Option<SocketAddr>,
@@ -228,7 +228,7 @@ pub fn parse_authority(s: &str, default_port: u16) -> Option<(String, u16)> {
 
 /// 从一行 HTTP 头里取出 `Proxy-Authorization` 的值。
 ///
-/// ★★ v0.5.7 修（第六轮审计 G-2）：**只按小写比对头名，值保持原样**。
+/// **只按小写比对头名，值保持原样**。
 ///
 /// # 原先为什么错了
 ///
@@ -255,7 +255,7 @@ pub fn parse_authority(s: &str, default_port: u16) -> Option<(String, u16)> {
 /// **匹配头名**是对的；错的是从那个小写副本里**取值**。
 /// 现在按小写副本判断"是不是这个头"，再从**原行**上切出值。
 ///
-/// ★ 这与审计总报告 M4（INI 段名/键名大小写）属**同一类**
+/// 这与 INI 段名/键名大小写属**同一类**
 ///   "大小写处理不一致"：一个把该敏感的弄成不敏感，
 ///   一个把该保留原样的弄成了小写。
 ///
@@ -570,7 +570,7 @@ mod static_file {
             return ("200 OK", b"nfrp static_file".to_vec(), "text/plain");
         }
 
-        // ★★ v0.5.8 修（第七轮审计 **D7-4**，低危）：**拒绝 NTFS 备用数据流（ADS）**。
+        // **拒绝 NTFS 备用数据流（ADS）**。
         //
         // # 现象（实测 `tmp/audit7/d_independent/repro_d74_ads.py`，9/9）
         //
@@ -604,7 +604,7 @@ mod static_file {
         // **不应出现冒号**（合法文件名在 Windows 上不含 `:`，
         // NTFS 会把它当流分隔符）。所以：`rel` 里出现 `:` 一律拒绝。
         //
-        // ★ 兼容性：Linux 上 `:` 是**合法**文件名（如 `a:b.txt`）。
+        // 兼容性：Linux 上 `:` 是**合法**文件名（如 `a:b.txt`）。
         //   但本插件是本地文件服务，`rel` 来自**公网访客**构造的 URL；
         //   拒绝带冒号的路径只是让 Linux 上极少数带冒号的文件名不可通过
         //   URL 访问 —— 相较"Windows 上静默绕过滤网"，这个代价可以接受。
@@ -698,7 +698,7 @@ mod tests {
         assert!(r.is_err(), "拼错的插件名必须报错");
     }
 
-    /// ★ 两张表必须锁在一起：`nfrp_common::config::SUPPORTED_PLUGIN_TYPES` 是
+    /// 两张表必须锁在一起：`nfrp_common::config::SUPPORTED_PLUGIN_TYPES` 是
     /// 解析阶段放行用的清单，这里的 `match` 才是真正能跑的实现。
     ///
     /// 只加一边 = 要么 `verify` 继续放行跑不起来的插件（假绿灯），
@@ -794,7 +794,7 @@ mod tests {
         );
     }
 
-    /// ★★ v0.5.7 新增（第六轮审计 G-2）：**头部解析 + 认证必须端到端串起来测**。
+    /// **头部解析 + 认证必须端到端串起来测**。
     ///
     /// # 为什么原来的测试没抓住这个 bug
     ///
@@ -906,7 +906,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// ★★ v0.5.8 回归（第七轮审计 **D7-4**，低危）：
     /// **`static_file` 必须拒绝 NTFS 备用数据流（ADS）写法。**
     ///
     /// # 现象（实测 `tmp/audit7/d_independent/repro_d74_ads.py`，9/9）

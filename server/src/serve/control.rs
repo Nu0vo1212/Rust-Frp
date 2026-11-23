@@ -65,14 +65,14 @@ pub(super) async fn handle_control(
     );
 
     let (req_tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<CtrlCmd>();
-    // ★★ v0.5.6 修（审计总报告 M15，中危）：**补上上界钳制**。
+    // **补上上界钳制**。
     //
     // 原先只有 `.max(5)` —— 只挡了 0（免得"0 = 立刻超时"），
     // **没有上界**。于是配置里写一个极大的值（比如 `u64::MAX` 秒）
     // 就让空闲工作连接**永不回收**：
     //
     // * 每个客户端还能预建多条代理的空闲工作连接（官方 `maxPoolCount`
-    //   默认 5；限制①批次1 起 NFrp 同样支持该项，默认 0 = 不限）；
+    // 默认 5；NFrp 同样支持该项，默认 0 = 不限）；
     // * 客户端重连后旧连接不会被及时清掉 ⇒ `idle_work_conns` 持续累积
     //   ⇒ fd / 内存缓慢增长，且它**不是**由攻击流量触发的，
     //   运维很难把它和配置项联系起来。
@@ -93,7 +93,7 @@ pub(super) async fn handle_control(
     let idle_timeout = Duration::from_secs(idle_secs);
     let limits = registry.limits().clone();
     let (conn_limit, backlog_limit, proxy_limit) = limits.per_client();
-    // 用户连接等配工作连接的超时（`userConnTimeout`，限制①批次1）：官方语义是
+    // 用户连接等配工作连接的超时（`userConnTimeout`）：官方语义是
     // "等不到工作连接就放弃这条用户连接"，默认 10 秒；配 0 折算默认
     // （官方 `EmptyOr` 口径），不会变成"无限等"。
     let user_conn_timeout = cfg.user_conn_timeout();
@@ -149,7 +149,7 @@ pub(super) async fn handle_control(
             // 客户端在 preamble TLV 里出示的一次性令牌（0.7.1 及更早没有这个）。
             let preamble_token: Option<String> = st.resume_token.clone();
 
-            // ★ 第一步：校验一次性续传令牌（0.7.2 起）。
+            // 第一步：校验一次性续传令牌（0.7.2 起）。
             //
             // 只靠 user + client_id + session_id 是不够的：那三个值都是**标识**
             // 而不是凭证，明文链路上的观察者抄走 preamble 就能冒充。
@@ -239,7 +239,7 @@ pub(super) async fn handle_control(
                     restored.join("\n").into_bytes(),
                 );
             }
-            // ★ 无论本次是否续传成功，都签发**下一轮**用的一次性令牌。
+            // 无论本次是否续传成功，都签发**下一轮**用的一次性令牌。
             //
             // 续传成功 ⇒ 客户端拿新令牌，下次断线用；旧令牌已在 consume 时作废。
             // 续传失败 ⇒ 仍给一个新令牌，让客户端这次建立的会话也能在未来续传
@@ -283,7 +283,7 @@ pub(super) async fn handle_control(
             conn.send_nlink(&frame).await?;
         }
 
-        // ★ 一次性续传令牌：**首连也要下发**。
+        // 一次性续传令牌：**首连也要下发**。
         //
         // 续传判定那一支里已经发过一次（覆盖"带着令牌回来"的路径）；
         // 但首次连接根本不带 FLAG_RESUME，压根不会走进那一支 ——
@@ -634,7 +634,7 @@ async fn handle_new_proxy(
     // 命名空间隔离：代理对外（注册表 / 工作连接 / 访问控制）用
     // `{user}.{name}` 这个全名。
     //
-    // ★ 官方 frpc 在**客户端**就加好了前缀再发上来
+    // 官方 frpc 在**客户端**就加好了前缀再发上来
     //   （`client/proxy/proxy_wrapper.go` 的 `wireName` =
     //   `naming.AddUserPrefix(clientCfg.User, name)`），
     //   实测抓包：`user = '2569'` 时线上就是
@@ -647,7 +647,7 @@ async fn handle_new_proxy(
     //   之所以要兜这一层：早期判断反了 —— 以为客户端该发原始名，
     //   结果第三方 frps（LoliaFRP）按全名查隧道，查不到就回
     //   「FRPC 配置文件错误,请检查后重试」。
-    // ★ v0.5.6（M5）：抽成 `canonical_wire_name()`，与面板管理
+    // 抽成 `canonical_wire_name()`，与面板管理
     //   路径（`admin.rs`）共用 —— 原先面板那条漏了 strip，
     //   于是全名会被叠成 `alice.alice.web`（端口/域名泄漏）。
     m.proxy_name = util::canonical_wire_name(&client.user, &m.proxy_name);
@@ -837,7 +837,7 @@ async fn handle_close(
     peer: SocketAddr,
 ) -> Result<()> {
     info!(proxy = %m.proxy_name, "客户端关闭代理");
-    // ★★ v0.5.6 修（审计总报告 M8，中危）：`proxies_active.dec()`
+    // `proxies_active.dec()`
     //   **不能无条件执行**。
     //
     // 原先它在这里就先减了，而下面 `stop_proxy` 可能返回 `None`
@@ -859,14 +859,14 @@ async fn handle_close(
     );
     // stcp / xtcp 的代理名
     //
-    // ★ v0.5.5（第四轮 B-1）：同样必须带上发起方的 client ——
+    // 同样必须带上发起方的 client ——
     //   只按名字摘会摘掉别的租户的同名 visitor 记录（跨租户 DoS）。
-    //   这是 H1 修复漏掉的第二处（同一根因）。
+    // 这是 H1 修复漏掉的第二处（同一根因）。
     registry.visitors.remove(client, &m.proxy_name);
     // 客户端主动关代理时，它占的 http/https 域名也得摘掉，
     // 否则域名会一直被占着、重连注册同一个域名会被判冲突
     //
-    // ★ v0.5.5（第四轮 H1）：必须带上**发起方**的 client ——
+    // 必须带上**发起方**的 client ——
     //   只按名字摘会把别的租户的同名路由一起摘掉（跨租户 DoS）。
     if let Some(t) = registry.vhosts() {
         t.remove_proxy(client, &m.proxy_name);
@@ -874,7 +874,7 @@ async fn handle_close(
     // tcp / udp 的公网端口同理：客户端这边只是记账，
     // 端口是注册表管的，必须显式还回去
     //
-    // ★ v0.5.6（M8）：`dec()` 挪到这里 —— **确实摘掉了才减**。
+    // `dec()` 挪到这里 —— **确实摘掉了才减**。
     if let Some(port) = client.stop_proxy(&m.proxy_name) {
         registry.metrics().proxies_active.dec();
         registry.release_port(port, client, &m.proxy_name);

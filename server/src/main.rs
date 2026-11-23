@@ -104,9 +104,9 @@ async fn main() -> Result<()> {
         cfg.token = token.clone();
     }
 
-    // ★ v0.6.5：`auth.tokenSource` —— 服务端的**期望 token** 也能来自外部源。
+    // `auth.tokenSource` —— 服务端的**期望 token** 也能来自外部源。
     //
-    // ★ 位置说明：必须放在 `check_token_strength` **之前** —— 那个检查看的是
+    // 位置说明：必须放在 `check_token_strength` **之前** —— 那个检查看的是
     //   实际生效的 token，先检查后解析等于在检查空字符串（会误报"token 太弱"）。
     //   但此时 tracing 还没初始化，所以这里**只做解析，失败就 `?` 返回**
     //   （启动错误用户一定看得到），"令牌来自文件/命令"这类提示放到
@@ -135,9 +135,9 @@ async fn main() -> Result<()> {
         Some(_) => None, // 命令行 -t 优先
         None => None,
     };
-    // ★ v0.5.3：弱/占位 token 的强告警。
+    // 弱/占位 token 的强告警。
     //
-    // 背景（第二轮审计的 B 项）：v1 控制通道的登录凭证是
+    // 背景：v1 控制通道的登录凭证是
     // `md5(token + timestamp)`，而且服务端**对 timestamp 不做新鲜性校验**
     // （只用报文自报的 ts 重算比对）。攻击者抓到**一条** Login 报文后，
     // 枚举一个候选 token 只需要 **1 次 MD5** —— 也就是说 token 的实际强度
@@ -204,7 +204,7 @@ async fn main() -> Result<()> {
             cfg.unsupported_fields.join(", ")
         );
     }
-    // ★★ v0.5.6 修（审计总报告 L4，低危）：**明文控制通道也要告警**。
+    // **明文控制通道也要告警**。
     //
     // 原先"空 token""面板无密码"都有强告警，唯独 `transport.tls.force = false`
     // （= 控制通道可明文）**完全静默** —— 三处安全项、两处有告警。
@@ -213,7 +213,7 @@ async fn main() -> Result<()> {
     // 在链路上可被嗅探；而 `login` 报文里的 `privilege_key` 也可以被
     // **原样重放**（M3 只把重放窗口压到 5 分钟，没消除重放本身）。
     //
-    // ★ 与官方 frp 一致：官方也默认不强制 TLS（`transport.tls.force` 默认 false），
+    // 与官方 frp 一致：官方也默认不强制 TLS（`transport.tls.force` 默认 false），
     //   所以**只告警、不拒绝启动** —— 拒绝会破坏"官方客户端零配置直连"
     //   这个核心承诺（官方 frpc 默认 `tls.enable = false` 时走明文）。
     if !cfg.tls_force {
@@ -232,7 +232,7 @@ async fn main() -> Result<()> {
             nfrp_common::config::format_port_ranges(&cfg.allow_ports)
         );
     } else {
-        // ★★ v0.5.6 修（审计总报告 L3，低危）：**空白名单必须告警**。
+        // **空白名单必须告警**。
         //
         // 原先只有 `if`、**没有 `else`** —— 于是 `allowPorts` 留空（= 全放行）
         // 这件事在启动日志里**完全静默**。
@@ -242,7 +242,7 @@ async fn main() -> Result<()> {
         // 而同样是安全项的"空 token""面板无密码"都有强告警，
         // 唯独这一项没有（`serve.rs` 里有对应的强告警，启动路径漏了）。
         //
-        // ★ 只是 warn 不是拒绝：默认配置就是全放行，
+        // 只是 warn 不是拒绝：默认配置就是全放行，
         //   拒绝启动会让出厂配置起不来（与空 token 那条同一个考量）。
         tracing::warn!(
             "未配置 allowPorts —— 客户端可以申请**任意**远端端口（除系统保留端口）。\
@@ -250,7 +250,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    // ★ RBAC 的经典陷阱：配了 [[roles]] 却忘了 denyUnknown。
+    // RBAC 的经典陷阱：配了 [[roles]] 却忘了 denyUnknown。
     //
     // 此时**没匹配到任何角色**的用户会拿到 `unrestricted`（全权）——
     // 因为 `role_for` 里那条分支是为了"老配置不启用 RBAC 时行为不变"而留的。
@@ -275,7 +275,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    // ★★ v0.5.7 新增（第六轮审计 D-5，**高危**）：**配了 [[roles]] 但用共享 token
+    // **配了 [[roles]] 但用共享 token
     //   ⇒ 整套分权可以被伪造**。
     //
     // 判据与完整说明见 [`rbac_identity_is_unverifiable`]。
@@ -307,7 +307,7 @@ async fn main() -> Result<()> {
     }
 
     if cli.check {
-        // ★★ v0.5.7 修（第六轮审计 F-1，中危）：**预检必须与启动同口径**。
+        // **预检必须与启动同口径**。
         //
         // 原先这里只调 `validate(&cfg)` 就返回，而真正启动还会构造
         // `SecurityContext`（ACL / RBAC / 认证 / 审计一整块校验）。
@@ -337,7 +337,6 @@ async fn main() -> Result<()> {
 /// **配了 `[[roles]]` 但身份不可验证** —— 即"角色划分看起来是租户隔离、
 /// 实际只是防误操作"。
 ///
-/// ★★ v0.5.7 新增（第六轮审计 D-5，**高危**）。
 ///
 /// # 为什么这是个真问题（而不是"已知设计"）
 ///
@@ -379,15 +378,15 @@ fn rbac_identity_is_unverifiable(cfg: &ServerConfig) -> bool {
     !cfg.roles.is_empty() && !cfg.effective_auth().token.is_empty()
 }
 
-/// 弱 token 检测（v0.5.3）。
+/// 弱 token 检测。
 /// 为什么值得单独做一件事：v1 的登录凭证是 `md5(token + timestamp)`，
 /// 抓到一条 Login 之后离线枚举一条候选只要 1 次 MD5。token 的强度
 /// **完全取决于它自身的随机性**，协议层面没有补救空间
 /// （PBKDF2 的 64 次迭代是官方 golib 的硬编码值）。
 ///
-/// ★ v0.5.7 更正：本注释原先写"服务端对 `timestamp` **没有新鲜性校验**"，
-///   那句已经**过时** —— M3（v0.5.6）给主登录加了 ±300 秒窗口，
-///   G-1（v0.5.7）把它铺到了全部 6 个凭证入口。
+/// 更正：本注释原先写"服务端对 `timestamp` **没有新鲜性校验**"，
+/// 那句已经**过时** —— M3给主登录加了 ±300 秒窗口，
+/// G-1把它铺到了全部 6 个凭证入口。
 ///   但**弱 token 依然是问题**：窗口只把重放面从"永久"压到 5 分钟，
 ///   攻击者在窗口内抓到一条 Login 仍然能离线枚举 token
 ///   （枚举成本与时间窗口无关）。所以这条检测继续保留。
@@ -457,7 +456,7 @@ fn validate(cfg: &ServerConfig) -> Result<()> {
             "p2p_port({v}) 不能与控制端口 {frp_port} 相同（UDP 与 TCP 端口空间是共用的）"
         );
     }
-    // ★★ v0.5.6 修（审计总报告 L2，低危）：**另外两个 UDP 监听口也要查**。
+    // **另外两个 UDP 监听口也要查**。
     //
     // 原先只有 `p2p_port` 有冲突检查，`kcp_bind_port` 与 `vnet_port`
     // **同为 UDP 监听口却一个都没查** —— 又是一处"同一语义只加固了一个"。
@@ -466,7 +465,7 @@ fn validate(cfg: &ServerConfig) -> Result<()> {
     // 另一个在 bind 时报"地址被占用"，错误信息完全指不到配置上
     // （尤其是 KCP：它绑不上只表现为"KCP 客户端连不上"，离原因很远）。
     //
-    // ★ 用同一个循环处理三个 UDP 口，避免下次再加 UDP 口时又漏一个。
+    // 用同一个循环处理三个 UDP 口，避免下次再加 UDP 口时又漏一个。
     let udp_ports = [
         ("p2p_port", cfg.p2p_port),
         ("kcp_bind_port", cfg.kcp_bind_port),
@@ -532,7 +531,7 @@ fn validate(cfg: &ServerConfig) -> Result<()> {
     // 从日志里自己发现。真要裸奔（比如面板只在跳板机能到的内网里），
     // 显式写 `allow_insecure_dashboard = true` 表明是知情选择。
     //
-    // ★★ v0.5.6 修（审计总报告 H1，高危）：判据同时看**用户名与密码**。
+    // 判据同时看**用户名与密码**。
     //
     // 原先这里只判 `dashboard_user.trim().is_empty()`，而上面那段注释写的却是
     // "配置 dashboard_user + dashboard_pwd" —— **注释与实现不符**，
@@ -542,7 +541,7 @@ fn validate(cfg: &ServerConfig) -> Result<()> {
     // Basic 头，密码为空时期望值就是 `"admin:"` —— 攻击者随手可构造，
     // 等于**鉴权退化成"知道用户名就能进"**。空密码不是弱密码，是**没有密码**。
     //
-    // ★ 四个判据现在共用 `nfrp_common::config::has_dashboard_creds()` 这一个真源
+    // 四个判据现在共用 `nfrp_common::config::has_dashboard_creds()` 这一个真源
     //   （本处 + 热重载闸门 + 暴露判定 + 客户端 webServer 校验）。
     if cfg.dashboard_port.is_some()
         && !nfrp_common::config::has_dashboard_creds(&cfg.dashboard_user, &cfg.dashboard_pwd)
@@ -568,9 +567,9 @@ fn validate(cfg: &ServerConfig) -> Result<()> {
         }
     }
 
-    // ---- 认证：空 token + 显式对外监听 ⇒ **拒绝启动**（v0.5.4 修 M4）----
+    // ---- 认证：空 token + 显式对外监听 ⇒ **拒绝启动**----
     //
-    // 与上面面板那条同一标准；但★★ **这里有个关键差异，不能照抄**：
+    // 与上面面板那条同一标准；但 **这里有个关键差异，不能照抄**：
     //
     // 面板是**可选功能** —— 不配 `dashboard_port` 就压根没有面板，所以
     // "配了面板 + 无凭据 + 对外"可以安全地判为"用户搞错了"。
@@ -587,7 +586,7 @@ fn validate(cfg: &ServerConfig) -> Result<()> {
     //     除非显式 `allow_insecure_no_auth = true`（知情选择）；
     //   * 绑**对外** + `bind_addr` 是**默认值**（用户没写过）⇒
     //     不拒绝启动（否则默认配置废掉），但给出可操作的强告警。
-    // ★★ v0.5.6 修（审计总报告 M6，中危）：判据改用**唯一真源** `has_no_auth()`。
+    // 判据改用**唯一真源** `has_no_auth()`。
     //
     // 原先这里是 `cfg.token.is_empty()` —— **只看顶层 token 字段、且不看
     // `auth.method`**。而 `guard.rs` 那边用的是
@@ -688,7 +687,7 @@ mod tests {
         assert!(validate(&c).is_ok(), "这只是浪费配额，不是错误");
     }
 
-    /// ★ 回归测试：面板配在非回环地址上却不配用户名，必须**拒绝启动**。
+    /// 回归测试：面板配在非回环地址上却不配用户名，必须**拒绝启动**。
     ///
     /// 这是实测复现过的漏洞：`dashboard_user` 为空 ⇒ `dashboard.rs` 整块
     /// 跳过鉴权 ⇒ 匿名者能读 `/api/status`、踢掉任意客户端、并对 nfrp
@@ -730,7 +729,7 @@ mod tests {
         assert!(validate(&c).is_ok());
     }
 
-    /// ★★ v0.5.7 新增（第六轮审计 D-5，**高危**）：`[[roles]]` + 共享 token
+    /// `[[roles]]` + 共享 token
     /// ⇒ 身份不可验证，必须告警。
     ///
     /// 锁三件事：
@@ -811,10 +810,10 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // M4（v0.5.4）：空 token + **显式**对外监听必须拒绝启动
+    // M4：空 token + **显式**对外监听必须拒绝启动
     // ------------------------------------------------------------------
 
-    /// ★★ M4 核心回归：**显式**把 bind_addr 写成对外地址 + 空 token ⇒ 拒绝启动。
+    /// M4 核心回归：**显式**把 bind_addr 写成对外地址 + 空 token ⇒ 拒绝启动。
     ///
     /// 原先只打一条 `warn!` 就放行：那等于对外开放一个任何人都能用的 frps
     /// （注册代理 + 申请公网端口），而同一个风险在面板路径上是 `ensure!` 拒绝的。
@@ -833,7 +832,7 @@ mod tests {
         assert!(msg.contains("无认证"), "错误要说清后果：{msg}");
     }
 
-    /// ★★ **出厂默认配置必须能启动** —— 这是"拒绝启动"不能无条件的理由。
+    /// **出厂默认配置必须能启动** —— 这是"拒绝启动"不能无条件的理由。
     ///
     /// `ServerConfig::default()` 就是 `bind_addr = "0.0.0.0"` + 空 token
     /// （与官方 frps 一致）。若无条件拒绝，连 `--gen-config` 生成的示例

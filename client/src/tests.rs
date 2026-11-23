@@ -34,7 +34,7 @@ pub(crate) fn full_tcp_config() -> ProxyConfig {
         bandwidth_limit: "1MB".into(),
         bandwidth_limit_mode: "server".into(),
         metas: [("pk".to_string(), "pv".to_string())].into_iter().collect(),
-        // 限制①批次1：注解要随 NewProxy 透传（官方 `m.Annotations = c.Annotations`）
+        // 注解要随 NewProxy 透传（官方 `m.Annotations = c.Annotations`）
         annotations: [("example.com/team".to_string(), "infra".to_string())]
             .into_iter()
             .collect(),
@@ -349,7 +349,7 @@ fn every_shareable_field_is_carried() {
     assert_eq!(tcp.bandwidth_limit, c.bandwidth_limit);
     assert_eq!(tcp.bandwidth_limit_mode, c.bandwidth_limit_mode);
     assert_eq!(tcp.metas, c.metas);
-    // 限制①批次1：注解必须跟着走（服务端只存不查，但报文要逐字段对齐官方）
+    // 注解必须跟着走（服务端只存不查，但报文要逐字段对齐官方）
     assert_eq!(tcp.annotations, c.annotations);
 
     // 用 http 分支检查「路由类」字段

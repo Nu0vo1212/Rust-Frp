@@ -185,7 +185,7 @@ pub fn handshake_token(secret_key: &str, sid: &str) -> String {
 
 /// P2P 应用握手的**应答口令**（provider → visitor）。
 ///
-/// ★ v0.5.8 修（第八轮审计 B-1，高危）：旧协议里 provider 校验完口令后
+/// 旧协议里 provider 校验完口令后
 /// 只回一个**固定**的 8 字节 `RTNL-OK`，visitor 收到它就认为握手成功。
 /// 而牵线用的 UDP HELLO 既没有鉴权、`sid` 又在报文里明文携带，
 /// 攻击者只要在链路上读到一次 HELLO，就能以 provider 身份抢先登记：
@@ -680,7 +680,7 @@ mod tests {
         assert!(a.bytes().all(|b| b.is_ascii_hexdigit()));
     }
 
-    /// ★ v0.5.8（第八轮审计 B-1，高危）：应答口令同样绑定 `secret_key`/`sid`，
+    /// 应答口令同样绑定 `secret_key`/`sid`，
     /// 且与请求口令**域分离** —— 两者一旦相等，攻击者把读到的 visitor 口令
     /// 原样回过去就能过，等于没修。
     #[test]

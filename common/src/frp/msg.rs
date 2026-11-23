@@ -62,19 +62,19 @@ fn is_empty_map(m: &HashMap<String, String>) -> bool {
 // 消息体
 // ---------------------------------------------------------------------------
 
-// ★★ v0.5.6 修（审计总报告 L9，低危）：**手工实现 `Debug`，`privilege_key` 打码**。
+// **手工实现 `Debug`，`privilege_key` 打码**。
 //
 // 去掉 `derive(Debug)` 是为了不让 `privilege_key` 进日志。它是一条
 // **可直接用来重放登录**的凭据（M3 把重放窗口压到 5 分钟，但没有消除重放），
 // 一旦被 `tracing::debug!("{login:?}")` 打出来就等于把凭据写进日志文件。
 //
-// ★ 这是**同一类坑的第三处**：`ServerAuthConfig` 与 `ClientAuthConfig`
+// 这是**同一类坑的第三处**：`ServerAuthConfig` 与 `ClientAuthConfig`
 //   都因为同样的原因手工实现了 `Debug`（各自带 `不得泄漏_token` 的锁定测试）。
 //   本处目前**不可达**（全仓没有生产代码打印 `Login`），所以定 Low ——
 //   但"等它能被打出来时再修"就晚了，而且下一个人加一行 debug 日志
 //   不会有任何提示。
 //
-// ★ 参照那两处的做法：敏感字段显示为 `<redacted>`，
+// 参照那两处的做法：敏感字段显示为 `<redacted>`，
 //   非敏感字段照常显示（否则排查问题时日志毫无用处）。
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Login {
@@ -116,7 +116,7 @@ impl std::fmt::Debug for Login {
             .field("os", &self.os)
             .field("arch", &self.arch)
             .field("user", &self.user)
-            // ★ v0.5.6（L9）：凭据**绝不**进日志。空/非空也区分显示 ——
+            // 凭据**绝不**进日志。空/非空也区分显示 ——
             //   长度本身是可用信息（能区分"没带凭证"与"带了错的"），
             //   所以只区分"空"与"非空"，不暴露长度。
             .field(
@@ -164,9 +164,9 @@ pub struct NfrpCaps {
     /// 支持服务端下发管理命令（面板上增删代理 / 踢人）。
     #[serde(default, skip_serializing_if = "is_false")]
     pub server_cmd: bool,
-    /// ★ v0.5.5：本客户端会在**工作连接**上携带 `privilege_key`。
+    /// 本客户端会在**工作连接**上携带 `privilege_key`。
     ///
-    /// 为什么需要这个能力位（第四轮 A-1）：工作连接原先只凭 `run_id` 接入
+    /// 为什么需要这个能力位：工作连接原先只凭 `run_id` 接入
     /// （`run_id` 还是明文 `LoginResp` 下发的），于是拿到它的人可以往
     /// 受害者的空闲工作连接池里灌自己的连接 ⇒ 用户流量被中继到攻击者（MITM）。
     ///
@@ -239,7 +239,7 @@ pub struct NewProxy {
     pub bandwidth_limit: String,
     /// 限流在哪一端执行：`client`（默认）/ `server`。
     ///
-    /// ★ 官方 frpc **只在值不等于默认的 `client` 时才发**
+    /// 官方 frpc **只在值不等于默认的 `client` 时才发**
     /// （`MarshalToMsg` 里写着 `if c.Transport.BandwidthLimitMode != "client"`）。
     /// 所以发之前必须把 `client` 归一化成空串，否则报文和官方 frpc 不一致。
     #[serde(default, skip_serializing_if = "is_empty_str")]
@@ -290,7 +290,7 @@ pub struct NewProxy {
     // ---- tcpmux 使用（Go: NewProxy 的 Multiplexer）----
     /// 多路复用器类型，官方目前只有 `httpconnect` 一种。
     ///
-    /// ★ 这是 `tcpmux` 代理**必须有**的字段：`tcpmux` 本身不绑端口，它把工作连接
+    /// 这是 `tcpmux` 代理**必须有**的字段：`tcpmux` 本身不绑端口，它把工作连接
     /// 挂到服务端 `tcpmuxHTTPConnectPort` 那个 HTTP CONNECT 复用器上，
     /// 由复用器按 CONNECT 的 host 分发。少了它服务端会报
     /// `unknown multiplexer []`（官方 `server/proxy/tcpmux.go` 的 `Run()`）。
@@ -599,14 +599,14 @@ impl NewProxy {
             // 带宽上限：官方 frpc 会原样上报，平台拿它做限流校验
             bandwidth_limit: p.bandwidth_limit.clone(),
             bandwidth_limit_mode,
-            // ★ 这里放的是**代理级** `[proxies.metadatas]`，不是顶层 `[metadatas]`。
+            // 这里放的是**代理级** `[proxies.metadatas]`，不是顶层 `[metadatas]`。
             //   官方 frpc 的 `MarshalToMsg` 写的是 `m.Metas = c.Metadatas`，
             //   顶层那份只进登录消息（`Login.Metas`）。
             metas: p.metas.clone(),
-            // ★ 官方 frpc 的 `MarshalToMsg`：`m.Annotations = c.Annotations`
+            // 官方 frpc 的 `MarshalToMsg`：`m.Annotations = c.Annotations`
             //   （基础代理配置对所有类型都带）—— 只透传，不解读。
             annotations: p.annotations.clone(),
-            // ★ 数据面开关必须上报：服务端靠它决定要不要解密/解压。
+            // 数据面开关必须上报：服务端靠它决定要不要解密/解压。
             //
             // 漏传的后果是最难查的那种：客户端加密了、服务端当明文
             // 透传，用户看到“能连上但数据全乱”。实测就是这样发现的。
@@ -731,7 +731,7 @@ impl UdpAddr {
 
     /// 用作会话 map 的 key（与 frp 的 `UDPAddr.String()` 语义一致）。
     ///
-    /// ★★ v0.5.6 修（审计总报告 M16，中危）：**必须消掉 IPv6 的歧义**。
+    /// **必须消掉 IPv6 的歧义**。
     ///
     /// 原先直接 `format!("{}:{}", self.ip, self.port)`，而 IPv6 地址**自身
     /// 就含冒号** ⇒ 表示不唯一：
@@ -1402,10 +1402,10 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // v0.5.6 回归（审计总报告 M16）：UdpAddr::key() 的 IPv6 歧义
+    // UdpAddr:key() 的 IPv6 歧义
     // ------------------------------------------------------------------
 
-    /// ★★ M16：IPv6 的 key 必须带方括号，否则不同地址会撞成同一个 key。
+    /// IPv6 的 key 必须带方括号，否则不同地址会撞成同一个 key。
     ///
     /// 碰撞的后果是**会话串访客**（UDP 响应写回错误的对端）
     /// 与**会话爆炸**（同一对端多个 key，每个建独立 socket，
@@ -1418,7 +1418,7 @@ mod tests {
             zone: String::new(),
         };
 
-        // ★ 原先这两组会拼出**同一个串** `::1:8080`
+        // 原先这两组会拼出**同一个串** `::1:8080`
         let a = mk("::1", 8080);
         let b = mk("::1:8080", 0);
         assert_ne!(
@@ -1442,7 +1442,7 @@ mod tests {
         };
         assert_ne!(z1.key(), z2.key(), "zone 的两种表示不能撞");
 
-        // ★ 反向：IPv4 保持原样（不能改，否则与既有 map 语义 / 官方行为分叉）
+        // 反向：IPv4 保持原样（不能改，否则与既有 map 语义 / 官方行为分叉）
         assert_eq!(mk("1.2.3.4", 80).key(), "1.2.3.4:80");
         assert_eq!(mk("0.0.0.0", 0).key(), "0.0.0.0:0");
     }

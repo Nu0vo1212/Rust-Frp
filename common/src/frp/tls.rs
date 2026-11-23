@@ -32,11 +32,11 @@ const TLS_HANDSHAKE_BYTE: u8 = 0x16;
 /// 探测首字节的等待时间，与 frp 的 `connReadTimeout` 对应。
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// TLS 握手阶段的总超时（第九轮 C9-4 修复）。
+/// TLS 握手阶段的总超时。
 ///
 /// 原先 `accept_server` 对 rustls 握手**没有任何时限**：只发一个 `0x16`
 /// （或 `0x17`）字节后静默，`TlsAcceptor::accept` 会永远等下去 ——
-/// 第九轮实测（`tmp/audit9/c/c9_4_timeouts_tls.py`）：50s 后仍被挂住，
+/// 实测（`tmp/audit9/c/c9_4_timeouts_tls.py`）：50s 后仍被挂住，
 /// 且可线性囤积（500 条连接 +515 句柄 / +6.4MB，无一被清理）。
 /// rustls 自己不做握手超时（协议层允许任意慢的来包），必须在调用侧加。
 ///
@@ -142,7 +142,7 @@ pub fn validate_server_tls_files(
 
 /// 客户端 TLS 配置：与 frp 默认行为一致，不校验服务端证书。
 ///
-/// ★★ v0.5.6（审计总报告 L16，低危）：保留这个默认，但**新增**
+/// 保留这个默认，但**新增**
 /// [`client_config_verifying`] 提供"真正校验"的可选路径。
 ///
 /// # 为什么默认不改
@@ -167,7 +167,7 @@ pub fn client_config() -> Result<Arc<rustls::ClientConfig>> {
     Ok(Arc::new(cfg))
 }
 
-/// 客户端 TLS 配置：**校验服务端证书**（v0.5.6，L16）。
+/// 客户端 TLS 配置：**校验服务端证书**。
 ///
 /// 用系统根证书 + 可选的额外信任 CA（`trustedCaFile`）。
 /// 与 [`client_config`] 的区别只有"验不验证书"。
@@ -178,7 +178,7 @@ pub fn client_config() -> Result<Arc<rustls::ClientConfig>> {
 /// * 服务端用**自签证书** ⇒ 把该证书填进 `transport.tls.trustedCaFile`，
 ///   同时 `tlsServerName` 要能对上证书里的名字。
 ///
-/// ★ 注意：开了校验之后，**官方 frpc 默认连不上**（它不校验，但也不提供
+/// 注意：开了校验之后，**官方 frpc 默认连不上**（它不校验，但也不提供
 ///   证书给你）—— 所以这个开关是给"自有客户端 + 自有服务端"的部署用的。
 ///   双方都配好 CA 即可。
 pub fn client_config_verifying(
@@ -192,7 +192,7 @@ pub fn client_config_verifying(
     // 内置的公开根证书（与 `httpc` 用同一份 `webpki-roots`，
     // 避免"同一个仓库两套根证书来源"）。
     //
-    // ★ 不引 `rustls-native-certs`：它会读系统信任库（Windows 证书store /
+    // 不引 `rustls-native-certs`：它会读系统信任库（Windows 证书store /
     //   Linux ca-certificates），覆盖面更广，但**多一个依赖 + 平台差异**；
     //   而本项目已有的 `httpc` 走的就是 `webpki-roots`。保持一致更重要 ——
     //   自签场景本来就必须配 `trustedCaFile`，那时系统根证书帮不上忙。
@@ -442,7 +442,7 @@ where
     match first[0] {
         FRP_TLS_HEAD_BYTE => {
             let acceptor = TlsAcceptor::from(server_config()?);
-            // ★ C9-4：握手必须有总时限，否则单字节就能永久占住一条连接。
+            // 握手必须有总时限，否则单字节就能永久占住一条连接。
             let tls = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream))
                 .await
                 .context("TLS 服务端握手超时")?
@@ -490,7 +490,7 @@ pub struct ClientTlsOptions<'a> {
 
 /// 客户端：按需发送 frp 自定义首字节并发起 TLS 握手。
 ///
-/// ★ v0.5.6（L16）：`verify = false` 走与官方一致的"不校验"（保互通），
+/// `verify = false` 走与官方一致的"不校验"（保互通），
 /// `true` 走真正校验（需要 `trustedCaFile` 配合自签场景）。
 pub async fn connect_client<S>(mut stream: S, opts: &ClientTlsOptions<'_>) -> Result<BoxStream>
 where

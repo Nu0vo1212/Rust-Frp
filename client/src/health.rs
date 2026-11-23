@@ -135,7 +135,7 @@ async fn probe_tcp(addr: &str, timeout: Duration) -> bool {
 
 /// HTTP 探测：**只有 2xx 才算活着**。
 ///
-/// ★ v0.6.2 对齐官方：官方 `client/health/health.go` 的 `doHTTPCheck` 用的是
+/// 官方：官方 `client/health/health.go` 的 `doHTTPCheck` 用的是
 /// `if resp.StatusCode/100 != 2 { return error }` —— **严格 2xx**。
 ///
 /// 原先这里判的是 `code < 400`，把 3xx 也算健康。差别在真实场景里很明显：
@@ -175,7 +175,6 @@ async fn probe_http(
 
 /// 拼一次 HTTP 探测请求。
 ///
-/// ★ v0.6.3（对齐官方 `HealthCheckConfig.HTTPHeaders`）：
 ///   官方在 `doHTTPCheck` 里把配置的 header 全设进 `req.Header`，再用
 ///   `req.Host = header.Get("Host")` 单独覆盖 Host。这里照做：
 ///   配置里有 `Host` 就用它，没有才用兜底值 `healthcheck`。
@@ -218,7 +217,7 @@ mod tests {
     use super::*;
 
     // ------------------------------------------------------------------
-    // v0.6.3：探测请求构造（对齐官方 HTTPHeaders）
+    // 探测请求构造（对齐官方 HTTPHeaders）
     // ------------------------------------------------------------------
 
     fn hdr(name: &str, value: &str) -> nfrp_common::config::HttpHeader {
@@ -267,12 +266,12 @@ mod tests {
         assert_eq!(req.matches("Host:").count(), 1, "Host 头必须唯一：{req:?}");
     }
 
-    /// ★ 头注入：值里的 CR/LF 必须被剥掉，不能让配置伪造出额外请求头。
+    /// 头注入：值里的 CR/LF 必须被剥掉，不能让配置伪造出额外请求头。
     ///
     /// 手写 HTTP 请求不像 Go 的 `http.Header` 会替我们校验，
     /// 一个含 `\r\n` 的值就能插进任意头、甚至拼出第二条请求。
     ///
-    /// ★ 判据要精确：剥掉 CR/LF 之后，攻击者控制的**字符串本身**仍会出现在
+    /// 判据要精确：剥掉 CR/LF 之后，攻击者控制的**字符串本身**仍会出现在
     ///   请求里（被压进上一个头的值），那是无害的 —— 关键是它**不能构成
     ///   独立的头行**。所以这里验"请求行的结构"，而非"某串字面量不存在"。
     #[test]

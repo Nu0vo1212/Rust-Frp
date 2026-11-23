@@ -247,7 +247,7 @@ impl PunchBus {
         let txn = m.transaction_id.clone();
         self.lock().insert(txn.clone(), tx);
         if let Err(e) = self.req_tx.send(m) {
-            // ★ 发送失败必须把刚登记的等待者摘掉。
+            // 发送失败必须把刚登记的等待者摘掉。
             //
             // 原先这里是 `.map_err(...)?` 直接返回，waiters 里那条永远留着了：
             // 没人会来 deliver 它（请求根本没发出去），也不会有人 remove。
@@ -297,7 +297,7 @@ pub struct P2PRoute {
     pub predict_window: u16,
     /// 打洞前用来探公网映射地址的 STUN 服务器（官方 `natHoleStunServer`）。
     ///
-    /// ★ v0.6.6：从 `ClientConfig` 在 [`setup`] 时拷贝过来 —— 这里不持 `&ClientConfig`
+    /// 从 `ClientConfig` 在 [`setup`] 时拷贝过来 —— 这里不持 `&ClientConfig`
     /// 是因为它要跨 task 共享（引用活不了那么久）。
     /// 空字符串 = 不做 STUN 探测。
     pub stun_servers: String,
@@ -402,7 +402,7 @@ pub async fn try_punch_as_visitor(
             Transport::Quic => "quic".to_string(),
             Transport::Kcp => "kcp".to_string(),
         },
-        // ★ v0.6.6：配了 `natHoleStunServer` 就先探一下自己的公网映射地址。
+        // 配了 `natHoleStunServer` 就先探一下自己的公网映射地址。
         //
         // 探不到不是致命错误（锥形 NAT 下靠"服务端看到的源地址"
         // 也能打），所以失败只记一条 debug 日志、继续走原流程。
@@ -740,7 +740,7 @@ async fn kcp_accept(
 /// visitor：先写口令，再等对方回**由同一 `secret_key` 派生的应答口令**；
 /// 之后这条流就是数据通道。
 ///
-/// ★ v0.5.8 修（第八轮审计 B-1，高危）：旧协议只校验"对方回没回固定的
+/// 旧协议只校验"对方回没回固定的
 /// `RTNL-OK`"。牵线 HELLO 无鉴权且 sid 明文，攻击者冒充 provider 时事
 /// 实上不需要任何秘密就能被接受 —— visitor 会把用户流量交给它。
 /// 现在校验的应答由 `handshake_ack(secret_key, sid)` 派生，攻击者不知道
@@ -782,7 +782,7 @@ where
         let _ = s.shutdown().await;
         bail!("P2P 握手口令不匹配（对方不是本次 xtcp 会话的 peer）");
     }
-    // ★ v0.5.8 修（第八轮审计 B-1）：应答同样派生自 secret_key，
+    // 应答同样派生自 secret_key，
     //   让 visitor 能反向确认"对面真的持有 secret_key"。
     s.write_all(p2p::handshake_ack(secret_key, sid).as_bytes())
         .await?;
@@ -1172,8 +1172,8 @@ mod tests {
     /// **按角色分别攒地址**，凑齐两个角色后把对方的全部采样地址下发出去，
     /// 端口预测才有输入。
     ///
-    /// ★ 注：这个替身**只服务一轮**就 `return`。
-    /// 本轮（v0.5.10）曾试着改成常驻循环，A/B 对照（各 5 次全组）
+    /// 注：这个替身**只服务一轮**就 `return`。
+    /// 本轮曾试着改成常驻循环，A/B 对照（各 5 次全组）
     /// 显示**无实质改善**（0/5 → 1/5，属噪声），已回滚。
     /// 真正的偶发失败原因（云端 Linux 上 p2p 全组 0/5）**尚未定位**，
     /// 见 `tmp/TRIAGE-2026-10-18.md`。
@@ -1346,7 +1346,7 @@ mod tests {
         assert!(srv.is_err());
     }
 
-    /// ★ v0.5.8（第八轮审计 B-1，高危）回归：假 provider **不知道 secret_key**，
+    /// 假 provider **不知道 secret_key**，
     /// 它能读到 visitor 递出的口令（口令是 visitor 先发的），然后模仿旧协议
     /// 回固定 `RTNL-OK`，或回一个内容错误 / 密钥猜错的应答。
     ///

@@ -61,7 +61,7 @@ type Renames = &'static [(&'static str, &'static str)];
 /// 真机对拍表现为客户端报「代理注册失败：客户端用了 subdomain，但服务端未配置
 /// subdomain_host」（见 tmp/interop_subdomain.py）。这里对齐 Go 的行为。
 ///
-/// ★ 只折叠大小写，**不折叠下划线**：官方同样不把 `subdomain_host` 当成
+/// 只折叠大小写，**不折叠下划线**：官方同样不把 `subdomain_host` 当成
 /// `subDomainHost`（Go 的 EqualFold 不忽略 `_`）。snake_case 是 NFrp 自己额外
 /// 容忍的写法，由 serde 的原生字段直接接住。
 fn find_key_ci(t: &toml::Table, name: &str) -> Option<String> {
@@ -261,7 +261,7 @@ fn merge_local_addr(p: &mut toml::Table) {
 /// `tunnelProxy` / `udpMultiplexer` 这些字段（verify 直接回 `unknown field`）。
 /// 把它们列进来，会让用户以为"官方有而 NFrp 缺"，实际是两边都没有。
 const UNSUPPORTED_CLIENT_FIELDS: &[&str] = &[
-    // v0.6.6：官方 0.71 的客户端顶层 / 代理 / visitor 字段已全部落地。
+    // 官方 0.71 的客户端顶层 / 代理 / visitor 字段已全部落地。
     // useEncryption、useCompression、proxyURL、tokenSource、udpPacketSize、
     // natHoleStunServer、dnsServer、includes、pprofEnable、assetsDir 均已在
     // 配置层与实际执行路径接通。
@@ -290,7 +290,7 @@ pub fn unsupported_fields(root: &Value) -> Vec<String> {
 /// 维护规则同客户端清单：只放"官方 0.71 确认支持、且 NFrp 确实没实现"的，
 /// 实现后删掉。清单按官方 `frps_full_example.toml`（v0.71.0）逐项比对得出。
 const UNSUPPORTED_SERVER_FIELDS: &[&str] = &[
-    // v0.6.6：官方 0.71 的 frps 顶层字段已全部落地。
+    // 官方 0.71 的 frps 顶层字段已全部落地。
     // pprofEnable、natholeAnalysisDataReserveHours、sshTunnelGateway、
     // httpPlugins 均已在配置层与执行路径接通。
     // 唯一仍单独检测的是 `webServer.tls.*`（面板 HTTPS），见下方路径扫描。
@@ -477,7 +477,7 @@ fn extract_plugin(p: &mut toml::Table) {
         ("hostHeaderRewrite", "plugin_host_header_rewrite"),
     ];
     for (from, to) in pairs {
-        // ★ v0.5.4 修（L8）：用**大小写折叠**查找，而不是精确匹配。
+        // 用**大小写折叠**查找，而不是精确匹配。
         //
         // 官方 frp 读配置走 `toml → json → json.Unmarshal`，Go 的
         // `encoding/json` 匹配字段名用 `strings.EqualFold` —— 即 `localPath`
@@ -489,7 +489,7 @@ fn extract_plugin(p: &mut toml::Table) {
         // 不构成安全漏洞；但与模块文档"对齐 Go 的 EqualFold"的承诺不符，
         // 而且错误提示会误导人。
         //
-        // ★ 已核实不存在反向风险：大小写折叠只影响"能不能找到这个键"，
+        // 已核实不存在反向风险：大小写折叠只影响"能不能找到这个键"，
         //   不会把危险字段偷渡进 `validate_remote_proxy`
         //   （那个函数读的是规范化后的结构体字段；远程下发路径不经过本兼容层）。
         let key = sub.keys().find(|k| k.eq_ignore_ascii_case(from)).cloned();
@@ -535,15 +535,15 @@ pub fn normalize_client(root: &mut toml::Value) {
             ("wireProtocol", "protocol"),
             ("heartbeatInterval", "heartbeat_interval"),
             ("heartbeatTimeout", "heartbeat_timeout"),
-            // 连接服务端的超时 / 本机出口绑定（限制①批次1 实现，语义对齐官方
+            // 连接服务端的超时 / 本机出口绑定（语义对齐官方
             // `connector.go`：仅走 TCP 拨号路径，KCP 不适用）。
             ("dialServerTimeout", "dial_server_timeout"),
             ("connectServerLocalIP", "connect_server_local_ip"),
-            // TCP keepalive / yamux 保活（限制①批次2 实现，官方同名键，
+            // TCP keepalive / yamux 保活（官方同名键，
             // 语义与落法见 config.rs 对应字段的文档）。
             ("dialServerKeepalive", "dial_server_keepalive"),
             ("tcpMuxKeepaliveInterval", "tcp_mux_keepalive_interval"),
-            // ★ v0.6.6：数据面加密/压缩、出站代理、自定义 DNS。
+            // 数据面加密/压缩、出站代理、自定义 DNS。
             // 官方 GetRealConn 读的是 pxy.baseCfg.Transport.*（客户端级），
             // 所以这几项必须从 [transport] 提升到顶层，否则配了也不生效。
             ("useEncryption", "useEncryption"),
@@ -559,7 +559,7 @@ pub fn normalize_client(root: &mut toml::Value) {
         &[
             ("enable", "tls_enable"),
             ("serverName", "tls_server_name"),
-            // 限制①批次3：mTLS / 自定义证书。官方把这几项放在
+            // mTLS / 自定义证书。官方把这几项放在
             // `[transport.tls]`，NFrp 结构体是平铺字段，必须 hoist 才生效。
             // 目标键保持官方 camelCase —— 结构体字段带 `rename`，serde 认的是它。
             ("trustedCaFile", "trustedCaFile"),
@@ -585,7 +585,7 @@ pub fn normalize_client(root: &mut toml::Value) {
     // 注意这是**顶层**的 `[metadatas]`，只进登录消息；`[[proxies]]` 里那份
     // `[proxies.metadatas]` 是另一回事（进 `NewProxy.metas`），在下面单独搬。
     //
-    // ★ 千万别顺手把 `metadatas.token` 当成本地认证 token —— 实测反过来：
+    // 千万别顺手把 `metadatas.token` 当成本地认证 token —— 实测反过来：
     //   frp 里 `metadatas` 只是"随消息带过去的附加信息"，**不参与认证**。
     //   平台给的这份配置没有 `auth.token`，服务端的全局 token 也是空的，
     //   于是官方 frpc 发的是 `md5("" + timestamp)`。我们若拿 `metadatas.token`
@@ -615,7 +615,7 @@ pub fn normalize_client(root: &mut toml::Value) {
             &[
                 ("bandwidthLimit", "bandwidth_limit"),
                 ("bandwidthLimitMode", "bandwidth_limit_mode"),
-                // ★ v0.6.6：数据面加密/压缩在官方的 [proxies.transport] 段里
+                // 数据面加密/压缩在官方的 [proxies.transport] 段里
                 ("useEncryption", "use_encryption"),
                 ("useCompression", "use_compression"),
             ],
@@ -634,7 +634,7 @@ pub fn normalize_client(root: &mut toml::Value) {
                 ("maxFailed", "health_check_max_failed"),
                 ("intervalSeconds", "health_check_interval_s"),
                 ("path", "health_check_url"),
-                // ★ v0.6.3：官方 `healthCheck.httpHeaders` ——
+                // 官方 `healthCheck.httpHeaders` ——
                 //   `[{ name = "Authorization", value = "Bearer x" }]`
                 //   整个数组搬过来，serde 按 `Vec<HttpHeader>` 解析。
                 ("httpHeaders", "health_check_http_headers"),
@@ -668,21 +668,21 @@ const SERVER_TOP: Renames = &[
     ("vhostHTTPPort", "vhost_http_port"),
     ("vhostHTTPSPort", "vhost_https_port"),
     // tcpmux：官方 frps.toml 里是 camelCase，NFrp 里是 snake_case。
-    // ★ 少这一行就会**静默忽略** —— 用户配了 tcpmuxHTTPConnectPort 却启动不了
+    // 少这一行就会**静默忽略** —— 用户配了 tcpmuxHTTPConnectPort 却启动不了
     //   CONNECT 复用器，然后 tcpmux 代理一条都注册不上，报错还指向代理而不是配置。
     ("tcpmuxHTTPConnectPort", "tcpmux_http_connect_port"),
     ("tcpmuxPassthrough", "tcpmux_passthrough"),
     // 虚拟主机 / 端口管控（官方 frps.toml 里都是顶层 camelCase）
     ("vhostHTTPTimeout", "vhost_http_timeout"),
     ("custom404Page", "custom_404_page"),
-    // ★ 安全相关：少了这两行，"端口白名单 + 单客户端端口数上限"会**静默失效** ——
+    // 安全相关：少了这两行，"端口白名单 + 单客户端端口数上限"会**静默失效** ——
     //   用户以为锁住了 22 / 3306，实际任何客户端都能申请。
     ("allowPorts", "allow_ports"),
     ("maxPortsPerClient", "max_ports_per_client"),
     ("detailedErrorsToClient", "detailed_errors_to_client"),
     ("subdomainHost", "subdomain_host"),
     ("transportProtocol", "transport_protocol"),
-    // 限制①批次1：数据面监听地址与"等用户连接配工作连接"的超时（官方顶层键）。
+    // 数据面监听地址与"等用户连接配工作连接"的超时（官方顶层键）。
     ("proxyBindAddr", "proxy_bind_addr"),
     ("userConnTimeout", "user_conn_timeout"),
     // 官方 0.71 新增的顶层键（serde 里已经是 camelCase，这里只是为了
@@ -724,9 +724,9 @@ pub fn normalize_server(root: &mut toml::Value) {
             // "原版 frps 配置能直接喂进来"而接受它。
             ("wireProtocol", "protocol"),
             ("heartbeatTimeout", "heartbeat_timeout"),
-            // 空闲工作连接池上限（限制①批次1 实现；官方默认 5，nfrp 默认 0 = 不限）。
+            // 空闲工作连接池上限。官方默认 5，nfrp 默认 0 = 不限。
             ("maxPoolCount", "max_pool_count"),
-            // yamux 保活间隔 + 主端口 TCP keepalive（限制①批次2 实现）。
+            // yamux 保活间隔 + 主端口 TCP keepalive。
             ("tcpMuxKeepaliveInterval", "tcp_mux_keepalive_interval"),
             ("tcpKeepalive", "tcp_keepalive"),
         ],
@@ -736,7 +736,7 @@ pub fn normalize_server(root: &mut toml::Value) {
         &["transport", "tls"],
         &[
             ("force", "tls_force"),
-            // 限制①批次3：服务端自定义证书 + mTLS。
+            // 服务端自定义证书 + mTLS。
             ("certFile", "certFile"),
             ("keyFile", "keyFile"),
             ("trustedCaFile", "trustedCaFile"),
@@ -809,7 +809,7 @@ mod tests {
     /// 实际是明文。TOML 的 camelCase 写法必须能识别出来。
     #[test]
     fn tom_里_use_encryption_已经实现所以不再报未实现() {
-        // ★ v0.6.6：`useEncryption` / `useCompression` 已经真正实现了
+        // `useEncryption` / `useCompression` 已经真正实现了
         // （数据面 AES-128-CFB + Snappy framing），所以它们**不该**再出现在
         // "未实现字段"清单里 —— 否则会出现"说没实现而实际能用"的反向假警报。
         let raw = r#"
@@ -975,7 +975,7 @@ log_max_days = 7
         assert_eq!(cfg.max_days, 7);
     }
 
-    /// ★ 写错的 `allow_ports` 必须报错，不能静默变成"不限制"。
+    /// 写错的 `allow_ports` 必须报错，不能静默变成"不限制"。
     /// 官方 INI 转换器把解析错误吞掉 → AllowPorts 为空 → **全端口放开**，
     /// 这是"配了安全策略却等于没配"的经典翻车现场。
     #[test]
@@ -1034,7 +1034,7 @@ bandwidthLimitMode = 'server'
         assert_eq!(cfg.user, "2569");
         // `[metadatas]` 里的 token 不是认证 token（frp 语义：它只随消息带给服务端）
         assert!(cfg.token.is_empty(), "metadatas.token 不该被当成认证 token");
-        // ★ 关键：`[metadatas]` 必须原样进 Login.metas / NewProxy.metas，
+        // 关键：`[metadatas]` 必须原样进 Login.metas / NewProxy.metas，
         //   否则服务端认不出隧道，只会回「FRPC 配置文件错误」
         assert_eq!(
             cfg.metas.get("token").map(String::as_str),
@@ -1191,7 +1191,7 @@ intervalSeconds = 7
         assert_eq!(p.health_check_interval_s, 7);
     }
 
-    /// ★ v0.6.3 对齐官方：`healthCheck.httpHeaders` 必须被识别。
+    /// 官方：`healthCheck.httpHeaders` 必须被识别。
     ///
     /// 官方 `HealthCheckConfig.HTTPHeaders` 用于需要鉴权的健康检查端点。
     /// 在支持它之前，这类端点一律探测失败 —— 表现为"服务明明活着，
@@ -1338,7 +1338,7 @@ bindPort = 9001
         assert_eq!(v.bind_port, 9001);
     }
 
-    /// ★ 回归：官方 `frpc_full_example.toml` 的 `vnet-visitor` 写的是 `bindPort = -1`，
+    /// 回归：官方 `frpc_full_example.toml` 的 `vnet-visitor` 写的是 `bindPort = -1`，
     /// 官方语义为"不监听本地端口"。这里用 `u16` 会让**整份官方配置解析失败**。
     #[test]
     fn visitor_的_bind_port_接受官方的负数写法() {
@@ -1440,7 +1440,7 @@ password = "pw"
         assert_eq!(cfg.dashboard_pwd, "pw");
     }
 
-    /// ★ 官方文档与 `frps_full_example.toml` 里写的是 `subDomainHost`（大写 D）。
+    /// 官方文档与 `frps_full_example.toml` 里写的是 `subDomainHost`（大写 D）。
     ///
     /// 官方 frp 读配置是 `toml → json → json.Unmarshal`，Go 的 `encoding/json`
     /// 匹配字段名走 `strings.EqualFold`（**大小写不敏感**），所以这几种写法官方都认。
@@ -1509,7 +1509,7 @@ enable = true
         );
     }
 
-    /// ★ v0.6.5：`quicBindPort` 已实现 —— 必须能真正读进来，
+    /// `quicBindPort` 已实现 —— 必须能真正读进来，
     /// 且**不再**出现在"未实现"清单里。
     ///
     /// 官方语义：配了就开一个**独立** UDP 端口，与 `bindPort` 无关。
@@ -1537,7 +1537,7 @@ enable = true
         assert_eq!(cfg3.quic_bind_port, None);
     }
 
-    /// 限制①批次1：这批客户端字段已实现 —— 既不能再被报"未实现"，
+    /// 这批客户端字段已实现 —— 既不能再被报"未实现"，
     /// 值也要真的落到配置里（含官方 camelCase 写法）。
     #[test]
     fn 批次1客户端字段读到值且不再报未实现() {
@@ -1597,7 +1597,7 @@ enabled = false
         assert!(cfg.visitors.is_empty(), "禁用的访客不该留下");
     }
 
-    /// 限制①批次1：服务端四个字段（proxyBindAddr / userConnTimeout /
+    /// 服务端四个字段（proxyBindAddr / userConnTimeout /
     /// maxPoolCount / disablePrintColor）同样要读进来且不报未实现。
     #[test]
     fn 批次1服务端字段读到值且不再报未实现() {
@@ -1626,7 +1626,7 @@ disablePrintColor = true
         assert!(cfg.disable_print_color);
     }
 
-    /// 限制①批次2：keepalive 组四个字段（客户端 `dialServerKeepalive` /
+    /// keepalive 组四个字段（客户端 `dialServerKeepalive` /
     /// `tcpMuxKeepaliveInterval`，服务端 `tcpMuxKeepaliveInterval` /
     /// `tcpKeepalive`）既能读官方 camelCase 写法，也不再被报"未实现"。
     #[test]
@@ -1666,7 +1666,7 @@ tcpKeepalive = 444
         assert_eq!(cfg.tcp_keepalive, 444);
     }
 
-    /// 限制①批次2：默认值取官方（7200 / 30 / 30 / 7200），不写就是这四档；
+    /// 默认值取官方（7200 / 30 / 30 / 7200），不写就是这四档；
     /// 显式写 `0` 保持"关闭"的原意，不被折算成官方默认。
     #[test]
     fn 批次2keepalive默认值与零语义() {
@@ -1864,7 +1864,7 @@ enabled = false
     /// 两者同名，必须按路径区分，不能因为前者实现就把后者一起“洗白”。
     #[test]
     fn 面板_tls_字段已经实现所以不再报未实现() {
-        // ★ v0.6.6：`webServer.tls.certFile` / `keyFile` 已经真正实现了
+        // `webServer.tls.certFile` / `keyFile` 已经真正实现了
         // （面板 HTTPS：rustls 包装 dashboard / client web 的监听器，
         //   并在 HTTPS 响应上带 HSTS）。
         //

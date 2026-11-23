@@ -105,7 +105,7 @@ pub struct VhostTable {
     inner: Mutex<VhostInner>,
 }
 
-/// "这两条路由属于同一个客户端吗"（第四轮 H1）。
+/// "这两条路由属于同一个客户端吗"。
 ///
 /// 用 `Arc::ptr_eq` 比**连接身份**，而不是比客户端可自报的字段：
 /// `VhostRoute.client` 是服务端在握手后持有的 `Arc<ClientState>`，
@@ -117,7 +117,7 @@ fn same_owner(a: &VhostRoute, b: &VhostRoute) -> bool {
 impl VhostTable {
     /// 注册路由；同一域名 + 同一路径前缀冲突时报错（与 frp 行为一致）。
     ///
-    /// ★★ v0.5.5 修（第四轮 H1）：**"这条路由是不是我的"必须同时比客户端身份，
+    /// **"这条路由是不是我的"必须同时比客户端身份，
     /// 不能只比代理名。**
     ///
     /// 原先这里三处都只比 `proxy_name`：
@@ -152,7 +152,7 @@ impl VhostTable {
             g.exact.entry(route.domain.clone()).or_default()
         };
         for existing in list.iter() {
-            // ★ 同一个客户端 + 同一个名字，才算"同一条代理的重复注册"。
+            // 同一个客户端 + 同一个名字，才算"同一条代理的重复注册"。
             let same_proxy =
                 same_owner(existing, &route) && existing.proxy_name == route.proxy_name;
             // 只有**完全相同**的路径才算冲突。
@@ -164,11 +164,11 @@ impl VhostTable {
                 .locations
                 .iter()
                 .any(|a| route.locations.iter().any(|b| a == b));
-            // ★ `route_by_http_user` 的**合法用途**：**同一个租户**自己在
+            // `route_by_http_user` 的**合法用途**：**同一个租户**自己在
             //   同一「域名 + 路径」上开多条路由，靠访问者用户名区分
             //   （官方 tcpmux 的 "Route by HTTP user" 就是这个拓扑）。
             //
-            // ★★ v0.5.6 修（审计总报告 M1，中危）：**跨租户一律算冲突**，
+            // **跨租户一律算冲突**，
             //   不许用 `route_by_http_user` 逃逸归属判定。
             //
             // 原先是 `duplicate && same_scope`（作用域**相同**才算冲突），
@@ -180,7 +180,7 @@ impl VhostTable {
             //   ① 受害者 B 注册 `custom_domains=["web.test"]` + `locations=["/"]`，
             //      未配 `routeByHTTPUser`（默认空串 ⇒ 兜底路由）；
             //   ② 攻击者 A 注册**同样的域名与路径**，但带 `routeByHTTPUser="alice"`；
-            //   ③ `same_proxy=false`（H1 已拦）、`duplicate=true`、
+            // ③ `same_proxy=false`（H1 已拦）、`duplicate=true`、
             //      **`same_scope=false`** ⇒ 冲突检查跳过 ⇒ 攻击者路由入表，
             //      且**返回注册成功、无任何告警**；
             //   ④ 之后**带 `Authorization: Basic alice:...` 的访客请求**会在
@@ -190,20 +190,20 @@ impl VhostTable {
             //      而 `same_scope` 永久为 false ⇒ 受害者之后怎么重注册都不冲突，
             //      域名被**静默寄生**。
             //
-            // ★★ 关于审计报告给的修法：它建议
+            // 关于审计报告给的修法：它建议
             //   `same_scope = same_owner(existing,&route) && existing.route_by_http_user == route.route_by_http_user`。
             //   **那个写法是错的**（本轮实测核对）：跨租户攻击时 `same_owner` 本来就是
             //   false，改完 `same_scope` 仍是 false、结论**完全不变**（对攻击无效）；
             //   反而在"跨租户 + 作用域相同"时把原本生效的冲突检查**关掉**了
             //   —— 等于**新开一个洞**。这正是"审计建议不能照抄"的又一例。
             //
-            // ★ 正确判据（本处实现）：**豁免共存的前提是"同一个租户"**，
+            // 正确判据（本处实现）：**豁免共存的前提是"同一个租户"**，
             //   与作用域是否相同无关：
             //   * 同租户 + 作用域不同 ⇒ 允许共存（自己的二级路由）；
             //   * 同租户 + 作用域相同 ⇒ 冲突（真重复）；
             //   * 跨租户 ⇒ 一律冲突。
             //
-            // ★ 这是一处**有意的行为收紧**：跨租户共用域名 + 路径、靠
+            // 这是一处**有意的行为收紧**：跨租户共用域名 + 路径、靠
             //   `routeByHTTPUser` 区分，从本版起不再允许。同租户的多作用域
             //   拓扑（官方 tcpmux 文档里的用法）**不受影响**。
             //   理由：服务端无法分辨"合法的跨租户多作用域"与"寄生劫持"，
@@ -211,7 +211,7 @@ impl VhostTable {
             let same_scope = existing.route_by_http_user == route.route_by_http_user;
             let cross_owner = !same_owner(existing, &route);
             if !same_proxy && duplicate && (cross_owner || same_scope) {
-                // ★★ v0.5.7 修（第六轮审计 D-3，低危）：**文案不再回显占用者的代理名**。
+                // **文案不再回显占用者的代理名**。
                 //
                 // 原先这里是 `"域名 {} 的路径已被代理 {} 占用"`，把
                 // `existing.proxy_name`（带租户前缀的**线上全名**，
@@ -224,7 +224,7 @@ impl VhostTable {
                 // # 为什么这是问题
                 //
                 // 1. **同轮已经修过同类问题**：`registry.rs::reserve_port` 的
-                //    端口冲突文案已被刻意统一成"不含占用者"（见那里的 L14 注释），
+                // 端口冲突文案已被刻意统一成"不含占用者"（见那里的 L14 注释），
                 //    **这条漏了** —— 又一次"防线没铺满"。
                 // 2. 它把**别人的代理名**送出来，而代理名正是 D-4/D-2 那类
                 //    攻击所需的"别家租户的名字"。
@@ -236,7 +236,7 @@ impl VhostTable {
                 //
                 // 照搬 `registry.rs` 的做法：回一条只承认"冲突"的固定文案，
                 // 细节（域名 + 占用者）走 `debug!` 只进服务端日志。
-                // ★ 注意**保留 route.domain**：它是**调用方自己请求的**域名，
+                // 注意**保留 route.domain**：它是**调用方自己请求的**域名，
                 //   不是别人的信息，回显它有助于用户排查自己的配置。
                 debug!(
                     domain = %route.domain,
@@ -246,7 +246,7 @@ impl VhostTable {
                 bail!("域名 {} 的路径已被占用（详情见服务端日志）", route.domain);
             }
         }
-        // ★ 只清理**自己**的旧路由（同一客户端 + 同名），不再误删别人的。
+        // 只清理**自己**的旧路由（同一客户端 + 同名），不再误删别人的。
         list.retain(|r| !(same_owner(r, &route) && r.proxy_name == route.proxy_name));
         list.push(route);
         Ok(())
@@ -258,7 +258,7 @@ impl VhostTable {
     /// 域名仍然留在表里：重连再注册同一个域名会被判成路径冲突，
     /// 而且请求还会被路由到一个已经关掉的代理上。
     ///
-    /// ★★ v0.5.5 修（第四轮 H1，同一根因的第二个面）：本函数原先也**只比名字**，
+    /// 本函数原先也**只比名字**，
     /// 于是客户端 A 对 `"victim.web"` 调一次 `CloseProxy`，就能把**受害者 B**
     /// 的路由一起摘掉 —— 一次不需要任何权限的拒绝服务（B 的隧道在自己的客户端
     /// 还活着的情况下对外静默失效）。现在必须带客户端身份。
@@ -418,7 +418,7 @@ pub(crate) mod tests {
         route(name, domain, &["/"], VhostKind::Http)
     }
 
-    /// 用**指定的**客户端构造路由（第四轮 H1 的测试要用它来区分租户）。
+    /// 用**指定的**客户端构造路由。
     ///
     /// `route()` 每次都会新建一个 `Arc<ClientState>`，两个路由即便同名也属于
     /// **不同**租户 —— 这正好是 H1 要覆盖的场景，所以需要能显式传入归属。
@@ -543,14 +543,14 @@ pub(crate) mod tests {
 
     /// `route_by_http_user` 让**同一个租户**的多条路由共用一个域名 + 路径。
     ///
-    /// ★ v0.5.6（审计总报告 M1）：这些路由必须来自**同一个客户端** ——
+    /// 这些路由必须来自**同一个客户端** ——
     ///   跨租户的"多作用域"现在一律算冲突（服务端无法分辨合法的多作用域
     ///   与寄生劫持，而后者能直接收割凭据）。原先用 `route()` 辅助函数
     ///   逐个新建客户端，恰好把"跨租户"这个语义喂了进去。
     #[test]
     fn route_by_http_user_filters_candidates() {
         let t = VhostTable::default();
-        // ★ 两条路由同属一个客户端（真实拓扑：一台 frpc 挂多条代理）
+        // 两条路由同属一个客户端（真实拓扑：一台 frpc 挂多条代理）
         let me = dummy_client("me");
         let mut alice = route_of(&me, "alice-app", "x.com", &["/"]);
         Arc::get_mut(&mut alice).unwrap().route_by_http_user = "alice".to_string();
@@ -581,7 +581,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// ★★ v0.5.6 回归（审计总报告 M1）：**跨租户**不得靠 `route_by_http_user`
+    /// **跨租户**不得靠 `route_by_http_user`
     /// 在同一个域名 + 路径上寄生。
     ///
     /// 修复前 `same_scope` 只比字符串 ⇒ 攻击者填一个**不同的作用域值**
@@ -603,7 +603,7 @@ pub(crate) mod tests {
         let e = t
             .register(evil)
             .expect_err("跨租户 + 不同作用域也必须冲突（M1）");
-        // ★ v0.5.7（第六轮审计 D-3）：文案改为"已被占用"，**不再回显占用者**。
+        // 文案改为"已被占用"，**不再回显占用者**。
         //   同时断言它**不泄露**别人的代理名。
         let msg = e.to_string();
         assert!(msg.contains("已被占用"), "{msg}");
@@ -625,7 +625,7 @@ pub(crate) mod tests {
 
     /// 跨租户 + **相同**作用域同样冲突（原有保护，防回退）。
     ///
-    /// ★ 这一条专门盯着审计报告给的那个**错误修法**：它建议把
+    /// 这一条专门盯着审计报告给的那个**错误修法**：它建议把
     ///   `same_scope` 改成 `same_owner && (作用域相等)`，那会让跨租户同作用域
     ///   从"冲突"变成"共存" —— **新开一个洞**。
     #[test]
@@ -678,7 +678,7 @@ pub(crate) mod tests {
 
     /// 同一条代理（**同一客户端**同名）重复注册 ⇒ 替换而非堆积。
     ///
-    /// ★ v0.5.5（第四轮 H1）：这个用例现在必须显式用**同一个** client ——
+    /// 这个用例现在必须显式用**同一个** client ——
     /// 原先 `route()` 每次都新建 Arc，两个路由其实属于不同租户，
     /// 恰好因为修复前的代码"只比名字"才通过。修复后它正确地判成了冲突，
     /// 于是这条测试暴露了自己在无意中依赖了那个 bug（见下面的 H1 用例）。
@@ -696,10 +696,10 @@ pub(crate) mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 第四轮 H1：跨租户的域名路由劫持
+    // 跨租户的域名路由劫持
     // ------------------------------------------------------------------
 
-    /// ★★ H1 核心回归：**不同租户**用同一个代理名注册同一个域名 ⇒ 必须被拒。
+    /// H1 核心回归：**不同租户**用同一个代理名注册同一个域名 ⇒ 必须被拒。
     ///
     /// 修复前的行为：`same_proxy` 只比名字 ⇒ 判成"同一条代理的重复注册" ⇒
     /// 跳过冲突检查 ⇒ `retain` 把**对方**的路由删掉 ⇒ 攻击者顶掉受害者的域名。
@@ -725,14 +725,14 @@ pub(crate) mod tests {
             .register(route_of(&attacker, "victim.web", "web.test", &["/"]))
             .expect_err("跨租户同名同域名必须被拒绝");
         let msg = err.to_string();
-        // ★ v0.5.7（第六轮审计 D-3）：文案改为"已被占用"，**不再回显占用者**。
+        // 文案改为"已被占用"，**不再回显占用者**。
         assert!(msg.contains("已被占用"), "错误要说清冲突：{msg}");
         assert!(
             !msg.contains("victim.web"),
             "冲突文案不得回显占用者的代理名（D-3）：{msg}"
         );
 
-        // ★ 关键断言：域名**仍然**归受害者，没有被顶掉
+        // 关键断言：域名**仍然**归受害者，没有被顶掉
         let (hit2, _) = t
             .lookup("web.test", "/", None, VhostKind::Http)
             .expect("域名仍应可用");

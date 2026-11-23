@@ -199,7 +199,7 @@ impl DailyFile {
         opt.create(true).write(true).truncate(true);
         #[cfg(unix)]
         {
-            // ★ 两个 trait 都要在作用域里：`OpenOptionsExt` 提供 `opt.mode()`，
+            // 两个 trait 都要在作用域里：`OpenOptionsExt` 提供 `opt.mode()`，
             // `PermissionsExt` 提供 `permissions().mode()`。少 import 前者编译不过；
             // 少 import 后者只有 **Linux** 报 E0599 —— Windows 上整块被 cfg 掉，
             // 本机 fmt/clippy/测试全绿也照样漏（2026-10-01 云端构建抓出来的）。
@@ -553,7 +553,7 @@ mod tests {
         assert!(sink_from_config("console", 3).is_none());
         assert!(sink_from_config("CONSOLE", 3).is_none());
         // 打不开的路径也不 panic，只是回落。
-        // ★ 不能用"盘符不存在"的路径（如 `Z:/...`）来构造错误：那在 Windows 上
+        // 不能用"盘符不存在"的路径（如 `Z:/...`）来构造错误：那在 Windows 上
         //   打不开，在 Linux 上却是**合法相对路径**（会真的建目录成功）——
         //   云端（root）实测必红。改成"父路径是一个文件"，两个平台都必然打不开。
         let d = tmpdir("badsink");

@@ -9,7 +9,7 @@
 //! 表里只存**原始名**（配置里的 `name`，不带 `{user}.` 前缀），
 //! 线上全名的转换统一由 [`crate::util::strip_user_prefix`] 负责。
 //!
-//! ★★ v0.5.5（第四轮 F2/F3）：表里每条都带**来源标记** [`ProxyOrigin`]，
+//! 表里每条都带**来源标记** [`ProxyOrigin`]，
 //! 远程下发只许操作 `Dynamic` 那批。详见这两个 enum 的注释。
 
 use std::{
@@ -19,7 +19,7 @@ use std::{
 
 use nfrp_common::config::ProxyConfig;
 
-/// 一条代理的**来源**（v0.5.5，第四轮 F2/F3）。
+/// 一条代理的**来源**。
 ///
 /// 为什么必须区分：配置文件的语义是"**本机用户**看着它写下的意图"，
 /// 服务端不该有能力让它在运行期失效或被人顶掉。而在此之前
@@ -127,7 +127,7 @@ impl ProxyTable {
 
     /// **远程下发**的新增/覆盖（`ServerCmd{op:"add_proxy"}`）。
     ///
-    /// 与 [`Self::insert`] 的区别：**拒绝覆盖配置文件里的代理**（F3 的修法）。
+    /// 与 [`Self:insert`] 的区别：**拒绝覆盖配置文件里的代理**（F3 的修法）。
     ///
     /// 为什么必须拒绝而不是"悄悄覆盖"：服务端下发同名 `add_proxy` 时，
     /// 客户端先 `insert`（此刻用户那条就没了）→ 服务端再因端口冲突回滚
@@ -178,7 +178,7 @@ impl ProxyTable {
 
     /// 本机侧的无条件新增/覆盖（**只在测试与本机流程里用**）。
     ///
-    /// ★ 远程下发的路径必须走 [`Self::insert_dynamic`] —— 那个会拒绝覆盖配置代理。
+    /// 远程下发的路径必须走 [`Self::insert_dynamic`] —— 那个会拒绝覆盖配置代理。
     pub fn insert(&self, p: ProxyConfig) -> Option<ProxyConfig> {
         let mut g = match self.inner.write() {
             Ok(g) => g,
@@ -194,7 +194,7 @@ impl ProxyTable {
 
     /// 本机侧的无条件删除（**只在测试与本机流程里用**）。
     ///
-    /// ★ 远程下发的路径必须走 [`Self::remove_dynamic`]。
+    /// 远程下发的路径必须走 [`Self::remove_dynamic`]。
     pub fn remove(&self, name: &str) -> Option<ProxyConfig> {
         let mut g = match self.inner.write() {
             Ok(g) => g,
@@ -247,10 +247,10 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 第四轮 F2/F3：远程下发不得动配置里的代理
+    // /F3：远程下发不得动配置里的代理
     // ------------------------------------------------------------------
 
-    /// ★★ F2 回归：远程 `remove` 不能删配置文件里的代理。
+    /// 远程 `remove` 不能删配置文件里的代理。
     #[test]
     fn 远程删除不得动配置里的代理() {
         let t = ProxyTable::from_iter([p("victim-ssh")]);
@@ -263,7 +263,7 @@ mod tests {
         assert!(t.get("victim-ssh").is_some(), "被拒之后那条代理必须还在");
     }
 
-    /// ★★ F3 回归：远程 `add` 不能覆盖配置文件里的代理。
+    /// 远程 `add` 不能覆盖配置文件里的代理。
     ///
     /// 这正是"双杀"链条的第一环：覆盖成功之后，服务端一回滚就会把
     /// 用户那条永久删掉。只要这里拒绝，整条链就断了。

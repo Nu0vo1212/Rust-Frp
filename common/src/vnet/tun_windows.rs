@@ -777,7 +777,7 @@ mod tests {
         }
     }
 
-    /// ★ 真机验证：真的创建一块 Wintun 网卡、配地址、再删掉。
+    /// 真机验证：真的创建一块 Wintun 网卡、配地址、再删掉。
     ///
     /// 需要**管理员**权限（创建虚拟网卡），所以标了 `#[ignore]`，
     /// 用 `cargo test -- --ignored 真机` 手动跑。
@@ -816,7 +816,7 @@ mod tests {
         // ④ 地址必须真的生效。
         //
         //    注意**不能**用 `netsh interface ipv4 show addresses` 查 ——
-        //    Wintun 是 L3 隧道适配器，`netsh` 那条路径看不到它上面的地址
+        // Wintun 是 L3 隧道适配器，`netsh` 那条路径看不到它上面的地址
         //    （实测：返回成功但只显示 "DHCP enabled: No"）。
         //    `Get-NetIPAddress` 走的是 IP Helper API，才能读出来。
         let out = std::process::Command::new("powershell")
@@ -854,7 +854,7 @@ mod tests {
         );
     }
 
-    /// ★ 真机验证：未配地址时也能创建，且 `set_address` 对非法前缀报错而非静默。
+    /// 真机验证：未配地址时也能创建，且 `set_address` 对非法前缀报错而非静默。
     #[test]
     #[ignore = "需要管理员权限与 wintun.dll，手动执行"]
     fn 真机_非法地址前缀要报错() {
@@ -872,7 +872,7 @@ mod tests {
         drop(tun);
     }
 
-    /// ★★ 真机验证（数据面）：**ping 自己这条 TUN 的另一端，由我们手工应答**。
+    /// 真机验证（数据面）：**ping 自己这条 TUN 的另一端，由我们手工应答**。
     ///
     /// # 这条测试证明什么
     ///
@@ -913,7 +913,7 @@ mod tests {
             tun.set_address(&format!("{OUR_IP}/24"))
                 .unwrap_or_else(|e| panic!("配地址失败：{e}"));
 
-            // ★ 多轮重试而不是单次固定等待。
+            // 多轮重试而不是单次固定等待。
             //
             // 实测教训：
             // * 建卡 + 配地址**返回后**，内核的路由表还要过一会儿才生效；
@@ -1014,7 +1014,7 @@ mod tests {
 
         // ① 交换 IPv4 源 / 目的。
         //
-        // ★ 偏移量必须精确：IPv4 头里 **源地址在 offset 12**、目的地址在 16。
+        // 偏移量必须精确：IPv4 头里 **源地址在 offset 12**、目的地址在 16。
         //   这里曾经写成 `(4, 16)` —— offset 4 是 **IP ID 字段**，
         //   于是"交换"把 ID/flags 和目的地址对调、源地址原地不动，
         //   内核收到后直接丢掉（实测：ping 100% loss，读方向通、写方向不通）。

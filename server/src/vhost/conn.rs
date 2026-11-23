@@ -26,7 +26,7 @@ use crate::registry::Registry;
 /// `flags` 是 `(useEncryption, useCompression)`，由调用方从
 /// `ClientState::proxy_flags(proxy_name)` 取（注册时记下）。
 ///
-/// ★ v0.7.6 修：vhost 的三条转发路径（http / https / tcpmux）此前都是**直接对
+/// vhost 的三条转发路径（http / https / tcpmux）此前都是**直接对
 /// 原始工作连接做中继**，`useEncryption` / `useCompression` 被完全忽略。
 /// 客户端开了加密时，服务端把密文当成明文透传 —— 隧道能建立、握手也可能过，
 /// 但数据全乱或直接超时，而日志里没有任何报错。
@@ -118,7 +118,7 @@ mod tests {
 
     use super::*;
     use tokio::io::AsyncWriteExt;
-    /// ★ 回归测试：`Host` 头里的 IPv6 要能正确取到域名。
+    /// 回归测试：`Host` 头里的 IPv6 要能正确取到域名。
     ///
     /// 原先按 `:` 硬切，`[::1]:8080` 会切出一个孤零零的 `[`。
     #[test]
@@ -149,7 +149,7 @@ mod tests {
         assert_eq!(canonical_host("  a.b:1  "), "a.b");
     }
 
-    /// ★★ v0.7.6 回归：vhost 工作连接必须按代理的加密/压缩标志包装。
+    /// vhost 工作连接必须按代理的加密/压缩标志包装。
     ///
     /// 守的是**行为**而不是 helper：两端都按生产同一条包装，数据必须能原样往返。
     /// 退回修复（裸流中继）时，客户端侧的密文会被当成明文，读出来的内容与写入

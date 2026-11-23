@@ -108,7 +108,7 @@ pub(super) fn default_bind_addr() -> String {
     DEFAULT_BIND_ADDR.to_string()
 }
 
-/// visitor 本地监听口的默认绑定地址（v0.5.6 修审计总报告 L1）。
+/// visitor 本地监听口的默认绑定地址。
 ///
 /// 与**服务端**的 [`DEFAULT_BIND_ADDR`]（`0.0.0.0`）刻意不同：
 /// 服务端是"对外提供服务"，默认全网卡有道理；而 visitor 的监听口是
@@ -121,7 +121,7 @@ pub(super) fn default_visitor_bind_addr() -> String {
     "127.0.0.1".to_string()
 }
 
-/// 登录时间戳默认允许的偏差（秒），v0.5.6 修审计总报告 M3。
+/// 登录时间戳默认允许的偏差（秒），
 /// 300 秒足够容纳常见的时钟漂移与网络延迟，同时把"录下一条 Login 报文
 /// 就能无限期重放"压到 5 分钟窗口。官方 frpc 发的是当前时间，**零感知**。
 pub(super) fn default_max_clock_skew() -> u64 {

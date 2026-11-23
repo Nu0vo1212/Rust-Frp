@@ -80,7 +80,7 @@ pub async fn run(
     }
     if cfg.bind_port <= 0 {
         // 与官方 frp 一致：`bindPort <= 0` 表示不监听本地端口（只用于给别的 visitor 做 fallback）。
-        // ★ 判据必须是 `<= 0` 而不是 `== 0` —— 官方用 `-1` 表达这件事，
+        // 判据必须是 `<= 0` 而不是 `== 0` —— 官方用 `-1` 表达这件事，
         // 只判 0 的话 `-1` 会一路走到 `TcpListener::bind("127.0.0.1:-1")` 报一个看不懂的错。
         info!(
             visitor = %cfg.name,
@@ -103,7 +103,7 @@ pub async fn run(
         .await
         .with_context(|| format!("解析 visitor 监听地址 {listen} 失败"))?;
 
-    // ★★ v0.5.6 修（审计总报告 L1 后半，低危）：**非回环监听要告警**。
+    // **非回环监听要告警**。
     //
     // 原先这里对 `bind_addr` **没有任何检查、也没有告警** ——
     // 配了 `0.0.0.0` 就把本机入口暴露到所有网卡上，而用户无从得知。
@@ -308,7 +308,7 @@ async fn handle_user(
 
     // xtcp 先试真 P2P：打通了数据就不经过服务端，带宽不再受它限制。
     //
-    // ★ v0.7.0：能不能直连由 `nlink::policy::decide_direct` **唯一**决定
+    // 能不能直连由 `nlink:policy:decide_direct` **唯一**决定
     //   （服务端、客户端、测试共用同一份判断）。三种结果：
     //   * Direct —— 试打洞，失败按策略回退（`direct-only` 不回退，直接报错）；
     //   * Relay  —— 一开始就不试（`relay-only`，或明确不可能成功）；

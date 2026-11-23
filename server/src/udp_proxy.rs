@@ -24,13 +24,13 @@ use tracing::{debug, info, warn};
 
 use crate::ClientState;
 
-/// "最近见过的访客 IP"集合上限（v0.5.6 修审计总报告 L18）。
+/// "最近见过的访客 IP"集合上限。
 ///
 /// 取 4096：一个 UDP 代理同时活跃的访客极少超过这个量级；
 /// 超过就清空重建，避免内存无上限增长。
 const MAX_SEEN_VISITOR_IPS: usize = 4096;
 
-/// "最近见过的访客 IP"集合（v0.5.6 修审计总报告 L18）。
+/// "最近见过的访客 IP"集合。
 ///
 /// 抽成独立类型是为了**可测** —— 判定逻辑放在 `run_session` 那种
 /// `tokio::select!` 循环里根本没法单测。
@@ -58,7 +58,7 @@ impl SeenVisitorIps {
     /// 卡死端口会误伤它们；而反射/放大必须跨 IP（把响应打给受害者），
     /// 所以按 IP 收紧就够。
     ///
-    /// ★ 锁中毒时返回 `true`（放行）：这里的选择是"宁可少拦，不要卡死转发"。
+    /// 锁中毒时返回 `true`（放行）：这里的选择是"宁可少拦，不要卡死转发"。
     ///   UDP 代理断掉是**确定的**服务中断，而漏拦一个回包只是少一层加固。
     fn allows(&self, ip: IpAddr) -> bool {
         match self.inner.lock() {
@@ -79,12 +79,12 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// 启动一个 UDP 代理：绑定 UDP 端口并持续维护"专用工作连接"。
 ///
-/// ★★ v0.5.9 修（第九轮审计 **E9-0**，中危）：新增 `sec` 参数。
+/// 新增 `sec` 参数。
 ///
 /// # 原先为什么错了
 ///
 /// `[acl]`（IP 白/黑名单）的唯一判定入口 `SecurityContext::check_ip`
-/// 在 v0.5.8 里只有 **4 处**调用（控制面 / TCP 代理 / vhost / VNet），
+/// 在 里只有 **4 处**调用（控制面 / TCP 代理 / vhost / VNet），
 /// **UDP 代理端口一处都没有** ⇒ 管理员用 `[acl]` 表达"只允许某些来源"时，
 /// **UDP 代理完全不遵守**（静默失效）。
 ///
@@ -99,17 +99,17 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// | 从 `127.0.0.1`（放行）发 UDP | ✅ 通（正对照） |
 /// | **从 LAN（被 deny）发 UDP** | ❌ **仍被转发**（内网服务收到包数 1 → 2） |
 ///
-/// ⇒ 与第七轮 F7-1（TCP 数据面未过 ACL）**完全同型**：
-///   第七轮补了 TCP，**UDP 被漏掉了**。
+/// ⇒ 与 F7-1（TCP 数据面未过 ACL）**完全同型**：
+/// 补了 TCP，**UDP 被漏掉了**。
 ///
-/// ★ 这条比面板那条严重：**UDP 代理没有别的防线**（不需要认证），
+/// 这条比面板那条严重：**UDP 代理没有别的防线**（不需要认证），
 ///   ACL 是唯一的来源管控手段。
 pub fn spawn(
     udp: Arc<UdpSocket>,
     proxy_name: String,
     client: Arc<ClientState>,
     sec: Arc<crate::guard::SecurityContext>,
-    // ★ v0.6.6：单报文缓冲上限（官方 frps 的 `udpPacketSize`）。
+    // 单报文缓冲上限（官方 frps 的 `udpPacketSize`）。
     // 由配置传入而不是写死常量 —— 见 `ServerConfig::udp_packet_size` 的说明。
     packet_size: usize,
 ) -> tokio::task::JoinHandle<()> {
@@ -150,7 +150,7 @@ pub fn spawn(
 
 /// 一条 UDP 工作连接的生命周期：双向搬运 + 心跳。
 ///
-/// ★ v0.5.9（第九轮审计 E9-0）：新增 `sec`，用于在**每个数据报**上做 ACL 判定。
+/// 新增 `sec`，用于在**每个数据报**上做 ACL 判定。
 async fn run_session(
     mut conn: FrpConn,
     udp: Arc<UdpSocket>,
@@ -169,7 +169,7 @@ async fn run_session(
     // FrpConn 是单所有者，所以读写都收敛在本任务的 select 里，避免加锁。
     let (to_client_tx, mut to_client_rx) = mpsc::channel::<UdpPacket>(1024);
 
-    // ★★ v0.5.6 修（审计总报告 L18，低危）：**记录"真的给我们发过包的访客 IP"**。
+    // **记录"真的给我们发过包的访客 IP"**。
     //
     // # 漏洞（报告判"不可利用"，我核实后认为**有一个真实增量**）
     //
@@ -205,7 +205,7 @@ async fn run_session(
     let udp_task = {
         let udp = udp.clone();
         let seen_ips = seen_ips.clone();
-        // ★ E9-0：`proxy_name` 是 `&str`，而 spawn 的任务要求 `'static`
+        // `proxy_name` 是 `&str`，而 spawn 的任务要求 `'static`
         //   （日志里要用它）⇒ 克隆一份。这只是一次短字符串分配，可忽略。
         let proxy_name_owned = proxy_name.to_string();
         tokio::spawn(async move {
@@ -213,7 +213,6 @@ async fn run_session(
             loop {
                 match udp.recv_from(&mut buf).await {
                     Ok((n, src)) => {
-                        // ★★ v0.5.9 修（第九轮审计 **E9-0**，中危）：
                         //    **UDP 数据面也要过 ACL**。
                         //
                         // 这是 ACL 在 UDP 代理端口上**唯一**的判定点 ——
@@ -252,7 +251,7 @@ async fn run_session(
     let mut keepalive = interval(KEEPALIVE_INTERVAL);
     keepalive.tick().await; // 丢掉立即触发的那次
 
-    // ★ v0.5.6（L18）：越界回写只 warn 一次，之后降 debug（防日志刷屏）
+    // 越界回写只 warn 一次，之后降 debug（防日志刷屏）
     let mut warned_off_path = false;
 
     let result = loop {
@@ -263,7 +262,7 @@ async fn run_session(
                 match msg {
                     FrpMessage::UdpPacket(pkt) => {
                         if let Some(dst) = pkt.remote_addr.as_ref().and_then(|a| a.to_socket()) {
-                            // ★ v0.5.6（L18）：只回写给"真的给我们发过包的访客 IP"。
+                            // 只回写给"真的给我们发过包的访客 IP"。
                             //
                             // 恶意客户端可以在这里塞任意地址，让 frps 向从未
                             // 请求过的目标发 UDP（反射/放大跳板）。
@@ -330,7 +329,7 @@ mod tests {
         s.parse().unwrap()
     }
 
-    /// ★★ L18 核心：**从未发过包的 IP 不许回写**。
+    /// **从未发过包的 IP 不许回写**。
     ///
     /// 修复前服务端直接拿客户端自报的 `pkt.remote_addr` 去 `send_to`，
     /// 于是恶意客户端能让 frps 向**从未请求过**的目标发 UDP
@@ -346,14 +345,14 @@ mod tests {
         seen.record(ip("203.0.113.7"));
         assert!(seen.allows(ip("203.0.113.7")), "见过的访客应放行");
 
-        // ★ 关键：别人仍然不行（这正是反射攻击的目标）
+        // 关键：别人仍然不行（这正是反射攻击的目标）
         assert!(
             !seen.allows(ip("198.51.100.9")),
             "没给我们发过包的 IP 必须被拒（否则可被当反射源）"
         );
     }
 
-    /// ★ 端口无关：TFTP 之类"换端口回包"的协议不能被误伤。
+    /// 端口无关：TFTP 之类"换端口回包"的协议不能被误伤。
     ///
     /// 而反射/放大必须**跨 IP**（把响应打给受害者），所以按 IP 收紧就够，
     /// 不必（也不该）卡端口。

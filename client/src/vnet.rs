@@ -257,7 +257,7 @@ async fn relay(stream: TcpStream, tun: &mut Tun) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// ★ 回归测试（对应官方 v0.71.1 的 VNet 重连退避）：
+    /// 回归测试（对应官方 v0.71.1 的 VNet 重连退避）：
     /// 连续失败要指数增长，但必须有 300 秒硬上限。
     #[test]
     fn 连续失败按指数退避且有上限() {

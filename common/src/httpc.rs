@@ -347,7 +347,7 @@ fn decode_chunked(raw: &[u8]) -> Result<Vec<u8>> {
         if size == 0 {
             break;
         }
-        // ★ 全部改 `checked_add` / `saturating_add`（v0.5.3 修）。
+        // 全部改 `checked_add` / `saturating_add`。
         //
         // `size` 来自被访问服务器返回的 chunk 长度（攻击者可控 —— 我们可能正在
         // 访问一个恶意上游，或中间人改过的响应），最大可达 `usize::MAX`。
@@ -390,7 +390,7 @@ pub struct Url {
 impl Url {
     pub fn parse(s: &str) -> Result<Self> {
         let s = s.trim();
-        // ★★ v0.5.6 修（审计总报告 M9，中危）：**先拒控制字符**。
+        // **先拒控制字符**。
         //
         // 原先 path 被**原样保留**（下面 `&rest[i..]`），而它随后被直接拼进
         // 请求报文（`httpc.rs` 的 `format!("{method} {request_target} HTTP/1.1\r\n…")`）。
@@ -400,13 +400,13 @@ impl Url {
         // `http://idp.example.com/a HTTP/1.1\r\nX-Injected: 1\r\n\r\nGET /b`
         // 得到的 path 里 CRLF 原样存活。
         //
-        // ★ 危害的诚实定位（不夸大）：`issuer` 来自**本地配置**，不是攻击者
+        // 危害的诚实定位（不夸大）：`issuer` 来自**本地配置**，不是攻击者
         //   直接输入；要利用得先控制/劫持 IdP（`discovery` 里的 `jwks_uri`
         //   会被原样信任）。所以它**不是**"未认证攻击者直达内网"，
         //   而是"远端可控输入缺少校验"；也**不构成经典请求走私**
         //   （这是对 IdP 的单向 GET、固定 `Connection: close`）。
         //
-        // ★ 但仍然必须修：这一层是**通用 URL 解析器**，将来接别的调用方时
+        // 但仍然必须修：这一层是**通用 URL 解析器**，将来接别的调用方时
         //   不该继承这个坑。按 RFC 3986，控制字符本来就不允许出现在 URL 里。
         if let Some(bad) = s.bytes().find(|b| *b < 0x20 || *b == 0x7f) {
             bail!("URL 含非法控制字符（{bad:#04x}，如 CR/LF/NUL）：{s:?}");
@@ -636,7 +636,7 @@ mod tests {
         assert!(decode_chunked(b"ff\r\nshort\r\n").is_err());
     }
 
-    /// ★★ v0.5.3 回归：chunk 长度导致 `i + size` / `i += size + 2` 算术回绕。
+    /// chunk 长度导致 `i + size` / `i += size + 2` 算术回绕。
     ///
     /// `size` 来自被访问服务器的响应（攻击者可控：恶意上游或中间人）。
     /// 旧代码用裸 `+`，在 release（未开 overflow-checks）下会回绕：
@@ -664,17 +664,17 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // v0.5.6 回归（审计总报告 M9）：URL 不得含控制字符
+    // URL 不得含控制字符
     // ------------------------------------------------------------------
 
-    /// ★★ M9：URL 里的 CR/LF 必须被拒 —— 否则会注入任意请求头。
+    /// URL 里的 CR/LF 必须被拒 —— 否则会注入任意请求头。
     ///
     /// 审计报告的实测用例（CRLF 原样存活、随后被拼进请求报文）。
     /// 危害定位是"远端可控输入缺校验"（`issuer` 来自本地配置，
     /// `jwks_uri` 来自远端 discovery 文档），不是"未认证直达内网"。
     #[test]
     fn url_必须拒绝控制字符() {
-        // ★ 报告里的原始 PoC：path 里夹 CRLF 再切出第二个请求
+        // 报告里的原始 PoC：path 里夹 CRLF 再切出第二个请求
         let poc = "http://idp.example.com/a HTTP/1.1\r\nX-Injected: 1\r\n\r\nGET /b";
         assert!(
             Url::parse(poc).is_err(),

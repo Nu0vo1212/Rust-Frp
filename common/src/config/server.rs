@@ -103,7 +103,7 @@ impl SshTunnelGatewayConfig {
 
 /// 服务端配置，对应 `server.toml`。
 ///
-/// ★ v0.5.3：手工实现 `Debug`（见文件下方），`token` 与 `dashboard_pwd`
+/// 手工实现 `Debug`（见文件下方），`token` 与 `dashboard_pwd`
 /// 一律脱敏，避免任何调试打印把密钥写进日志。
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -118,7 +118,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub nlink: crate::nlink::ServerNLinkConfig,
 
-    /// ★ 用户是否**显式写过** `bind_addr`（v0.5.4，配合 M4 的判定）。
+    /// 用户是否**显式写过** `bind_addr`。
     ///
     /// 为什么需要这个标志：认不出"默认值"和"用户明确写了 0.0.0.0"，
     /// 就没法区分这两种情形 ——
@@ -186,7 +186,7 @@ pub struct ServerConfig {
     /// `max_pending_per_client` 同口径**取更小者**。
     ///
     /// `0`（默认）= 不限制 —— 保持向后兼容（与项目其它 `Limit` 一致）。
-    /// ★ 与官方的默认值 5 **不同**：官方不写就是 5（+10 余量），nfrp 不写
+    /// 与官方的默认值 5 **不同**：官方不写就是 5（+10 余量），nfrp 不写
     ///   就是不限制；只有显式写入才生效。官方配置原样搬过来时照常起作用。
     #[serde(default)]
     pub max_pool_count: usize,
@@ -205,7 +205,7 @@ pub struct ServerConfig {
     /// 对官方对端完全互通：官方 yamux 的 Ping 由 crate 原生应答，反向的
     /// Ping/Pong 也照常流动，本看门狗只是补上"静默即断"的判定。
     ///
-    /// `0` 表示**关闭看门狗**（行为回到 v0.5.10 基线）—— 项目约定
+    /// `0` 表示**关闭看门狗**—— 项目约定
     /// "0 = 关掉这项"；官方把 0 折算成 30，这里不复刻。
     ///
     /// 只在 `tcp_mux = true` 时有意义（官方注释同）。
@@ -388,7 +388,7 @@ pub struct ServerConfig {
     /// | 4096 | ≈ 62 MB | 数千客户端的单实例 |
     /// | 16384 | ≈ 250 MB | 需要确认内存充足 |
     ///
-    /// ★ 超大规模部署的正确做法**不是无限调大**，而是：
+    /// 超大规模部署的正确做法**不是无限调大**，而是：
     /// 1. 用 TCP / QUIC 承载控制连接（KCP 只在这些都走不通时才需要）；
     /// 2. 或者在前面挂负载均衡，把客户端拆到多个 frps 实例上。
     ///
@@ -468,7 +468,7 @@ pub struct ServerConfig {
     /// 无关。好处是能把 QUIC 放到另一个端口（`bindPort` 已被占用、或要做端口
     /// 分流），防火墙规则也更好写。
     ///
-    /// ★ v0.6.5：配了它之后，QUIC 监听**只**在这个端口上开，**不再**顺带占用
+    /// 配了它之后，QUIC 监听**只**在这个端口上开，**不再**顺带占用
     /// `bindPort` 的同名 UDP 端口。那是旧行为的隐式副作用，会让
     /// "我明明配了 quicBindPort=7101，为什么 7000/udp 也被占了" 变成谜。
     ///
@@ -502,7 +502,7 @@ pub struct ServerConfig {
 
     /// 是否在面板端口上导出 Prometheus 指标（官方 frps 的 `enablePrometheus`）。
     ///
-    /// ★ v0.6.5：**默认关闭**，与官方一致。此前是无条件开放 `/metrics`。
+    /// **默认关闭**，与官方一致。此前是无条件开放 `/metrics`。
     ///
     /// 为什么默认关：
     /// * 官方默认就不开（`server.go` 的注释写明"配了才导出"），
@@ -523,7 +523,7 @@ pub struct ServerConfig {
 
     /// UDP 转发的单报文缓冲上限（官方 frps 的 `udpPacketSize`）。
     ///
-    /// ★ v0.6.6：官方默认 **1500**，而 NFrp 一直用 **65507**（UDP 协议上限）。
+    /// 官方默认 **1500**，而 NFrp 一直用 **65507**（UDP 协议上限）。
     ///
     /// 为什么默认**故意与官方不同**：
     /// * 它决定"单个 UDP 报文最多能带多少字节"，超过就被截断；
@@ -541,7 +541,7 @@ pub struct ServerConfig {
 
     /// 面板静态资源目录（官方 frps 的 `webServer.assetsDir`）。
     ///
-    /// ★ v0.6.6：配了它之后，面板的 `/` 与其它路径会**优先从这个目录读文件**，
+    /// 配了它之后，面板的 `/` 与其它路径会**优先从这个目录读文件**，
     /// 而不是用内嵌的那份 HTML。这样可以把面板换成自己的页面（换 logo、
     /// 加公司信息之类），不用改二进制。
     ///
@@ -556,7 +556,7 @@ pub struct ServerConfig {
 
     /// 是否在面板端口上挂 `/debug/pprof/profile`（官方 `webServer.pprofEnable`）。
     ///
-    /// ★ v0.6.6：默认关闭。与 `enablePrometheus` 同口径 —— 诊断端点不该在
+    /// 默认关闭。与 `enablePrometheus` 同口径 —— 诊断端点不该在
     /// "只想开个面板"的部署里默认暴露。
     ///
     /// Unix 上由 pprof-rs 采集并输出 Go pprof 兼容的 protobuf；Windows 没有
@@ -592,7 +592,7 @@ pub struct ServerConfig {
 
     /// 面板用户名（留空表示**不做鉴权**）。
     ///
-    /// ★ 留空只在 `bind_addr` 是回环时被接受（本机自用）。配了
+    /// 留空只在 `bind_addr` 是回环时被接受（本机自用）。配了
     /// `dashboard_port` 却把面板绑在非回环地址上又留空用户名，服务端会
     /// **拒绝启动** —— 那等于把面板连同"开端口 / 踢人"的写接口对外开放。
     /// 确实需要就显式打开 [`Self::allow_insecure_dashboard`]。
@@ -606,7 +606,7 @@ pub struct ServerConfig {
     /// （典型合法场景：面板只在跳板机能到的内网里，靠网络隔离兜底）。
     #[serde(default)]
     pub allow_insecure_dashboard: bool,
-    /// 明确同意"**服务端不做认证**且对外监听"（v0.5.4 新增，修 M4）。
+    /// 明确同意"**服务端不做认证**且对外监听"。
     ///
     /// 背景：`token` 留空时认证被完全跳过（与官方 frps 一致，靠网络隔离兜底）。
     /// 但"留空 + 绑 0.0.0.0"等于对外开放一个**任何人都能用**的 frps ——
@@ -616,12 +616,12 @@ pub struct ServerConfig {
     /// 是硬性 `ensure!` 拒绝启动的** —— 两种标准。现在统一：
     /// 默认 `false` ⇒ 拒绝启动；确实需要（比如纯内网lab）显式置 `true`。
     ///
-    /// ★ 为什么不干脆禁止：官方 frp 允许空 token，而且确实有大量内网部署
+    /// 为什么不干脆禁止：官方 frp 允许空 token，而且确实有大量内网部署
     /// 这么跑。直接砍掉会破坏兼容性；"拒绝启动 + 显式逃生开关"既堵住了
     /// 无意的误配置（把空 token 部署到公网），又保留了知情选择。
     #[serde(default)]
     pub allow_insecure_no_auth: bool,
-    /// 登录时间戳允许的偏差（秒），v0.5.6 修审计总报告 M3。
+    /// 登录时间戳允许的偏差（秒），
     ///
     /// # 为什么需要
     ///
@@ -644,7 +644,7 @@ pub struct ServerConfig {
     /// * **0 = 关闭校验**：给时钟严重不准的嵌入式设备留的逃生开关
     ///   （关闭会在启动日志里告警）。
     ///
-    /// ★ 与官方 frp 的默认值不同：官方**完全不校验**。对需要与
+    /// 与官方 frp 的默认值不同：官方**完全不校验**。对需要与
     ///   时钟严重不准的官方客户端互通的场景，把它设为 0 即可。
     #[serde(default = "default_max_clock_skew")]
     pub max_clock_skew_secs: u64,
@@ -652,7 +652,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub hot_reload: bool,
 
-    // ================= 以下为 v0.3.4 新增 =================
+    // ================= 扩展配置 =================
     // 全部 `#[serde(default)]`，且默认值都等价于"不启用"——
     // 老的 server.toml 一个字节都不用改就能继续跑。
     /// 认证配置（`[auth]`）：`method = "token" | "oidc"` + `auth.oidc.*`。
@@ -726,7 +726,7 @@ pub struct ServerConfig {
 }
 
 impl std::fmt::Debug for ServerConfig {
-    /// ★ v0.5.3：`token` / `dashboard_pwd` 永不进日志。
+    /// `token` / `dashboard_pwd` 永不进日志。
     ///
     /// 这两个字段原来会随 `#[derive(Debug)]` 一起打出来 ——
     /// 任何一句 `tracing::debug!(?cfg)` 都会把面板口令写进日志文件。
@@ -904,7 +904,7 @@ impl ServerConfig {
     }
 }
 
-/// **唯一判据**：这对面板 / 管理界面凭据能不能用来鉴权（v0.5.6 修审计总报告 H1）。
+/// **唯一判据**：这对面板 / 管理界面凭据能不能用来鉴权。
 ///
 /// # 为什么必须是"用户名与密码都非空"
 ///
@@ -941,7 +941,7 @@ impl ServerConfig {
 /// `dashboard.rs` —— 用配置里的**原样**字符串拼 `user:password` 再定长比较。
 ///
 /// ⇒ `dashboard_user = " admin "` 的部署**不能**用 `admin` 登录，必须发
-///   字面量 `" admin "`（第八轮审计 F8-L3 实测确认）。原先这里的注释写成
+/// 字面量 `" admin "`。原先这里的注释写成
 ///   "用户名惯例允许两侧空白"，与实现不符，会给排障指错方向。
 pub fn has_dashboard_creds(user: &str, pwd: &str) -> bool {
     !user.trim().is_empty() && !pwd.is_empty()
@@ -949,7 +949,6 @@ pub fn has_dashboard_creds(user: &str, pwd: &str) -> bool {
 
 impl ServerConfig {
     /// **唯一判据**：本服务端是不是处于"**没有任何认证**"的状态
-    /// （v0.5.6 修审计总报告 M6）。
     ///
     /// # 为什么需要它
     ///
@@ -970,9 +969,9 @@ impl ServerConfig {
     /// 二级危害是这类"狼来了"告警会训练管理员忽略同类告警，
     /// 或者为了"消掉告警"随手塞一个多余 token —— 后者会**改变认证语义**。
     ///
-    /// ★ `effective_auth()` 会做字段合并（`[auth] token` 为空时回落到顶层
+    /// `effective_auth()` 会做字段合并（`[auth] token` 为空时回落到顶层
     ///   `token`），所以判据必须用它，而不是直接读 `self.token`。
-    /// ★ 必须同时判 `method`：OIDC 模式下没有 token 是**正常**的。
+    /// 必须同时判 `method`：OIDC 模式下没有 token 是**正常**的。
     pub fn has_no_auth(&self) -> bool {
         let eff = self.effective_auth();
         eff.method == crate::security::AuthMethod::Token && eff.token.is_empty()
@@ -1044,7 +1043,7 @@ impl Default for ServerConfig {
             dashboard_pwd: String::new(),
             allow_insecure_dashboard: false,
             allow_insecure_no_auth: false,
-            // v0.5.6（M3）：默认 ±300 秒的登录时间戳窗口（0 = 关闭）
+            // 默认 ±300 秒的登录时间戳窗口（0 = 关闭）
             max_clock_skew_secs: default_max_clock_skew(),
             hot_reload: false,
             auth: Default::default(),

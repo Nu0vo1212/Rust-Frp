@@ -42,7 +42,7 @@ pub async fn run(
     conn: FrpConn,
     local_addr: String,
     proxy_name: String,
-    // ★ v0.6.6：单报文缓冲上限（官方 frpc 的 `udpPacketSize`）
+    // 单报文缓冲上限（官方 frpc 的 `udpPacketSize`）
     packet_size: usize,
 ) -> Result<()> {
     let local: SocketAddr = util::resolve_addr(&local_addr)
@@ -111,7 +111,7 @@ async fn new_session(
     remote: &UdpAddr,
     sessions: &Arc<Mutex<HashMap<String, SessionTx>>>,
     to_server: &mpsc::Sender<UdpPacket>,
-    // ★ v0.6.6：单报文缓冲上限（官方 frpc 的 `udpPacketSize`）
+    // 单报文缓冲上限（官方 frpc 的 `udpPacketSize`）
     packet_size: usize,
 ) -> Result<SessionTx> {
     let bind: SocketAddr = if local.is_ipv4() {

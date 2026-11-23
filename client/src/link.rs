@@ -82,7 +82,7 @@ impl ServerLink {
         // 优先级高于标准 `transport_protocol = "quic"`：两个都配时按 NLink 走
         // （否则 preamble 会发到只认 `nfrp-frp` 的端点上，握手失败）。
         //
-        // ★ 判据必须看**编译期能力 ∩ 便利开关**，而不是裸 `features()`：
+        // 判据必须看**编译期能力 ∩ 便利开关**，而不是裸 `features()`：
         //   `quic = true` 会由 `ClientNLink::from_config` 隐式补上 CAP_QUIC，
         //   0.7.0 这里查裸列表，导致只写 `quic = true` 时静默走 TCP。
         let nlink_quic = nlink_quic_requested(&cfg);
@@ -120,7 +120,7 @@ impl ServerLink {
 
         let mux = if quic.is_none() && cfg.tcp_mux {
             let stream = raw_connect(&cfg).await?;
-            // yamux 保活（限制①批次2，官方 `tcpMuxKeepaliveInterval`）：
+            // yamux 保活：
             // 0 = 关闭看门狗（None），默认 30 秒。
             Some(MuxSession::new(
                 stream,

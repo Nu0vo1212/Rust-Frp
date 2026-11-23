@@ -50,13 +50,13 @@ impl MuxAcceptor {
 /// 会话健康检查的心跳。
 const SESSION_TICK: Duration = Duration::from_secs(2);
 
-/// **没有任何活跃流**的会话在此期限后被关闭（第九轮 C9-4/C9-3 修复）。
+/// **没有任何活跃流**的会话在此期限后被关闭。
 ///
 /// # 为什么需要
 ///
 /// yamux 会话本身没有任何时间上界：crate 不设 keepalive，frp 侧原先也没设。
 /// 攻击者只发一个 `0x00`（让服务端建立会话）后静默，或只开一条注定
-/// 握手超时的流（12 字节），会话就能被**无限期**挂住 —— 第九轮实测量化：
+/// 握手超时的流（12 字节），会话就能被**无限期**挂住 —— 实测量化：
 /// ① 只发 0x00 的连接 50s 后仍存活，500 条可线性囤积（+515 句柄 / +6.4MB）；
 /// ② 未认证开流 ≈9.5 KiB/条、单会话上限 512 条、跨会话无全局上限，
 ///    攻击者 129 KB 流量 + 22 个 fd 就能把服务端内存抬 +100 MB。
@@ -69,7 +69,7 @@ const SESSION_TICK: Duration = Duration::from_secs(2);
 /// 重连逻辑重建整条连接，不会造成不可用。）
 const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// yamux 会话保活参数（限制①批次2，对应 frp `tcpMuxKeepaliveInterval`）。
+/// yamux 会话保活参数。
 ///
 /// 官方把间隔交给 Go yamux：每 `interval` 秒向对端发 Ping，超时收不到 Pong
 /// 就关会话。rust-yamux **没有** keepalive API（0.13 / 0.14 均无），nfrp 用
@@ -251,7 +251,7 @@ fn serve_with_timeouts(
             let item = tokio::select! {
                 item = poll_fn(|cx| conn.poll_next_inbound(cx)) => item,
                 _ = &mut tick => {
-                    // 保活看门狗（限制①批次2）：静默超过判定线 = 会话已死。
+                    // 保活看门狗：静默超过判定线 = 会话已死。
                     if let Some(ka) = keepalive {
                         let silence = last_recv
                             .lock()
@@ -412,7 +412,7 @@ async fn drive_client<S>(
             Some(ticker) => tokio::select! {
                 ev = fut => ev,
                 _ = ticker.tick() => {
-                    // 保活看门狗（限制①批次2）：静默超过判定线 = 会话已死。
+                    // 保活看门狗：静默超过判定线 = 会话已死。
                     if let Some(ka) = keepalive {
                         let dead = last_recv
                             .lock()
@@ -470,7 +470,7 @@ mod tests {
 
     /// 有活跃流时不得误杀；流结束后应由看门狗回收 —— C9-3 的残留路线。
     ///
-    /// ★ 关键事实：rust-yamux 的 SYN 帧是**懒发送**的 —— 流对象创建后，
+    /// 关键事实：rust-yamux 的 SYN 帧是**懒发送**的 —— 流对象创建后，
     /// 要等它第一次被 poll（读/写都算）才把 SYN 推给连接。所以这里必须
     /// 真的对 `held` 写一个字节，服务端才会"看见"这条流。
     /// （C9-3 的攻击探针手搓 SYN 帧，模拟的正是"有人强行把流塞过来"。）
@@ -524,7 +524,7 @@ mod tests {
         assert_eq!(k.deadline, Duration::from_secs(310));
     }
 
-    /// 保活看门狗（限制①批次2）：对端"TCP 活着但一声不吭"超过判定线，
+    /// 保活看门狗：对端"TCP 活着但一声不吭"超过判定线，
     /// 会话必须被关闭（accept 返回 None），且不能一上来就杀。
     #[tokio::test]
     async fn 保活看门狗关闭静默会话() {
@@ -586,8 +586,7 @@ mod tests {
         drop((held, s2));
     }
 
-    /// `tcpMuxKeepaliveInterval = 0`（折算 `None`）时不做任何静默判定 ——
-    /// 行为回到 v0.5.10 基线。
+    /// `tcpMuxKeepaliveInterval = 0`（折算 `None`）时不做任何静默判定。
     #[tokio::test]
     async fn 保活关闭时不判定静默() {
         let (srv, _cli) = tokio::io::duplex(4096);

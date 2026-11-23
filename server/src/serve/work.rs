@@ -50,7 +50,7 @@ pub fn admit_user(user: PendingUser, client: &Arc<ClientState>, registry: &Arc<R
         return;
     }
     registry.metrics().conns_total.inc();
-    // ★★ v0.5.6 修（审计总报告 M7）：`conns_active.inc()` **不在这里**。
+    // `conns_active.inc()` **不在这里**。
     //
     // 原先 `admit_user` 与 `handle_work` 各 inc 一次，而 `finish_conn` 只 dec 一次
     // ⇒ "用户先到、工作连接后到"这条路径 **+2 / -1**，每来一条连接就虚高 1。
@@ -130,7 +130,7 @@ pub(super) async fn handle_work(
             .ok_or_else(|| anyhow!("插件改写后的 run_id={} 不存在", msg.run_id))?;
     }
 
-    // ★★ v0.5.5 修（第四轮 A-1，高危）：工作连接必须绑定到**发起它的那个客户端**。
+    // 工作连接必须绑定到**发起它的那个客户端**。
     //
     // 原先这里被 `auth_method() == Oidc` 门住，于是 **token 模式（默认）下
     // `msg.privilege_key` / `msg.timestamp` 从头到尾没人读** —— `run_id` 成了
@@ -151,7 +151,7 @@ pub(super) async fn handle_work(
     // 此后连到受害者隧道的用户流量会落到攻击者的连接上 —— 完整 MITM。
     // A 组独立复现时 6/6 用户连接全部被劫持。
     //
-    // ★★ 但"一刀切要求凭证"会**破坏与官方 frpc 的互通** —— 这是实测出来的，
+    // 但"一刀切要求凭证"会**破坏与官方 frpc 的互通** —— 这是实测出来的，
     //   不是推测。官方 `pkg/auth/token.go` 的 `SetNewWorkConn`：
     //
     // ```go
@@ -170,7 +170,7 @@ pub(super) async fn handle_work(
     //
     //   README 明确承诺"官方客户端不需要改任何配置就能连上"，所以不能这么修。
     //
-    // ★★ 最终策略（既不破坏互通、又堵住劫持）：
+    // 最终策略（既不破坏互通、又堵住劫持）：
     //
     // | 凭证 | 处理 |
     // |---|---|
@@ -225,10 +225,10 @@ pub(super) async fn handle_work(
             // 带了凭证 ⇒ **必须正确**。这是 NFrp 客户端的路径，
             // 也是攻击者最容易露馅的地方（凭证 = md5(token+ts)，猜不出来）。
             //
-            // ★★ v0.5.7 修（第六轮审计 G-1，高危）：**改调 `verify_login`**。
+            // **改调 `verify_login`**。
             //
             //   原先这里是就地手写 `auth_key(token, ts)` 比对 —— 内容判对了，
-            //   但**不知道有"新鲜性"这回事**（M3 的时间窗口只加在主登录一处）。
+            // 但**不知道有"新鲜性"这回事**（M3 的时间窗口只加在主登录一处）。
             //   实测：**一年前**的 `NewWorkConn` 凭证仍被接受，并且打通了
             //   完整双向 MITM（用户的明文落到攻击者手里、回包由攻击者伪造）。
             //
@@ -249,7 +249,7 @@ pub(super) async fn handle_work(
                 );
             }
         } else if client.caps().work_conn_cred {
-            // ★★ 这条会话**自己声明过**"我的工作连接带凭证"
+            // 这条会话**自己声明过**"我的工作连接带凭证"
             //   （NFrp ≥ 0.5.5 恒声明，见 `client/src/main.rs`）。
             //   那它就必须带，且必须正确 —— **空凭证也拒**。
             //
@@ -267,7 +267,7 @@ pub(super) async fn handle_work(
             // 没声明这个能力（官方 frpc、或老版 NFrp）：官方默认**不带凭证**，
             // 所以不能拦。退而求其次 —— 要求同源 IP。
             //
-            // ★★ v0.5.6 修（审计总报告 L5，低危）：**把"可能是误拒"说清楚**。
+            // **把"可能是误拒"说清楚**。
             //
             // 这条判据在**混合传输**下可能误伤合法用户：控制连接走 TCP、
             // 工作连接走 QUIC（`protocol = "quic"`）时，两条连接的出口 IP
@@ -277,11 +277,11 @@ pub(super) async fn handle_work(
             // 现状下用户的症状是：**控制连接登录成功、但每条用户连接都失败**，
             // 日志里只有一句"来源与登录来源不一致" —— 完全指不到"是网络路径不同"。
             //
-            // ★ 为什么**不**放宽判据（如实说明）：
-            //   放宽就等于让"拿 run_id 冒充"重新变得容易（那正是 A-1 要堵的）。
+            // 为什么**不**放宽判据（如实说明）：
+            // 放宽就等于让"拿 run_id 冒充"重新变得容易（那正是 A-1 要堵的）。
             //   在"可用性"和"防冒充"之间，这里选择**保住防线**，
             //   但把诊断信息补足，让人能一眼看出自己踩的是哪种情况。
-            // ★ 提示语之所以**不**按"哪种传输"分支：`handle_work` 里拿不到
+            // 提示语之所以**不**按"哪种传输"分支：`handle_work` 里拿不到
             //   服务端配置（它只收 registry / peer / conn），而为了写一句提示
             //   去把 `Arc<ServerConfig>` 一路传进来，代价大于收益。
             //   两种情况合并成一条，信息量一样够用。
@@ -312,7 +312,7 @@ pub(super) async fn handle_work(
                 client.peer_ip()
             );
         } else {
-            // ★★ v0.5.6 修（审计总报告 M14，中危）：**放行分支也必须审计**。
+            // **放行分支也必须审计**。
             //
             // 原先这条"无凭证 + 同源 IP ⇒ 放行"的路径**零审计** ——
             // 上面三条拒绝路径全都记了审计事件，唯独**真正放行**的这条什么都没记。
@@ -356,7 +356,7 @@ pub(super) async fn handle_work(
     match client.submit_work(work) {
         Some(p) => {
             debug!(proxy = %p.user.proxy, "工作连接与排队用户配对");
-            // ★★ v0.5.6（M7）：这里**不再** inc —— 计数收敛到 `bridge` 的
+            // 这里**不再** inc —— 计数收敛到 `bridge` 的
             //   `ConnGuard`（配对成功那一刻 +1，作用域结束 -1）。
             //   原先这里与 `admit_user` 各加一次，于是 +2/-1 虚高。
             spawn_bridge(p.user, p.work, registry.clone());
@@ -382,7 +382,7 @@ pub(super) async fn reject(
 
 /// 同上，但把"回给对端的文案"与"日志里的详情"分开。
 ///
-/// ★ v0.5.3 修：visitor 这条路径原来**完全没走** `detailed_errors_to_client`
+/// visitor 这条路径原来**完全没走** `detailed_errors_to_client`
 /// 开关，把内部细节原样回给了**尚未通过任何认证**的来访者，包括：
 ///
 /// * 代理名是否存在（可用来枚举 stcp 隧道名）；
@@ -425,7 +425,7 @@ pub(super) async fn handle_visitor(
 
     // 1) run_id 必须能对上一条已登录的控制会话（对应 frps 的 admitVisitorByRunID）
     //
-    // ★★ v0.5.7 修（第六轮审计 D-2，中危）：**空 `run_id` 不再被放行**。
+    // **空 `run_id` 不再被放行**。
     //
     // # 原先为什么错了
     //
@@ -449,7 +449,7 @@ pub(super) async fn handle_visitor(
     // 文案与下面所有拒绝路径**完全一致**（不新增可区分信息）——
     // 否则"空 run_id 被单独拒绝"本身又成了一个可区分信号。
     let Some(session) = registry.get(&msg.run_id) else {
-        // ★★ v0.5.5 修（第四轮 A-3）：**这一条无论如何都只回通用文案**，
+        // **这一条无论如何都只回通用文案**，
         // 不受 `detailed_errors_to_client` 影响。
         //
         // 为什么单独处理它：它本质上是一个 **run_id 在线预言机** ——
@@ -480,7 +480,7 @@ pub(super) async fn handle_visitor(
 
     // 2) 代理必须已注册
     //
-    // ★★ v0.5.7 修（第六轮审计 D-4，中危）：**两条拒绝路径共用同一条文案**。
+    // **两条拒绝路径共用同一条文案**。
     //
     // # 原先为什么错了
     //
@@ -516,7 +516,7 @@ pub(super) async fn handle_visitor(
 
     // 3) 密钥签名校验：hex(md5(secret_key + timestamp))
     //
-    // ★ v0.5.7（第六轮审计 G-1）：把 `registry` 的时钟窗口传进去 ——
+    // 把 `registry` 的时钟窗口传进去 ——
     //   新鲜性校验在 `check_sign` 内部，不是可选项。
     if !entry.check_sign(
         &msg.sign_key,
@@ -524,7 +524,7 @@ pub(super) async fn handle_visitor(
         registry.security().max_clock_skew_secs(),
     ) {
         warn!(proxy = %proxy_name, "visitor 密钥校验失败");
-        // ★ v0.5.7（第六轮审计 D-4）：文案与"代理名不存在"那条**逐字一致**，
+        // 文案与"代理名不存在"那条**逐字一致**，
         //   且不经过 `detailed_errors_to_client`（那个开关默认 true，
         //   经过它就等于把"名字对不对"送出去）。
         //   排查信息进服务端日志，不回给未认证的对端。
@@ -543,7 +543,7 @@ pub(super) async fn handle_visitor(
     // 与官方 frps 一致：比对的**不是** visitor 的 name，而是发起这条 visitor 连接的那个
     // frpc 在 Login 里声明的顶层 `user`（对应 frpc.toml 的 `user = "alice"`）。
     //
-    // ★★ v0.5.7 修（第六轮审计 D-2）：**从上面已经取到的 `session` 直接拿**，
+    // **从上面已经取到的 `session` 直接拿**，
     //   不再 `registry.get(&msg.run_id).unwrap_or_default()`。
     //
     //   后者在 `run_id` 为空（或会话刚好掉线）时退化成**空串**，而
@@ -553,7 +553,7 @@ pub(super) async fn handle_visitor(
     let visitor_user = session.user.clone();
     if !entry.check_user(&visitor_user) {
         warn!(proxy = %proxy_name, user = %visitor_user, "visitor 用户不在 allow_users 白名单内");
-        // ★ 脱敏：**绝不能**把 allow_users 里的真实用户名回显出去 ——
+        // 脱敏：**绝不能**把 allow_users 里的真实用户名回显出去 ——
         //   那直接泄露了"谁被允许访问这条隧道"，也等于确认了这个用户名有效。
         return reject_with(
             &mut conn,
@@ -590,7 +590,7 @@ pub(super) async fn handle_visitor(
     .context("发送 NewVisitorConnResp 失败")?;
     registry.metrics().visitor_conns.inc();
     registry.metrics().conns_total.inc();
-    // ★★ v0.5.6（M7）：这里**不再** inc —— `bridge` / `spawn_sudp_bridge`
+    // 这里**不再** inc —— `bridge` / `spawn_sudp_bridge`
     //   里的守卫会各自在配对成功那一刻 +1，并在离开作用域时 -1。
     //   原先这里 inc + `acquire_work_conn` 失败时手工 dec，是"配对前就加、
     //   失败要手工回滚"的脆弱写法。

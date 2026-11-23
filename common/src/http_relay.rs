@@ -86,7 +86,7 @@ impl<S: AsyncRead + Unpin> HttpIo<S> {
 
     /// 再读一段进缓冲，返回读到的字节数（0 = 对端关闭）。
     ///
-    /// # 取消安全（v0.6.7 重构的关键）
+    /// # 取消安全
     ///
     /// 用 [`AsyncReadExt::read_buf`] **直接读进 `self.buf`**，而不是
     /// `read(&mut 局部数组)` 再 `extend_from_slice`。区别在于：
@@ -96,7 +96,7 @@ impl<S: AsyncRead + Unpin> HttpIo<S> {
     /// * `read_buf` 版：字节落在**属于 `self` 的缓冲**里，future 被取消也还在。
     ///
     /// 这正是 `plugin_bridge` 那个"Linux 上 5/10 超时、请求从未转给上游"
-    /// 的根因（第十五轮记录、第十七轮仍未修）。现在补上。
+    /// 的根因。现在补上。
     pub async fn fill(&mut self) -> Result<usize> {
         // 预留一次读取的空间：`read_buf` 只在**预留容量**里写，不会无限膨胀。
         self.buf.reserve(16 * 1024);
@@ -112,12 +112,12 @@ impl<S: AsyncRead + Unpin> HttpIo<S> {
     ///
     /// 用途：等待上游（响应头、上游 TLS 握手）时用 `tokio::select!` 同时轮询
     /// 这里 —— 对端撤离后立刻结束等待，别替一个已经离开的访问者继续等
-    /// （★ v0.5.8，第八轮审计 **F8T-1**：`https2*` 悬挂上游 + 访问方撤离，
+    /// （`https2*` 悬挂上游 + 访问方撤离，
     /// 上游连接原先永不释放）。
     ///
-    /// # 取消安全（v0.6.7 修好了，第十五 / 十七轮的已知缺陷已关闭）
+    /// # 取消安全
     ///
-    /// 第十五轮实测：同一测试在 Linux 上 10 次里 5 次 5 秒超时，表现是
+    /// 实测：同一测试在 Linux 上 10 次里 5 次 5 秒超时，表现是
     /// "插件收到连接却从未把请求转给上游"。根因是旧实现 `read(&mut chunk)`
     /// 读进**局部数组**，future 被 `select!` 取消时那批字节随局部变量一起消失。
     ///
@@ -127,12 +127,12 @@ impl<S: AsyncRead + Unpin> HttpIo<S> {
     /// 2. 在循环里加 `if io.available() > 0 { return Ok(fut.await) }` 只治了
     ///    一半 —— 判断放在了 `watch_closed` **返回之后**，那一轮已经空转了。
     ///
-    /// v0.6.7 的修法（两处一起改才成立）：
+    /// 的修法（两处一起改才成立）：
     /// * 本函数改用 [`Self::fill`]（`read_buf` 写进 `self.buf`）⇒ 取消不丢字节；
     /// * **调用方**在 `select!` **之前**先看 `available()`：缓冲里有字节就直接
     ///   `fut.await`，不再进 `select!` ⇒ 没有任何一路会"永远就绪"。
     ///
-    /// ★ 使用约束（别写回旧形状）：本函数在缓冲非空时会**立即**返回
+    /// 使用约束（别写回旧形状）：本函数在缓冲非空时会**立即**返回
     ///   `Ok(false)`。调用方必须保证"返回 false 之后不会再次立刻调用它"，
     ///   否则就是忙等。`wait_upstream` 已按这个约束写，并有
     ///   `wait_upstream_不许忙等` 回归测试盯着。
@@ -161,7 +161,7 @@ impl<S: AsyncRead + Unpin> HttpIo<S> {
     /// 代理"的后端来说，没必要冒这个险。
     /// 读出**原始**头部字节与行列表（到 `\r\n\r\n` 为止，含空行）。
     ///
-    /// ★★ v0.5.5 修（第四轮 C-2）：**上限必须真的生效**。
+    /// **上限必须真的生效**。
     ///
     /// 原先的检查顺序是：
     ///
@@ -190,7 +190,7 @@ impl<S: AsyncRead + Unpin> HttpIo<S> {
         loop {
             if let Some(idx) = find_subslice(&self.buf[self.pos..], b"\r\n\r\n") {
                 let end = self.pos + idx + 4;
-                // ★ 真正的上限判定：**这一段头的长度**（不是缓冲区大小）。
+                // 真正的上限判定：**这一段头的长度**（不是缓冲区大小）。
                 let head_len = end - self.pos;
                 if head_len > MAX_HEAD {
                     bail!("HTTP 头部 {head_len} 字节，超过上限 {MAX_HEAD}");
@@ -207,7 +207,7 @@ impl<S: AsyncRead + Unpin> HttpIo<S> {
                 return Ok(Some((raw, lines)));
             }
             // 没找到结束符：缓冲区已经超限 ⇒ 不可能再凑出一个合法的头了。
-            // ★ 用 `>=` 而不是 `>`：正好等于上限时再多一个字节就越界，
+            // 用 `>=` 而不是 `>`：正好等于上限时再多一个字节就越界，
             //   而 `fill()` 一次至少读 1 字节。
             if self.available() >= MAX_HEAD {
                 bail!("HTTP 头部超过 {MAX_HEAD} 字节（未见到结束符）");
@@ -272,7 +272,7 @@ impl<S: AsyncRead + Unpin> HttpIo<S> {
                 }
                 return Ok(out);
             }
-            // ★ 必须用 `saturating_add`（v0.5.3 修）。
+            // 必须用 `saturating_add`。
             //
             // `out.len() + size` 里 `size` 是**攻击者可控**的：它直接来自报文中的
             // chunk 长度（十六进制解析，最大可达 `usize::MAX`）。release profile
@@ -351,7 +351,7 @@ impl HeadParts {
 
     /// 取同名头的**全部**值（保序）。
     ///
-    /// ★ v0.5.4 新增（H2）。为什么必须有它：`get()` 只返回**第一个**，
+    /// 为什么必须有它：`get()` 只返回**第一个**，
     /// 而 `to_bytes()` 会把 `headers` 里的**所有**同名头都序列化出去 ——
     /// "读只读第一个、写却写出去两个"正是 CL.CL 请求走私的温床。
     /// 任何需要判断"这个头出现了几次"的地方都要用它，不要用 `get().is_some()`。
@@ -373,7 +373,7 @@ impl HeadParts {
 
     /// 写一个头（同名则替换）。
     ///
-    /// ★ 名字和值里的 **CR / LF 会被就地剥掉**。
+    /// 名字和值里的 **CR / LF 会被就地剥掉**。
     ///
     /// 这不是洁癖：`plugin_request_headers`（插件自定义请求头）能由**服务端
     /// 经 `ServerCmd` 下发**，`set()` 又直接 `push_str` 到报文里 —— 值里塞一个
@@ -383,7 +383,7 @@ impl HeadParts {
     ///
     /// 剥掉而不是报错：调用方遍布转发热路径，逐处处理 `Result` 不值得；
     /// 而且 HTTP 头的名字/值本来就不允许含 CRLF，剥掉等于"按规范收敛"。
-    /// 严格解析 `Content-Length`（v0.5.4，H2）。
+    /// 严格解析 `Content-Length`。
     ///
     /// 返回 `Ok(0)` 表示"没有这个头"（合法，等价于没有请求体）。
     ///
@@ -418,7 +418,7 @@ impl HeadParts {
             .map_err(|_| anyhow!("Content-Length 数值溢出: {s:?}"))
     }
 
-    /// 同名头去重（v0.5.4，H2 的第三层纵深防御）。
+    /// 同名头去重。
     ///
     /// 调用点：转发前。确保"读到的"与"写出去的"永远一致 ——
     /// 即便上游某个环节漏了检查，也不会把重复头原样送到下游。
@@ -452,7 +452,7 @@ impl HeadParts {
 
     /// 写一个头（同名则替换）。
     ///
-    /// ★ 名字和值里的 **CR / LF 会被就地剥掉**。
+    /// 名字和值里的 **CR / LF 会被就地剥掉**。
     ///
     /// 这不是洁癖：`plugin_request_headers`（插件自定义请求头）能由**服务端
     /// 经 `ServerCmd` 下发**，`set()` 又直接 `push_str` 到报文里 —— 值里塞一个
@@ -541,7 +541,7 @@ pub fn body_length(parts: &HeadParts) -> Option<usize> {
 
 /// 这条报文用的是 chunked 传输编码吗。
 ///
-/// ★★ v0.5.5 修（第四轮 C 组 TE.TE 走私）：按 **RFC 7230 §3.3.3** 判定 ——
+/// 按 **RFC 7230 §3.3.3** 判定 ——
 /// 传输编码是一串**按顺序应用**的编码，`chunked` 必须是**最后一个**令牌
 /// 才算"按 chunked 分帧"。
 ///
@@ -567,7 +567,7 @@ pub fn body_length(parts: &HeadParts) -> Option<usize> {
 /// （见 [`transfer_encoding_is_unsupported`]）—— 与"读一个口径、写另一个口径"
 /// 这类走私的通用修法一致：**双方口径必须完全一致**。
 ///
-/// ★ 第一版修得过头了：要求"恰好一个 `chunked`"，把 RFC 合法的
+/// 第一版修得过头了：要求"恰好一个 `chunked`"，把 RFC 合法的
 ///   `identity, chunked` 也 400 了（C 组脚本里的对照组立刻变红）。
 ///   合法的东西不能被拒 —— 那会把"修漏洞"变成"制造不兼容"。
 pub fn is_chunked(parts: &HeadParts) -> bool {
@@ -670,7 +670,7 @@ pub async fn relay_until_eof<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 /// 三种读法都在这里收口，省得每个调用方各写一遍、各漏一种：
 /// 无正文（1xx/204/304）→ chunked → 定长 → 读到 EOF。
 ///
-/// ★ 只适合**响应**。请求请用 [`relay_request_body`] —— 两者在"没有框架信息"
+/// 只适合**响应**。请求请用 [`relay_request_body`] —— 两者在"没有框架信息"
 /// 时的语义**相反**，混用会死锁。
 pub async fn relay_body<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     up: &mut HttpIo<S>,
@@ -697,7 +697,7 @@ pub async fn relay_body<S: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
 /// 转发**请求**体。
 ///
-/// ★ 与 [`relay_body`] 的唯一区别，也是必须分开的原因：请求没有
+/// 与 [`relay_body`] 的唯一区别，也是必须分开的原因：请求没有
 /// "读到 EOF" 这种形态。一个请求既没有 `Content-Length` 也没有
 /// `Transfer-Encoding: chunked`，就是**没有请求体**。
 ///
@@ -742,10 +742,10 @@ pub fn wants_upgrade(parts: &HeadParts) -> bool {
 
 /// 逐跳（hop-by-hop）头：只对**这一段连接**有意义，转发时必须摘掉。
 ///
-/// ★ `Transfer-Encoding` **不在此列**。转发时我们是把 chunked 的分块格式
+/// `Transfer-Encoding` **不在此列**。转发时我们是把 chunked 的分块格式
 /// 原样搬过去的，摘掉它下游就不知道该怎么解帧了。
 ///
-/// ★★ v0.5.8 补（第七轮审计 **D7-3**，低危）：加入 `proxy-connection`。
+/// 加入 `proxy-connection`。
 ///
 /// 它**不在** RFC 7230 的逐跳头清单里 —— 那是 Netscape 时代的老写法，
 /// 但现实里大量反代（nginx 的部分配置、老 IIS、各类中间盒）**仍在收发它**。
@@ -779,7 +779,7 @@ pub fn connection_tokens(parts: &HeadParts) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// **请求 framing 校验**（v0.5.6 修审计总报告 M2）。
+/// **请求 framing 校验**。
 ///
 /// 服务端 `vhost.rs` 早就做了这三项检查，客户端 `plugin_bridge.rs`
 /// **一项都没有** —— 于是"同一语义写了两遍、只加固了一遍"。
@@ -809,7 +809,7 @@ pub fn validate_request_framing(req: &HeadParts) -> Result<(), String> {
     Ok(())
 }
 
-/// ★★ v0.5.8 新增（第七轮审计 **D7-2**，中危）：**响应侧的 framing 校验**。
+/// **响应侧的 framing 校验**。
 ///
 /// # 为什么需要它
 ///
@@ -817,7 +817,7 @@ pub fn validate_request_framing(req: &HeadParts) -> Result<(), String> {
 /// 不支持的 TE），而**响应侧一项都没有** —— 内网服务（或一个被攻陷的后端）
 /// 回什么 framing，NFrp 就原样转发给公网访客。
 ///
-/// 这正是第七轮 **D7-1** 的同一条链路上的第二个洞：
+/// 这正是同一条链路上的第二个洞：
 /// D7-1 修的是"响应侧**判定口径**与请求侧不一致"，
 /// 这一条修的是"响应侧**根本没有校验**"。
 ///
@@ -861,7 +861,7 @@ pub fn validate_response_framing(resp: &HeadParts) -> Result<(), String> {
     Ok(())
 }
 
-/// **剥掉逐跳头**（v0.5.6 修审计总报告 M2）。
+/// **剥掉逐跳头**。
 ///
 /// 常驻的 [`HOP_BY_HOP`] 加上 `Connection` 里点名的那批。
 /// 服务端 `vhost.rs` 的请求侧与响应侧都做了，客户端 `plugin_bridge.rs`
@@ -869,7 +869,7 @@ pub fn validate_response_framing(resp: &HeadParts) -> Result<(), String> {
 /// `Connection: keep-alive, X-Secret` 会让 `X-Secret`、`Upgrade`、
 /// `Keep-Alive` 等**原样泄漏给公网访客**（已实测复现）。
 ///
-/// ★ 调用顺序要紧：**先剥再写自己的 `Connection`**，
+/// 调用顺序要紧：**先剥再写自己的 `Connection`**，
 ///   否则刚写的那条会被自己剥掉。
 pub fn strip_hop_by_hop(head: &mut HeadParts) {
     let mut hop: Vec<String> = HOP_BY_HOP.iter().map(|s| (*s).to_string()).collect();
@@ -901,7 +901,7 @@ mod tests {
         assert_eq!(text, "GET /a HTTP/1.1\r\nHost: new\r\nX-B: 2\r\n\r\n");
     }
 
-    /// ★ 回归测试：头的名字/值里塞 CRLF 必须被剥掉，不能让报文被撑开。
+    /// 回归测试：头的名字/值里塞 CRLF 必须被剥掉，不能让报文被撑开。
     ///
     /// `plugin_request_headers` 能被**服务端经 `ServerCmd` 下发**，而 `set()`
     /// 直接拼进报文 —— 值里一个 `"\r\nX-Admin: 1"` 就能往用户内网服务的请求里
@@ -959,10 +959,10 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // H2（v0.5.4）：重复 Content-Length / 同名头去重
+    // H2：重复 Content-Length / 同名头去重
     // ------------------------------------------------------------------
 
-    /// ★★ `get_all` / `count` 必须能看到**全部**同名头 —— 这是 H2 的地基。
+    /// `get_all` / `count` 必须能看到**全部**同名头 —— 这是 H2 的地基。
     ///
     /// `get()` 只看第一个，而 `to_bytes()` 会把所有同名头都写出去。
     /// 如果只有 `get()`，"读一个、写两个"的走私面就无法被检测。
@@ -991,7 +991,7 @@ mod tests {
         );
     }
 
-    /// ★★ H2 核心：严格解析 Content-Length。
+    /// 严格解析 Content-Length。
     #[test]
     fn content_length_严格解析() {
         let p = |v: &[&str]| HeadParts::parse(&lines(v)).unwrap();
@@ -1018,7 +1018,7 @@ mod tests {
         // 没有这个头 ⇒ 0
         assert_eq!(p(&["POST / HTTP/1.1"]).content_length_strict().unwrap(), 0);
 
-        // ★ 重复 —— 哪怕值相同也拒绝（CL.CL 走私面）
+        // 重复 —— 哪怕值相同也拒绝（CL.CL 走私面）
         let dup_same = p(&["POST / HTTP/1.1", "Content-Length: 5", "Content-Length: 5"]);
         assert!(
             dup_same.content_length_strict().is_err(),
@@ -1028,7 +1028,7 @@ mod tests {
         let e = dup_diff.content_length_strict().unwrap_err().to_string();
         assert!(e.contains("重复"), "{e}");
 
-        // ★ 带符号 / 非数字 —— 旧实现 `unwrap_or(0)` 会静默当成 0
+        // 带符号 / 非数字 —— 旧实现 `unwrap_or(0)` 会静默当成 0
         for bad in ["+5", "-1", "abc", "5x", "", "0x10", "1 2"] {
             let h = p(&["POST / HTTP/1.1", &format!("Content-Length: {bad}")]);
             assert!(
@@ -1045,7 +1045,7 @@ mod tests {
         assert!(huge.content_length_strict().is_err());
     }
 
-    /// ★★ H2 第三层：转发前同名头去重（纵深防御）。
+    /// H2 第三层：转发前同名头去重（纵深防御）。
     #[test]
     fn 转发前同名头去重() {
         let mut h = HeadParts::parse(&lines(&[
@@ -1066,7 +1066,7 @@ mod tests {
         // 普通头只留第一个
         assert_eq!(h.get_all("x-dup"), vec!["a"]);
         assert_eq!(h.count("content-length"), 1);
-        // ★ set-cookie 必须逐个保留（合并会破坏语义）
+        // set-cookie 必须逐个保留（合并会破坏语义）
         assert_eq!(
             h.get_all("set-cookie"),
             vec!["s1=1", "s2=2"],
@@ -1144,14 +1144,14 @@ mod tests {
         assert!(io.read_head().await.unwrap().is_none());
     }
 
-    /// ★ v0.5.8（第八轮审计 F8T-1，低危）配套：`watch_closed` 要能识别 EOF，
+    /// 配套：`watch_closed` 要能识别 EOF，
     /// 且**读到的字节不会丢**（存进缓冲，后续照常消费）。
     ///
-    /// ★ v0.6.7 起语义补一条：**缓冲里还有数据时返回 `Ok(false)`** ——
+    /// 语义补一条：**缓冲里还有数据时返回 `Ok(false)`** ——
     /// 不读就无法观测 EOF，硬读又会把字节藏进缓冲。调用方契约是
     /// "先看 `available()`、有数据就先消费"，`wait_upstream` 已按此写。
     ///
-    /// ★ 这一调用必须**立刻**返回：老实现（无条件 `read`）在缓冲非空时仍会去读，
+    /// 这一调用必须**立刻**返回：老实现（无条件 `read`）在缓冲非空时仍会去读，
     /// 而对端此时沉默 ⇒ 永久挂起。用 `timeout` 兜住，让这种回退**快速失败**
     /// 而不是把整个测试进程挂死（挂死看起来只是"CI 超时"，查不出原因）。
     #[tokio::test]
@@ -1178,12 +1178,12 @@ mod tests {
         assert!(io.watch_closed().await.unwrap(), "EOF 必须被识别");
     }
 
-    /// ★★ v0.6.7：`watch_closed` 被 `select!` 取消后，字节必须还在。
+    /// `watch_closed` 被 `select!` 取消后，字节必须还在。
     ///
     /// 锁住的不变式：读取结果落在 **`self.buf`**（`read_buf`）而不是某个局部
     /// 数组里，所以 future 被 drop 不会带走数据。
     ///
-    /// ★ 如实标注这条测试的边界：它**证明不了**第十五轮那个 Linux 竞态已经消失
+    /// 如实标注这条测试的边界：它**证明不了**那个 Linux 竞态已经消失
     /// —— 那是时序相关的，Windows 上 21/21 都复现不出来。这里能做的是
     /// "取消一次 → 字节一个不少 → 之后再读还能读全"这条确定性检查；
     /// 真正盯住 Linux 的闸门是 CI 上 `http2*` / `https2*` 用例连跑，
@@ -1239,7 +1239,7 @@ mod tests {
         assert_eq!(io.read_chunked().await.unwrap(), raw.to_vec());
     }
 
-    /// ★★ v0.5.3 回归：chunk 长度大到能让 `len + size` **算术回绕**时，
+    /// chunk 长度大到能让 `len + size` **算术回绕**时，
     /// ACL 必须照常拒绝（而不是因为回绕成小值而"通过"）。
     ///
     /// release profile 没开 `overflow-checks`，裸 `+` 会静默回绕 ——
@@ -1304,7 +1304,7 @@ mod tests {
         assert_eq!(&rest, b"garbage");
     }
 
-    /// ★★ v0.5.8 回归（第七轮审计 **D7-2**，中危）：**响应侧也要做 framing 校验**。
+    /// **响应侧也要做 framing 校验**。
     ///
     /// # 原先的洞
     ///

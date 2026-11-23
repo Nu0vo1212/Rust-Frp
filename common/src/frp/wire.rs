@@ -172,7 +172,7 @@ pub fn new_client_hello(transport: &str, tls: bool, tcp_mux: bool) -> ClientHell
 
 /// 服务端校验 ClientHello（对应 `ValidateClientHello`）。
 ///
-/// ★ v0.5.5 修（第四轮 A-5）：`clientRandom` 补上 **base64 形态与长度**校验。
+/// `clientRandom` 补上 **base64 形态与长度**校验。
 ///
 /// 原先只查"非空"（`is_empty()`）—— 于是 `clientRandom = "!!!"` 这种
 /// 根本不是 base64 的串也能通过协商。实际影响很小（见下），但
@@ -299,7 +299,7 @@ pub fn validate_server_hello(client_hello: &ClientHello, server_hello: &ServerHe
 mod tests {
     use super::*;
 
-    /// ★★ A-5 回归（v0.5.5）：`clientRandom` 必须是合法 base64。
+    /// A-5 回归：`clientRandom` 必须是合法 base64。
     ///
     /// 修复前只查非空，`"!!!"` 这类垃圾串也能通过协商。
     #[test]
@@ -333,7 +333,7 @@ mod tests {
         let e = validate_client_hello(&hello).expect_err("空串必须被拒");
         assert!(e.to_string().contains("length 0"), "{e}");
 
-        // ★ 兼容性：标准 / URL-safe / 带不带填充都要认
+        // 兼容性：标准 / URL-safe / 带不带填充都要认
         hello.capabilities.crypto.client_random = "AAAAAAAAAAAAAAAAAAAAAAAA".to_string(); // 16 字节
         assert!(validate_client_hello(&hello).is_ok(), "16 字节无填充应通过");
         hello.capabilities.crypto.client_random = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(); // 23 字节带填充

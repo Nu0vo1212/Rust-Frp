@@ -186,7 +186,7 @@ async fn visitor_reject_with_缺省回详情() {
     }
 }
 
-/// ★ C9-3 修复的回归锁：闸门排满后必须**排队超时放弃**，而不是无限等待。
+/// C9-3 修复的回归锁：闸门排满后必须**排队超时放弃**，而不是无限等待。
 #[tokio::test]
 async fn 未认证闸门排满后排队超时放弃() {
     let gate = tokio::sync::Semaphore::new(1);
@@ -209,7 +209,7 @@ fn tcp_proxy(name: &str, port: u16) -> nfrp_common::frp::msg::NewProxy {
     }
 }
 
-/// ★ `allowPorts` 是安全项：白名单外的端口必须在**绑定之前**就被拒。
+/// `allowPorts` 是安全项：白名单外的端口必须在**绑定之前**就被拒。
 #[tokio::test]
 async fn allow_ports_拦下白名单外的端口() {
     let registry = Arc::new(Registry::unlimited());
@@ -263,7 +263,7 @@ async fn allow_ports_放行白名单内的端口() {
     assert!(err.contains("解析"), "应该走到解析地址那一步：{err}");
 }
 
-/// ★ `maxPortsPerClient`：按**端口数**（不是代理数）封顶。
+/// `maxPortsPerClient`：按**端口数**（不是代理数）封顶。
 #[tokio::test]
 async fn max_ports_per_client_按端口数封顶() {
     let registry = Arc::new(Registry::unlimited());
@@ -329,7 +329,7 @@ async fn 没填端口时报的是必须指定而不是白名单() {
     assert!(!err.contains("allowPorts"), "{err}");
 }
 
-/// ★ `detailedErrorsToClient = false` 时回给客户端的必须是短句，
+/// `detailedErrorsToClient = false` 时回给客户端的必须是短句，
 /// 不能把"域名已被代理 xxx 占用"这类**别人的代理名**泄露出去。
 #[test]
 fn 关闭详细错误后回给客户端的是短句() {
@@ -464,7 +464,7 @@ fn 续传指纹跨_map_插入顺序稳定() {
 }
 
 // ==================================================================
-// v0.5.6 回归（审计总报告 M7）：活跃连接计数必须收支平衡
+// 活跃连接计数必须收支平衡
 //
 // 审计找出**四处**同类问题（重复 inc / 无条件 dec / 两处 `?` 漏 dec），
 // 但它们其实是**同一个 bug 的四个表现**：
@@ -472,7 +472,7 @@ fn 续传指纹跨_map_插入顺序稳定() {
 // 修法用 RAII 把 -1 绑到作用域上 —— 下面这几条锁住这个不变量。
 // ==================================================================
 
-/// ★★ M7：守卫创建 +1、离开作用域 -1（**无论怎么离开**）。
+/// 守卫创建 +1、离开作用域 -1（**无论怎么离开**）。
 #[test]
 fn 连接守卫必须收支平衡() {
     let r = Registry::unlimited();
@@ -494,7 +494,7 @@ fn 连接守卫必须收支平衡() {
     assert_eq!(r.metrics().conns_active.get(), 0);
 }
 
-/// ★★ M7 核心：**提前返回（`?` 路径）也必须把计数还回来**。
+/// **提前返回（`?` 路径）也必须把计数还回来**。
 ///
 /// 这是原先漏 dec 的那两条路径的等价物：函数在守卫建好之后、
 /// `finish_conn` 之前就 return 了。

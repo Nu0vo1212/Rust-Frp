@@ -73,7 +73,7 @@ const MAX_HANDSHAKE: usize = 16 * 1024;
 /// 正常不会有更大的帧；给到 16 MiB 是留出余量，同时挡住"声称 2^63 字节"的帧头。
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 
-/// 控制帧（ping / pong / close）的载荷上限（v0.5.4，L9）。
+/// 控制帧（ping / pong / close）的载荷上限。
 ///
 /// RFC 6455 §5.5 规定控制帧载荷不得超过 125 字节。不检查的后果是
 /// "对端发 16 MiB 的 Ping ⇒ 我们回 16 MiB 的 Pong"这种放大型 DoS。
@@ -388,7 +388,7 @@ impl<S> WsStream<S> {
 /// * 客户端 → 服务端的帧**必须**带掩码（不掩码 ⇒ 报错关闭连接）；
 /// * 服务端 → 客户端的帧**必须不**带掩码（带了 ⇒ 同样报错）。
 ///
-/// ★★ v0.5.5 修（第四轮 G-7）：原先只读掩码位用于"要不要异或"，
+/// 原先只读掩码位用于"要不要异或"，
 /// **从不校验它**，于是未掩码的客户端帧被照常处理（实弹 `tmp/audit4g/g8_ws_mask.py`：
 /// 发一个 `masked=False` 的 Login 帧，服务端照回 `LoginResp`）。
 ///
@@ -413,7 +413,7 @@ fn take_frame(
     let masked = b1 & 0x80 != 0;
     let len7 = (b1 & 0x7f) as usize;
 
-    // ★ 掩码位方向性校验（RFC 6455 §5.1 的两个 MUST）。
+    // 掩码位方向性校验（RFC 6455 §5.1 的两个 MUST）。
     if our_role_is_client && masked {
         return Err(WsError::Protocol(
             "服务端发来的帧不该带掩码（RFC 6455 §5.1）".into(),
@@ -453,7 +453,7 @@ fn take_frame(
         )));
     }
 
-    // ★★ v0.5.4 修（L9）：**控制帧载荷不得超过 125 字节**（RFC 6455 §5.5）。
+    // **控制帧载荷不得超过 125 字节**（RFC 6455 §5.5）。
     //
     // 原先只查了通用的 `MAX_FRAME`（16 MiB）。于是恶意对端可以发一个
     // 16 MiB 载荷的 `Ping`，而 `poll_read` 会**原样回一个 16 MiB 的 `Pong`**
@@ -561,7 +561,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsStream<S> {
                     OP_PING => {
                         let pong = build_frame(OP_PONG, &payload, this.is_client);
                         this.tx.extend_from_slice(&pong);
-                        // ★ 必须**就地**把 Pong 推到底层，不能只排队等上层来写：
+                        // 必须**就地**把 Pong 推到底层，不能只排队等上层来写：
                         // 上层此刻很可能正阻塞在 `poll_read` 上等数据，而读侧
                         // 又在等我们返回 —— 两边都不写就是死锁（RFC 6455 要求
                         // Pong 尽快回，对端可能正靠它做保活）。
@@ -757,7 +757,7 @@ mod tests {
 
     /// 帧被拆成两半时要等第二半，不能把半个载荷当数据交出去。
     ///
-    /// ★ v0.5.5（G-7）：构造的帧要带**客户端掩码** —— 现在服务端视角会
+    /// 构造的帧要带**客户端掩码** —— 现在服务端视角会
     /// 按 RFC 校验掩码位，未掩码的帧已经不合规了。
     #[test]
     fn partial_frame_waits_for_the_rest() {
@@ -776,7 +776,7 @@ mod tests {
 
     /// 一段字节里连着多个帧时必须逐个取出 —— 对端可能把好几个 Write 攒在一个 TCP 段里。
     ///
-    /// ★ v0.5.5（G-7）：同上，用带掩码的客户端帧。
+    /// 同上，用带掩码的客户端帧。
     #[test]
     fn multiple_frames_in_one_buffer() {
         let mut buf = build_frame(OP_BINARY, b"aa", true);
@@ -944,7 +944,7 @@ mod tests {
         assert_eq!(got, payload);
     }
 
-    /// ★★ v0.5.4 回归（L9）：控制帧载荷必须 ≤125 字节（RFC 6455 §5.5）。
+    /// （L9）：控制帧载荷必须 ≤125 字节（RFC 6455 §5.5）。
     ///
     /// 不检查的后果：对端发一个 16 MiB 的 Ping，我们会**原样回一个 16 MiB 的
     /// Pong** —— 而 `tx` 队列没有独立上限，属廉价的放大型 DoS。
@@ -994,7 +994,7 @@ mod tests {
             "CLOSE 也要限"
         );
 
-        // ★ 数据帧不受这条限制（只受 MAX_FRAME）
+        // 数据帧不受这条限制（只受 MAX_FRAME）
         let mut data = make(OP_BINARY, 126);
         assert!(
             take_frame(&mut data, false).is_ok(),
@@ -1003,7 +1003,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 第四轮 G-7：掩码位的方向性校验（RFC 6455 §5.1 两个 MUST）
+    // 掩码位的方向性校验（RFC 6455 §5.1 两个 MUST）
     // ------------------------------------------------------------------
 
     /// 造一个可控掩码位的帧。
@@ -1026,7 +1026,7 @@ mod tests {
         v
     }
 
-    /// ★★ G-7 核心：**服务端视角**收到未掩码的客户端帧必须报错。
+    /// **服务端视角**收到未掩码的客户端帧必须报错。
     ///
     /// 修复前它被照常处理（实弹：未掩码的 Login 帧收到了 LoginResp）。
     #[test]

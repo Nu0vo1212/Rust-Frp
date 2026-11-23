@@ -199,7 +199,7 @@ async fn register_visitor_proxy(
         })
         .map_err(|e| anyhow!(e))?;
     client.add_proxy(m.proxy_name.clone(), None, slot);
-    // ★ v0.6.6：把数据面标志记下来，工作连接那一侧要用它决定是否解密/解压
+    // 把数据面标志记下来，工作连接那一侧要用它决定是否解密/解压
     client.set_proxy_flags(&m.proxy_name, m.use_encryption, m.use_compression);
     client.set_proxy_type(&m.proxy_name, &m.proxy_type);
     // 与官方 frps 一致：visitor 类代理没有公网地址，remote_addr 留空
@@ -217,7 +217,7 @@ async fn register_tcp(
     if m.remote_port == 0 {
         anyhow::bail!("tcp 代理必须指定 remote_port");
     }
-    // ★ 限制①批次1：数据面端口跟随 `proxyBindAddr`（官方
+    // 数据面端口跟随 `proxyBindAddr`（官方
     //   `ports.NewManager("tcp", cfg.ProxyBindAddr, ...)` 与 tcp.go 的
     //   `net.Listen(..., ProxyBindAddr, ...)`；留空 = `bindAddr`）。
     let proxy_host = cfg.effective_proxy_bind_addr();
@@ -272,7 +272,7 @@ async fn register_udp(
     if m.remote_port == 0 {
         anyhow::bail!("udp 代理必须指定 remote_port");
     }
-    // ★ 限制①批次1：数据面端口跟随 `proxyBindAddr`（官方 udp.go：
+    // 数据面端口跟随 `proxyBindAddr`（官方 udp.go：
     //   `ResolveUDPAddr(..., ProxyBindAddr, ...)`；留空 = `bindAddr`）。
     let proxy_host = cfg.effective_proxy_bind_addr();
     // 同 tcp：只有第一个成员负责绑定，后来者复用。
@@ -305,7 +305,7 @@ async fn register_udp(
             return Err(e);
         }
     };
-    // ★ v0.5.9（第九轮审计 E9-0）：把安全上下文传进去，让 UDP 数据面也过 ACL。
+    // 把安全上下文传进去，让 UDP 数据面也过 ACL。
     let handle = udp_proxy::spawn(
         Arc::new(udp),
         m.proxy_name.clone(),
@@ -315,7 +315,7 @@ async fn register_udp(
     );
     registry.attach_listener(m.remote_port, handle.abort_handle());
     client.add_proxy(m.proxy_name.clone(), Some(m.remote_port), slot);
-    // ★ v0.7.6 修：udp 此前漏记数据面标志与代理类型。
+    // udp 此前漏记数据面标志与代理类型。
     //
     // tcp / stcp / xtcp 都在注册后写了这两项，只有 udp 没写 —— 于是
     // `proxy_flags()` 永远返回 (false,false)、`proxy_type()` 返回空串。
@@ -412,7 +412,7 @@ async fn register_vhost(
         }))?;
     }
     client.add_proxy(m.proxy_name.clone(), None, slot);
-    // ★ v0.7.6 修：vhost（http / https / tcpmux）此前**既没记类型，也没记
+    // vhost（http / https / tcpmux）此前**既没记类型，也没记
     // 加密/压缩标志** —— tcp / stcp / xtcp 都记了，只有这三条漏了。
     //
     // 后果不是"少个字段"，而是数据面错误：客户端开了 `useEncryption` 后
@@ -431,7 +431,7 @@ async fn proxy_accept_loop(listener: TcpListener, remote_port: u16, registry: Ar
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
-                // ★★ v0.5.8 修（第七轮审计 F7-1，中危）：**数据面也要过 ACL**。
+                // **数据面也要过 ACL**。
                 //
                 // # 原先为什么错了
                 //
@@ -519,7 +519,7 @@ async fn proxy_accept_loop(listener: TcpListener, remote_port: u16, registry: Ar
                     proxy_type: client.proxy_type(&backend.proxy_name),
                     client_user: client.user.clone(),
                     client_run_id: client.run_id(),
-                    // ★ v0.6.6：数据面标志随用户连接带下去
+                    // 数据面标志随用户连接带下去
                     use_encryption: {
                         let (e, _) = client.proxy_flags(&backend.proxy_name);
                         e

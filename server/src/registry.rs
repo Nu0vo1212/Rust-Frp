@@ -424,7 +424,7 @@ impl Registry {
     /// - group 名不同（或已有的是独占端口）-> 冲突；
     /// - group 名相同但 group_key 不同 -> 认证失败（对应官方 `ErrGroupAuthFailed`）。
     ///
-    /// ★ `group_key` 是**认证凭据**而非标签：只比对组名会让任何知道组名的客户端
+    /// `group_key` 是**认证凭据**而非标签：只比对组名会让任何知道组名的客户端
     /// 混入他人的负载均衡组、分走该端口的流量份额（跨租户流量劫持）。
     /// 官方的 `TCPGroup.Listen` 在加入分支上做同样的校验。
     ///
@@ -450,7 +450,7 @@ impl Registry {
                 // 早先这里只比 `pg.name != group`，于是两个都没配 group 的代理
                 // 反而被当成同组，端口冲突检测直接失效。
                 //
-                // ★★ v0.5.6 修（审计总报告 L14，低危）：**错误文案统一，不再区分原因**。
+                // **错误文案统一，不再区分原因**。
                 //
                 // 原先这里有**四种**可区分的文案，对未认证 / 低权限的调用方构成
                 // 一个**枚举预言机**：
@@ -466,12 +466,12 @@ impl Registry {
                 //   于是**组名可枚举** —— 而组名正是官方 group 负载均衡的
                 //   唯一共享凭据名。
                 //
-                // ★ 与下面 `constant_time_eq` 的意图自相矛盾：那行注释写着
+                // 与下面 `constant_time_eq` 的意图自相矛盾：那行注释写着
                 //   "用常量时间比较，避免按字节泄露密钥前缀" —— 定长比较挡住了
                 //   逐字节试探，**却用错误文案把整个组名送了出去**。
                 //   又是一次"防线写对了、但同一件事的另一半没铺满"。
                 //
-                // ★ 修法：所有失败原因共用**一条**文案（只承认"端口被占用"，
+                // 修法：所有失败原因共用**一条**文案（只承认"端口被占用"，
                 //   既不说是谁占的、也不说组名对不对）。
                 //   真正需要区分原因的只有服务端日志 —— 那走 `debug!`，不外泄。
                 let reason = if pg.name.is_empty() {
@@ -479,7 +479,7 @@ impl Registry {
                 } else if group.is_empty() {
                     "未指定 group 的代理不能共享"
                 } else if pg.owner_user != client.user {
-                    // ★★ v0.5.7 修（第六轮审计 D-1，高危）：**跨租户一律拒绝**。
+                    // **跨租户一律拒绝**。
                     //
                     // 原先这里没有这一条：判定只看 (组名, group_key)，
                     // 于是"知道组名"就能把工作连接挂到别人的公网端口上，
@@ -741,7 +741,7 @@ impl Drop for LoadGuard {
 /// 同一个连接上的对象必然 `Arc::ptr_eq`；跨重连时靠 `run_id` 认亲
 /// （`run_id` 由服务端在 `LoginResp` 里下发，同一次会话内不变）。
 ///
-/// ★ 注意这是"客户端级"的判据，**不能**用来判断"同一个代理" ——
+/// 注意这是"客户端级"的判据，**不能**用来判断"同一个代理" ——
 /// 一个客户端可以注册多个代理，判代理要再加上 `proxy_name`。
 fn same_client(a: &Arc<ClientState>, b: &Arc<ClientState>) -> bool {
     Arc::ptr_eq(a, b) || a.run_id() == b.run_id()
@@ -771,9 +771,8 @@ struct PortGroup {
     ///
     /// 只有 `name` 非空时才有意义：独占端口的 `key` 恒为空串。
     key: String,
-    /// ★★ 建立这个组的**租户**（`ClientState.user`），后续成员必须同租户。
+    /// 建立这个组的**租户**（`ClientState.user`），后续成员必须同租户。
     ///
-    /// v0.5.7 新增（第六轮审计 D-1，高危）。
     ///
     /// # 为什么必须有这个字段
     ///
@@ -831,7 +830,7 @@ impl PortGroup {
     fn push(&mut self, client: Arc<ClientState>, proxy_name: &str) {
         // 同一个代理重复注册（重连 / 重复 NewProxy）不该把成员表撑爆。
         //
-        // ★ 去重键必须是 **(客户端, 代理名)**，不能只看客户端。
+        // 去重键必须是 **(客户端, 代理名)**，不能只看客户端。
         // 官方 frp 允许**同一个 frpc** 注册多个同 group 的代理（一份配置里两条
         // `[[proxies]]` 共用一个 remotePort、group 相同），那时两条的 run_id 一样；
         // 早先按 run_id 去重会把兄弟成员一起删掉，于是组里永远只剩最后一个，
@@ -901,7 +900,7 @@ impl PortGroup {
             return self.members.get(start).cloned();
         }
 
-        // ★ 最少连接：**必须从 start 自身开始比较**。
+        // 最少连接：**必须从 start 自身开始比较**。
         //
         // 旧实现先把 best_load 初始化成 members[0]，而循环从 start+1 扫，
         // 于是 start 从没进过循环、members[0] 却在 start≠0 时被多算一次 ——
@@ -1030,7 +1029,7 @@ impl Drop for ClientGuard {
             return;
         };
         self.registry.remove(&run_id);
-        // ★★ v0.6.1 修（Shannon 审计，低危）：**会话结束时清掉 OIDC 的 subject 绑定**。
+        // **会话结束时清掉 OIDC 的 subject 绑定**。
         //
         // `forget_session` 早就写好（`security.rs` / `guard.rs` / `oidc.rs`），
         // 但**除了一处单测，全仓没有任何生产调用点** ⇒
@@ -1054,7 +1053,7 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::mpsc;
 
-    /// ★★ v0.6.1 回归（Shannon 审计，低危）：**控制连接退出时必须清掉 OIDC 的 subject 绑定。**
+    /// **控制连接退出时必须清掉 OIDC 的 subject 绑定。**
     ///
     /// # 原先的问题
     ///
@@ -1068,7 +1067,7 @@ mod tests {
     /// 造一个**真的 OIDC 上下文**（`AuthProvider::Oidc`），手工塞一条绑定，
     /// 然后 drop 一个 `ClientGuard` —— 绑定必须消失。
     ///
-    /// ★ 不用 `SecurityContext::from_config`：那条路径在 JWKS 未拉取时会把
+    /// 不用 `SecurityContext::from_config`：那条路径在 JWKS 未拉取时会把
     ///   认证换成 `OidcUnavailable`，`forget_session` 变成空操作，测不到修复点。
     #[test]
     fn 控制连接退出必须清掉_oidc_subject_绑定() {
@@ -1113,7 +1112,7 @@ mod tests {
 
     /// 指定 `user`（租户）的客户端。
     ///
-    /// ★ v0.5.7（第六轮审计 D-1）：`PortGroup` 现在带 `owner_user`，
+    /// `PortGroup` 现在带 `owner_user`，
     /// 跨租户共享端口会被拒 —— 测这条边界需要一个能设 `user` 的构造器。
     /// 注意上面的 [`client`] 传的是**空 user**，所以既有的组测试
     /// （都视为同一租户）行为不变。
@@ -1254,7 +1253,7 @@ mod tests {
         r.release_port(65535, &a, "a");
     }
 
-    /// ★ 同一个客户端注册的**多个 group 成员**必须都留在组里。
+    /// 同一个客户端注册的**多个 group 成员**必须都留在组里。
     ///
     /// 这是真机上抓到的 bug：`PortGroup::push` 早先按 `run_id` 去重，同一次会话的
     /// 第二个成员会把第一个成员删掉，于是组里永远只剩最后一个 —— 表现为
@@ -1313,7 +1312,7 @@ mod tests {
         assert_eq!(r.backend_count(6000), 3, "三个后端都挂在同一个端口上");
     }
 
-    /// ★ 回归测试（H5）：组名相同但 `group_key` 不同**必须被拒绝**。
+    /// 回归测试（H5）：组名相同但 `group_key` 不同**必须被拒绝**。
     ///
     /// `group_key` 是认证凭据，不是标签。早先 `reserve_port` 只比对组名，
     /// 于是任何知道组名的客户端（多租户 frps 上就是任意一个持合法 token 的用户）
@@ -1366,7 +1365,7 @@ mod tests {
     /// 这是兼容性回归：官方 frp 里 `groupKey` 是可选字段，两个成员都不写
     /// 就都是空串，空 == 空，照常成组。
     ///
-    /// ★ v0.5.7（第六轮审计 D-1）：**这条兼容性仍然保留，但多了"同租户"前提**。
+    /// **这条兼容性仍然保留，但多了"同租户"前提**。
     ///   两个成员都不写 `group_key` 时**照常成组**（本测试锁定这一点），
     ///   但它们必须属于**同一租户**（同 `user`）—— 跨租户见
     ///   [`跨租户不能靠组名寄生到别人的公网端口`]。
@@ -1390,7 +1389,7 @@ mod tests {
         assert_eq!(r.backend_count(6002), 2);
     }
 
-    /// ★★ v0.5.7 新增（第六轮审计 D-1，高危）：**跨租户不得靠组名寄生**。
+    /// **跨租户不得靠组名寄生**。
     ///
     /// # 锁的是什么
     ///
@@ -1499,7 +1498,7 @@ mod tests {
             .reserve_port(6000, "api", "", "b", client("b"))
             .expect_err("不同组不能抢同一个端口");
 
-        // ★★ v0.5.6 修（审计总报告 L14）：**错误文案不得泄露任何组名**。
+        // **错误文案不得泄露任何组名**。
         //
         // 原先这条测试断言 `e.contains("api") && e.contains("web")`
         // —— 那正是在**固化枚举预言机**：调用方（未认证 / 低权限）
@@ -1557,7 +1556,7 @@ mod tests {
     /// 场景：a 手上还压着 5 条没结束的转发，b 一条都没有。
     /// 纯轮询会把第 6 条照样分给 a（各 50%），最小连接数则应当全给 b。
     ///
-    /// ★ v0.6.2：这条测试现在**显式把策略设成 LeastConn**。
+    /// 这条测试现在**显式把策略设成 LeastConn**。
     ///   默认策略已改为 RoundRobin（对齐官方 frp），不再默认倾斜。
     #[test]
     fn pick_prefers_the_least_loaded_backend() {
@@ -1585,7 +1584,7 @@ mod tests {
         );
     }
 
-    /// ★ v0.6.2 回归：**默认策略必须是轮询**，与官方 frp 的 group 行为一致。
+    /// **默认策略必须是轮询**，与官方 frp 的 group 行为一致。
     ///
     /// 官方 `server/group/base.go` 的 `worker` 把连接丢进共享 `acceptCh`，
     /// 哪个代理先 `Accept()` 谁拿到 —— 等价于无状态的轮询。

@@ -17,7 +17,7 @@ use crate::cli::{AdminArgs, VerifyArgs};
 /// 启动器据此判断"这份配置能不能用"。这里把 `unsupported_fields` 一并报出来 ——
 /// 官方 frpc 对未知字段会**直接报错**，NFrp 只是忽略，得让用户知道差在哪。
 ///
-/// ★★ v0.5.7 修（第六轮审计 F-1，中危）：**必须跑完整启动校验，不能只解析配置**。
+/// **必须跑完整启动校验，不能只解析配置**。
 ///
 /// # 原先为什么错了
 ///
@@ -57,7 +57,7 @@ pub(crate) fn cmd_verify(a: &VerifyArgs) -> Result<()> {
         .with_context(|| format!("读取配置 {} 失败", path.display()))?;
     match nfrp_common::config::parse_client(&raw) {
         Ok(cfg) => {
-            // ★ v0.5.7（F-1）：与启动同口径的启动期校验。
+            // 与启动同口径的启动期校验。
             //
             // 注意**放在打印"通过"之前** —— 否则会先打"配置校验通过"
             // 再报错退出，用户（和解析输出的启动器）会被那句"通过"误导。
@@ -126,7 +126,7 @@ pub(crate) fn cmd_verify(a: &VerifyArgs) -> Result<()> {
 /// `allowInsecureRemote = true` 表明知情。回环地址上留空是允许的
 /// （默认值就是 127.0.0.1，只有本机能连）。
 ///
-/// ★★ v0.5.6 修（审计总报告 H1，高危）：判据同时看 `user` **与** `password`。
+/// 判据同时看 `user` **与** `password`。
 ///
 /// 原先只判 `user.trim().is_empty()`，但上面这段注释写的是
 /// "必须配 `user`/`password`" —— **注释与实现不符**（审计报告 H1 的 C 处）。
@@ -136,7 +136,7 @@ pub(crate) fn cmd_verify(a: &VerifyArgs) -> Result<()> {
 /// `"admin:"` —— 任何能访问该端口的人送一个 `admin:` 就能进来，
 /// 等于**鉴权退化成"知道用户名就能进"**。
 ///
-/// ★ 与服务端共用同一个真源 `nfrp_common::config::has_dashboard_creds()`，
+/// 与服务端共用同一个真源 `nfrp_common::config::has_dashboard_creds()`，
 ///   保证两端口径永不漂移。
 pub(crate) fn check_web_server_is_safe(cfg: &ClientConfig) -> Result<()> {
     // 先校验 TLS 文件成对，避免端口已经绑定后才在启动路径深处失败。
@@ -225,7 +225,7 @@ pub(crate) async fn cmd_stop(a: &AdminArgs) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// ★ 回归测试：管理界面监听非回环却不配凭据，必须**拒绝启动**。
+    /// 回归测试：管理界面监听非回环却不配凭据，必须**拒绝启动**。
     ///
     /// 原先只打一条 warn 就放行 ⇒ 任何能访问该端口的人都能增删隧道、
     /// 直接停止客户端。而且这个检查必须在 bind **之前** —— 否则端口已经

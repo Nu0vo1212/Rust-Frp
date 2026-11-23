@@ -132,7 +132,7 @@ impl ApiError {
         serde_json::json!({ "api": API_VERSION, "error": err }).to_string()
     }
 
-    /// 按 `detailedErrorsToClient` 决定是否脱敏（v0.5.6 修审计总报告 L13）。
+    /// 按 `detailedErrorsToClient` 决定是否脱敏。
     ///
     /// * `detailed_errors_to_client = true`（默认，与官方一致）⇒ **逐字不变**
     ///   （仍走 [`Self::to_json`]）；
@@ -274,7 +274,7 @@ pub async fn route(
     Some(
         match dispatch(registry, cfg, method, rest, &q, body).await {
             Ok(r) => r,
-            // ★★ v0.5.6 修（审计总报告 L13，低危）：**走 `detailedErrorsToClient` 脱敏**。
+            // **走 `detailedErrorsToClient` 脱敏**。
             //
             // 原先这里直接回 `e.to_json()` —— 而 v2 的错误文案里含
             // **别的租户的代理名 / 客户端名 / 端口占用情况**
@@ -284,7 +284,7 @@ pub async fn route(
             // （那里注释明确写着"详细错误里往往带着别人的代理名 / 端口占用"），
             // 而面板这条路径**没套** —— 又是"同一语义只加固了一半"。
             //
-            // ★ 只在 `detailed_errors_to_client = false` 时改变行为；
+            // 只在 `detailed_errors_to_client = false` 时改变行为；
             //   默认（true，与官方一致）**逐字不变**。
             Err(e) => Response::json(e.status, e.to_json_redacted(cfg)),
         },
@@ -411,7 +411,7 @@ fn status_response(registry: &Registry) -> Response {
 }
 
 fn clients_response(registry: &Registry, q: &Query) -> Result<Response, ApiError> {
-    // ★ v0.5.6（M13）：不带过滤条件即全平台枚举 ⇒ 必须显式 ?all=1
+    // 不带过滤条件即全平台枚举 ⇒ 必须显式 ?all=1
     require_explicit_enumeration(q, "/api/v2/clients")?;
     let page = Page::from_query(q)?;
     let user = q.get("user").map(String::as_str).unwrap_or("");
@@ -462,7 +462,6 @@ fn clients_response(registry: &Registry, q: &Query) -> Result<Response, ApiError
 }
 
 /// **枚举门槛**：不带任何过滤条件时，必须显式写 `?all=1`
-/// （v0.5.6 修审计总报告 M13，中危）。
 ///
 /// # 问题
 ///
@@ -491,7 +490,7 @@ fn clients_response(registry: &Registry, q: &Query) -> Result<Response, ApiError
 /// 但能让"全量导出"成为一个**有意识的选择**而不是默认行为，
 /// 也让审计日志 / 反向代理日志里能看出这是一次全量查询。
 ///
-/// ★ 根本解法是给面板引入**只读角色**（面板凭据 → 受限 scope），
+/// 根本解法是给面板引入**只读角色**（面板凭据 → 受限 scope），
 ///   那是一次接口与配置的扩展，不在本轮范围（已记进 SECURITY-FIXES-ROUND5.md）。
 ///
 /// `/status` 与 `/version` **不适用**本门槛：它们只回聚合计数、
@@ -523,7 +522,7 @@ fn require_explicit_enumeration(q: &Query, what: &str) -> Result<(), ApiError> {
 }
 
 fn proxies_response(registry: &Registry, q: &Query) -> Result<Response, ApiError> {
-    // ★ v0.5.6（M13）：全量枚举要显式确认
+    // 全量枚举要显式确认
     require_explicit_enumeration(q, "/api/v2/proxies")?;
     let page = Page::from_query(q)?;
     let user = q.get("user").map(String::as_str).unwrap_or("");
@@ -572,7 +571,7 @@ fn proxies_response(registry: &Registry, q: &Query) -> Result<Response, ApiError
 }
 
 fn visitors_response(registry: &Registry, q: &Query) -> Result<Response, ApiError> {
-    // ★ v0.5.6（M13）：全量枚举要显式确认
+    // 全量枚举要显式确认
     require_explicit_enumeration(q, "/api/v2/visitors")?;
     let page = Page::from_query(q)?;
     let needle = q
@@ -631,7 +630,7 @@ fn ports_response(registry: &Registry) -> Response {
 }
 
 fn audit_response(registry: &Registry, q: &Query) -> Result<Response, ApiError> {
-    // ★ v0.5.6（M13）：审计日志含全部租户的 run_id / user / IP ⇒ 全量枚举要显式确认
+    // 审计日志含全部租户的 run_id / user / IP ⇒ 全量枚举要显式确认
     require_explicit_enumeration(q, "/api/v2/audit")?;
     let page = Page::from_query(q)?;
     let ok = match q.get("ok") {
@@ -815,7 +814,7 @@ mod tests {
     /// 列表接口没数据时也要给出完整的分页元信息。
     #[tokio::test]
     async fn 空列表也有分页元信息() {
-        // ★ v0.5.6（M13）：全量枚举现在要显式 ?all=1
+        // 全量枚举现在要显式 ?all=1
         let r = route(&reg(), &cfg(), "GET", "/api/v2/clients", "?all=1", "")
             .await
             .expect("v2 路径");
@@ -1001,7 +1000,7 @@ mod tests {
     /// 审计默认关闭时，接口不该回一个"空错误"让人以为坏了。
     #[tokio::test]
     async fn 审计关闭时给出说明() {
-        // ★ v0.5.6（M13）：审计日志含全部租户信息，全量枚举要显式确认
+        // 审计日志含全部租户信息，全量枚举要显式确认
         let r = route(&reg(), &cfg(), "GET", "/api/v2/audit", "?all=1", "")
             .await
             .expect("v2 路径");
@@ -1012,10 +1011,10 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // v0.5.6 回归（审计总报告 M13）：读接口不得默认全量枚举
+    // 读接口不得默认全量枚举
     // ------------------------------------------------------------------
 
-    /// ★★ M13：不带过滤条件时必须要求显式 `?all=1`。
+    /// 不带过滤条件时必须要求显式 `?all=1`。
     ///
     /// 原先 `user` 为空即返回全平台数据，而 `run_id` / 代理名正是
     /// `POST /clients/kick` 与 `/proxies/remove` 的**主键** ——
@@ -1099,10 +1098,10 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // v0.5.6 回归（审计总报告 L13）：v2 错误文案必须可脱敏
+    // v2 错误文案必须可脱敏
     // ------------------------------------------------------------------
 
-    /// ★★ L13：关掉详细错误后，错误文案里**不得含任何租户标识**。
+    /// 关掉详细错误后，错误文案里**不得含任何租户标识**。
     ///
     /// 同一个错误在 `serve.rs` 的客户端路径上套了 `cfg.error_to_client()`，
     /// 面板这条路径原先**没套** —— 于是"域名 x 已被代理 alice.web 占用"

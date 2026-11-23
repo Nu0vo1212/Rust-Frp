@@ -47,7 +47,7 @@ static SERVER_CFG: OnceLock<
 
 /// 服务端 QUIC 配置（自签证书）。
 ///
-/// ★ v0.7.0：缓存按 **ALPN 分桶**。
+/// 缓存按 **ALPN 分桶**。
 ///
 /// 0.6.x 用的是单槽 `OnceLock`，命中时还断言"本次 ALPN 必须与首次一致"。
 /// NLink 需要一个自己的 ALPN（`nfrp-nlink`）与标准 frp 的 `nfrp-frp` 并存，
@@ -465,7 +465,7 @@ mod tests {
         let _ = client_config(ALPN).expect("客户端配置");
     }
 
-    /// ★ v0.7.0：缓存**按 ALPN 分桶**。
+    /// 缓存**按 ALPN 分桶**。
     ///
     /// 0.6.x 是单槽缓存 + "不同 ALPN 就报错"。NLink 需要 `nfrp-nlink`
     /// 与标准的 `nfrp-frp` 并存，所以改成每 ALPN 一份配置。

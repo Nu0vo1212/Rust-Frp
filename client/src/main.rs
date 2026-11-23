@@ -114,7 +114,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| cfg.log_level.clone());
     util::init_tracing(&level, &cfg.log_to, cfg.max_days, cfg.disable_print_color);
 
-    // ★ v0.6.5：`auth.tokenSource` —— 从文件 / 外部命令取 token。
+    // `auth.tokenSource` —— 从文件 / 外部命令取 token。
     //
     // 位置很关键：必须在 CLI 的 `-t/--token` **之后**、真正登录**之前**。
     // 语义与官方 `AuthClientConfig` 一致（注释原文 "mutually exclusive with
@@ -219,7 +219,7 @@ async fn main() -> Result<()> {
     // 登录时逐条发 NewProxy、工作连接查本地表、面板列表。并一次，
     // 四处都自然看得见；分开维护就迟早会漏掉其中一处。
     let store = Arc::new(store::Store::from_config(&cfg)?);
-    // ★ v0.5.5（第四轮 F2/F3）：记住**哪些名字来自配置文件**。
+    // 记住**哪些名字来自配置文件**。
     //
     // `merge_initial` 把 store 恢复的动态代理并进了 `cfg.proxies`，
     // 于是那份列表里配置代理与动态代理混在一起、看不出区别了。
@@ -293,7 +293,7 @@ async fn main() -> Result<()> {
     //
     // 各建一张的话，"刚在界面上加的代理"要等下次重连才会被会话看见 ——
     // 而那期间界面显示"已添加"、流量却进不来。
-    // ★ v0.5.5（第四轮 F2/F3）：配置来源的先建表，**store 恢复的再作为动态并入**。
+    // 配置来源的先建表，**store 恢复的再作为动态并入**。
     //
     // 不能一把 `from_iter(cfg.proxies)` 了事 —— 那样所有条目（含 store 恢复的
     // 动态代理）都会被标成 `Config`，于是面板连自己加的代理都删不掉了。
@@ -310,7 +310,7 @@ async fn main() -> Result<()> {
             .cloned(),
     );
 
-    // ★ v0.5.9 修（第九轮 D9-7，低危）：启动时**预检插件配置**。
+    // 启动时**预检插件配置**。
     //
     // `Plugin::from_proxy` 是纯函数（不连网、不落盘），但原先只有工作连接
     // 真正建立时才会调用 —— 于是"Windows 上配了 unix_domain_socket 插件"
@@ -330,7 +330,7 @@ async fn main() -> Result<()> {
     // `port` 为 0（默认）时整段都不执行：不绑端口、不起任务，
     // 与没有这个功能的版本**完全一致**。
     let hub = if cfg.web_server.is_enabled() {
-        // ★ 安全检查必须在 **bind 之前**。
+        // 安全检查必须在 **bind 之前**。
         //
         // 非回环 + 无凭据 = 任何能访问这个端口的人都能增删隧道、直接停止
         // 客户端。原先只打一条 warn 就放行。
@@ -413,7 +413,7 @@ async fn main() -> Result<()> {
                         }
                     }
                     Err(e) => {
-                        // ★ v0.7.6：把失败原因也写进本地面板。
+                        // 把失败原因也写进本地面板。
                         //
                         // 开机自启用 `frpc.vbs` 隐藏窗口拉起，没有控制台；
                         // 0.7.5 起进程又按退避策略持续重试、不再退出 ——

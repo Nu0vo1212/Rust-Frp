@@ -54,7 +54,7 @@ const MAX_SAMPLES: usize = 8;
 struct Session {
     /// 会话创建时间：刚 create 出来、两端都还没到的时候全靠它保命。
     created: Instant,
-    /// ★ v0.5.8 修（第八轮审计 B-1，高危）：两个角色在**控制连接**上的源 IP。
+    /// 两个角色在**控制连接**上的源 IP。
     ///
     /// 牵线用的 UDP HELLO 是零鉴权的：谁先发到谁就是这个角色，`sid` 又在
     /// 报文里明文携带。攻击者只要在链路上读到一次 HELLO，就能抢先以
@@ -202,7 +202,7 @@ impl P2PHub {
         let Some(session) = g.get_mut(sid) else {
             return RegisterOutcome::NoSession;
         };
-        // ★ v0.5.8 修（第八轮审计 B-1，高危）：角色来源必须与控制连接同主机。
+        // 角色来源必须与控制连接同主机。
         //   注册在会话上的 IP 来自过了 token 鉴权的 TCP 控制连接，攻击者
         //   伪造不了 —— 于是"随便谁先发 HELLO 谁就是这个角色"的窗口关死。
         if !same_host(&addr.ip(), &session.expected_ip(role)) {
@@ -255,12 +255,12 @@ impl P2PHub {
 
 /// 在 UDP socket 上跑牵线主循环。
 ///
-/// ★★ v0.5.9 修（第九轮审计 **E9-1**，低危）：新增 `sec`，让牵线 UDP 也过 ACL。
+/// 新增 `sec`，让牵线 UDP 也过 ACL。
 ///
 /// # 原先为什么错了
 ///
-/// `p2p.rs` 里**没有 `check_ip` 调用**（第九轮 grep 零命中）。
-/// 牵线唯一的来源判定是第八轮 B-1 加的"与控制连接 IP 同源"
+/// `p2p.rs` 里**没有 `check_ip` 调用**。
+/// 牵线唯一的来源判定是此前的 B-1 加的"与控制连接 IP 同源"
 /// （`register` 里的 `same_host` 检查）—— 那拦的是"**冒充别人**"，
 /// **不读 `[acl]`**，两者不等价。
 ///
@@ -284,7 +284,7 @@ impl P2PHub {
 /// * 所以这是"如果将来某条路径能拿到 sid，ACL 不会兜底"的**纵深防御缺口**，
 ///   不是当下可打的漏洞。
 ///
-/// ★ 但补它的成本极低（一次位运算），而口径统一的价值很高：
+/// 但补它的成本极低（一次位运算），而口径统一的价值很高：
 ///   不能有一条路径"碰巧安全"却靠的是另一条路径的防线。
 pub async fn run_rendezvous(
     sock: Arc<UdpSocket>,
@@ -307,7 +307,7 @@ pub async fn run_rendezvous(
                 continue;
             }
         };
-        // ★ E9-1：ACL 判定放在**解析报文之前** —— 与其它路径同序（最便宜的闸先撞）。
+        // ACL 判定放在**解析报文之前** —— 与其它路径同序（最便宜的闸先撞）。
         //   拒绝时静默丢弃：不给被拒的来源任何回包，也就不会泄露"这里有个牵线服务"。
         if let Err(reason) = sec.check_ip(peer.ip()) {
             debug!(%peer, "牵线 UDP 的 IP 访问控制拒绝：{reason}");
@@ -333,7 +333,7 @@ pub async fn run_rendezvous(
                 continue;
             }
             RegisterOutcome::IpMismatch => {
-                // ★ v0.5.8 修（第八轮审计 B-1）：可能有人在冒名登记，
+                // 可能有人在冒名登记，
                 //   也可能只是多宿主 / 双栈解析差异 —— 两种都拒绝，
                 //   由客户端按既有逻辑回退中继（打洞失败本来就有兜底）。
                 warn!(%peer, %sid, ?role, "HELLO 来源 IP 与控制连接不符，拒绝登记");
@@ -428,7 +428,7 @@ pub async fn handle_nat_hole_visitor(
     }
     // 带了签名就必须对（NFrp↔NFrp 的保证一点没放松）
     //
-    // ★ v0.5.7（第六轮审计 G-1，高危）：把时钟窗口传进去 ——
+    // 把时钟窗口传进去 ——
     //   新鲜性校验在 `check_sign` 内部，不是可选项。
     //   原先这里只比内容不看新旧 ⇒ 嗅探到一条 `NatHoleVisitor` 即可无限期重放。
     if !entry.check_sign(
@@ -479,7 +479,7 @@ pub async fn handle_nat_hole_visitor(
     };
 
     let sid = nfrp_common::util::new_run_id();
-    // ★ v0.5.8 修（第八轮审计 B-1）：把两个角色的 HELLO 来源钉在各自的
+    // 把两个角色的 HELLO 来源钉在各自的
     //   控制连接 IP 上（控制连接过了 token 鉴权，伪造不了）。
     hub.create(&sid, visitor_client.peer_ip(), entry.client.peer_ip());
 
@@ -544,7 +544,7 @@ mod tests {
 
     /// 构造一条 **时间戳新鲜** 的 `NatHoleVisitor`（签名由 `sk` 算出）。
     ///
-    /// ★ v0.5.7（第六轮审计 G-1）：原先这里要调用方传一个**写死的** `ts`
+    /// 原先这里要调用方传一个**写死的** `ts`
     ///   （1 / 123 / 456 / 9 / 11…）。`check_sign` 现在自带新鲜性校验之后，
     ///   那些写死的时间戳全都会**因为过期**而被拒 —— 测试会"因为时间错"而失败，
     ///   而不是因为它本来要测的那件事。所以默认用当前时间。
@@ -602,7 +602,7 @@ mod tests {
         ));
     }
 
-    /// ★ v0.5.8（第八轮审计 B-1，高危）回归：HELLO 的来源 IP 必须与该角色
+    /// HELLO 的来源 IP 必须与该角色
     /// **控制连接**的 IP 一致。修复前牵线端口对 HELLO 零鉴权 —— 攻击者从
     /// 任意地址抢先登记为 provider，就能把 visitor 引到自己的地址上。
     #[test]
@@ -705,7 +705,7 @@ mod tests {
         assert_eq!(hub.len(), before, "密钥不对时不能创建会话");
     }
 
-    /// ★★ v0.5.7 新增（第六轮审计 G-1，高危）：**过期的签名必须被拒**。
+    /// **过期的签名必须被拒**。
     ///
     /// # 锁的是什么
     ///

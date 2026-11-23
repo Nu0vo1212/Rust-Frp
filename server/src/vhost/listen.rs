@@ -90,7 +90,7 @@ pub async fn run_vhost(
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
-                // ★★ v0.5.8 修（第七轮审计 F7-1，中危）：**数据面也要过 ACL**。
+                // **数据面也要过 ACL**。
                 //
                 // 与 `serve.rs::proxy_accept_loop` 同一处修复：vhost 端口
                 // （http / https / tcpmux）同样是承载用户流量的数据面，
@@ -153,10 +153,9 @@ mod tests {
     use crate::vhost::router::tests::{route, table_with};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     // -----------------------------------------------------------------------
-    // 第七轮审计 F7-1：数据面也要过 ACL
+    // -1：数据面也要过 ACL
     // -----------------------------------------------------------------------
 
-    /// ★★ v0.5.8 回归（第七轮审计 F7-1，中危）：
     /// **vhost 端口（http / https / tcpmux）必须做 IP 白/黑名单判定。**
     ///
     /// # 原先的漏洞
@@ -203,7 +202,7 @@ mod tests {
             VhostKind::Http,
         )]));
 
-        // ★ 服务端安全上下文：deny 掉 127.0.0.1（本机测试的源地址就是它）
+        // 服务端安全上下文：deny 掉 127.0.0.1（本机测试的源地址就是它）
         let scfg = nfrp_common::config::ServerConfig {
             acl: AclConfig {
                 allow: vec![],
@@ -243,7 +242,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
-        // ★ 就绪等待：ACL 会把**确认连接也拦掉**，所以"能连上"不能当就绪判据
+        // 就绪等待：ACL 会把**确认连接也拦掉**，所以"能连上"不能当就绪判据
         //   （本用例第一版就卡在这里：探测连接被立即关闭 ⇒ 循环永远不 break）。
         //   改成直接重试"连上并发请求、看是否被立刻关闭"，最多等 2 秒。
         let mut closed_fast = false;
@@ -303,7 +302,7 @@ mod tests {
     /// 没有这条，"上面那条测试"就无法排除"vhost 本来就连接不上"
     /// 这种恒真的解释 —— 与 `handle_frp_stream` 那边"基线必须通过"同理。
     ///
-    /// ★ 断言口径刻意选在 **accept 是否放行**这一层，而不是"后端是否收到请求"：
+    /// 断言口径刻意选在 **accept 是否放行**这一层，而不是"后端是否收到请求"：
     ///   后者会把"路由没匹配上""后端没接上"一并算进来，测试就失去区分力
     ///   （本用例第一版正是因此假失败 —— 路由目标压根没连到那个后端）。
     ///   这里直接看：空 ACL 时 `check_ip` 必须**通过**，被 deny 时必须**拒绝**，

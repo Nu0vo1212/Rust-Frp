@@ -50,7 +50,7 @@ impl AuthMethod {
 
 /// 服务端认证配置（`[auth]` 段）。
 ///
-/// ★ v0.5.3：**手工实现 `Debug`**，`token` 一律脱敏。
+/// **手工实现 `Debug`**，`token` 一律脱敏。
 ///
 /// 原来派生 `Debug` 时，任何一句调试用的 `println!("{cfg:?}")` 或
 /// `tracing::debug!(?cfg)` 都会把**明文 token** 打进日志。项目里眼下没有
@@ -82,7 +82,7 @@ pub struct ServerAuthConfig {
     pub oidc: ServerOidcConfig,
     /// 令牌来源（官方 frps 的 `auth.tokenSource`）。
     ///
-    /// ★ v0.6.5 已**真正实现**（此前只是"声明以便官方配置能解析通过"）。
+    /// 已**真正实现**（此前只是"声明以便官方配置能解析通过"）。
     ///
     /// 服务端用它做**期望 token** 的来源：从文件或外部命令读，再与客户端
     /// 送来的 token 比对。这样 token 不必写在配置里，适合 k8s Secret /
@@ -103,7 +103,7 @@ pub fn default_scopes() -> Vec<String> {
 }
 
 impl std::fmt::Debug for ServerAuthConfig {
-    /// ★ v0.5.3：`token` 永不进日志。
+    /// `token` 永不进日志。
     ///
     /// 只暴露"有没有配、多长"，够排障用，又不会把密钥写进任何日志文件。
     /// （`AuthProvider::Debug` 早就是这么做的，这里与它对齐。）
@@ -159,7 +159,7 @@ impl ServerAuthConfig {
 
 /// 客户端认证配置。
 ///
-/// ★ v0.5.4 修（M5）：**手工实现 `Debug`**，`token` 必须脱敏。
+/// **手工实现 `Debug`**，`token` 必须脱敏。
 ///
 /// 原来这里是 `#[derive(Debug)]`，而同文件的 `ServerAuthConfig` 早就手工脱敏了
 /// —— 同一个文件、同一个项目、两种标准。任何一句 `tracing::debug!(?auth_cfg)`
@@ -183,7 +183,7 @@ pub struct ClientAuthConfig {
     ///
     /// 令牌来源（官方 frpc 的 `auth.tokenSource`：从文件 / 外部命令读 token）。
     ///
-    /// ★ v0.6.5 已**真正实现**（此前只是"声明以便官方配置能解析通过"）。
+    /// 已**真正实现**（此前只是"声明以便官方配置能解析通过"）。
     ///
     /// 与 `token` 字段**互斥**：两者都配时以 `tokenSource` 为准并告警
     /// （官方 `AuthClientConfig` 的注释写的就是 "mutually exclusive with
@@ -204,7 +204,7 @@ pub struct ClientAuthConfig {
 }
 
 impl std::fmt::Debug for ClientAuthConfig {
-    /// ★ v0.5.4（M5）：`token` 永不进日志，与 `ServerAuthConfig::Debug` 同口径。
+    /// `token` 永不进日志，与 `ServerAuthConfig:Debug` 同口径。
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let token = if self.token.is_empty() {
             "<empty>".to_string()
@@ -331,7 +331,7 @@ impl ValueSource {
 
     /// 真正去取值。返回的是**已去掉首尾空白**的字符串（官方同样处理）。
     ///
-    /// ★ 返回值**绝不能进日志** —— 它是 token 本身。
+    /// 返回值**绝不能进日志** —— 它是 token 本身。
     pub fn resolve(&self) -> anyhow::Result<String> {
         self.validate()?;
         match self.kind.as_str() {
@@ -536,7 +536,6 @@ pub fn check_freshness(ts: i64, skew: u64, what: &str) -> anyhow::Result<()> {
 /// 校验一份**基于共享密钥的凭证证明**：`given` 必须等于 `auth_key(secret, ts)`，
 /// **且 `ts` 必须新鲜**。
 ///
-/// ★★ v0.5.7 新增（第六轮审计 G-1，高危）。
 ///
 /// # 为什么需要它
 ///
@@ -580,9 +579,9 @@ impl AuthProvider {
     ///
     /// 返回身份标识（token 方式为空串，OIDC 方式为 `sub`）。
     ///
-    /// `run_id` 用于把 OIDC 的 subject **绑定到本次会话**（v0.5.3 起）。
+    /// `run_id` 用于把 OIDC 的 subject **绑定到本次会话**。
     ///
-    /// ★★ v0.5.6 修（审计总报告 M3，中危）：token 模式增加 **timestamp 新鲜性窗口**。
+    /// token 模式增加 **timestamp 新鲜性窗口**。
     ///
     /// # 问题
     ///
@@ -612,16 +611,16 @@ impl AuthProvider {
     /// 严重不准的嵌入式设备）。选 300s 的理由：足够容纳常见的时钟漂移与
     /// 网络延迟，同时把重放窗口压到 5 分钟（原先**无限期**）。
     ///
-    /// ★ 注意：这**不是**完整的防重放（窗口内仍可重放）。
+    /// 注意：这**不是**完整的防重放（窗口内仍可重放）。
     ///   完整的做法要维护"已用过的 (run_id, ts)"集合，那要引入一张会增长的
     ///   表并处理过期清理 —— 对登录这种低频事件收益不划算。
     ///   窗口已经把攻击面从"永久"压到"5 分钟"，且**零互通代价**。
     ///
-    /// ★★ v0.5.7 修（第六轮审计 G-1，高危）：**把新鲜性校验并进来**。
+    /// **把新鲜性校验并进来**。
     ///
     /// # 原先为什么错了
     ///
-    /// M3 把新鲜性做成了**独立的** [`Self::check_timestamp`]，并在注释里解释了
+    /// M3 把新鲜性做成了**独立的** [`Self:check_timestamp`]，并在注释里解释了
     /// 理由（"先判时间成本更低 / 让两种失败在日志里分开"）。那个理由本身成立，
     /// 但**代价是调用方可以忘**——而实际就有 4 处忘了：
     ///
@@ -642,7 +641,7 @@ impl AuthProvider {
     /// 想校验凭证就**必须**提供时间窗口，没有"只校验凭证"的入口可以误用。
     /// 两种失败在日志里**仍然分得开**（错误文案不同），所以原设计的收益没丢。
     ///
-    /// ★ 同一个教训本轮还出现在另外三处（visitor / p2p 走
+    /// 同一个教训本轮还出现在另外三处（visitor / p2p 走
     ///   [`verify_shared_secret_proof`]，工作连接改调本函数）——
     ///   **本项目连续六轮的模式：防线写对了，但没铺满它声称保护的所有路径。**
     pub fn verify_login(
@@ -704,9 +703,9 @@ impl AuthProvider {
         }
     }
 
-    /// 登录时间戳的新鲜性校验（v0.5.6，M3）。
+    /// 登录时间戳的新鲜性校验。
     ///
-    /// ★ v0.5.7：**已经由 [`Self::verify_login`] 内部调用**，
+    /// **已经由 [`Self:verify_login`] 内部调用**，
     ///   不再需要调用方自己记得调。独立保留是为了：
     ///   * 让 [`verify_shared_secret_proof`] 复用同一份实现；
     ///   * 错误文案可区分（"过期" vs "凭证错"），运维能一眼看出是时钟问题还是配置问题。
@@ -722,7 +721,7 @@ impl AuthProvider {
     /// 只要在同一个 `run_id` 上发消息就能搭便车。OIDC 方式下这里要求
     /// **验签通过且 `sub` 与本会话登录时一致**。
     ///
-    /// `run_id` 是必需的（v0.5.3）：旧实现只查一个全局 subject 集合，
+    /// `run_id` 是必需的：旧实现只查一个全局 subject 集合，
     /// 于是"自己登录过一次"就能给**别人的** run_id 背书。
     pub fn verify_followup(&self, cred: &str, what: &str, run_id: &str) -> anyhow::Result<()> {
         match self {
@@ -759,7 +758,7 @@ impl AuthProvider {
     ///   （客户端刚换来的、服务端从 `Login.privilege_key` 读到的），
     ///   而且它自带有效期 —— 比拿一个长期不变的共享密钥派生更稳妥。
     ///
-    /// ★ 客户端必须用 [`Credential::raw`] 保持一致，否则就是
+    /// 客户端必须用 [`Credential::raw`] 保持一致，否则就是
     /// "能登录成功但之后每个消息都解不开"。
     pub fn control_key(&self, login_privilege_key: &str) -> String {
         match self {
@@ -835,7 +834,7 @@ impl Cidr {
     /// 地址是否落在网段内。**IPv4 与 IPv6 之间永远不匹配** ——
     /// 不做 v4-mapped-v6 的隐式转换，否则 `::/0` 会把整个 IPv4 空间也吃掉。
     pub fn contains(&self, ip: IpAddr) -> bool {
-        // ★ IPv4 与 IPv6 必须**分开**按各自的位宽比较。
+        // IPv4 与 IPv6 必须**分开**按各自的位宽比较。
         // 曾经把 v4 也提升到 u128 再统一右移：IPv4 的 32 位落在 u128 的低位，
         // 任何 `/0`～`/96` 的前缀右移后高位全是 0，于是"跟谁都比得中" ——
         // 白名单会静默变成"全放行"，是安全检查里最不能出的错。
@@ -865,7 +864,7 @@ impl Cidr {
 /// 判定顺序：**deny 优先**。命中 deny 直接拒；deny 没命中时，
 /// `allow` 为空表示"放行"，非空则必须命中才放行。
 ///
-/// ★★ v0.5.4 修（M9）：加 `deny_unknown_fields`。
+/// 加 `deny_unknown_fields`。
 ///
 /// 这不是洁癖 —— 少了它，**一个拼写错误会让整个访问控制静默消失**：
 ///
@@ -889,7 +888,7 @@ impl Cidr {
 ///
 /// 同文件的 `RoleConfig` 早就这么做了 —— 机制存在，只是没铺到最需要它的地方。
 ///
-/// ★ 为什么这里可以直接加、而顶层的 `ServerConfig` 不能：`[acl]` 是
+/// 为什么这里可以直接加、而顶层的 `ServerConfig` 不能：`[acl]` 是
 ///   NFrp **自己**的配置段（官方 frp 没有同名的 `[acl]` 表），加严不会
 ///   影响"官方配置拿来直接用"的场景。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1222,7 +1221,7 @@ impl CompiledRbac {
                     .unwrap_or_else(|| "不限".into())
             );
         }
-        // ★★ v0.5.6 修（审计总报告 H3，高危）：**判据必须走唯一真源**。
+        // **判据必须走唯一真源**。
         //
         // 原先这里是就地硬编码 `matches!(ty_l.as_str(), "stcp" | "xtcp")`
         // —— **漏了 `sudp`**。而项目自己在三处都把 `sudp` 定义为访客类：
@@ -1245,7 +1244,7 @@ impl CompiledRbac {
         }
         // 角色级代理数配额（0 = 不限，退给服务端全局的 maxProxiesPerClient 兜底）。
         //
-        // ★ 这个字段曾经是**死字段**：从配置读进来、编译进 Role，但没有任何
+        // 这个字段曾经是**死字段**：从配置读进来、编译进 Role，但没有任何
         // 生产代码读它 —— 管理员写了 `maxProxies = 5` 以为限住了，实际没限。
         // 判据用 `>=`：`used_proxies` 不含当前这条，所以"已用 5 条、再注册第 6 条"
         // 时 `5 >= 5` 命中，允许的总数正好是 max_proxies 条。
@@ -1277,7 +1276,7 @@ pub struct AuditConfig {
     ///
     /// 轮转保留**上一份**备份（`<path>.1`），磁盘占用上界 ≈ 2×。
     ///
-    /// ★ v0.5.9（第九轮 A9-3）：原先只有内存环形上限，审计文件**无上界** ——
+    /// 原先只有内存环形上限，审计文件**无上界** ——
     /// 实测 ~1000 行/s、约 37 MB/h 可持续增长，这是一条可被利用的磁盘
     /// 耗尽路径（审计默认关闭，但开启后就再无保护）。有了默认上限后
     /// 占用可预期，且**事件不丢**（旧内容在 `.1` 里）。
@@ -1388,7 +1387,7 @@ mod tests {
         assert!(Cidr::parse("::/129").is_err());
     }
 
-    /// ★ 核心语义：deny 优先。否则把 allow 写成 `0.0.0.0/0` 会把 deny 吞掉。
+    /// 核心语义：deny 优先。否则把 allow 写成 `0.0.0.0/0` 会把 deny 吞掉。
     #[test]
     fn deny_优先于_allow() {
         let acl = AclConfig {
@@ -1524,10 +1523,10 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // v0.5.6 回归（审计总报告 H3）：allowVisitors 必须覆盖全部访客类型
+    // allowVisitors 必须覆盖全部访客类型
     // ------------------------------------------------------------------
 
-    /// ★★ H3 核心回归：`allowVisitors = false` 必须挡住**全部三种**访客类型。
+    /// H3 核心回归：`allowVisitors = false` 必须挡住**全部三种**访客类型。
     ///
     /// 修复前判据是就地硬编码的 `matches!(ty, "stcp" | "xtcp")` ——
     /// **漏了 `sudp`**，而项目自己另外三处都把 sudp 归为访客类。
@@ -1590,7 +1589,7 @@ mod tests {
         }
     }
 
-    /// ★ 回归测试：角色的 `maxProxies` 必须真的生效。
+    /// 回归测试：角色的 `maxProxies` 必须真的生效。
     /// 这个字段曾经是**死字段** —— 配置读得进来、`compile()` 也赋了值，
     /// 但没有任何生产代码读它。管理员写 `maxProxies = 2` 以为限住了，
     /// 实际想注册多少条都行。这条测试就是防止它再退化回去。
@@ -1750,10 +1749,10 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // M5（v0.5.4）：ClientAuthConfig 的 Debug 必须脱敏
+    // M5：ClientAuthConfig 的 Debug 必须脱敏
     // ------------------------------------------------------------------
 
-    /// ★★ M5 回归：客户端认证配置的 `Debug` 不得泄漏 token。
+    /// 客户端认证配置的 `Debug` 不得泄漏 token。
     ///
     /// 原先 `ClientAuthConfig` 是 `#[derive(Debug)]`，而同文件的
     /// `ServerAuthConfig` 早就手工脱敏了 —— 一个文件两种标准。
@@ -1788,7 +1787,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // v0.5.6 回归（审计总报告 M3）：登录时间戳新鲜性窗口
+    // 登录时间戳新鲜性窗口
     // ------------------------------------------------------------------
 
     fn now() -> i64 {
@@ -1798,7 +1797,7 @@ mod tests {
             .as_secs() as i64
     }
 
-    /// ★★ M3 核心：**过期 / 未来的时间戳必须被拒**（原先无期限接受）。
+    /// **过期 / 未来的时间戳必须被拒**（原先无期限接受）。
     ///
     /// 审计实测过：`ts = 0 / -1 / -2^40 / i64::MAX / i64::MIN`、
     /// 未来 100 年、过去 100 年 —— **全部登录成功**
@@ -1847,7 +1846,7 @@ mod tests {
         }
     }
 
-    /// ★ 端到端：**重放一条真实登录报文**必须在窗口外被拒。
+    /// 端到端：**重放一条真实登录报文**必须在窗口外被拒。
     ///
     /// 这条模拟审计报告里的重放场景：用某个旧时间戳算出**正确**的
     /// `privilege_key`（即攻击者拿到了合法报文），服务端必须因为
@@ -1873,10 +1872,10 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // M9（v0.5.4）：[acl] 拼写错误必须报错，而不是静默失效
+    // M9：[acl] 拼写错误必须报错，而不是静默失效
     // ------------------------------------------------------------------
 
-    /// ★★ M9 回归：`deny_unknown_fields` 让拼错的键名当场报错。
+    /// `deny_unknown_fields` 让拼错的键名当场报错。
     ///
     /// 少了它，`denny = [...]` 会被静默丢弃 —— 只配黑名单时后果是
     /// **对所有 IP 一律放行**（管理员以为封了一段，实际完全敞开），
@@ -1918,7 +1917,7 @@ deny = ["10.1.0.0/16"]
     }
 
     // ==================================================================
-    // v0.6.5：tokenSource（官方 ValueSource）
+    // tokenSource（官方 ValueSource）
     // ==================================================================
 
     #[test]
@@ -1991,7 +1990,7 @@ value = "https://vault:8200"
         assert!(v.validate().unwrap_err().to_string().contains("command"));
     }
 
-    /// ★ file 类型：要去掉首尾空白（文件末尾常有换行，不 trim 就对不上）。
+    /// file 类型：要去掉首尾空白（文件末尾常有换行，不 trim 就对不上）。
     #[test]
     fn tokensource_file_会去掉首尾空白() {
         let d = std::env::temp_dir().join(format!("nfrp-ts-{}", std::process::id()));
@@ -2021,7 +2020,7 @@ value = "https://vault:8200"
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// ★ exec 类型：取 stdout 并 trim；非 0 退出码要报错。
+    /// exec 类型：取 stdout 并 trim；非 0 退出码要报错。
     #[cfg(unix)]
     #[test]
     fn tokensource_exec_取_stdout() {
@@ -2080,7 +2079,7 @@ value = "https://vault:8200"
         assert_eq!(v.resolve().unwrap(), "env-token-xyz");
     }
 
-    /// ★ 安全：`ValueSource` 的 Debug 输出**不能**包含 token 本身。
+    /// 安全：`ValueSource` 的 Debug 输出**不能**包含 token 本身。
     ///
     /// 它只含配置（路径 / 命令名），不含取到的值 —— 但这条测试是防止
     /// 以后有人把"解析结果"缓存进结构体里又让它进日志。

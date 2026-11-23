@@ -62,7 +62,7 @@ pub fn apply_dynamic(
         }
     }
     if old.dashboard_user != new.dashboard_user || old.dashboard_pwd != new.dashboard_pwd {
-        // ★★ 安全闸门（v0.5.3 修，v0.5.6 补 H1）：**绝不能**在热重载里把鉴权改成"无"，
+        // 安全闸门：**绝不能**在热重载里把鉴权改成"无"，
         // 只要面板监听在非回环地址上。
         //
         // 早先这里是无条件 `*g = if new.dashboard_user.is_empty() { None } else { ... }`，
@@ -73,13 +73,13 @@ pub fn apply_dynamic(
         //
         // 判据：**新配置**会造成"面板对外且无鉴权" ⇒ 拒绝本次热改。
         //
-        // ★ 注意这里判的是 `new` 而不是 `old`：旧的 `old` 带着凭据，
+        // 注意这里判的是 `new` 而不是 `old`：旧的 `old` 带着凭据，
         //   `dashboard_is_exposed(old)` 恒为 false，拿它做判据等于没拦
         //   （这正是我第一版写错、被测试抓出来的地方）。
-        // ★ `bind_addr` / `dashboard_port` 要取 `old`（运行期生效那份）——
-        //   它们都不可热改，新配置里那个值当次并不生效。漏掉后者就是 H1 的绕过点。
+        // `bind_addr` / `dashboard_port` 要取 `old`（运行期生效那份）——
+        // 它们都不可热改，新配置里那个值当次并不生效。漏掉后者就是 H1 的绕过点。
         //
-        // ★★ v0.5.6 修（审计总报告 H1，高危）：**判据必须同时看用户名和密码**。
+        // **判据必须同时看用户名和密码**。
         //
         // 原先这里（以及下面 `dashboard_is_exposed`、启动校验、客户端 webServer
         // 校验共**四处**）都只判 `dashboard_user` 是否为空，**从不判密码**。
@@ -93,12 +93,12 @@ pub fn apply_dynamic(
         //   ⑥ 攻击者送 `Authorization: Basic base64("admin:")` ⇒ **鉴权通过**
         //   ⑦ 拿到面板全部写权限（开公网端口、踢人、读全部租户）
         //
-        // ★ 为什么测试全绿也没暴露：现有的 H1 回归测试用的是
+        // 为什么测试全绿也没暴露：现有的 H1 回归测试用的是
         //   `c.dashboard_user.clear(); c.dashboard_pwd.clear();`（**同时清两个**），
         //   恰好绕过了"只清密码"这种组合 —— 而那正是攻击者实际会用的手法。
         //   判据只认 user、测试也只喂 user，两者互相印证形成了闭环盲区。
         //
-        // ★ 现在改用**唯一判据** `has_dashboard_creds()`（见下），
+        // 现在改用**唯一判据** `has_dashboard_creds()`（见下），
         //   四处共用同一份语义，杜绝"同一判定各写一遍"。
         let clears_creds = !has_dashboard_creds(&new.dashboard_user, &new.dashboard_pwd);
         if clears_creds && dashboard_exposed_after_reload(old, new) {
@@ -137,7 +137,7 @@ pub fn apply_dynamic(
     changed("bind_port", old.bind_port != new.bind_port);
     changed("control_port", old.control_port != new.control_port);
     changed("work_port", old.work_port != new.work_port);
-    // 数据面监听地址 + 用户连接超时 + 空闲池上限（限制①批次1）：三者都固化在
+    // 数据面监听地址 + 用户连接超时 + 空闲池上限：三者都固化在
     // 每个 `ClientState` / 监听器里，热改没法让已建立的会话回头生效。
     changed(
         "proxy_bind_addr",
@@ -148,7 +148,7 @@ pub fn apply_dynamic(
         old.user_conn_timeout != new.user_conn_timeout,
     );
     changed("max_pool_count", old.max_pool_count != new.max_pool_count);
-    // TCP keepalive / yamux 保活（限制①批次2）：都固化在监听器与已建会话上，
+    // TCP keepalive / yamux 保活：都固化在监听器与已建会话上，
     // 热改没法回头生效。
     changed(
         "tcp_mux_keepalive_interval",
@@ -221,7 +221,7 @@ pub fn apply_dynamic(
     );
     changed("log_to", old.log_to != new.log_to);
     changed("max_days", old.max_days != new.max_days);
-    // `disablePrintColor` 同属日志订阅者，只能启动时固化（限制①批次1 实现）。
+    // `disablePrintColor` 同属日志订阅者，只能启动时固化。
     changed(
         "disable_print_color",
         old.disable_print_color != new.disable_print_color,
@@ -238,19 +238,19 @@ fn mtime(path: &Path) -> Option<u128> {
 
 /// 面板安全校验：非回环地址 + 没有凭据 ⇒ 不安全（除非显式开了逃生开关）。
 ///
-/// ★ 这里返回 `bool` 而不是 `Result`，并且**必须**与 `main.rs::validate` 里
+/// 这里返回 `bool` 而不是 `Result`，并且**必须**与 `main.rs::validate` 里
 /// 那条同口径 —— 但**不能直接复用它**：`validate` 是纯函数只看配置，
 /// 而热重载时要拿**运行期实际生效的监听参数**去判。
 ///
 /// 抽成公共函数是为了让「启动校验」与「热重载校验」用同一段逻辑，
 /// 免得两处口径漂移 —— 早先的 bug 正是「只在启动时校验过一次」。
-/// **唯一判据**：这对面板凭据能不能用来鉴权（v0.5.6 修 H1）。
+/// **唯一判据**：这对面板凭据能不能用来鉴权。
 ///
-/// ★ 真正的实现在 `nfrp_common::config::has_dashboard_creds()` ——
+/// 真正的实现在 `nfrp_common::config::has_dashboard_creds()` ——
 ///   服务端与客户端共用同一份语义（客户端 `[webServer]` 的校验也用它），
 ///   这里只是转出，避免两端口径漂移。
 ///
-/// ★ 为什么必须抽成一个函数：审计总报告 H1 的根因是"同一判定在四处各写了一遍，
+/// 为什么必须抽成一个函数：这个判定的根因是"同一判定在四处各写了一遍，
 ///   每处都只判了 `user`"。四处分别是：
 ///
 /// | 位置 | 用途 |
@@ -260,7 +260,7 @@ fn mtime(path: &Path) -> Option<u128> {
 /// | `server/src/main.rs` 的启动校验 | 拒绝启动 |
 /// | `client/src/main.rs` 的 `check_web_server_is_safe` | 客户端界面拒绝启动 |
 ///
-/// ★ 为什么"用户名非空但密码为空"必须算**没有凭据**：
+/// 为什么"用户名非空但密码为空"必须算**没有凭据**：
 ///   `dashboard.rs` 的鉴权是 `format!("{}:{}", user, pwd)` 然后比 Basic 头。
 ///   密码为空时期望值是 `"admin:"` —— 攻击者随手就能构造，
 ///   等于**鉴权退化成"知道用户名就能进"**。
@@ -268,19 +268,19 @@ pub use nfrp_common::config::has_dashboard_creds;
 
 /// 面板是否处于"对外暴露且无鉴权"的危险状态。
 ///
-/// ★ 四个条件全部要正确取到"运行期真实值"才算对 —— H2（审计总报告）就是
+/// 四个条件全部要正确取到"运行期真实值"才算对 —— H2就是
 ///   其中第三个条件取错了来源。
 pub fn dashboard_is_exposed(cfg: &ServerConfig) -> bool {
     cfg.dashboard_port.is_some()
-        // ★ v0.5.6 修（H1）：同时看用户名与密码，不再只看用户名。
+        // 同时看用户名与密码，不再只看用户名。
         && !has_dashboard_creds(&cfg.dashboard_user, &cfg.dashboard_pwd)
         && !nfrp_common::util::is_loopback_addr(&cfg.bind_addr)
         && !cfg.allow_insecure_dashboard
 }
 
-/// ★★ 热重载场景下的判据（v0.5.4 修 H1）：**所有"不可热改"的字段都必须取运行期那份**。
+/// 热重载场景下的判据：**所有"不可热改"的字段都必须取运行期那份**。
 ///
-/// 上一版（v0.5.3）这里只把 `bind_addr` 换成了 `live` 的值，却漏了
+/// 上一版这里只把 `bind_addr` 换成了 `live` 的值，却漏了
 /// `dashboard_port` —— 于是存在一条绕过：
 ///
 /// ```text
@@ -296,7 +296,7 @@ pub fn dashboard_is_exposed(cfg: &ServerConfig) -> bool {
 /// 正确做法是：判据里凡是"需要重启才生效"的字段一律用**运行期已生效的那份**取值，
 /// 只有真正的可热改字段（`dashboard_user`、`dashboard_pwd`）才看新配置。
 ///
-/// ★★ v0.5.6 修（审计总报告 H2，高危）：**`allow_insecure_dashboard` 也必须取 live**。
+/// **`allow_insecure_dashboard` 也必须取 live**。
 ///
 /// 上一版的注释把它归为"可热改字段" —— **这个归类是错的**。
 /// 全仓检索确认它只在**启动期**被读（`serve.rs` 的 bind 前兜底检查），
@@ -320,28 +320,28 @@ pub fn dashboard_is_exposed(cfg: &ServerConfig) -> bool {
 /// 而 `allow_insecure_dashboard` 这次改动**并没有真的生效**（它不可热改），
 /// 所以攻击者既绕过了闸门、又没有留下"开关被打开"的痕迹。
 ///
-/// ★ 这个字段与 `allow_insecure_no_auth` 的对照反向印证了漏洞的真实性：
+/// 这个字段与 `allow_insecure_no_auth` 的对照反向印证了漏洞的真实性：
 ///   两者都是"知情自担风险"的逃生开关，但 `allow_insecure_no_auth` 的触发字段
 ///   （`token`）**需要重启**、不可热改 ⇒ 绕不过去；而 `allow_insecure_dashboard`
 ///   的触发字段（`dashboard_user`）**可热改** ⇒ 能绕过。
 ///   两者唯一的区别就是"触发条件能不能在运行期改"。
 ///
-/// ★ 更根本的做法（本条已按此改写）：不再手工列举字段，而是**从"需重启清单"
-///   反过来推导**（见 [`live_view`]）——手工列举正是 H1/H2 共同的成因。
+/// 更根本的做法（本条已按此改写）：不再手工列举字段，而是**从"需重启清单"
+/// 反过来推导**（见 [`live_view`]）——手工列举正是 H1/H2 共同的成因。
 fn dashboard_exposed_after_reload(live: &ServerConfig, new: &ServerConfig) -> bool {
     dashboard_is_exposed(&live_view(live, new))
 }
 
-/// 把"运行期实际生效的配置"和"新配置"合成一份**判据用视图**（v0.5.6 修 H2）。
+/// 把"运行期实际生效的配置"和"新配置"合成一份**判据用视图**。
 ///
 /// 规则：凡是**需要重启才生效**的字段，一律取 `live`（运行期那份）；
 /// 只有真正可热改的字段才取 `new`。
 ///
-/// ★ 为什么这么写而不是继续手工列举：手工列举漏一个字段就是一次漏洞 ——
-///   v0.5.3 漏了 `dashboard_port`（第一轮的 H1），v0.5.4 补上了它却漏了
-///   `allow_insecure_dashboard`（本次的 H2）。**两次都是"清单不全"**。
+/// 为什么这么写而不是继续手工列举：手工列举漏一个字段就是一次漏洞 ——
+/// 漏了 `dashboard_port`，补上了它却漏了
+/// `allow_insecure_dashboard`（本次的 H2）。**两次都是"清单不全"**。
 ///
-/// ★ 但这里仍然要列清单（Rust 没有反射）。所以补了一条**不变量测试**
+/// 但这里仍然要列清单（Rust 没有反射）。所以补了一条**不变量测试**
 ///   （`需重启清单里的字段在判据里必须取运行期值`）：它遍历
 ///   `changed()` 报出的"需重启"字段名，断言 `live_view` 确实覆盖了它们 ——
 ///   将来有人新增"需重启"字段却忘了同步这里，测试会红。
@@ -350,7 +350,7 @@ fn live_view(live: &ServerConfig, new: &ServerConfig) -> ServerConfig {
     // —— 以下是"需重启才生效"的字段：运行期改它们不生效，判据必须用 live ——
     effective.bind_addr = live.bind_addr.clone();
     effective.dashboard_port = live.dashboard_port;
-    // ★ v0.5.6（H2）：它只在启动期被读，属"需重启"，取 new 会被绕过。
+    // 它只在启动期被读，属"需重启"，取 new 会被绕过。
     effective.allow_insecure_dashboard = live.allow_insecure_dashboard;
     effective
 }
@@ -366,7 +366,7 @@ fn reject_reason(live: &ServerConfig) -> String {
 
 /// 后台任务：盯着配置文件，变了就重载。
 ///
-/// ★ `current` 是 `&mut Arc<ServerConfig>`（v0.5.3 起）：应用成功后**必须**把
+/// `current` 是 `&mut Arc<ServerConfig>`：应用成功后**必须**把
 /// 它换成新配置，否则会出现「清空了凭据 → 再改回来 old == new → 分支不再进入
 /// → 鉴权永远停在 None」这种**不可逆**的状态（实测复现过）。
 /// 旧签名是 `Arc<ServerConfig>`，等于拿一份永不更新的启动快照做 diff。
@@ -395,14 +395,13 @@ pub async fn watch(
             }
         };
 
-        // ★ 安全校验重跑一次。启动时那道（main.rs::validate / serve.rs 兜底）
-        // 只在启动路径跑过，对"运行期漂移"完全无效 —— 这正是 v0.5.2 那个
+        // 安全校验重跑一次。启动时那道（main.rs::validate / serve.rs 兜底）
+        // 只在启动路径跑过，对"运行期漂移"完全无效 —— 这正是那个
         // 高危漏洞的成因。这里对新配置**照同样口径**再判一次，不通过就整份拒绝。
         //
-        // ★ 判据里 `bind_addr` 与 `dashboard_port` 都取 `current`（运行期已生效那份）：
+        // 判据里 `bind_addr` 与 `dashboard_port` 都取 `current`（运行期已生效那份）：
         //   两者都不可热改，新配置里那个值本次并不生效。**只换 bind_addr 是不够的** ——
         //   删掉 `dashboard_port` 那一行同样能让判据误以为"面板没开"，而监听器还活着
-        //   （这就是 v0.5.3 漏掉的 H1 绕过点）。
         if dashboard_exposed_after_reload(&current, &new) {
             warn!(
                 "热重载被拒：{} 这正是 v0.5.2 修掉的那个漏洞场景，运行期不允许制造它。\
@@ -421,7 +420,7 @@ pub async fn watch(
                 pending.fields.join(", ")
             );
         }
-        // ★ 关键：更新基线快照。不更新的话下一次 diff 仍拿启动时那份比，
+        // 关键：更新基线快照。不更新的话下一次 diff 仍拿启动时那份比，
         // 会让"改回去"这类操作被误判为"没变化"而静默丢失（不可逆 bug）。
         // 安全闸门不通过的情形已经在上面 `continue` 掉了，走不到这里。
         current = Arc::new(new);
@@ -477,9 +476,9 @@ mod tests {
         );
     }
 
-    /// ★★ v0.5.3 回归：**对外地址上绝不允许通过热重载清空面板鉴权**。
+    /// **对外地址上绝不允许通过热重载清空面板鉴权**。
     ///
-    /// 这是 v0.5.2 那个高危漏洞的锁定测试。复现步骤（实测过）：
+    /// 这是 那个高危漏洞的锁定测试。复现步骤（实测过）：
     /// `bind_addr=0.0.0.0` + `dashboard_user=admin` 启动（合法）→
     /// 编辑配置清空用户名 → 面板变匿名可写（`/api/status` 从 401 变 200）。
     #[test]
@@ -510,7 +509,7 @@ mod tests {
         );
     }
 
-    /// ★★ v0.5.3 回归：**不可逆 bug** —— 改回去必须能恢复鉴权。
+    /// **不可逆 bug** —— 改回去必须能恢复鉴权。
     ///
     /// 旧的 `watch()` 用一份永不更新的 `current` 快照做 diff，于是
     /// 「清空 → 改回」第二次因为 `old == new` 而跳过，鉴权永久为 None。
@@ -583,7 +582,7 @@ mod tests {
 
     /// 没开面板端口时，清空用户名不影响任何安全语义。
     ///
-    /// ★ 注意：这条测的是"**运行期也没绑**面板"的情形（`old.dashboard_port` 为空）。
+    /// 注意：这条测的是"**运行期也没绑**面板"的情形（`old.dashboard_port` 为空）。
     /// 它**不能**推广成"新配置里没写 dashboard_port 就等于面板没开" ——
     /// 那正是 H1 绕过点的错误假设，对应场景见下面
     /// `已绑定面板后删掉端口行仍应被视为暴露`。
@@ -602,10 +601,10 @@ mod tests {
         assert!(auth.read().unwrap().is_none());
     }
 
-    /// ★★ v0.5.4 回归（H1）：**运行期已绑定面板，配置里删掉 `dashboard_port` 行，
+    /// （H1）：**运行期已绑定面板，配置里删掉 `dashboard_port` 行，
     /// 仍然必须被视为"暴露"**。
     ///
-    /// 这是 v0.5.3 漏掉的绕过点，根因是拿"配置里写没写"代表"运行期有没有在监听"：
+    /// 这是 漏掉的绕过点，根因是拿"配置里写没写"代表"运行期有没有在监听"：
     ///
     /// ```text
     ///   ① 启动：0.0.0.0 + dashboard_port = 7500 + dashboard_user = "admin"（合法）
@@ -706,7 +705,7 @@ mod tests {
         c.bind_addr = String::new();
         assert!(dashboard_is_exposed(&c), "空绑定地址表示监听全网卡");
 
-        // ★★ v0.5.6（审计总报告 H1）：**只配用户名、不配密码 ≠ 有凭据**。
+        // **只配用户名、不配密码 ≠ 有凭据**。
         //
         // 这一条是原测试写错的地方 —— 它原先在这里只设 `dashboard_user = "admin"`
         // 就断言"安全"，恰好把 H1 的漏洞配置当成了安全配置固化下来。
@@ -764,7 +763,6 @@ mod tests {
     }
 
     // ==================================================================
-    // v0.5.6 回归（审计总报告 H1 / H2）
     //
     // H1 的根因是"同一判定在四处各写了一遍，每处都只判了 user"，
     // 而现有测试恰好喂的是"user 与 pwd 同时清空"，把"只清 pwd"这种
@@ -783,7 +781,7 @@ mod tests {
         c
     }
 
-    /// ★★ H1 核心回归：**只清空密码**不得把鉴权降级成 `admin:`。
+    /// H1 核心回归：**只清空密码**不得把鉴权降级成 `admin:`。
     ///
     /// 这正是攻击者实际会用的手法（保留用户名、清掉密码）。
     /// 修复前 `clears_creds = "admin".is_empty() = false` ⇒ 闸门不拦
@@ -820,7 +818,7 @@ mod tests {
         );
     }
 
-    /// ★★ H2 核心回归：热重载时**同时**打开 `allow_insecure_dashboard`
+    /// H2 核心回归：热重载时**同时**打开 `allow_insecure_dashboard`
     /// 也不能绕过闸门。
     ///
     /// 修复前 `dashboard_exposed_after_reload` 只把 `bind_addr` 与
@@ -885,7 +883,7 @@ mod tests {
         );
     }
 
-    /// ★ 不变量：`live_view` 必须把**所有不可热改**的判据字段都取运行期值。
+    /// 不变量：`live_view` 必须把**所有不可热改**的判据字段都取运行期值。
     ///
     /// 这是防"手工列举漏字段"的护栏 —— H1（漏 `dashboard_port`）与
     /// H2（漏 `allow_insecure_dashboard`）都是同一成因。
@@ -895,7 +893,7 @@ mod tests {
         // 攻击者把三项**不可热改**的字段全改成"看起来安全"的值，
         // 但**凭据保持不变**（凭据是可热改的，本来就该取 new）。
         //
-        // ★ 第一版这条测试写错了：我把凭据也清空了，然后断言"结论必须与
+        // 第一版这条测试写错了：我把凭据也清空了，然后断言"结论必须与
         //   live 一致" —— 但凭据是可热改字段，判据**本来就应该**看到
         //   "新配置把凭据清掉了"。清空凭据后判为暴露是**正确**行为。
         //   这条不变量只针对不可热改的那三项。

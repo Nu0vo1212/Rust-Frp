@@ -85,13 +85,13 @@ pub struct AeadWriter {
     stream_nonce: [u8; NONCE_LEN],
     nonce: [u8; NONCE_LEN],
     header_sent: bool,
-    /// 已发帧数（v0.5.4，M7）。
+    /// 已发帧数。
     ///
     /// 上游 Go 实现在帧数达到 2³² 时会 **fail-closed**（主动断开），
     /// 因为 nonce 是 96 位里带着一个 32 位计数器 —— 越过 2³² 就有重用风险。
     /// NFrp 原先没有这个计数，等于丢掉了上游的一道防御（fail-open 回归）。
     ///
-    /// ★ 诚实说明：由于 `nonce` 每帧都真正 +1，**当前不存在 nonce 重用**，
+    /// 诚实说明：由于 `nonce` 每帧都真正 +1，**当前不存在 nonce 重用**，
     ///   所以这不是"当前可利用的漏洞"。但缺了它，未来任何一次加密层重构
     ///   都可能把"丢帧计数"变成真的 nonce 重用 ⇒ 灾难性失密（CFB/GCM 下
     ///   重用 nonce 会让攻击者直接恢复明文异或）。加这一条成本几乎为零。
@@ -124,7 +124,7 @@ impl AeadWriter {
             self.header_sent = true;
         }
         for chunk in plaintext.chunks(MAX_PAYLOAD) {
-            // ★ v0.5.4（M7）：帧数逼近 nonce 空间上限时 **fail-closed**。
+            // 帧数逼近 nonce 空间上限时 **fail-closed**。
             //   与上游一致：宁可断开，也不能冒 nonce 重用的风险。
             if self.frame_count >= MAX_FRAMES {
                 bail!("AEAD 帧数达到上限（{MAX_FRAMES}），为避免 nonce 重用强制断开");
@@ -273,7 +273,7 @@ mod tests {
         assert_ne!(c2s, s2c);
     }
 
-    /// ★★ v0.5.4 回归（M7）：AEAD 必须记帧数，并在逼近 2³² 时 **fail-closed**。
+    /// （M7）：AEAD 必须记帧数，并在逼近 2³² 时 **fail-closed**。
     ///
     /// 上游 Go 实现在帧数达上限时主动断开（nonce 是 96 位里含一个 32 位计数器）。
     /// NFrp 原先没有这个计数 —— 属 fail-open 回归。

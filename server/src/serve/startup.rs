@@ -38,7 +38,7 @@ use crate::{
 use super::conn::{handle_conn, handle_frp_stream, handle_stream};
 use super::preauth::PreauthSlot;
 
-/// ★★ v0.5.8（第七轮审计 A-1）：**认证前连接失败日志的折叠器**。
+/// **认证前连接失败日志的折叠器**。
 ///
 /// # 为什么是"折叠"而不是"限速"—— 这是实测踩出来的
 ///
@@ -88,7 +88,7 @@ pub async fn serve(cfg: Arc<ServerConfig>, registry: Arc<Registry>) -> Result<()
 
 /// **启动前的完整校验** —— `frps --check` 应当走这条。
 ///
-/// ★★ v0.5.7 修（第六轮审计 F-1，中危）：**预检必须与启动同口径**。
+/// **预检必须与启动同口径**。
 ///
 /// # 原先为什么错了
 ///
@@ -130,7 +130,7 @@ pub async fn serve(cfg: Arc<ServerConfig>, registry: Arc<Registry>) -> Result<()
 pub fn preflight(cfg: &ServerConfig) -> Result<()> {
     // 与 `serve_with` 启动路径**同一份**校验，只是不绑端口、不拉 JWKS。
     crate::guard::SecurityContext::from_config(cfg)?;
-    // 限制①批次3：证书/私钥/CA 能否装载，必须在 --check 阶段就暴露，
+    // 证书/私钥/CA 能否装载，必须在 --check 阶段就暴露，
     // 不能等到真正 TLS 握手时才报错。
     frp::tls::validate_server_tls_files(
         &cfg.tls_cert_file,
@@ -193,7 +193,7 @@ pub async fn serve_on_with(
 ) -> Result<()> {
     let addr = listener.local_addr().context("取不到监听地址")?;
 
-    // 限制①批次3：自定义证书 / mTLS。必须在任何 accept_server 之前安装。
+    // 自定义证书 / mTLS。必须在任何 accept_server 之前安装。
     frp::tls::configure_server_tls(
         &cfg.tls_cert_file,
         &cfg.tls_key_file,
@@ -202,7 +202,7 @@ pub async fn serve_on_with(
 
     // 安全上下文：认证方式 / IP 白黑名单 / 角色权限 / 审计日志。
     //
-    // ★ 编译失败必须**拦住启动**：配置里写错一个 CIDR 就静默退化成
+    // 编译失败必须**拦住启动**：配置里写错一个 CIDR 就静默退化成
     //   "没有访问控制"，那比起不来危险得多。
     let security = Arc::new(crate::guard::SecurityContext::from_config(&cfg)?);
     registry.set_security(security.clone());
@@ -339,7 +339,7 @@ pub async fn serve_on_with(
     }
 
     info!("nfrp-server 已启动：frp v2 协议，监听 {addr}");
-    // ★ 这份清单必须与 `register_proxy` 的 match 分支一一对应。
+    // 这份清单必须与 `register_proxy` 的 match 分支一一对应。
     //   tcpmux 加进来时漏过一次：代理类型真能用，但启动日志里没有它，
     //   用户按日志判断"这个版本支不支持 tcpmux"会得到相反的结论。
     info!("支持的代理类型：tcp / udp / http / https / tcpmux / stcp / xtcp / sudp");
@@ -379,7 +379,7 @@ pub async fn serve_on_with(
             (cfg.vhost_https_port, vhost::VhostKind::Https),
             (cfg.tcpmux_http_connect_port, vhost::VhostKind::TcpMux),
         ];
-        // ★ 限制①批次1：vhost 的 HTTP/HTTPS/tcpmux 监听跟随 `proxyBindAddr`
+        // vhost 的 HTTP/HTTPS/tcpmux 监听跟随 `proxyBindAddr`
         //   （官方 `ProxyBindAddr` 的作用范围之一就是 vhost 端口；留空时
         //   = `bindAddr`，行为与老版本一致）。
         let proxy_host = cfg.effective_proxy_bind_addr();
@@ -426,13 +426,13 @@ pub async fn serve_on_with(
                 .await
                 .with_context(|| format!("监听 UDP {addr} 失败"))?,
         );
-        // ★ v0.5.9（第九轮审计 E9-1）：牵线 UDP 也过 ACL（纵深防御，口径统一）。
+        // 牵线 UDP 也过 ACL（纵深防御，口径统一）。
         tokio::spawn(crate::p2p::run_rendezvous(sock, hub, registry.security()));
     }
 
     // 内置面板 + /metrics：与 frp 的 dashboard 一样是可选端口
     //
-    // ★ v0.5.6 修（审计总报告 H1）：这是同一判定的**第五处**（审计报告漏列了它），
+    // 这是同一判定的**第五处**（审计报告漏列了它），
     //   原先同样只判 `dashboard_user.is_empty()`。必须用唯一真源，
     //   否则"用户名非空 + 密码为空"会初始化出 `Some(("admin", ""))`，
     //   而 `dashboard.rs` 会拿它去比 `"admin:"` —— 鉴权形同虚设。
@@ -448,7 +448,7 @@ pub async fn serve_on_with(
         // `serve_with` 是所有启动方式的必经之地（包括将来新加的加载路径、
         // 以及嵌进别的宿主程序时直接调它的场景）。面板无鉴权 + 非回环 =
         // 匿名者可写，这条不能只靠上游校验。
-        // ★ v0.5.6（H1）：同样要判**密码**，不能只看用户名。
+        // 同样要判**密码**，不能只看用户名。
         if !has_dash_creds
             && !nfrp_common::util::is_loopback_addr(&cfg.bind_addr)
             && !cfg.allow_insecure_dashboard
@@ -489,9 +489,9 @@ pub async fn serve_on_with(
     // 配置热重载：改完日志级别/面板密码不用重启
     if cfg.hot_reload {
         if let Some(path) = extras.config_path.clone() {
-            // ★ watch 持有这份快照的**所有权**（`Arc<ServerConfig>` 按值传入，
+            // watch 持有这份快照的**所有权**（`Arc<ServerConfig>` 按值传入，
             // 由它自己 `current = Arc::new(new)` 更新），所以这里给它一份克隆。
-            // 关键点是它**内部会更新自己那份**，不再像 v0.5.2 那样拿一份永不
+            // 关键点是它**内部会更新自己那份**，不再像 那样拿一份永不
             // 更新的启动快照做 diff（那会导致「改回去不生效」的不可逆状态）。
             tokio::spawn(crate::reload::watch(
                 path,
@@ -522,7 +522,7 @@ pub async fn serve_on_with(
 
     // QUIC 传输。
     //
-    // ★ v0.6.5：**优先用独立的 `quicBindPort`**（对齐官方 frps 语义）。
+    // **优先用独立的 `quicBindPort`**（对齐官方 frps 语义）。
     //
     // 旧行为是"`transport_protocol = quic` 时在 `bindPort` 的同名 UDP 端口
     // 上额外监听"，客户端没法指定别的端口。现在：
@@ -608,7 +608,7 @@ pub async fn serve_on_with(
         let kaddr = util::resolve_addr(&format!("{}:{}", cfg.bind_addr, kport))
             .await
             .with_context(|| format!("解析 KCP 地址 {}:{} 失败", cfg.bind_addr, kport))?;
-        // ★ v0.6.2：会话上限可配（默认 1024，约 15 MB 峰值）。
+        // 会话上限可配（默认 1024，约 15 MB 峰值）。
         //
         // 这是内存上界的**唯一**决定因素：KCP 每会话约 15.3 KB。
         // 超大规模部署应该拆实例或改用 TCP/QUIC 承载控制连接，
@@ -660,7 +660,7 @@ pub async fn serve_on_with(
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, peer) = accepted.context("accept 失败")?;
-                // 主端口 TCP keepalive（限制①批次2，官方 `tcpKeepalive`：
+                // 主端口 TCP keepalive（官方 `tcpKeepalive`：
                 // 官方在 `bind_port` 主监听器上 `SetKeepAlive`，作用范围一致）。
                 // `0` = 不打开（项目约定）。
                 if cfg.tcp_keepalive > 0 {
@@ -676,7 +676,7 @@ pub async fn serve_on_with(
                 let registry = registry.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_conn(stream, peer, cfg, registry).await {
-                        // ★★ v0.5.8 修（第七轮审计 **A-1**，中危）：**限流这条 WARN**。
+                        // **限流这条 WARN**。
                         //
                         // # 原先为什么错了
                         //
@@ -702,7 +702,7 @@ pub async fn serve_on_with(
                         // 同一失败原因每 5 秒窗口最多写两条（首条 + 汇总），
                         // ⇒ 磁盘增长有**上界**，与攻击速率无关。
                         //
-                        // ★ 第一版只做速率限制（20 条/秒），实测**对慢速打无效**
+                        // 第一版只做速率限制（20 条/秒），实测**对慢速打无效**
                         //   —— 攻击者把速率压到配额以下就绕过了（仍有 12.5× 放大）。
                         //   详见 `CONN_END_LOG` 的文档注释。
                         let d = CONN_END_LOG.observe();

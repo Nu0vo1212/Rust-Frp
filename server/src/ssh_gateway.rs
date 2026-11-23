@@ -395,7 +395,7 @@ async fn run_tunnel(
         // 公钥认证通过时官方不再验 token；只有 authorized_keys 为空才强制。
         // 但用户显式给了 --token 也校验一次，避免“token 写错却静默通过”。
         //
-        // ★ 0.7.7：这里必须用 `verify_raw_token`。`--token` 是**原始 token**，
+        // 0.7.7：这里必须用 `verify_raw_token`。`--token` 是**原始 token**，
         //   而 `verify_login` 期望的是 `auth_key(token, ts)` 派生值 ——
         //   0.7.6 及以前直接调 `verify_login`，导致 token 认证**永远失败**
         //   （报 "token in login doesn't match token from configuration"）。

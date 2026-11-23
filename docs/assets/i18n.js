@@ -44,7 +44,7 @@ const I18N = {
     't-nlink': 'NLink v1 协议',
 
     /* ---- home hero ---- */
-    'hero-badge': 'v0.7.8 · 与 frp 0.71.0 实测互通',
+    'hero-badge': 'v0.7.10 · 与 frp 0.71.0 实测互通',
     'hero-title-1': '把内网服务',
     'hero-title-2': '安全地',
     'hero-title-3': '带到公网',
@@ -187,7 +187,7 @@ const I18N = {
     'nav-nlink': 'NLink v1 Protocol',
     't-nlink': 'NLink v1 Protocol',
 
-    'hero-badge': 'v0.7.8 · verified against frp 0.71.0',
+    'hero-badge': 'v0.7.10 · verified against frp 0.71.0',
     'hero-title-1': 'Bring internal services ',
     'hero-title-2': 'to the public',
     'hero-title-3': ' safely',

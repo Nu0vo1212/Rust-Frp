@@ -20,7 +20,7 @@ cargo test --workspace                     # 1010 个测试通过
 
 ---
 
-## 二、测试分布（v0.7.7 实测）
+## 二、测试分布（v0.7.10 实测）
 
 `cargo test --workspace` 实测输出：
 

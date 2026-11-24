@@ -151,6 +151,21 @@ def parse_test_claims() -> tuple[list[Claim], dict[str, list[Claim]]]:
         total += collect(p, prose_re, "tests", "正文测试数")
         total += collect(p, cmd_re, "tests", "测试命令注释")
 
+    # 文档站概览卡片也必须与真实测试数一致。data-count 驱动数字动画，
+    # stat-value 是首屏可见值，两者都要校验，避免只改一处。
+    site = ROOT / "docs" / "index.html"
+    if site.is_file():
+        total += collect(
+            site,
+            r'data-count="(\d+)"[^>]*><div class="stat-value">\d+</div>'
+            r'<div class="stat-label" data-i18n="stat-tests"',
+            "tests", "文档站概览 data-count")
+        total += collect(
+            site,
+            r'data-count="\d+"[^>]*><div class="stat-value">(\d+)</div>'
+            r'<div class="stat-label" data-i18n="stat-tests"',
+            "tests", "文档站概览可见值")
+
     for name in ["QUALITY.md", *README_FILES]:
         p = ROOT / name
         if not p.is_file():
